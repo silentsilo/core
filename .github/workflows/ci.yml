@@ -1,0 +1,234 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# One run per branch: a newer push supersedes the runs before it, so a hung
+# job cannot hold a queue of stale commits behind it.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The whole suite, on the platform where it has always run.
+  #
+  # Windows only, deliberately. Parts of `silentsilo-vault` reach the OS
+  # keychain, and that path has been exercised on a Windows runner and nowhere
+  # else: on Linux it wants a D-Bus session and on macOS an unlocked keychain,
+  # neither of which a runner gives by default. The code falls back to a file
+  # when the keychain refuses, so it may well pass on all three, but "may well"
+  # is not what a green tick should mean. Widening this matrix is a deliberate
+  # piece of work, and the right time is when the macOS port starts.
+  #
+  # `--locked` everywhere: a lockfile that drifts silently is how a release
+  # picks up dependency versions nobody chose.
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --all --locked
+      - run: cargo check --all --locked
+
+  # Evidence that the engine still compiles off Windows, plus the format
+  # fixtures, which are worth running on other filesystems: a case-insensitive
+  # APFS volume is where a name-resolution regression shows up first. The
+  # fixtures touch no keychain, so they are safe to run anywhere.
+  portability:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: portability-${{ matrix.os }}
+      # The keychain crate reaches the Secret Service over D-Bus, and the
+      # security-key backend speaks HID over udev.
+      - name: System libraries the workspace links against
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          for attempt in 1 2 3; do
+            sudo timeout 180 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && break
+            echo "apt-get update stalled or failed (attempt $attempt)"
+            sleep 5
+          done
+          sudo apt-get install -y libdbus-1-dev libudev-dev pkg-config
+      - run: cargo check --all --locked
+      - run: cargo test -p silentsilo-fixture --locked
+
+  # The dependency direction, as a test rather than as a paragraph. Nothing
+  # in this repository may reach a user interface: not Tauri, not a webview,
+  # not the desktop application's OS integration crate. A crate that starts
+  # depending on one of those has stopped being usable from a mobile client,
+  # and the only thing that would say so is this job.
+  no-ui-deps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: no-ui-deps
+      - name: System libraries the workspace links against
+        run: |
+          for attempt in 1 2 3; do
+            sudo timeout 180 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && break
+            echo "apt-get update stalled or failed (attempt $attempt)"
+            sleep 5
+          done
+          sudo apt-get install -y libdbus-1-dev libudev-dev pkg-config
+      - name: No crate here may depend on a UI
+        run: |
+          forbidden='^(tauri|tauri-build|tauri-runtime|wry|tao|webkit2gtk|gtk|silentsilo-shell)$'
+          fail=0
+          for crate in $(cargo metadata --format-version 1 --no-deps \
+              | python3 -c "import sys,json;[print(p['name']) for p in json.load(sys.stdin)['packages']]"); do
+            hits=$(cargo tree -p "$crate" -e normal --prefix none --locked \
+              | awk '{print $1}' | sort -u | grep -E "$forbidden" || true)
+            if [ -n "$hits" ]; then
+              echo "::error::$crate depends on $(echo "$hits" | tr '\n' ' ')"
+              fail=1
+            fi
+          done
+          exit $fail
+
+  # Compile-checks the CTAP2/USB-HID security-key backend. This is the code
+  # path Windows never builds (it uses the OS WebAuthn API instead), so
+  # without this job a change could break the Linux and macOS path unnoticed.
+  fido-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+      - name: System libraries this job links against
+        run: |
+          for attempt in 1 2 3; do
+            sudo timeout 180 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && break
+            echo "apt-get update stalled or failed (attempt $attempt)"
+            sleep 5
+          done
+          sudo apt-get install -y libudev-dev pkg-config
+      - run: cargo check -p silentsilo-fido --features hardware --locked
+
+  # File modes are a Unix-only concern. Scoped to the `workdir` module on
+  # purpose: it is the one that decides what the plaintext working copy and
+  # every opened file are readable by. The symlink test needs a runner that
+  # can create symbolic links without developer mode, which Windows cannot.
+  permissions-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+      # The keyring backend reaches the Secret Service over D-Bus, which
+      # builds against the system library.
+      - name: System libraries this job links against
+        run: |
+          for attempt in 1 2 3; do
+            sudo timeout 180 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && break
+            echo "apt-get update stalled or failed (attempt $attempt)"
+            sleep 5
+          done
+          sudo apt-get install -y libdbus-1-dev pkg-config
+      # Quoted: a plain YAML scalar ending in a colon reads as a mapping key.
+      - run: "cargo test -p silentsilo-vault --locked workdir::"
+      - run: "cargo test -p silentsilo-vault --locked protected::"
+
+  # The tests that talk to a real S3 server, WebDAV share and SFTP account,
+  # which skip themselves when no endpoint is configured. Signing, header
+  # compatibility and response parsing are exactly what unit tests cannot
+  # reach, and exactly where an S3 client breaks against a provider that is
+  # not AWS.
+  storage-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SILENTSILO_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+      SILENTSILO_TEST_S3_KEY: silentsilo
+      SILENTSILO_TEST_S3_SECRET: silentsilo123
+      SILENTSILO_TEST_S3_BUCKET: vault-test
+      SILENTSILO_TEST_WEBDAV_URL: http://127.0.0.1:8088
+      SILENTSILO_TEST_SFTP_HOST: 127.0.0.1
+      SILENTSILO_TEST_SFTP_PORT: "2222"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+      - name: System libraries this job links against
+        run: |
+          for attempt in 1 2 3; do
+            sudo timeout 180 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && break
+            echo "apt-get update stalled or failed (attempt $attempt)"
+            sleep 5
+          done
+          sudo apt-get install -y libdbus-1-dev pkg-config
+      # Started as steps rather than service containers: two of the three
+      # images need a command, and services cannot give one.
+      - name: Start the storage backends
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=silentsilo \
+            -e MINIO_ROOT_PASSWORD=silentsilo123 \
+            minio/minio server /data
+          docker run -d --name webdav -p 8088:80 \
+            -e USERNAME=silentsilo -e PASSWORD=silentsilo123 \
+            bytemark/webdav
+          docker run -d --name sftp -p 2222:22 \
+            atmoz/sftp:alpine silentsilo:silentsilo123:::silo
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:9000/minio/health/live; then break; fi
+            sleep 1
+          done
+          # MC_HOST_<alias> rather than `mc alias set`: the alias would be
+          # written inside a --rm container and gone before the next command,
+          # which fails as "Access Denied" and looks like a credentials
+          # problem rather than a missing alias.
+          docker run --rm --network host \
+            -e MC_HOST_local=http://silentsilo:silentsilo123@127.0.0.1:9000 \
+            minio/mc mb --ignore-existing local/vault-test
+      - run: cargo test -p silentsilo-s3 --locked --test live_roundtrip
+      - run: cargo test -p silentsilo-store --locked --test contract
+      - run: cargo test -p silentsilo-sync --locked
+      # A backend that quietly skipped is the failure this job exists to
+      # prevent, so make the skip loud rather than leave it in captured
+      # output nobody reads.
+      - name: Fail if a backend was skipped
+        run: |
+          out=$(cargo test -p silentsilo-store --locked --test contract -- --nocapture 2>&1)
+          echo "$out"
+          if echo "$out" | grep -q "skipped"; then
+            echo "::error::a storage backend was not exercised"
+            exit 1
+          fi
+      - name: Container logs on failure
+        if: failure()
+        run: docker logs minio; docker logs webdav; docker logs sftp

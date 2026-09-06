@@ -1,0 +1,10 @@
+The minisign public key the SilentSilo updater checks a release against, and
+the key the extraction tool released here is signed with.
+
+Verify a downloaded extractor with minisign:
+
+    minisign -Vm silentsilo-extract-linux-x86_64 -P <the key line below>
+
+untrusted comment: minisign public key: 79E53220B75C79B7
+RWS3eVy3IDLlean9BrZWUaxbTyj+oKfoc4g+IJ6xaAhUwbV8v8WnDbZP
+

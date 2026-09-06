@@ -1,0 +1,56 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/silentsilo-core",
+    "crates/silentsilo-crypto",
+    "crates/silentsilo-vault",
+    "crates/silentsilo-vfs",
+    "crates/silentsilo-fido",
+    "crates/silentsilo-s3",
+    "crates/silentsilo-store",
+    "crates/silentsilo-fixture",
+    "crates/silentsilo-testkit",
+    "crates/silentsilo-sync",
+    "crates/silentsilo-extract",
+]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.94"
+license = "AGPL-3.0-or-later"
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
+aes-gcm = "0.10"
+blake3 = "1"
+rand = "0.9"
+zeroize = { version = "1", features = ["derive"] }
+argon2 = "0.5"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+silentsilo-core = { path = "crates/silentsilo-core" }
+silentsilo-crypto = { path = "crates/silentsilo-crypto" }
+silentsilo-fixture = { path = "crates/silentsilo-fixture" }
+silentsilo-testkit = { path = "crates/silentsilo-testkit" }
+silentsilo-vault = { path = "crates/silentsilo-vault" }
+silentsilo-vfs = { path = "crates/silentsilo-vfs" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"] }
+silentsilo-fido = { path = "crates/silentsilo-fido" }
+silentsilo-s3 = { path = "crates/silentsilo-s3" }
+silentsilo-store = { path = "crates/silentsilo-store" }
+silentsilo-sync = { path = "crates/silentsilo-sync" }
+# default-https-client, not the legacy "rustls" feature: that one drags in
+# rustls 0.21 with a webpki release carrying three RUSTSEC advisories, while
+# this one rides the maintained rustls 0.23 / aws-lc stack the tree already
+# compiles anyway.
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"] }
+aws-credential-types = "1"
+aws-smithy-types = "1"
+aws-smithy-runtime-api = "1"

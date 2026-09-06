@@ -1,0 +1,7 @@
+target
+
+# Internal working documents
+private/
+
+# Git history archives
+*.bundle
