@@ -1,5 +1,6 @@
 The minisign public key the SilentSilo updater checks a release against, and
-the key the extraction tool released here is signed with.
+the key the extraction tool is signed with. The tool is built from this
+repository and published on silentsilo/desktop's release page.
 
 Verify a downloaded extractor with minisign:
 

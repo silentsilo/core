@@ -39,9 +39,12 @@ files, the trash to one side, the passwords as CSV and the attachments. No
 interface, no security key, one source that builds on Windows, Linux and
 macOS.
 
-Binaries for all three are attached to each release here, signed with the
-same minisign key the updater checks. The public half is in
-[`SIGNING-PUBKEY.txt`](SIGNING-PUBKEY.txt).
+Binaries for all three ship with every desktop release, on the
+[silentsilo/desktop releases page](https://github.com/silentsilo/desktop/releases),
+built from the core tag that release pins and signed with the same minisign
+key the updater checks. The public half is in
+[`SIGNING-PUBKEY.txt`](SIGNING-PUBKEY.txt). This repository publishes tags,
+not releases.
 
 ## Dev
 
