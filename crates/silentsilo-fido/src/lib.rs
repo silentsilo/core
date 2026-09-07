@@ -4,6 +4,8 @@
 //! - **Linux / macOS**: CTAP2 over USB HID.
 
 mod backend;
+#[cfg(feature = "enclave")]
+pub mod enclave;
 // Only the hardware backends build client data; its deps are optional and
 // follow the same feature.
 #[cfg(feature = "hardware")]

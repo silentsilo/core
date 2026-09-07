@@ -176,10 +176,44 @@ const KEY_ENVELOPE: &str = r#"{"kind":"fido2","credential_id":"aa11","public_key
 /// in a bucket looks like this, and it must read as a FIDO2 key forever.
 const KEY_ENVELOPE_PRE_KIND: &str = r#"{"credential_id":"bb22","public_key":"3059","key_slot":1,"rp_id":"silentsilo.com","label":"Backup","wrapped_dek":"cafef00d","platform":false,"revoked":false}"#;
 
-/// A kind this build has never heard of, with a credential id that is not
-/// hex. What a macOS build would publish; a Windows client must carry it
-/// without using it and without failing over it.
-const KEY_ENVELOPE_FOREIGN: &str = r#"{"kind":"secure-enclave","credential_id":"touch-id-key-1","public_key":"","key_slot":2,"rp_id":"silentsilo.com","label":"MacBook Touch ID","wrapped_dek":"beefcafe","platform":true,"revoked":false}"#;
+/// A kind with a credential id that is not hex. Kept as the general case: a
+/// client must carry an envelope it cannot read the id of without using it
+/// and without failing over it, whatever the platform behind it.
+const KEY_ENVELOPE_FOREIGN: &str = r#"{"kind":"touch-id-of-the-future","credential_id":"touch-id-key-1","public_key":"","key_slot":2,"rp_id":"silentsilo.com","label":"MacBook Touch ID","wrapped_dek":"beefcafe","platform":true,"revoked":false}"#;
+
+/// A Secure Enclave envelope as the macOS build writes it, the second kind
+/// ever shipped. The credential id is the 16-byte keychain tag followed by
+/// the 65-byte ephemeral public key; `public_key` repeats the point. A
+/// Windows build carries it and skips it; a Mac build lists it as usable.
+const KEY_ENVELOPE_SECURE_ENCLAVE: &str = r#"{"kind":"secure-enclave","derivation":"ecdh-p256-hkdf-sha256-v1","credential_id":"000102030405060708090a0b0c0d0e0f046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5","public_key":"046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5","key_slot":3,"rp_id":"silentsilo.com","label":"MacBook Air Touch ID","wrapped_dek":"beefcafe","platform":true,"revoked":false}"#;
+
+#[test]
+fn the_secure_enclave_envelope_still_decodes() {
+    use silentsilo_vault::{StoredFidoCredential, StoredFidoKeys};
+
+    let key: StoredFidoCredential = serde_json::from_str(KEY_ENVELOPE_SECURE_ENCLAVE)
+        .expect("a Secure Enclave envelope can no longer be read");
+    assert_eq!(
+        key.kind,
+        silentsilo_vault::KIND_SECURE_ENCLAVE,
+        "the kind moved"
+    );
+    assert_eq!(
+        key.derivation,
+        silentsilo_vault::DERIVATION_ECDH_P256_V1,
+        "the derivation moved"
+    );
+    assert_eq!(key.credential_id.len(), 2 * 81, "the id is tag plus point");
+    assert!(key.platform, "sealed to the machine, like Hello");
+
+    let keys = StoredFidoKeys { keys: vec![key] };
+    // The composed behaviour: on the platform that made it, it unlocks; on
+    // any other, it is carried and skipped, and the id still decodes as hex
+    // so the allow-list is not the thing that fails.
+    let usable = if cfg!(target_os = "macos") { 1 } else { 0 };
+    assert_eq!(keys.usable().count(), usable);
+    assert_eq!(keys.credential_ids_bytes().expect("hex").len(), usable);
+}
 
 #[test]
 fn the_key_envelope_still_decodes() {

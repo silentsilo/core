@@ -41,9 +41,9 @@ pub use device_store::{
 };
 pub use error::VaultError;
 pub use fido_store::{
-    Authority, DERIVATION_HMAC_V1, KEY_SLOT_PRIMARY, KIND_FIDO2, OrgProof, POLICY_ORG,
-    StoredFidoCredential, StoredFidoKeys, fido_keys_path, has_backup_key, is_fido_enrolled,
-    load_fido_keys, save_fido_keys,
+    Authority, DERIVATION_ECDH_P256_V1, DERIVATION_HMAC_V1, KEY_SLOT_PRIMARY, KIND_FIDO2,
+    KIND_SECURE_ENCLAVE, OrgProof, POLICY_ORG, StoredFidoCredential, StoredFidoKeys,
+    fido_keys_path, has_backup_key, is_fido_enrolled, load_fido_keys, save_fido_keys,
 };
 pub use kdf::derive_vault_key;
 pub use kek_store::{kek_path, load_kek, save_kek, unwrap_kek_bytes, wrap_kek_bytes};

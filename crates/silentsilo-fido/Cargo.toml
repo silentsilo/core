@@ -16,6 +16,8 @@ base64 = { version = "0.22", optional = true }
 hex = { version = "0.4", optional = true }
 ciborium = { version = "0.2", optional = true }
 ctap-hid-fido2 = { version = "3.5.12", optional = true }
+p256 = { version = "0.14", features = ["ecdh"], optional = true }
+hkdf = { version = "0.12", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
@@ -25,8 +27,20 @@ windows = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+# The enclave, reached through Security.framework: the wrapper crate for key
+# generation, lookup and agreement, its sys crate for the one call it does
+# not wrap (importing a raw public key), Core Foundation for that call's
+# attribute dictionary, and LocalAuthentication to ask whether Touch ID can
+# answer at all. `OSX_10_15` is the data-protection keychain, the only one
+# an enclave key can live in.
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { version = "3.7", features = ["OSX_10_15"], optional = true }
+security-framework-sys = { version = "2.17", optional = true }
+core-foundation = { version = "0.10", optional = true }
+objc2-local-authentication = { version = "0.3", optional = true }
+
 [features]
-default = ["hardware"]
+default = ["hardware", "enclave"]
 hardware = [
     "dep:rand",
     "dep:blake3",
@@ -35,6 +49,22 @@ hardware = [
     "dep:hex",
     "dep:ciborium",
     "dep:ctap-hid-fido2",
+]
+# The Secure Enclave path. Its key agreement and derivation are pure Rust
+# and build everywhere, which is what makes them testable on every platform;
+# only the two macOS crates below reach the chip itself. Separate from
+# `hardware` so the module can be type-checked for macOS from a machine that
+# cannot compile the HID stack's C sources.
+enclave = [
+    "dep:rand",
+    "dep:sha2",
+    "dep:hex",
+    "dep:p256",
+    "dep:hkdf",
+    "dep:security-framework",
+    "dep:security-framework-sys",
+    "dep:core-foundation",
+    "dep:objc2-local-authentication",
 ]
 
 [[example]]

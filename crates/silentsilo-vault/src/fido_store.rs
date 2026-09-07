@@ -24,6 +24,26 @@ pub const KIND_FIDO2: &str = "fido2";
 /// nothing.
 pub const DERIVATION_HMAC_V1: &str = "hmac-secret-v1";
 
+/// A key held in a Mac's Secure Enclave and gated on Touch ID. Sealed to
+/// that machine, like Windows Hello; unlike Hello it is not a FIDO2
+/// credential at all, hence its own kind.
+pub const KIND_SECURE_ENCLAVE: &str = "secure-enclave";
+
+/// How a Secure Enclave key's wrap key is derived: P-256 Diffie-Hellman
+/// between the enclave key and an ephemeral key made at enrolment, then
+/// HKDF-SHA256 salted by the same per-vault string as `hmac-secret-v1`. The
+/// ephemeral public key rides in the credential id, after a 16-byte tag.
+pub const DERIVATION_ECDH_P256_V1: &str = "ecdh-p256-hkdf-sha256-v1";
+
+/// The kinds a ceremony on this build can end with the DEK. Windows and
+/// Linux answer for FIDO2 only; a Mac answers for its enclave too.
+fn usable_here(kind: &str, derivation: &str) -> bool {
+    (kind == KIND_FIDO2 && derivation == DERIVATION_HMAC_V1)
+        || (cfg!(target_os = "macos")
+            && kind == KIND_SECURE_ENCLAVE
+            && derivation == DERIVATION_ECDH_P256_V1)
+}
+
 /// A key an organisation administers, not the person holding this machine.
 ///
 /// An employee cannot retire a key carrying it, so a company keeps a way into
@@ -257,7 +277,7 @@ impl StoredFidoKeys {
     /// machine end with the DEK", the one every unlock path wants.
     pub fn usable(&self) -> impl Iterator<Item = &StoredFidoCredential> {
         self.active()
-            .filter(|k| k.kind == KIND_FIDO2 && k.derivation == DERIVATION_HMAC_V1)
+            .filter(|k| usable_here(&k.kind, &k.derivation))
     }
 
     pub fn primary(&self) -> Option<&StoredFidoCredential> {
@@ -379,6 +399,29 @@ mod tests {
             vec![vec![0xaa, 0x11]]
         );
         assert!(keys.find_by_credential_id(&[0xcc, 0x33]).is_none());
+    }
+
+    #[test]
+    fn a_secure_enclave_key_is_usable_on_a_mac_and_nowhere_else() {
+        // The one kind that exists besides FIDO2, with the id shape the Mac
+        // backend really writes: a 16-byte tag then a 65-byte point, hex.
+        let id = format!("{}04{}", "11".repeat(16), "22".repeat(64));
+        let mut mac = foreign("unused");
+        mac.kind = KIND_SECURE_ENCLAVE.into();
+        mac.derivation = DERIVATION_ECDH_P256_V1.into();
+        mac.credential_id = id;
+        let keys = StoredFidoKeys {
+            keys: vec![fido2("aa11"), mac],
+        };
+        assert_eq!(keys.active().count(), 2, "both are enrolled on the silo");
+        let expected = if cfg!(target_os = "macos") { 2 } else { 1 };
+        assert_eq!(keys.usable().count(), expected);
+        assert_eq!(
+            keys.credential_ids_bytes()
+                .expect("an 81-byte hex id decodes like any other")
+                .len(),
+            expected
+        );
     }
 
     #[test]
