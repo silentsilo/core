@@ -144,6 +144,36 @@ Slots are assigned in enrollment order (`0` for the first key), but carry no
 privilege difference: every enrolled key wraps the same DEK and can unlock the
 vault on its own. Enrolling a second key is redundancy against losing the first.
 
+## Touch ID unlock (Secure Enclave, ECDH)
+
+The macOS build's platform authenticator is not a FIDO2 credential. What a
+Mac has is a P-256 key in the Secure Enclave whose private half never
+leaves the chip and whose use is gated on Touch ID
+(`kSecAccessControlBiometryCurrentSet`: adding or removing a fingerprint
+invalidates it). There is no `hmac-secret` to ask for, so the wrap key comes
+from a key agreement instead.
+
+| Field | Value |
+|-------|-------|
+| Kind / derivation | `secure-enclave` / `ecdh-p256-hkdf-sha256-v1` |
+| Enclave key | P-256, `kSecAttrTokenIDSecureEnclave`, data-protection keychain |
+| Agreement | ECDH, raw x coordinate (`kSecKeyAlgorithmECDHKeyExchangeStandard`) |
+| KDF | HKDF-SHA256, salt `silentsilo-dek-v1:{vault_uuid}`, info `silentsilo secure-enclave wrap key v1` |
+| Credential id | 16-byte keychain tag, then the 65-byte uncompressed ephemeral public key |
+
+Flow:
+
+1. **Enrollment**: generate the enclave key; generate an ephemeral P-256 pair in software; ECDH between the ephemeral private key and the enclave public key; HKDF the shared secret into `wrap_key`; keep the ephemeral public key in the credential id and discard its private half. One ceremony, no prompt: the enclave signs nothing here.
+2. **Unlock**: split the credential id, find the enclave key by its tag, hand the ephemeral public key to the enclave; ECDH with the enclave private key runs behind the Touch ID sheet; the same HKDF reproduces `wrap_key`.
+
+Both public keys are stored in the clear, and that is fine: recovering the
+shared secret from them is the computational Diffie-Hellman problem, and the
+enclave key is the only thing that can compute it. The salt is the vault id,
+so two silos on one machine never share a wrap key. The agreement and the
+KDF are plain Rust and tested on every platform; only the calls into the
+enclave are macOS code. A client on another platform carries the envelope
+and skips it, exactly as it would any kind it does not know.
+
 ## Enrolled key records (`keys/fido.json`)
 
 One record per enrolled credential, stored locally alongside the vault:
@@ -547,3 +577,5 @@ machine](#malware-on-the-users-machine).
 | Argon2 KDF | `crates/silentsilo-vault/src/kdf.rs` |
 | FIDO hmac-secret (Windows) | `crates/silentsilo-fido/src/backend/win.rs` |
 | FIDO hmac-secret (Linux/macOS) | `crates/silentsilo-fido/src/backend/ctap.rs` |
+| Secure Enclave agreement and KDF | `crates/silentsilo-fido/src/enclave.rs` |
+| Secure Enclave calls (macOS) | `crates/silentsilo-fido/src/backend/enclave_mac.rs` |

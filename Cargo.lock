@@ -3903,7 +3903,7 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-core"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "serde",
  "tempfile",
@@ -3913,7 +3913,7 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-crypto"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "aes-gcm 0.10.3",
  "blake3",
@@ -3928,7 +3928,7 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-extract"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "base64",
  "hex",
@@ -3947,7 +3947,7 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-fido"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "base64",
  "blake3",
@@ -3971,7 +3971,7 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-fixture"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "rusqlite",
  "serde_json",
@@ -3988,7 +3988,7 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-s3"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "aws-credential-types",
  "aws-sdk-s3",
@@ -4003,7 +4003,7 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-store"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "percent-encoding",
@@ -4025,7 +4025,7 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-sync"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "rusqlite",
@@ -4046,11 +4046,11 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-testkit"
-version = "1.0.0"
+version = "1.1.0"
 
 [[package]]
 name = "silentsilo-vault"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "aes-gcm 0.10.3",
  "argon2 0.5.3",
@@ -4073,7 +4073,7 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-vfs"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "base64",
  "blake3",
