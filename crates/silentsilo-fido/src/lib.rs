@@ -75,10 +75,11 @@ pub fn begin_enrollment(
 
 /// Whether this machine has a built-in authenticator that can wrap the DEK.
 ///
-/// Presence is not enough — it has to support the `hmac-secret`/PRF
-/// extension, which is what produces the wrap key. Offering the option on a
-/// machine that would fail halfway through the ceremony is worse than not
-/// offering it.
+/// Presence is not enough. On Windows the gate is `hmac-secret`/PRF support,
+/// which is what produces the wrap key there; on macOS it is whether Touch
+/// ID can answer, meaning a sensor exists, has fingerprints enrolled and is
+/// not locked out. Offering the option on a machine that would fail halfway
+/// through the ceremony is worse than not offering it.
 pub fn platform_authenticator_available() -> bool {
     #[cfg(feature = "hardware")]
     {

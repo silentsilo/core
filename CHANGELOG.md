@@ -9,6 +9,42 @@ This repository has its own version line, separate from the desktop
 application's. A client pins a tag from here; the tag it pins is what its
 release notes should say.
 
+## [Unreleased]
+
+No persisted format changed, and nothing here affects a Windows or Linux
+client at runtime, so there is no tag yet: desktop keeps pinning 1.1.0 and
+builds exactly as before. A tag follows when a Mac build needs one. A review
+of what 1.1.0 added found three ways the macOS unlock could refuse a silo it
+should have opened.
+
+### Fixed
+
+- Unlock falls through to an enrolled security key when Touch ID cannot
+  answer, instead of stopping at the enclave. Biometry has more ways to be
+  unavailable than a security key does: the lid is closed on an external
+  display, biometry is locked out after five failed attempts, or the user
+  added a fingerprint and invalidated the enclave key for good. Each of
+  those was a lockout with a working key plugged in.
+- Whether biometry can answer is now asked at unlock, not assumed from
+  enrolment.
+- A `secure-enclave` envelope whose credential id is not readable is no
+  longer counted as usable. It reached the hex decode that builds the
+  allow-list, which fails as a whole, so one damaged entry took down every
+  other key on the silo. Only macOS was exposed, because only there is the
+  kind usable at all.
+- The enclave key is created with `kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly`
+  rather than the wrapper's default of `kSecAttrAccessibleWhenUnlocked`. The
+  private half could not leave the chip either way, but the keychain item
+  now says what the hardware already enforced.
+
+### Documentation
+
+- `docs/ARCHITECTURE.md` shows the second branch that wraps the DEK, and no
+  longer says `derivation` is unused.
+- `docs/CRYPTO.md` records that the stored ephemeral point is not
+  authenticated, what that does and does not let an attacker do, and the
+  `keys/fido.json` fields as both kinds actually write them.
+
 ## [1.1.0] - Groundwork for the macOS build
 
 No persisted format changed. The 1.0.0 fixtures still describe the current

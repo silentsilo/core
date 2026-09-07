@@ -10,11 +10,13 @@ pub struct FidoStatus {
 
 /// Which kind of authenticator an enrollment targets.
 ///
-/// Both produce a wrap key the same way — through the `hmac-secret`/PRF
-/// extension — so neither is cryptographically weaker than the other. What
-/// differs is where the secret lives: a security key is portable and
-/// survives the machine, a platform authenticator is sealed to this
-/// computer's TPM and does not.
+/// Neither is cryptographically weaker than the other, but they no longer
+/// reach the wrap key the same way. A security key, and Windows Hello with
+/// it, derives it from the `hmac-secret`/PRF extension. Touch ID has no
+/// such extension, so the macOS build agrees with a key in the Secure
+/// Enclave instead; see `crate::enclave`. What they share is where the
+/// secret lives: a security key is portable and survives the machine, a
+/// platform authenticator is sealed to this computer and does not.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Authenticator {

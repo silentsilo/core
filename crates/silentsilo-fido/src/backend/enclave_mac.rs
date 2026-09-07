@@ -29,7 +29,7 @@ use core_foundation::error::{CFError, CFErrorRef};
 use core_foundation::number::CFNumber;
 use core_foundation::string::CFString;
 use objc2_local_authentication::{LAContext, LAPolicy};
-use security_framework::access_control::SecAccessControl;
+use security_framework::access_control::{ProtectionMode, SecAccessControl};
 use security_framework::item::{
     ItemClass, ItemSearchOptions, KeyClass, Location, Reference, SearchResult,
 };
@@ -90,7 +90,14 @@ pub fn enrol(vault_id: &str) -> Result<EnrolMaterial, FidoError> {
 }
 
 fn generate(tag: &[u8; TAG_LEN]) -> Result<SecKey, FidoError> {
-    let access = SecAccessControl::create_with_flags(
+    // The protection class is passed rather than defaulted: with `None` the
+    // wrapper picks `kSecAttrAccessibleWhenUnlocked`, which is eligible for
+    // keychain migration to another Mac. The private half cannot leave the
+    // chip either way, so nothing was extractable, but "sealed to this
+    // machine" should be what the item says and not only what the hardware
+    // enforces.
+    let access = SecAccessControl::create_with_protection(
+        Some(ProtectionMode::AccessibleWhenPasscodeSetThisDeviceOnly),
         kSecAccessControlBiometryCurrentSet | kSecAccessControlPrivateKeyUsage,
     )
     .map_err(|e| FidoError::EnrollmentFailed(format!("Touch ID access control: {e}")))?;
@@ -118,6 +125,12 @@ pub fn holds_any(credential_ids: &[Vec<u8>]) -> bool {
 
 /// Reproduces the wrap key for the first of `credential_ids` this Mac holds
 /// the enclave key for. The Touch ID sheet appears inside the agreement.
+///
+/// A caveat the caller has to know: success here means the enclave performed
+/// an agreement, not that the wrap key opens anything. The chip agrees with
+/// any point on the curve, so an envelope whose stored point was altered
+/// produces a Touch ID prompt that succeeds and a key that unwraps nothing.
+/// Only the caller, holding the sealed DEK, can tell the two apart.
 pub fn derive_unlock_material(
     credential_ids: &[Vec<u8>],
     vault_id: &str,

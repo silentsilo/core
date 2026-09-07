@@ -82,9 +82,16 @@ pub fn complete_enrollment(challenge: &EnrollmentChallenge) -> Result<Enrollment
 }
 
 /// `on` says which authenticator the user picked. Without it, Touch ID goes
-/// first when this Mac holds one of the enclave keys: it prompts on the
-/// machine and needs nothing plugged in. A silo whose enclave keys all
-/// belong to other Macs falls through to the security key.
+/// first when this Mac holds one of the enclave keys and biometry can
+/// actually answer: it prompts on the machine and needs nothing plugged in.
+/// Anything else falls through to the security key.
+///
+/// The fall-through is the part that matters. Touch ID has more ways to be
+/// unavailable than a security key does: the lid is closed on an external
+/// display, biometry is locked out after five failed attempts, or the user
+/// added a fingerprint and invalidated the enclave key for good. In every
+/// one of those a key is plugged in and works, so refusing there would be a
+/// lockout this code chose rather than one the silo requires.
 pub fn derive_unlock_material(
     credential_ids: &[Vec<u8>],
     vault_id: &str,
@@ -95,22 +102,44 @@ pub fn derive_unlock_material(
         .cloned()
         .partition(|id| enclave::split_credential_id(id).is_some());
 
-    match on {
-        Some(Authenticator::ThisDevice) => {
-            enclave_mac::derive_unlock_material(&enclave_ids, vault_id)
-        }
-        Some(Authenticator::SecurityKey) => ctap::derive_unlock_material(&fido2_ids, vault_id, on),
-        None => {
-            if enclave_mac::holds_any(&enclave_ids) {
-                return enclave_mac::derive_unlock_material(&enclave_ids, vault_id);
-            }
-            if fido2_ids.is_empty() {
-                return Err(FidoError::UnlockFailed(
-                    "No Touch ID key for this silo on this Mac, and no security key enrolled"
-                        .into(),
-                ));
-            }
-            ctap::derive_unlock_material(&fido2_ids, vault_id, on)
-        }
+    // Asked here rather than trusted from enrolment: whether the sensor can
+    // answer is a property of this moment, not of this machine.
+    let touch_id_ready = !enclave_ids.is_empty() && enclave_mac::available();
+
+    if on == Some(Authenticator::SecurityKey) {
+        return ctap::derive_unlock_material(&fido2_ids, vault_id, on);
     }
+
+    let enclave_err = if touch_id_ready
+        && (on == Some(Authenticator::ThisDevice) || enclave_mac::holds_any(&enclave_ids))
+    {
+        match enclave_mac::derive_unlock_material(&enclave_ids, vault_id) {
+            Ok(material) => return Ok(material),
+            Err(e) => Some(e),
+        }
+    } else {
+        None
+    };
+
+    // The user named Touch ID, so a security key is not what they were
+    // asked for. Say why it did not work rather than sending them to a
+    // drawer for hardware they did not mention.
+    if on == Some(Authenticator::ThisDevice) {
+        return Err(enclave_err.unwrap_or_else(|| {
+            FidoError::UnlockFailed(
+                "Touch ID cannot answer right now, and this Mac holds no Touch ID key for this \
+                 silo. Use an enrolled security key."
+                    .into(),
+            )
+        }));
+    }
+
+    if fido2_ids.is_empty() {
+        return Err(enclave_err.unwrap_or_else(|| {
+            FidoError::UnlockFailed(
+                "No Touch ID key for this silo on this Mac, and no security key enrolled".into(),
+            )
+        }));
+    }
+    ctap::derive_unlock_material(&fido2_ids, vault_id, on)
 }

@@ -82,7 +82,17 @@ pub fn enrol(
 
     let ephemeral = random_secret();
     let ephemeral_public = ephemeral.public_key().to_sec1_bytes().to_vec();
-    debug_assert_eq!(ephemeral_public.len(), POINT_LEN);
+    // Checked rather than asserted in debug only. `to_sec1_bytes` is
+    // uncompressed for this curve today; if that ever changed, a release
+    // build would mint an id `split_credential_id` rejects forever, and it
+    // would do so after the DEK had been re-wrapped under a key nothing can
+    // reproduce. An error here costs an enrolment, the alternative costs
+    // the silo.
+    if ephemeral_public.len() != POINT_LEN {
+        return Err(FidoError::EnrollmentFailed(
+            "the ephemeral public key is not an uncompressed point".into(),
+        ));
+    }
 
     let shared = diffie_hellman(ephemeral.to_nonzero_scalar(), enclave_public.as_affine());
     let wrap_key = wrap_key_from_shared(shared.raw_secret_bytes(), vault_id);
@@ -110,10 +120,12 @@ pub fn random_tag() -> [u8; TAG_LEN] {
 /// A fresh P-256 private key from the process's own generator.
 ///
 /// Not `SecretKey::random`: that wants the `rand_core` the curve crate was
-/// built against, which is a major behind the one this workspace uses, and
-/// bridging the two is more code than drawing thirty-two bytes and asking
-/// the curve whether they are a valid scalar. All but two values in that
-/// range are, so the loop runs once.
+/// built against, 0.10, which is a major ahead of the 0.9 this workspace
+/// uses through `rand`. Bridging the two is more code than drawing
+/// thirty-two bytes and asking the curve whether they are a valid scalar.
+/// The values it rejects are zero and everything from the group order up,
+/// about one draw in four billion, so a second iteration is something no
+/// machine here will see.
 fn random_secret() -> SecretKey {
     loop {
         let mut bytes = Zeroizing::new([0u8; 32]);

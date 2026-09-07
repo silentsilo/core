@@ -8,8 +8,9 @@ const FIDO_KEYS_FILE: &str = "keys/fido.json";
 
 pub const KEY_SLOT_PRIMARY: u8 = 0;
 
-/// The only kind of key this build can unlock with: a FIDO2 credential whose
-/// `hmac-secret` output derives the key that unwraps `wrapped_dek`.
+/// A FIDO2 credential whose `hmac-secret` output derives the key that
+/// unwraps `wrapped_dek`. Every build can use one; see
+/// [`KIND_SECURE_ENCLAVE`] for the kind only a Mac can.
 ///
 /// It is a string rather than an enum on purpose. The point of the field is
 /// to be read by a build that has never heard of the value in it, and an enum
@@ -35,13 +36,42 @@ pub const KIND_SECURE_ENCLAVE: &str = "secure-enclave";
 /// ephemeral public key rides in the credential id, after a 16-byte tag.
 pub const DERIVATION_ECDH_P256_V1: &str = "ecdh-p256-hkdf-sha256-v1";
 
-/// The kinds a ceremony on this build can end with the DEK. Windows and
-/// Linux answer for FIDO2 only; a Mac answers for its enclave too.
-fn usable_here(kind: &str, derivation: &str) -> bool {
-    (kind == KIND_FIDO2 && derivation == DERIVATION_HMAC_V1)
-        || (cfg!(target_os = "macos")
-            && kind == KIND_SECURE_ENCLAVE
-            && derivation == DERIVATION_ECDH_P256_V1)
+/// A Secure Enclave credential id is a 16-byte keychain label plus a
+/// 65-byte uncompressed P-256 point, hex-encoded. Written here rather than
+/// imported because the vault does not depend on the authenticator crate;
+/// the two are kept in step by the byte vectors.
+const SECURE_ENCLAVE_ID_LEN: usize = 16 + 65;
+
+/// Whether a ceremony on this build can end with the DEK. Windows and Linux
+/// answer for FIDO2 only; a Mac answers for its enclave too.
+///
+/// The id shape is part of the question, not a detail. Everything
+/// downstream, [`StoredFidoKeys::credential_ids_bytes`] above all, takes
+/// "usable" to mean the id can be handed to an authenticator, and one entry
+/// that cannot would otherwise take the whole allow-list down with it. An
+/// enclave envelope whose id is malformed is therefore not usable, which is
+/// what every other platform already does with it.
+fn usable_here(kind: &str, derivation: &str, credential_id: &str) -> bool {
+    if kind == KIND_FIDO2 && derivation == DERIVATION_HMAC_V1 {
+        return hex::decode(credential_id).is_ok();
+    }
+    if cfg!(target_os = "macos")
+        && kind == KIND_SECURE_ENCLAVE
+        && derivation == DERIVATION_ECDH_P256_V1
+    {
+        return secure_enclave_id_well_formed(credential_id);
+    }
+    false
+}
+
+/// Whether a Secure Enclave credential id has the shape the Mac backend
+/// writes. Deliberately not behind the platform gate: the branch above only
+/// runs on a Mac, the suite only runs in full on Windows, and a rule nothing
+/// exercises is a rule that drifts.
+fn secure_enclave_id_well_formed(credential_id: &str) -> bool {
+    hex::decode(credential_id)
+        .map(|bytes| bytes.len() == SECURE_ENCLAVE_ID_LEN)
+        .unwrap_or(false)
 }
 
 /// A key an organisation administers, not the person holding this machine.
@@ -277,7 +307,7 @@ impl StoredFidoKeys {
     /// machine end with the DEK", the one every unlock path wants.
     pub fn usable(&self) -> impl Iterator<Item = &StoredFidoCredential> {
         self.active()
-            .filter(|k| usable_here(&k.kind, &k.derivation))
+            .filter(|k| usable_here(&k.kind, &k.derivation, &k.credential_id))
     }
 
     pub fn primary(&self) -> Option<&StoredFidoCredential> {
@@ -298,10 +328,14 @@ impl StoredFidoKeys {
     /// The allow-list handed to the authenticator.
     ///
     /// Over [`Self::usable`], and that is the load-bearing part. A credential
-    /// id only has to be hex because a FIDO2 one is; another kind is free to
+    /// id only has to be hex because a usable one is; another kind is free to
     /// identify its key however its platform does. Built from every enrolled
     /// key, one such id would fail the `collect` and take the whole unlock or
     /// join down with it, on a machine whose own key is sitting right there.
+    ///
+    /// That holds only because [`usable_here`] checks the id shape as well
+    /// as the kind. Adding a kind without that check puts this `collect`
+    /// back in reach of a single malformed entry.
     pub fn credential_ids_bytes(&self) -> Result<Vec<Vec<u8>>, VaultError> {
         self.usable()
             .map(|k| hex::decode(&k.credential_id).map_err(|_| VaultError::InvalidCredentials))
@@ -399,6 +433,61 @@ mod tests {
             vec![vec![0xaa, 0x11]]
         );
         assert!(keys.find_by_credential_id(&[0xcc, 0x33]).is_none());
+    }
+
+    #[test]
+    fn a_malformed_enclave_id_does_not_take_the_allow_list_down() {
+        // The regression this guards: `usable()` deciding on kind alone let
+        // a `secure-enclave` entry with an unreadable id reach the `collect`
+        // in `credential_ids_bytes`, which fails as a whole. On a Mac that
+        // turned one bad entry into a silo nobody could open, with a working
+        // security key sitting right there. Off macOS the same entry was
+        // filtered out and harmless, so the failure existed on exactly the
+        // platform that could least afford it.
+        let good = format!("{}04{}", "11".repeat(16), "22".repeat(64));
+        assert!(
+            secure_enclave_id_well_formed(&good),
+            "the shape the Mac backend writes has to pass"
+        );
+
+        for bad in [
+            "not-hex-at-all",
+            "abc",                                                // odd length
+            &format!("{}04{}", "11".repeat(16), "22".repeat(60)), // short point
+            &"aa".repeat(200),                                    // too long
+        ] {
+            // Checked directly as well as through `usable`, because the
+            // branch that consults this only compiles on macOS while the
+            // suite runs in full on Windows.
+            assert!(!secure_enclave_id_well_formed(bad), "{bad}: should fail");
+            let mut mac = foreign("unused");
+            mac.kind = KIND_SECURE_ENCLAVE.into();
+            mac.derivation = DERIVATION_ECDH_P256_V1.into();
+            mac.credential_id = bad.to_string();
+            let keys = StoredFidoKeys {
+                keys: vec![fido2("aa11"), mac],
+            };
+            assert_eq!(keys.active().count(), 2, "{bad}: both are enrolled");
+            assert_eq!(keys.usable().count(), 1, "{bad}: only the FIDO2 key");
+            assert_eq!(
+                keys.credential_ids_bytes()
+                    .unwrap_or_else(|_| panic!("{bad}: took the allow-list down"))
+                    .len(),
+                1,
+                "{bad}: the working key still reaches the authenticator"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fido2_key_whose_id_is_not_hex_is_skipped_rather_than_fatal() {
+        // Same hazard from the other side. Nothing this project writes
+        // produces one, but an envelope arrives over shared storage.
+        let keys = StoredFidoKeys {
+            keys: vec![fido2("aa11"), fido2("zz")],
+        };
+        assert_eq!(keys.usable().count(), 1);
+        assert_eq!(keys.credential_ids_bytes().expect("still Ok").len(), 1);
     }
 
     #[test]

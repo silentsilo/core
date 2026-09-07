@@ -166,13 +166,24 @@ Flow:
 1. **Enrollment**: generate the enclave key; generate an ephemeral P-256 pair in software; ECDH between the ephemeral private key and the enclave public key; HKDF the shared secret into `wrap_key`; keep the ephemeral public key in the credential id and discard its private half. One ceremony, no prompt: the enclave signs nothing here.
 2. **Unlock**: split the credential id, find the enclave key by its tag, hand the ephemeral public key to the enclave; ECDH with the enclave private key runs behind the Touch ID sheet; the same HKDF reproduces `wrap_key`.
 
-Both public keys are stored in the clear, and that is fine: recovering the
-shared secret from them is the computational Diffie-Hellman problem, and the
-enclave key is the only thing that can compute it. The salt is the vault id,
-so two silos on one machine never share a wrap key. The agreement and the
-KDF are plain Rust and tested on every platform; only the calls into the
-enclave are macOS code. A client on another platform carries the envelope
-and skips it, exactly as it would any kind it does not know.
+The ephemeral public key is stored in the clear, and that is fine:
+recovering the shared secret from it and the enclave's public half is the
+computational Diffie-Hellman problem, and the enclave key is the only thing
+that can compute it. The enclave's own public key is not stored anywhere; it
+is read at enrolment and dropped. The salt is the vault id, so two silos on
+one machine never share a wrap key. The agreement and the KDF are plain Rust
+and tested on every platform; only the calls into the enclave are macOS
+code. A client on another platform carries the envelope and skips it,
+exactly as it would any kind it does not know.
+
+What this does not give is authenticity. The stored point is not signed, and
+the enclave will agree with any valid point on the curve, so someone who can
+write to shared storage can replace it. They learn nothing by doing so,
+because the only consumer of the derived key is an AEAD open that either
+works or does not, and there is no oracle in between. What they get is
+denial of service with a Touch ID prompt that appears to succeed. The
+unlock path therefore treats a failed agreement as a reason to fall through
+to an enrolled security key rather than as the end of the attempt.
 
 ## Enrolled key records (`keys/fido.json`)
 
@@ -180,10 +191,12 @@ One record per enrolled credential, stored locally alongside the vault:
 
 | Field | Content |
 |-------|---------|
-| `credential_id` | FIDO credential id (hex) |
+| `kind` | `fido2` or `secure-enclave`. A client that does not know the value carries the record and never offers the key |
+| `derivation` | `hmac-secret-v1` or `ecdh-p256-hkdf-sha256-v1`, how `wrap_key` is reached |
+| `credential_id` | Hex. A FIDO credential id, or for `secure-enclave` the 16-byte keychain label followed by the 65-byte ephemeral point |
 | `wrapped_dek` | Sealed envelope (below) holding the Master DEK under that key's wrap key |
 | `key_slot` | Enrollment order, `0` for the first key |
-| `public_key` | COSE/DER public key |
+| `public_key` | Hex. COSE/DER for `fido2`, the raw SEC1 point again for `secure-enclave` |
 | `policy` | Empty, or `org` for a key an organisation administers |
 
 Each record independently wraps the same Master DEK, which is what lets any

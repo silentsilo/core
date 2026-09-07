@@ -76,6 +76,7 @@ thing that can be wrong.
 ```mermaid
 flowchart TD
     FIDO2["FIDO2 hmac-secret<br/>(per enrolled key)"] -->|"wraps"| DEK
+    SE["Secure Enclave ECDH<br/>(macOS, per enrolled key)"] -->|"wraps"| DEK
     DS["device secret<br/>(keyring, per device)<br/>Argon2id + vault.salt"] -->|"wraps, until a key is enrolled"| DEK
     RC["recovery code<br/>(160-bit, on paper)<br/>Argon2id + salt in envelope"] -->|"wraps"| DEK
     DEK["vault DEK (32B)<br/>one per silo, shared by devices"]
@@ -236,9 +237,12 @@ Read this before "fixing" any of it.
 - **`verify_chains` is never called.** Wiring it naively false-positives on
   every rebootstrapped device, whose new chain legitimately starts above
   zero from the fetcher's point of view. It waits for a checkpoint design.
-- **`derivation` on key envelopes looks unused.** It is groundwork for
-  platform authenticators on mobile (Secure Enclave, TPM) and every device
-  reads every other device's envelopes. Do not prune.
+- **`derivation` on key envelopes decides more than it looks.** It shipped
+  before anything varied, as groundwork for platform authenticators, and the
+  macOS build is the first to use it: `ecdh-p256-hkdf-sha256-v1` alongside
+  `hmac-secret-v1`. Every device reads every other device's envelopes, and a
+  device skips the ones whose derivation it cannot perform. Mobile will add
+  to the list rather than change it.
 - **Purge does not delete bucket blobs.** The sweep does, two-pass, after
   convergence. Deleting at purge time froze "referenced" at what one device
   knew and destroyed content another device still pointed at.
