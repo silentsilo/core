@@ -21,7 +21,7 @@ pub(crate) fn fido_key_present() -> bool {
     }
     get_hid_devices().iter().any(|d| {
         KNOWN_FIDO_VIDS.contains(&d.vid)
-            || d.info.contains("usage_page=61904")
+            || d.info.contains(FIDO_USAGE_PAGE)
             || matches_known_vid_pid(d.vid, d.pid)
     })
 }
@@ -74,6 +74,18 @@ fn open_device() -> Result<FidoKeyHid, FidoError> {
     ))
 }
 
+/// The FIDO usage page, `0xF1D0`. CTAP over HID is defined by it, so an
+/// interface that reports it is a key whatever its vendor id, and hidapi
+/// exposes the page the same way on Linux and macOS.
+const FIDO_USAGE_PAGE: &str = "usage_page=61904";
+
+/// Every HID path worth trying, keys the library recognises first.
+///
+/// The library's own list is by vendor and product id, so a key it has not
+/// heard of only shows up through its usage page. This used to also rewrite
+/// Windows interface paths (`MI_00` to `MI_01`, a trailing `\KBD`), which
+/// never matched anything here: this backend is compiled only off Windows,
+/// where hidapi paths look like `/dev/hidraw3` or an IOKit service id.
 fn fido_hid_paths() -> Vec<String> {
     let mut paths = Vec::new();
     for dev in get_fidokey_devices() {
@@ -82,18 +94,10 @@ fn fido_hid_paths() -> Vec<String> {
         }
     }
     for d in get_hid_devices() {
-        let HidParam::Path(path) = &d.param else {
-            continue;
-        };
-        if path.contains("MI_01") && !path.ends_with("\\KBD") {
+        if d.info.contains(FIDO_USAGE_PAGE)
+            && let HidParam::Path(path) = &d.param
+        {
             paths.push(path.clone());
-        }
-        if path.contains("MI_00") {
-            let fido = path
-                .replace("MI_00", "MI_01")
-                .trim_end_matches("\\KBD")
-                .to_string();
-            paths.push(fido);
         }
     }
     paths.sort();
