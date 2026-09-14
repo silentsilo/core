@@ -525,6 +525,7 @@ pub async fn run_sync_pass(
     let inbox_targets: Vec<crate::inbox_import::InboxTarget<'_>> = targets
         .iter()
         .map(|t| crate::inbox_import::InboxTarget {
+            id: t.id,
             store: &*t.store,
             label: &t.label,
             may_finish: every_copy_reached && t.role.allows_delete(),
@@ -546,8 +547,14 @@ pub async fn run_sync_pass(
     // Content is fetched from whichever copy has it: a blob is the same
     // bytes everywhere, so there is nothing to choose between them, and the
     // first target being behind must not stop a full copy from filling up.
-    let reachable: Vec<&dyn ObjectStore> = targets.iter().map(|t| &*t.store).collect();
+    let reachable: Vec<(Uuid, &dyn ObjectStore)> =
+        targets.iter().map(|t| (t.id, &*t.store)).collect();
     let pulled = fetch_missing_for_full_copy(state, host, silo, &reachable).await;
+    // What came down, from the inbox or for the full copy, is on the copy it
+    // came from, and no longer counts as waiting to back up there.
+    if pulled > 0 || inbox.imported > 0 {
+        let _ = silentsilo_vault::settle_blob_delivery(&root, &every_target);
+    }
 
     // Compaction publishes to each target before pruning it, which
     // `publish_compaction` guarantees for the target it is given. A target
@@ -658,7 +665,7 @@ async fn fetch_missing_for_full_copy(
     state: &AppState,
     host: &dyn Host,
     silo: &SiloEntry,
-    stores: &[&dyn ObjectStore],
+    stores: &[(Uuid, &dyn ObjectStore)],
 ) -> usize {
     if !silentsilo_vault::keep_full_copy(&silo.path) {
         return 0;
@@ -690,7 +697,7 @@ async fn fetch_missing_for_full_copy(
         // bytes are damaged, held every later blob back on every pass
         // afterwards: a device asked to keep a full copy never became one
         // and never said why.
-        match sync::fetch_blob_from_any(stores, &silo.path, blob_id).await {
+        match sync::fetch_blob_from_targets(stores, &silo.path, blob_id).await {
             Ok(_) => fetched += 1,
             Err(e) => host.warn("sync", &format!("blob {blob_id} did not come down: {e}")),
         }

@@ -88,20 +88,26 @@ pub async fn decrypt_to_file(
     let root = &silo.path;
     let blob_path = silentsilo_vault::VaultPaths::new(root.clone()).blob_path(file.blob_id);
     if !blob_path.is_file() {
-        let targets: Vec<Box<dyn ObjectStore>> = host
-            .targets(silo.id)
+        let configured = host.targets(silo.id);
+        let every_target: Vec<Uuid> = configured.iter().map(|t| t.config.target_id()).collect();
+        let targets: Vec<(Uuid, Box<dyn ObjectStore>)> = configured
             .into_iter()
-            .filter_map(|t| t.config.open().ok())
+            .filter_map(|t| {
+                let id = t.config.target_id();
+                t.config.open().ok().map(|store| (id, store))
+            })
             .collect();
         if targets.is_empty() {
             return Err(
                 "This file isn't on this device, and no backup storage is connected.".into(),
             );
         }
-        let stores: Vec<&dyn ObjectStore> = targets.iter().map(|t| &**t).collect();
-        silentsilo_sync::fetch_blob_from_any(&stores, root, file.blob_id)
+        let stores: Vec<(Uuid, &dyn ObjectStore)> =
+            targets.iter().map(|(id, t)| (*id, &**t)).collect();
+        silentsilo_sync::fetch_blob_from_targets(&stores, root, file.blob_id)
             .await
             .map_err(|e| format!("could not download the file content: {e}"))?;
+        let _ = silentsilo_vault::settle_blob_delivery(root, &every_target);
     }
 
     let key = silentsilo_crypto::unwrap_content_key(&wrapped, &kek)

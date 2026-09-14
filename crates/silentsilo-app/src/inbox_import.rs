@@ -34,6 +34,8 @@ pub trait OpenSilo: Sync {
 
 /// One target as the import sees it.
 pub struct InboxTarget<'a> {
+    /// The target's id, to note content fetched from it as held there.
+    pub id: Uuid,
     pub store: &'a dyn ObjectStore,
     pub label: &'a str,
     /// Whether an item already recorded may leave this target's inbox: the
@@ -133,11 +135,17 @@ pub async fn import_inbox(
             if added {
                 outcome.imported += 1;
             }
-            if keep_local
-                && let Err(e) =
-                    silentsilo_sync::fetch_blob(target.store, silo_root, item.blob_id).await
-            {
-                warn(&format!("{} did not come down: {e}", item.name));
+            if keep_local {
+                match silentsilo_sync::fetch_blob(target.store, silo_root, item.blob_id).await {
+                    Ok(_) => {
+                        let _ = silentsilo_vault::record_blob_delivered(
+                            silo_root,
+                            item.blob_id,
+                            target.id,
+                        );
+                    }
+                    Err(e) => warn(&format!("{} did not come down: {e}", item.name)),
+                }
             }
         }
     }

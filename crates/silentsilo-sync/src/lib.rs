@@ -1110,6 +1110,29 @@ pub async fn fetch_blob_from_any(
     Err(last)
 }
 
+/// [`fetch_blob_from_any`] that also notes which target served the blob.
+/// Content that came down from a copy is plainly on that copy, and without
+/// the note it counted as waiting to back up until the next push had asked
+/// every target about it. Settle with every configured target afterwards
+/// (`settle_blob_delivery`) for the count to change.
+pub async fn fetch_blob_from_targets(
+    targets: &[(Uuid, &dyn ObjectStore)],
+    vault_root: &Path,
+    blob_id: Uuid,
+) -> Result<u64, SyncError> {
+    let mut last = SyncError::Storage("no backup target could be reached".into());
+    for (target, client) in targets {
+        match fetch_blob(*client, vault_root, blob_id).await {
+            Ok(size) => {
+                let _ = record_blob_delivered(vault_root, blob_id, *target);
+                return Ok(size);
+            }
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
 // ── Snapshots ───────────────────────────────────────────────────────
 
 /// Where compaction writes the state of the vault.

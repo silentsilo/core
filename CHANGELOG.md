@@ -23,6 +23,8 @@ release notes should say.
 - `silentsilo_app::files::import_file`, adding a file from this device, moved
   from the desktop's import, and `decrypt_to_file`, for opening a file
   outside a preview.
+- `fetch_blob_from_targets`: content downloaded from a copy is noted as held
+  there, so it no longer shows as waiting to back up until the next push.
 - `silentsilo_app::inbox_import`, public, for a client whose sync pass is
   still its own: it hands over its open silo through `OpenSilo`.
 - `inbox::send_item_from` and `encrypt_stream` in the crate root, for content

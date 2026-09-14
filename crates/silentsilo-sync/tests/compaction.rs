@@ -561,6 +561,35 @@ async fn a_blob_comes_from_whichever_copy_holds_it() {
 }
 
 #[tokio::test]
+async fn a_downloaded_blob_is_not_owed_to_the_copy_it_came_from() {
+    // Desktop 1.0.0 showed everything it had just downloaded as "waiting to
+    // back up" until the next push asked every target about it.
+    let (_dir_a, only) = store();
+    let vault = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(vault.path().join("blobs")).unwrap();
+    let blob = Uuid::new_v4();
+    put_blob(&only, blob).await;
+    let target = Uuid::new_v4();
+
+    silentsilo_sync::fetch_blob_from_targets(
+        &[(target, &only as &dyn ObjectStore)],
+        vault.path(),
+        blob,
+    )
+    .await
+    .unwrap();
+    silentsilo_vault::settle_blob_delivery(vault.path(), &[target]).unwrap();
+    assert!(silentsilo_vault::list_unsynced_blob_ids(vault.path()).is_empty());
+
+    // With a second copy that has not got it, it is still owed there.
+    silentsilo_vault::settle_blob_delivery(vault.path(), &[target, Uuid::new_v4()]).unwrap();
+    assert_eq!(
+        silentsilo_vault::list_unsynced_blob_ids(vault.path()),
+        vec![blob]
+    );
+}
+
+#[tokio::test]
 async fn purged_content_another_device_still_references_survives_the_sweeps() {
     // A purges the only row it knows about, while B has already written a
     // second row carrying the same blob and not yet pushed it. Deleting the
