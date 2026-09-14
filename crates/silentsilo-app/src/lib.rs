@@ -13,10 +13,12 @@
 pub mod flows;
 mod host;
 mod state;
+mod store_config;
 mod sync_pass;
 
 pub use host::{AppEvent, Host};
 pub use state::{
     AppState, MAX_OPEN_SILOS, SessionGuard, SessionSnapshot, open_scratch_dir, wipe_open_scratch,
 };
+pub use store_config::{SftpAuthInput, StoreConfigInput, StoreConfigView};
 pub use sync_pass::{SyncReport, TargetStatus, run_sync_pass, sync_now};
