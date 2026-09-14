@@ -234,6 +234,18 @@ jobs:
       # quay.io so a tag that disappears fails here by name.
       - name: Start the storage backends
         run: |
+          # Registries time out now and then (quay.io answered 504 twice in
+          # one day), which failed the job before any test ran. Pulled first,
+          # with a few tries, so a slow registry is not a red build.
+          for image in quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z \
+                       quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z \
+                       bytemark/webdav atmoz/sftp:alpine; do
+            for attempt in 1 2 3 4; do
+              if docker pull "$image"; then break; fi
+              if [ "$attempt" = 4 ]; then exit 1; fi
+              sleep $((attempt * 15))
+            done
+          done
           docker run -d --name minio -p 9000:9000 \
             -e MINIO_ROOT_USER=silentsilo \
             -e MINIO_ROOT_PASSWORD=silentsilo123 \
