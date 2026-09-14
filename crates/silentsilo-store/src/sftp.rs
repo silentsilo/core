@@ -339,6 +339,38 @@ impl SftpStore {
     }
 }
 
+/// A temporary name no other writer uses. Two writers of one key at once
+/// happen: two devices publishing the manifest, or two runs of a phone's
+/// backup job. With a shared `.part` name one renamed the other's file away,
+/// and the other failed with "no such file".
+fn temp_beside(final_path: &str) -> String {
+    format!("{final_path}.{}.part", uuid::Uuid::new_v4().simple())
+}
+
+/// Moves a finished temporary file over the key. SFTP rename refuses an
+/// existing target, and re-writing a key is legitimate for the manifest and
+/// the key envelopes; another writer can put the target back between the
+/// removal and the rename, so that is tried again.
+async fn replace(
+    sftp: &russh_sftp::client::SftpSession,
+    temp_path: String,
+    final_path: String,
+    key: &str,
+) -> Result<(), StoreError> {
+    let mut attempt = 0;
+    loop {
+        let _ = sftp.remove_file(final_path.clone()).await;
+        match sftp.rename(temp_path.clone(), final_path.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(_) if attempt < 2 => attempt += 1,
+            Err(e) => {
+                let _ = sftp.remove_file(temp_path).await;
+                return Err(StoreError::Other(format!("{key}: {e}")));
+            }
+        }
+    }
+}
+
 fn missing(err: &russh_sftp::client::error::Error) -> bool {
     matches!(
         err,
@@ -361,7 +393,7 @@ impl ObjectStore for SftpStore {
                 // the same reasoning as the folder backend, and it matters
                 // more here because the reader is on a different machine.
                 let final_path = self.path_for(key);
-                let temp_path = format!("{final_path}.part");
+                let temp_path = temp_beside(&final_path);
                 let mut file = sftp
                     .open_with_flags(
                         temp_path.clone(),
@@ -376,13 +408,7 @@ impl ObjectStore for SftpStore {
                     .await
                     .map_err(|e| StoreError::Other(format!("{key}: {e}")))?;
 
-                // SFTP rename fails if the target exists, and re-writing a
-                // key is legitimate for the manifest and the key envelopes.
-                let _ = sftp.remove_file(final_path.clone()).await;
-                sftp.rename(temp_path, final_path)
-                    .await
-                    .map_err(|e| StoreError::Other(format!("{key}: {e}")))?;
-                Ok(())
+                replace(&sftp, temp_path, final_path, key).await
             }
         })
         .await
@@ -414,7 +440,7 @@ impl ObjectStore for SftpStore {
             // Same temp-and-rename shape as `put`, streamed in pieces so a
             // blob is never held whole in memory.
             let final_path = self.path_for(key);
-            let temp_path = format!("{final_path}.part");
+            let temp_path = temp_beside(&final_path);
             let mut local = tokio::fs::File::open(source)
                 .await
                 .map_err(|e| StoreError::Other(format!("{key}: {e}")))?;
@@ -445,11 +471,7 @@ impl ObjectStore for SftpStore {
                 .await
                 .map_err(|e| StoreError::Other(format!("{key}: {e}")))?;
 
-            let _ = sftp.remove_file(final_path.clone()).await;
-            sftp.rename(temp_path, final_path)
-                .await
-                .map_err(|e| StoreError::Other(format!("{key}: {e}")))?;
-            Ok(())
+            replace(&sftp, temp_path, final_path, key).await
         })
         .await
     }

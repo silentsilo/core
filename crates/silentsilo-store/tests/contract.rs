@@ -235,6 +235,31 @@ async fn rewriting_a_key_replaces_it() {
 }
 
 #[tokio::test]
+async fn two_writers_of_one_key_at_once_both_succeed() {
+    // Two devices publishing the manifest, or two runs of a phone's backup
+    // job sending the same item. A shared temporary name made one of them
+    // fail with "no such file".
+    for_each_store(|store| async move {
+        let key = "inbox/items/race.sslo";
+        let first = vec![1u8; 256 * 1024];
+        let second = vec![2u8; 256 * 1024];
+        let (a, b) = tokio::join!(
+            store.put(key, first.clone()),
+            store.put(key, second.clone())
+        );
+        a.expect("the first writer succeeds");
+        b.expect("the second writer succeeds");
+
+        let stored = store.get(key).await.unwrap();
+        assert!(stored == first || stored == second, "one whole write wins");
+        let listed = store.list("inbox/items/").await.unwrap();
+        assert_eq!(listed.len(), 1, "no temporary file is listed: {listed:?}");
+        store.delete(key).await.unwrap();
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn a_copy_is_the_same_bytes_under_the_new_key_and_leaves_the_original() {
     // The inbox import copies an item into `blobs/` before it records the
     // file, and deletes the original only afterwards. A copy that moved,

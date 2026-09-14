@@ -142,11 +142,14 @@ impl ObjectStore for FolderStore {
 }
 
 /// The temporary name a write goes to before its rename, always ending in
-/// `.part` so listings can skip it.
+/// `.part` so listings can skip it, and unique to this write: two writers of
+/// one key at once, such as two devices on a synced folder, must not rename
+/// each other's half-written file away.
 fn temp_beside(path: &Path) -> PathBuf {
     path.with_extension(format!(
-        "{}.part",
-        path.extension().and_then(|e| e.to_str()).unwrap_or("tmp")
+        "{}.{}.part",
+        path.extension().and_then(|e| e.to_str()).unwrap_or("tmp"),
+        uuid::Uuid::new_v4().simple()
     ))
 }
 
