@@ -11,6 +11,16 @@ release notes should say.
 
 ## [Unreleased]
 
+### Added
+
+- The sync pass in `silentsilo-app` imports the inbox: items a locked phone
+  sent become ordinary files in the folder the item names, and leave the
+  inbox a pass later, once their record has reached every target. Items from
+  an unknown sender or a removed key stay and are reported in
+  `SyncReport::inbox_refused`.
+- `set_local_protector`, for sealing the local secret files where there is
+  no DPAPI. Files written before it was set still read.
+
 ## [1.3.0] - The shared application crate
 
 No existing format version changed, so the 1.0.0 fixtures still describe the

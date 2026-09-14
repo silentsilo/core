@@ -3,6 +3,9 @@
 //! user, which can call `CryptUnprotectData` itself; what it closes off is
 //! the file being readable outside this user's live Windows logon: a cloned
 //! disk, an offline mount, another account, a restored profile backup.
+//!
+//! Elsewhere the client may supply a [`LocalProtector`] that plays the same
+//! part, under the same file prefix.
 
 #[cfg(windows)]
 mod imp {
@@ -42,7 +45,7 @@ mod imp {
         }
     }
 
-    /// Reverse of [`protect`] — only succeeds for the same Windows user
+    /// Reverse of [`protect`]. Only succeeds for the same Windows user
     /// account that originally called `protect`.
     pub fn unprotect(data: &[u8]) -> Option<Vec<u8>> {
         let mut input = data.to_vec();
@@ -96,12 +99,37 @@ mod imp {
 #[cfg(windows)]
 pub use imp::{protect, unprotect};
 
-#[cfg(not(windows))]
-pub fn protect(_data: &[u8]) -> Option<Vec<u8>> {
-    None
+/// Seals the local secret files where there is no DPAPI, supplied by the
+/// client: on Android, a Keystore key that never leaves the phone. Without
+/// one those files are written in the clear, private to the app or user.
+pub trait LocalProtector: Send + Sync {
+    fn protect(&self, data: &[u8]) -> Option<Vec<u8>>;
+    fn unprotect(&self, data: &[u8]) -> Option<Vec<u8>>;
 }
 
 #[cfg(not(windows))]
-pub fn unprotect(_data: &[u8]) -> Option<Vec<u8>> {
-    None
+static PROTECTOR: std::sync::OnceLock<Box<dyn LocalProtector>> = std::sync::OnceLock::new();
+
+/// Set once, before the first secret is read or written. Returns false when
+/// one was already set, or on Windows, which keeps DPAPI.
+pub fn set_local_protector(protector: Box<dyn LocalProtector>) -> bool {
+    #[cfg(not(windows))]
+    {
+        PROTECTOR.set(protector).is_ok()
+    }
+    #[cfg(windows)]
+    {
+        drop(protector);
+        false
+    }
+}
+
+#[cfg(not(windows))]
+pub fn protect(data: &[u8]) -> Option<Vec<u8>> {
+    PROTECTOR.get()?.protect(data)
+}
+
+#[cfg(not(windows))]
+pub fn unprotect(data: &[u8]) -> Option<Vec<u8>> {
+    PROTECTOR.get()?.unprotect(data)
 }

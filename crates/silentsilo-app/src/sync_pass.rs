@@ -67,6 +67,13 @@ pub struct SyncReport {
     /// below them in the log. Retried on every pass.
     #[serde(default)]
     pub held_back: usize,
+    /// Items a locked device sent that this pass recorded as files.
+    #[serde(default)]
+    pub inbox_imported: usize,
+    /// Items left in an inbox, with why: an unknown sender, a removed key, a
+    /// newer format.
+    #[serde(default)]
+    pub inbox_refused: Vec<String>,
 }
 
 /// How one target fared this pass, so "the second one is behind" can be said
@@ -508,6 +515,32 @@ pub async fn run_sync_pass(
     silentsilo_vault::settle_blob_delivery(&root, &every_target).map_err(|e| e.to_string())?;
     record_target_outcomes(state, silo, &statuses, now)?;
 
+    // ── The inbox ───────────────────────────────────────────────────
+    //
+    // After the push, so an item recorded by an earlier pass has had its
+    // record sent before it may leave the inbox. With more than one copy the
+    // content comes down too, for the next push to spread.
+    let every_copy_reached = statuses.len() == every_target.len()
+        && statuses.iter().all(|s| s.failed.is_none() && !s.waiting);
+    let inbox_targets: Vec<crate::inbox_import::InboxTarget<'_>> = targets
+        .iter()
+        .map(|t| crate::inbox_import::InboxTarget {
+            store: &*t.store,
+            label: &t.label,
+            may_finish: every_copy_reached && t.role.allows_delete(),
+        })
+        .collect();
+    let inbox = crate::inbox_import::import_inbox(
+        state,
+        host,
+        silo,
+        &inbox_targets,
+        &kek,
+        vault_id,
+        every_target.len() > 1,
+    )
+    .await;
+
     // ── Housekeeping ────────────────────────────────────────────────
     //
     // Content is fetched from whichever copy has it: a blob is the same
@@ -554,10 +587,12 @@ pub async fn run_sync_pass(
             .map(|u| format!("{}: {}", u.key, u.error))
             .collect(),
         held_back,
+        inbox_imported: inbox.imported,
+        inbox_refused: inbox.refused,
     };
 
     // The file list is stale the moment remote changes land.
-    if report.ops_applied > 0 {
+    if report.ops_applied > 0 || report.inbox_imported > 0 {
         host.emit(AppEvent::VaultChanged);
     }
 

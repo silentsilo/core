@@ -13,6 +13,7 @@
 pub mod files;
 pub mod flows;
 mod host;
+mod inbox_import;
 mod state;
 mod store_config;
 mod sync_pass;

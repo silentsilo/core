@@ -39,6 +39,7 @@ pub use dek_store::{
 pub use device_store::{
     LocalVaultAuth, clear_credentials, is_provisioned, load_credentials, save_credentials,
 };
+pub use dpapi::{LocalProtector, set_local_protector};
 pub use error::VaultError;
 pub use fido_store::{
     Authority, DERIVATION_ECDH_P256_V1, DERIVATION_HMAC_V1, DERIVATION_KEYSTORE_AES_GCM_V1,

@@ -75,8 +75,9 @@ closing a silo, the sync pass, the recovery and device key flows, and file
 previews. A client gives it a `Host` for events, diagnostics and its saved
 storage settings. The order and invariants of the pass are described in the
 desktop repository's `docs/ARCHITECTURE.md` until the move is done, with one
-step that exists only here so far: before pushing, the pass reconciles the
-enrolled keys with `keys/` (`silentsilo-sync/key_sync.rs`, `FORMATS.md`).
+two steps that exist only here so far: before pushing, the pass reconciles
+the enrolled keys with `keys/` (`silentsilo-sync/key_sync.rs`, `FORMATS.md`),
+and after pulling it imports the inbox (below).
 
 The extract binary deliberately reuses the same crates rather than
 reimplementing the read path: a second interpretation of the log is a second
@@ -144,6 +145,11 @@ property:
   import returns: the record naming it can reach the bucket within seconds,
   and a truncated key file or a hollow blob after a power cut is a lockout
   or a permanently unopenable file.
+- **The local secrets** (outside the folder): device credentials, storage
+  settings and the silo list. Kept in the OS keyring where there is one,
+  else in files. On Windows those files are DPAPI-wrapped; elsewhere a client
+  may register a `LocalProtector` (Android: a Keystore key), and without one
+  they are plaintext, private to the user or app.
 - **The machine workdir** (keyed by silo path, outside the folder): the
   plaintext working copy `vault.db` with its WAL, decrypted files the user
   opened (`open/`), and `cache.db` (blob bookkeeping). Wiped on lock;
@@ -232,6 +238,15 @@ unlocked device imports it (`silentsilo-sync/src/inbox.rs`, formats in
 `FORMATS.md`). The import copies the item into `blobs/` before it records
 the file and deletes the item only after. Nothing waiting may live under
 `blobs/`: the sweep would delete it after two passes, on any version.
+
+In `silentsilo-app` the import runs after the pull and before housekeeping.
+An item recorded in one pass leaves the inbox in a later pass, and only when
+that pass reached every configured target: the record is pushed at the start
+of the pass after the one that wrote it, so the item is never gone from
+storage while the only trace of it is one device's database. An archive
+target keeps its items; they are skipped as already known. With more than one
+target the importer fetches the content down, so its next push spreads it to
+the targets the phone did not send to.
 
 ## Recovery matrix
 
