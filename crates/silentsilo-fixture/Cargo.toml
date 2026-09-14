@@ -19,3 +19,8 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 tempfile = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+# The vault as 1.0.0 shipped it, so what an installed client does with keys
+# written today is answered by its own code.
+silentsilo-vault-v1_0_0 = { package = "silentsilo-vault", git = "https://github.com/silentsilo/core", tag = "v1.0.0" }

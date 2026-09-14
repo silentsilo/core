@@ -137,26 +137,37 @@ different key are not mistaken for the answer.
 ## The kind of a key
 
 Every enrolled key carries a `kind`, in `keys/fido.json` and in the envelope
-published to `keys/….env`. There are two values:
+published to `keys/….env`. There are three values:
 
 - `fido2`, with derivation `hmac-secret-v1`: a FIDO2 credential whose
   `hmac-secret` output derives the key that unwraps `wrapped_dek`. Windows
   Hello is one of these. An envelope written before the field existed reads
   as `fido2`, which is what it is.
-- `secure-enclave`, with derivation `ecdh-p256-hkdf-sha256-v1`, added for the
-  macOS build: a P-256 key in the Mac's Secure Enclave, gated on Touch ID.
-  The wrap key is the HKDF-SHA256 of a Diffie-Hellman agreement between that
-  key and an ephemeral key made at enrolment, salted by the same per-vault
-  string the FIDO2 path uses. The ephemeral public key has to reach unlock,
-  so `credential_id` carries it: a 16-byte tag naming the key in that Mac's
-  keychain, then the 65-byte uncompressed point, all hex; `public_key`
-  repeats the point. `platform` is true, as for Hello, and means the same
-  thing: the key does not survive the machine.
+- `secure-enclave`, with derivation `ecdh-p256-hkdf-sha256-v1`, for the
+  macOS and iOS builds: a P-256 key in the device's Secure Enclave, gated on
+  Touch ID or Face ID. The wrap key is the HKDF-SHA256 of a Diffie-Hellman
+  agreement between that key and an ephemeral key made at enrolment, salted
+  by the same per-vault string the FIDO2 path uses. The ephemeral public key
+  has to reach unlock, so `credential_id` carries it: a 16-byte tag naming
+  the key on that device, then the 65-byte uncompressed point, all hex.
+  `public_key` is the device key's own uncompressed point. `platform` is
+  true, as for Hello, and means the same thing: the key does not survive the
+  device.
+- `android-keystore`, with the same derivation and the same id shape, for the
+  Android build: a P-256 key in the phone's Keystore (StrongBox where the
+  phone has one), gated on a strong biometric. A kind of its own so a Mac
+  never offers a phone's key to its enclave, nor a phone a Mac's key.
 
-Adding the second kind changed nothing a 1.0.0 client does. It carries the
-envelope verbatim, because `credential_id` and `wrapped_dek` are strings it
-never looks inside, and it does not offer the key to its authenticator,
-because `kind` is not one it knows. The byte vectors hold both envelopes.
+Core 1.1.0 wrote the ephemeral point into `public_key` of a `secure-enclave`
+envelope. No release of any client carried that code, so no such envelope
+exists in a user's bucket; nothing reads `public_key` to unlock either way.
+
+Adding kinds changed nothing a 1.0.0 client does. It carries the envelope
+verbatim, because `credential_id` and `wrapped_dek` are strings it never
+looks inside, and it does not offer the key to its authenticator, because
+`kind` is not one it knows. The byte vectors hold every envelope, and one
+test runs the 1.0.0 vault code itself against them and against a
+`keys/fido.json` it loads and saves back.
 
 The field is not for this build. It is for the one that meets a key it has
 never heard of, and that is not a hypothetical: a macOS build would enrol

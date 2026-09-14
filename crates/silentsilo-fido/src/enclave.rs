@@ -28,7 +28,9 @@
 //! untouched.
 //!
 //! Everything here runs on every platform and is tested on every platform;
-//! the enclave itself only enters in `backend/enclave_mac.rs`.
+//! the enclave itself only enters in `backend/enclave_mac.rs`. An Android
+//! Keystore key follows the same scheme under its own kind, with the
+//! Keystore doing the agreement in the mobile app.
 
 use hkdf::Hkdf;
 use p256::ecdh::diffie_hellman;
@@ -61,9 +63,13 @@ pub struct EnrolMaterial {
     /// Tag, then ephemeral public key. What the envelope stores as
     /// `credential_id`, hex-encoded.
     pub credential_id: Vec<u8>,
-    /// The ephemeral public key alone, for the envelope's `public_key`
-    /// field. The same bytes as the tail of `credential_id`.
+    /// The ephemeral public key alone. The same bytes as the tail of
+    /// `credential_id`.
     pub ephemeral_public: Vec<u8>,
+    /// The device key's public half, uncompressed, for the envelope's
+    /// `public_key` field: what names the key that can reproduce the
+    /// agreement, as a FIDO2 envelope names its credential's key.
+    pub device_public: Vec<u8>,
     /// Wraps the DEK. Wiped when this is dropped.
     pub wrap_key: Zeroizing<[u8; 32]>,
 }
@@ -80,6 +86,7 @@ pub fn enrol(
         FidoError::EnrollmentFailed("the enclave returned a public key that is not P-256".into())
     })?;
 
+    let device_public = enclave_public.to_sec1_bytes().to_vec();
     let ephemeral = random_secret();
     let ephemeral_public = ephemeral.public_key().to_sec1_bytes().to_vec();
     // Checked rather than asserted in debug only. `to_sec1_bytes` is
@@ -88,9 +95,9 @@ pub fn enrol(
     // would do so after the DEK had been re-wrapped under a key nothing can
     // reproduce. An error here costs an enrolment, the alternative costs
     // the silo.
-    if ephemeral_public.len() != POINT_LEN {
+    if ephemeral_public.len() != POINT_LEN || device_public.len() != POINT_LEN {
         return Err(FidoError::EnrollmentFailed(
-            "the ephemeral public key is not an uncompressed point".into(),
+            "a public key in the agreement is not an uncompressed point".into(),
         ));
     }
 
@@ -104,6 +111,7 @@ pub fn enrol(
     Ok(EnrolMaterial {
         credential_id,
         ephemeral_public,
+        device_public,
         wrap_key,
     })
 }
@@ -202,6 +210,10 @@ mod tests {
             &enrolled.ephemeral_public[..]
         );
         assert_eq!(enrolled.ephemeral_public[0], 0x04, "uncompressed SEC1");
+        assert_eq!(
+            enrolled.device_public, enclave_public,
+            "the device key, not the ephemeral one"
+        );
     }
 
     #[test]

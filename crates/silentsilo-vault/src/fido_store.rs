@@ -10,7 +10,7 @@ pub const KEY_SLOT_PRIMARY: u8 = 0;
 
 /// A FIDO2 credential whose `hmac-secret` output derives the key that
 /// unwraps `wrapped_dek`. Every build can use one; see
-/// [`KIND_SECURE_ENCLAVE`] for the kind only a Mac can.
+/// [`KIND_SECURE_ENCLAVE`] and [`KIND_ANDROID_KEYSTORE`] for device keys.
 ///
 /// It is a string rather than an enum on purpose. The point of the field is
 /// to be read by a build that has never heard of the value in it, and an enum
@@ -25,52 +25,70 @@ pub const KIND_FIDO2: &str = "fido2";
 /// nothing.
 pub const DERIVATION_HMAC_V1: &str = "hmac-secret-v1";
 
-/// A key held in a Mac's Secure Enclave and gated on Touch ID. Sealed to
-/// that machine, like Windows Hello; unlike Hello it is not a FIDO2
-/// credential at all, hence its own kind.
+/// A key held in a Mac's or an iPhone's Secure Enclave and gated on Touch
+/// ID or Face ID. Sealed to that device, like Windows Hello; unlike Hello it
+/// is not a FIDO2 credential at all, hence its own kind.
 pub const KIND_SECURE_ENCLAVE: &str = "secure-enclave";
 
-/// How a Secure Enclave key's wrap key is derived: P-256 Diffie-Hellman
-/// between the enclave key and an ephemeral key made at enrolment, then
-/// HKDF-SHA256 salted by the same per-vault string as `hmac-secret-v1`. The
-/// ephemeral public key rides in the credential id, after a 16-byte tag.
+/// A key held in an Android phone's Keystore (StrongBox when the phone has
+/// one) and gated on a strong biometric. Same derivation and id shape as
+/// [`KIND_SECURE_ENCLAVE`]; its own kind so a Mac never offers it to its
+/// enclave, or a phone a Mac's key to its Keystore.
+pub const KIND_ANDROID_KEYSTORE: &str = "android-keystore";
+
+/// How a device key's wrap key is derived: P-256 Diffie-Hellman between the
+/// device key and an ephemeral key made at enrolment, then HKDF-SHA256
+/// salted by the same per-vault string as `hmac-secret-v1`. The ephemeral
+/// public key rides in the credential id, after a 16-byte tag.
 pub const DERIVATION_ECDH_P256_V1: &str = "ecdh-p256-hkdf-sha256-v1";
 
-/// A Secure Enclave credential id is a 16-byte keychain label plus a
-/// 65-byte uncompressed P-256 point, hex-encoded. Written here rather than
-/// imported because the vault does not depend on the authenticator crate;
-/// the two are kept in step by the byte vectors.
-const SECURE_ENCLAVE_ID_LEN: usize = 16 + 65;
+/// A device key credential id is a 16-byte tag plus a 65-byte uncompressed
+/// P-256 point, hex-encoded. Written here rather than imported because the
+/// vault does not depend on the authenticator crate; the two are kept in
+/// step by the byte vectors.
+const DEVICE_KEY_ID_LEN: usize = 16 + 65;
+
+/// The device key kind this build can answer for, if any.
+const fn device_kind_here() -> Option<&'static str> {
+    if cfg!(any(target_os = "macos", target_os = "ios")) {
+        Some(KIND_SECURE_ENCLAVE)
+    } else if cfg!(target_os = "android") {
+        Some(KIND_ANDROID_KEYSTORE)
+    } else {
+        None
+    }
+}
 
 /// Whether a ceremony on this build can end with the DEK. Windows and Linux
-/// answer for FIDO2 only; a Mac answers for its enclave too.
+/// answer for FIDO2 only; Apple builds for their enclave too, Android for
+/// its Keystore.
 ///
 /// The id shape is part of the question, not a detail. Everything
 /// downstream, [`StoredFidoKeys::credential_ids_bytes`] above all, takes
 /// "usable" to mean the id can be handed to an authenticator, and one entry
-/// that cannot would otherwise take the whole allow-list down with it. An
-/// enclave envelope whose id is malformed is therefore not usable, which is
-/// what every other platform already does with it.
+/// that cannot would otherwise take the whole allow-list down with it. A
+/// device key envelope whose id is malformed is therefore not usable, which
+/// is what every other platform already does with it.
 fn usable_here(kind: &str, derivation: &str, credential_id: &str) -> bool {
+    usable_on(device_kind_here(), kind, derivation, credential_id)
+}
+
+/// [`usable_here`] with the platform passed in, so every platform's answer
+/// is tested on the one machine the suite runs in full on.
+fn usable_on(device_kind: Option<&str>, kind: &str, derivation: &str, credential_id: &str) -> bool {
     if kind == KIND_FIDO2 && derivation == DERIVATION_HMAC_V1 {
         return hex::decode(credential_id).is_ok();
     }
-    if cfg!(target_os = "macos")
-        && kind == KIND_SECURE_ENCLAVE
-        && derivation == DERIVATION_ECDH_P256_V1
-    {
-        return secure_enclave_id_well_formed(credential_id);
+    if device_kind == Some(kind) && derivation == DERIVATION_ECDH_P256_V1 {
+        return device_key_id_well_formed(credential_id);
     }
     false
 }
 
-/// Whether a Secure Enclave credential id has the shape the Mac backend
-/// writes. Deliberately not behind the platform gate: the branch above only
-/// runs on a Mac, the suite only runs in full on Windows, and a rule nothing
-/// exercises is a rule that drifts.
-fn secure_enclave_id_well_formed(credential_id: &str) -> bool {
+/// Whether a device key credential id has the shape the backends write.
+fn device_key_id_well_formed(credential_id: &str) -> bool {
     hex::decode(credential_id)
-        .map(|bytes| bytes.len() == SECURE_ENCLAVE_ID_LEN)
+        .map(|bytes| bytes.len() == DEVICE_KEY_ID_LEN)
         .unwrap_or(false)
 }
 
@@ -121,10 +139,10 @@ pub struct StoredFidoCredential {
     /// AES-GCM wrapped DEK (hex) so this key can unlock the vault locally.
     #[serde(default)]
     pub wrapped_dek: String,
-    /// True for a built-in authenticator (Windows Hello, Touch ID).
+    /// True for a built-in authenticator (Windows Hello, Touch ID, a phone).
     ///
     /// Cryptographically identical to a removable key, but it does not
-    /// survive the machine — the UI has to say so, or someone will treat
+    /// survive the machine. The UI has to say so, or someone will treat
     /// it as their backup and lose the vault with the laptop.
     #[serde(default)]
     pub platform: bool,
@@ -435,19 +453,30 @@ mod tests {
         assert!(keys.find_by_credential_id(&[0xcc, 0x33]).is_none());
     }
 
+    /// A device key of `kind` with `id`, written as the backends write it.
+    fn device(kind: &str, id: &str) -> StoredFidoCredential {
+        StoredFidoCredential {
+            kind: kind.into(),
+            derivation: DERIVATION_ECDH_P256_V1.into(),
+            credential_id: id.into(),
+            ..foreign("unused")
+        }
+    }
+
+    fn device_id() -> String {
+        format!("{}04{}", "11".repeat(16), "22".repeat(64))
+    }
+
     #[test]
-    fn a_malformed_enclave_id_does_not_take_the_allow_list_down() {
+    fn a_malformed_device_key_id_does_not_take_the_allow_list_down() {
         // The regression this guards: `usable()` deciding on kind alone let
         // a `secure-enclave` entry with an unreadable id reach the `collect`
         // in `credential_ids_bytes`, which fails as a whole. On a Mac that
         // turned one bad entry into a silo nobody could open, with a working
-        // security key sitting right there. Off macOS the same entry was
-        // filtered out and harmless, so the failure existed on exactly the
-        // platform that could least afford it.
-        let good = format!("{}04{}", "11".repeat(16), "22".repeat(64));
+        // security key sitting right there.
         assert!(
-            secure_enclave_id_well_formed(&good),
-            "the shape the Mac backend writes has to pass"
+            device_key_id_well_formed(&device_id()),
+            "the shape the backends write has to pass"
         );
 
         for bad in [
@@ -456,16 +485,15 @@ mod tests {
             &format!("{}04{}", "11".repeat(16), "22".repeat(60)), // short point
             &"aa".repeat(200),                                    // too long
         ] {
-            // Checked directly as well as through `usable`, because the
-            // branch that consults this only compiles on macOS while the
-            // suite runs in full on Windows.
-            assert!(!secure_enclave_id_well_formed(bad), "{bad}: should fail");
-            let mut mac = foreign("unused");
-            mac.kind = KIND_SECURE_ENCLAVE.into();
-            mac.derivation = DERIVATION_ECDH_P256_V1.into();
-            mac.credential_id = bad.to_string();
+            assert!(!device_key_id_well_formed(bad), "{bad}: should fail");
+            for kind in [KIND_SECURE_ENCLAVE, KIND_ANDROID_KEYSTORE] {
+                assert!(
+                    !usable_on(Some(kind), kind, DERIVATION_ECDH_P256_V1, bad),
+                    "{kind} {bad}: usable on its own platform"
+                );
+            }
             let keys = StoredFidoKeys {
-                keys: vec![fido2("aa11"), mac],
+                keys: vec![fido2("aa11"), device(KIND_SECURE_ENCLAVE, bad)],
             };
             assert_eq!(keys.active().count(), 2, "{bad}: both are enrolled");
             assert_eq!(keys.usable().count(), 1, "{bad}: only the FIDO2 key");
@@ -491,19 +519,39 @@ mod tests {
     }
 
     #[test]
-    fn a_secure_enclave_key_is_usable_on_a_mac_and_nowhere_else() {
-        // The one kind that exists besides FIDO2, with the id shape the Mac
-        // backend really writes: a 16-byte tag then a 65-byte point, hex.
-        let id = format!("{}04{}", "11".repeat(16), "22".repeat(64));
-        let mut mac = foreign("unused");
-        mac.kind = KIND_SECURE_ENCLAVE.into();
-        mac.derivation = DERIVATION_ECDH_P256_V1.into();
-        mac.credential_id = id;
+    fn each_device_key_is_usable_on_its_own_platform_and_nowhere_else() {
+        // Every platform's answer, checked here because the suite runs in
+        // full on Windows only.
+        let id = device_id();
+        let apple = Some(KIND_SECURE_ENCLAVE);
+        let android = Some(KIND_ANDROID_KEYSTORE);
+        let ecdh = DERIVATION_ECDH_P256_V1;
+
+        assert!(usable_on(apple, KIND_SECURE_ENCLAVE, ecdh, &id));
+        assert!(!usable_on(apple, KIND_ANDROID_KEYSTORE, ecdh, &id));
+        assert!(usable_on(android, KIND_ANDROID_KEYSTORE, ecdh, &id));
+        assert!(!usable_on(android, KIND_SECURE_ENCLAVE, ecdh, &id));
+        for kind in [KIND_SECURE_ENCLAVE, KIND_ANDROID_KEYSTORE] {
+            assert!(!usable_on(None, kind, ecdh, &id), "{kind} on a desktop");
+            assert!(
+                !usable_on(Some(kind), kind, DERIVATION_HMAC_V1, &id),
+                "{kind} with a derivation it does not use"
+            );
+        }
+        for platform in [None, apple, android] {
+            assert!(usable_on(platform, KIND_FIDO2, DERIVATION_HMAC_V1, "aa11"));
+        }
+
+        // And through the real filter, on whatever this build is.
         let keys = StoredFidoKeys {
-            keys: vec![fido2("aa11"), mac],
+            keys: vec![
+                fido2("aa11"),
+                device(KIND_SECURE_ENCLAVE, &id),
+                device(KIND_ANDROID_KEYSTORE, &id),
+            ],
         };
-        assert_eq!(keys.active().count(), 2, "both are enrolled on the silo");
-        let expected = if cfg!(target_os = "macos") { 2 } else { 1 };
+        assert_eq!(keys.active().count(), 3, "all are enrolled on the silo");
+        let expected = if device_kind_here().is_some() { 2 } else { 1 };
         assert_eq!(keys.usable().count(), expected);
         assert_eq!(
             keys.credential_ids_bytes()

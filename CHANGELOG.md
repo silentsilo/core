@@ -11,13 +11,31 @@ release notes should say.
 
 ## [Unreleased]
 
-No persisted format changed, and nothing here affects a Windows or Linux
-client at runtime, so there is no tag yet: desktop keeps pinning 1.1.0 and
-builds exactly as before. A tag follows when a Mac build needs one. A review
-of what 1.1.0 added found three ways the macOS unlock could refuse a silo it
-should have opened.
+Groundwork for the mobile builds, to be tagged 1.2.0. Nothing here changes
+what a Windows or Linux client does at runtime, and a test runs the 1.0.0
+vault code against every key written now.
+
+### Added
+
+- A third key kind, `android-keystore`, with the derivation and id shape of
+  `secure-enclave`. Usable on Android only; every other build carries it and
+  skips it.
+- `secure-enclave` keys are usable on iOS as well as macOS.
+- The byte vectors hold an Android Keystore envelope, and
+  `silentsilo-fixture` depends on the 1.0.0 vault to check that an installed
+  client offers only its FIDO2 keys and keeps every other key intact through
+  a load and save of `keys/fido.json`.
+
+### Changed
+
+- `public_key` in a `secure-enclave` envelope is the enclave key's point, not
+  a copy of the ephemeral point already in the credential id. No released
+  client wrote the old form.
 
 ### Fixed
+
+A review of what 1.1.0 added found three ways the macOS unlock could refuse
+a silo it should have opened.
 
 - Unlock falls through to an enrolled security key when Touch ID cannot
   answer, instead of stopping at the enclave. Biometry has more ways to be

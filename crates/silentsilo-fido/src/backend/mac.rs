@@ -67,7 +67,7 @@ pub fn complete_enrollment(challenge: &EnrollmentChallenge) -> Result<Enrollment
             Ok(Enrollment {
                 credential: CredentialInfo {
                     credential_id: material.credential_id.clone(),
-                    public_key: material.ephemeral_public.clone(),
+                    public_key: material.device_public.clone(),
                     key_slot: challenge.key_slot,
                     rp_id: challenge.rp_id.clone(),
                     authenticator: challenge.authenticator,

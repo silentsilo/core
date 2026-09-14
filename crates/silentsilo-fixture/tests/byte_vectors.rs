@@ -181,11 +181,15 @@ const KEY_ENVELOPE_PRE_KIND: &str = r#"{"credential_id":"bb22","public_key":"305
 /// and without failing over it, whatever the platform behind it.
 const KEY_ENVELOPE_FOREIGN: &str = r#"{"kind":"touch-id-of-the-future","credential_id":"touch-id-key-1","public_key":"","key_slot":2,"rp_id":"silentsilo.com","label":"MacBook Touch ID","wrapped_dek":"beefcafe","platform":true,"revoked":false}"#;
 
-/// A Secure Enclave envelope as the macOS build writes it, the second kind
-/// ever shipped. The credential id is the 16-byte keychain tag followed by
-/// the 65-byte ephemeral public key; `public_key` repeats the point. A
-/// Windows build carries it and skips it; a Mac build lists it as usable.
-const KEY_ENVELOPE_SECURE_ENCLAVE: &str = r#"{"kind":"secure-enclave","derivation":"ecdh-p256-hkdf-sha256-v1","credential_id":"000102030405060708090a0b0c0d0e0f046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5","public_key":"046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5","key_slot":3,"rp_id":"silentsilo.com","label":"MacBook Air Touch ID","wrapped_dek":"beefcafe","platform":true,"revoked":false}"#;
+/// A Secure Enclave envelope as the Apple builds write it. The credential id
+/// is the 16-byte keychain tag followed by the 65-byte ephemeral public key;
+/// `public_key` is the enclave key's own point. A Windows build carries it
+/// and skips it; a Mac or an iPhone lists it as usable.
+const KEY_ENVELOPE_SECURE_ENCLAVE: &str = r#"{"kind":"secure-enclave","derivation":"ecdh-p256-hkdf-sha256-v1","credential_id":"000102030405060708090a0b0c0d0e0f046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5","public_key":"047cf27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc4766997807775510db8ed040293d9ac69f7430dbba7dade63ce982299e04b79d227873d1","key_slot":3,"rp_id":"silentsilo.com","label":"MacBook Air Touch ID","wrapped_dek":"beefcafe","platform":true,"revoked":false}"#;
+
+/// An Android Keystore envelope: the same derivation and id shape as the
+/// Secure Enclave one, under its own kind.
+const KEY_ENVELOPE_ANDROID_KEYSTORE: &str = r#"{"kind":"android-keystore","derivation":"ecdh-p256-hkdf-sha256-v1","credential_id":"101112131415161718191a1b1c1d1e1f045ecbe4d1a6330a44c8f7ef951d4bf165e6c6b721efada985fb41661bc6e7fd6c8734640c4998ff7e374b06ce1a64a2ecd82ab036384fb83d9a79b127a27d5032","public_key":"04e2534a3532d08fbba02dde659ee62bd0031fe2db785596ef509302446b030852e0f1575a4c633cc719dfee5fda862d764efc96c3f30ee0055c42c23f184ed8c6","key_slot":4,"rp_id":"silentsilo.com","label":"Galaxy S23 Ultra","wrapped_dek":"cafebeef","platform":true,"revoked":false}"#;
 
 #[test]
 fn the_secure_enclave_envelope_still_decodes() {
@@ -210,7 +214,51 @@ fn the_secure_enclave_envelope_still_decodes() {
     // The composed behaviour: on the platform that made it, it unlocks; on
     // any other, it is carried and skipped, and the id still decodes as hex
     // so the allow-list is not the thing that fails.
-    let usable = if cfg!(target_os = "macos") { 1 } else { 0 };
+    let usable = if cfg!(any(target_os = "macos", target_os = "ios")) {
+        1
+    } else {
+        0
+    };
+    assert_eq!(keys.usable().count(), usable);
+    assert_eq!(keys.credential_ids_bytes().expect("hex").len(), usable);
+}
+
+#[test]
+fn the_android_keystore_envelope_still_decodes() {
+    use silentsilo_vault::{StoredFidoCredential, StoredFidoKeys};
+
+    let key: StoredFidoCredential = serde_json::from_str(KEY_ENVELOPE_ANDROID_KEYSTORE)
+        .expect("an Android Keystore envelope can no longer be read");
+    assert_eq!(
+        key.kind,
+        silentsilo_vault::KIND_ANDROID_KEYSTORE,
+        "the kind moved"
+    );
+    assert_eq!(
+        key.derivation,
+        silentsilo_vault::DERIVATION_ECDH_P256_V1,
+        "the derivation moved"
+    );
+    assert_eq!(key.credential_id.len(), 2 * 81, "the id is tag plus point");
+    assert!(key.platform, "sealed to the phone");
+
+    let enclave: StoredFidoCredential =
+        serde_json::from_str(KEY_ENVELOPE_SECURE_ENCLAVE).expect("decodes");
+    let keys = StoredFidoKeys {
+        keys: vec![key, enclave],
+    };
+    // Each device kind unlocks only where it was made, and neither breaks
+    // the allow-list anywhere else.
+    let usable = if cfg!(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android"
+    )) {
+        1
+    } else {
+        0
+    };
+    assert_eq!(keys.active().count(), 2);
     assert_eq!(keys.usable().count(), usable);
     assert_eq!(keys.credential_ids_bytes().expect("hex").len(), usable);
 }
@@ -287,4 +335,52 @@ fn the_manifest_still_decodes() {
         "the vault id moved"
     );
     assert_eq!(manifest.version, 1, "the manifest version moved");
+}
+
+/// What 1.0.0, the release people have installed, does with every kind of
+/// key written today. Its own code answers, not a description of it.
+#[test]
+fn an_installed_1_0_0_client_carries_device_keys_and_unlocks_with_its_own() {
+    use silentsilo_vault::{Authority, StoredFidoCredential, StoredFidoKeys};
+    use silentsilo_vault_v1_0_0 as v1_0_0;
+
+    let envelopes = [
+        KEY_ENVELOPE,
+        KEY_ENVELOPE_SECURE_ENCLAVE,
+        KEY_ENVELOPE_ANDROID_KEYSTORE,
+        KEY_ENVELOPE_FOREIGN,
+    ];
+    let old: Vec<v1_0_0::StoredFidoCredential> = envelopes
+        .iter()
+        .map(|e| serde_json::from_str(e).expect("1.0.0 parses every envelope"))
+        .collect();
+    let old = v1_0_0::StoredFidoKeys { keys: old };
+    assert_eq!(old.active().count(), 4, "all are enrolled on the silo");
+    assert_eq!(old.usable().count(), 1, "only the FIDO2 key is offered");
+    assert_eq!(
+        old.credential_ids_bytes()
+            .expect("device keys must not fail the allow-list"),
+        vec![vec![0xaa, 0x11]]
+    );
+
+    // The silo file: written now, loaded and saved again by 1.0.0, read back
+    // now. Every key has to survive the trip unchanged.
+    let dir = tempfile::tempdir().unwrap();
+    let now = StoredFidoKeys {
+        keys: envelopes
+            .iter()
+            .map(|e| serde_json::from_str::<StoredFidoCredential>(e).expect("parses"))
+            .collect(),
+    };
+    silentsilo_vault::save_fido_keys(dir.path(), &now, Authority::Machine).expect("saves");
+    let through_old = v1_0_0::load_fido_keys(dir.path()).expect("1.0.0 loads the file");
+    assert_eq!(through_old.usable().count(), 1);
+    v1_0_0::save_fido_keys(dir.path(), &through_old, v1_0_0::Authority::Machine)
+        .expect("1.0.0 saves it back");
+    let back = silentsilo_vault::load_fido_keys(dir.path()).expect("loads again");
+    assert_eq!(
+        serde_json::to_value(&back.keys).unwrap(),
+        serde_json::to_value(&now.keys).unwrap(),
+        "1.0.0 changed a key on its way through"
+    );
 }
