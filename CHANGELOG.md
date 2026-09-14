@@ -11,9 +11,12 @@ release notes should say.
 
 ## [Unreleased]
 
-Groundwork for the mobile builds, to be tagged 1.2.0. Nothing here changes
-what a Windows or Linux client does at runtime, and a test runs the 1.0.0
-vault code against every key written now.
+## [1.2.0] - Groundwork for the mobile builds
+
+No existing format version changed, so the 1.0.0 fixtures still describe the
+current era. The new objects (the inbox and the Android key kind) are pinned
+by byte vectors, and a test runs the 1.0.0 vault and sync code against them.
+Nothing here changes what a Windows or Linux client does at runtime.
 
 ### Added
 
