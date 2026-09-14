@@ -278,6 +278,27 @@ impl S3Client {
         }
     }
 
+    /// The largest object one CopyObject request may copy.
+    pub const MAX_SINGLE_COPY: i64 = 5 * 1024 * 1024 * 1024;
+
+    /// Copies an object inside the bucket, on the server.
+    pub async fn copy(&self, from: &str, to: &str) -> Result<(), S3Error> {
+        let source = format!(
+            "{}/{}",
+            self.config.bucket,
+            encode_copy_source(&self.config.key(from))
+        );
+        self.client
+            .copy_object()
+            .bucket(&self.config.bucket)
+            .copy_source(source)
+            .key(self.config.key(to))
+            .send()
+            .await
+            .map_err(|e| S3Error::from_sdk("copy", e))?;
+        Ok(())
+    }
+
     pub async fn delete(&self, key: &str) -> Result<(), S3Error> {
         self.client
             .delete_object()
@@ -357,9 +378,32 @@ fn status_says_absent(status: u16) -> bool {
     matches!(status, 404 | 403)
 }
 
+/// The `x-amz-copy-source` key, percent-encoded as S3 requires. Slashes
+/// stay, since they separate the prefix from the key.
+fn encode_copy_source(key: &str) -> String {
+    let mut out = String::with_capacity(key.len());
+    for byte in key.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_copy_source_is_percent_encoded_but_keeps_its_slashes() {
+        assert_eq!(
+            encode_copy_source("my silo/inbox/items/a.sslo"),
+            "my%20silo/inbox/items/a.sslo"
+        );
+        assert_eq!(encode_copy_source("ș+?"), "%C8%99%2B%3F");
+    }
 
     fn config() -> S3Config {
         S3Config {

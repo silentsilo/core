@@ -235,6 +235,48 @@ async fn rewriting_a_key_replaces_it() {
 }
 
 #[tokio::test]
+async fn a_copy_is_the_same_bytes_under_the_new_key_and_leaves_the_original() {
+    // The inbox import copies an item into `blobs/` before it records the
+    // file, and deletes the original only afterwards. A copy that moved,
+    // truncated or failed to replace would lose a photo nobody else holds.
+    for_each_store(|store| async move {
+        let bytes: Vec<u8> = (0..(1024 * 1024 + 7)).map(|i| (i % 251) as u8).collect();
+        store
+            .put("inbox/items/a.sslo", bytes.clone())
+            .await
+            .unwrap();
+        store.put("blobs/b.sslo", vec![9; 10]).await.unwrap();
+
+        store
+            .copy("inbox/items/a.sslo", "blobs/b.sslo")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.get("blobs/b.sslo").await.unwrap(),
+            bytes,
+            "{}: the copy is not the original",
+            store.describe()
+        );
+        assert_eq!(
+            store.get("inbox/items/a.sslo").await.unwrap(),
+            bytes,
+            "{}: the original changed",
+            store.describe()
+        );
+
+        let missing = store.copy("inbox/items/absent.sslo", "blobs/c.sslo").await;
+        assert!(
+            matches!(missing, Err(StoreError::NotFound(_))),
+            "{}: copying nothing must say so: got {missing:?}",
+            store.describe()
+        );
+        assert_eq!(store.head("blobs/c.sslo").await.unwrap(), None);
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn the_write_check_round_trips_and_leaves_nothing_behind() {
     for_each_store(|store| async move {
         store.check().await.unwrap();

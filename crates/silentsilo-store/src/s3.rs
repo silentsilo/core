@@ -65,6 +65,23 @@ impl ObjectStore for S3Client {
         S3Client::get_file(self, key, dest).await.map_err(map)
     }
 
+    async fn copy(&self, from: &str, to: &str) -> Result<(), StoreError> {
+        let Some(size) = S3Client::head(self, from).await.map_err(map)? else {
+            return Err(StoreError::NotFound(from.to_string()));
+        };
+        // One CopyObject request takes up to 5 GiB; past that S3 wants a
+        // multipart copy, and going through disk is simpler than that.
+        if size > S3Client::MAX_SINGLE_COPY {
+            let temp =
+                tempfile::NamedTempFile::new().map_err(|e| StoreError::Other(e.to_string()))?;
+            S3Client::get_file(self, from, temp.path())
+                .await
+                .map_err(map)?;
+            return S3Client::put_file(self, to, temp.path()).await.map_err(map);
+        }
+        S3Client::copy(self, from, to).await.map_err(map)
+    }
+
     async fn head(&self, key: &str) -> Result<Option<i64>, StoreError> {
         S3Client::head(self, key).await.map_err(map)
     }

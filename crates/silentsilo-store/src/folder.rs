@@ -88,6 +88,14 @@ impl ObjectStore for FolderStore {
         Ok(())
     }
 
+    async fn copy(&self, from: &str, to: &str) -> Result<(), StoreError> {
+        let source = self.path_for(from)?;
+        if !source.is_file() {
+            return Err(StoreError::NotFound(from.to_string()));
+        }
+        self.put_from_file(to, &source).await
+    }
+
     async fn get_to_file(&self, key: &str, dest: &Path) -> Result<(), StoreError> {
         std::fs::copy(self.path_for(key)?, dest)
             .map(|_| ())

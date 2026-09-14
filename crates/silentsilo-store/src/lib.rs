@@ -1,4 +1,4 @@
-//! What SilentSilo needs from a place to keep a backup: five operations,
+//! What SilentSilo needs from a place to keep a backup: a handful of operations,
 //! nothing a plain file server cannot do, so a bucket, a folder, a WebDAV
 //! share and an SFTP account are all the same thing to the layer above.
 //!
@@ -81,6 +81,17 @@ pub trait ObjectStore: Send + Sync {
     async fn get_to_file(&self, key: &str, path: &Path) -> Result<(), StoreError> {
         let body = self.get(key).await?;
         std::fs::write(path, body).map_err(|e| StoreError::Other(e.to_string()))
+    }
+
+    /// Copies an object to another key, replacing whatever is there.
+    ///
+    /// The default goes through a temporary file on this machine, which works
+    /// on any backend; S3, WebDAV and a folder override it to copy in place,
+    /// without moving the bytes over the network.
+    async fn copy(&self, from: &str, to: &str) -> Result<(), StoreError> {
+        let temp = tempfile::NamedTempFile::new().map_err(|e| StoreError::Other(e.to_string()))?;
+        self.get_to_file(from, temp.path()).await?;
+        self.put_from_file(to, temp.path()).await
     }
 
     /// The object's size, or `None` when it isn't there.

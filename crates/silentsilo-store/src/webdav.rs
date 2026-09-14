@@ -230,6 +230,33 @@ impl ObjectStore for WebDavStore {
         Ok(())
     }
 
+    async fn copy(&self, from: &str, to: &str) -> Result<(), StoreError> {
+        self.ensure_parents(to).await?;
+        let response = self
+            .request(Method::from_bytes(b"COPY").unwrap(), &self.url_for(from))
+            .header("Destination", self.url_for(to))
+            .header("Overwrite", "T")
+            .send()
+            .await
+            .map_err(Self::map_send)?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        // A server without COPY still stores and serves objects, so the
+        // copy goes through this machine instead of failing.
+        if matches!(
+            status,
+            StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED
+        ) {
+            let temp =
+                tempfile::NamedTempFile::new().map_err(|e| StoreError::Other(e.to_string()))?;
+            self.get_to_file(from, temp.path()).await?;
+            return self.put_from_file(to, temp.path()).await;
+        }
+        Err(Self::map_status(status, from))
+    }
+
     async fn head(&self, key: &str) -> Result<Option<i64>, StoreError> {
         let response = self
             .request(Method::HEAD, &self.url_for(key))
