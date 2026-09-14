@@ -76,7 +76,7 @@ thing that can be wrong.
 ```mermaid
 flowchart TD
     FIDO2["FIDO2 hmac-secret<br/>(per enrolled key)"] -->|"wraps"| DEK
-    SE["Secure Enclave / Android Keystore ECDH<br/>(macOS, iOS, Android, per enrolled key)"] -->|"wraps"| DEK
+    SE["Secure Enclave ECDH / Android Keystore AES<br/>(macOS, iOS, Android, per enrolled key)"] -->|"wraps"| DEK
     DS["device secret<br/>(keyring, per device)<br/>Argon2id + vault.salt"] -->|"wraps, until a key is enrolled"| DEK
     RC["recovery code<br/>(160-bit, on paper)<br/>Argon2id + salt in envelope"] -->|"wraps"| DEK
     DEK["vault DEK (32B)<br/>one per silo, shared by devices"]

@@ -28,9 +28,8 @@
 //! untouched.
 //!
 //! Everything here runs on every platform and is tested on every platform;
-//! the enclave itself only enters in `backend/enclave_mac.rs`. An Android
-//! Keystore key follows the same scheme under its own kind, with the
-//! Keystore doing the agreement in the mobile app.
+//! the enclave itself only enters in `backend/enclave_mac.rs`. The iOS
+//! build uses the same scheme, with its own code reaching the enclave.
 
 use hkdf::Hkdf;
 use p256::ecdh::diffie_hellman;

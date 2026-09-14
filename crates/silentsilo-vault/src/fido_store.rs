@@ -31,9 +31,8 @@ pub const DERIVATION_HMAC_V1: &str = "hmac-secret-v1";
 pub const KIND_SECURE_ENCLAVE: &str = "secure-enclave";
 
 /// A key held in an Android phone's Keystore (StrongBox when the phone has
-/// one) and gated on a strong biometric. Same derivation and id shape as
-/// [`KIND_SECURE_ENCLAVE`]; its own kind so a Mac never offers it to its
-/// enclave, or a phone a Mac's key to its Keystore.
+/// one) and usable once per strong biometric. See
+/// [`DERIVATION_KEYSTORE_AES_GCM_V1`].
 pub const KIND_ANDROID_KEYSTORE: &str = "android-keystore";
 
 /// How a device key's wrap key is derived: P-256 Diffie-Hellman between the
@@ -42,18 +41,47 @@ pub const KIND_ANDROID_KEYSTORE: &str = "android-keystore";
 /// public key rides in the credential id, after a 16-byte tag.
 pub const DERIVATION_ECDH_P256_V1: &str = "ecdh-p256-hkdf-sha256-v1";
 
-/// A device key credential id is a 16-byte tag plus a 65-byte uncompressed
-/// P-256 point, hex-encoded. Written here rather than imported because the
-/// vault does not depend on the authenticator crate; the two are kept in
-/// step by the byte vectors.
-const DEVICE_KEY_ID_LEN: usize = 16 + 65;
+/// How an Android Keystore key's wrap key is reached: 32 random bytes chosen
+/// at enrolment, encrypted with AES-256-GCM under a Keystore key that allows
+/// one operation per strong biometric, with `silentsilo-dek-v1:{vault_id}` as
+/// associated data. The credential id is a 16-byte tag naming the Keystore
+/// key, the 12-byte nonce, then the 48-byte ciphertext and tag.
+///
+/// A cipher rather than the enclave's key agreement because Android binds a
+/// single use of a key to a biometric only for ciphers, signatures and MACs,
+/// and every StrongBox chip supports AES.
+pub const DERIVATION_KEYSTORE_AES_GCM_V1: &str = "keystore-aes-256-gcm-v1";
+
+/// One device key kind: what it is called, how it derives, and how many
+/// bytes its credential id has. Lengths written here rather than imported
+/// because the vault does not depend on the authenticator code; the byte
+/// vectors keep the two in step.
+struct DeviceKind {
+    kind: &'static str,
+    derivation: &'static str,
+    id_len: usize,
+}
+
+const SECURE_ENCLAVE: DeviceKind = DeviceKind {
+    kind: KIND_SECURE_ENCLAVE,
+    derivation: DERIVATION_ECDH_P256_V1,
+    // Tag, then the uncompressed ephemeral point.
+    id_len: 16 + 65,
+};
+
+const ANDROID_KEYSTORE: DeviceKind = DeviceKind {
+    kind: KIND_ANDROID_KEYSTORE,
+    derivation: DERIVATION_KEYSTORE_AES_GCM_V1,
+    // Tag, nonce, then the wrapped 32-byte key and its GCM tag.
+    id_len: 16 + 12 + 48,
+};
 
 /// The device key kind this build can answer for, if any.
-const fn device_kind_here() -> Option<&'static str> {
+const fn device_kind_here() -> Option<&'static DeviceKind> {
     if cfg!(any(target_os = "macos", target_os = "ios")) {
-        Some(KIND_SECURE_ENCLAVE)
+        Some(&SECURE_ENCLAVE)
     } else if cfg!(target_os = "android") {
-        Some(KIND_ANDROID_KEYSTORE)
+        Some(&ANDROID_KEYSTORE)
     } else {
         None
     }
@@ -75,20 +103,27 @@ fn usable_here(kind: &str, derivation: &str, credential_id: &str) -> bool {
 
 /// [`usable_here`] with the platform passed in, so every platform's answer
 /// is tested on the one machine the suite runs in full on.
-fn usable_on(device_kind: Option<&str>, kind: &str, derivation: &str, credential_id: &str) -> bool {
+fn usable_on(
+    device_kind: Option<&DeviceKind>,
+    kind: &str,
+    derivation: &str,
+    credential_id: &str,
+) -> bool {
     if kind == KIND_FIDO2 && derivation == DERIVATION_HMAC_V1 {
         return hex::decode(credential_id).is_ok();
     }
-    if device_kind == Some(kind) && derivation == DERIVATION_ECDH_P256_V1 {
-        return device_key_id_well_formed(credential_id);
+    match device_kind {
+        Some(here) if here.kind == kind && here.derivation == derivation => {
+            device_key_id_well_formed(here, credential_id)
+        }
+        _ => false,
     }
-    false
 }
 
-/// Whether a device key credential id has the shape the backends write.
-fn device_key_id_well_formed(credential_id: &str) -> bool {
+/// Whether a device key credential id has the shape its backend writes.
+fn device_key_id_well_formed(device_kind: &DeviceKind, credential_id: &str) -> bool {
     hex::decode(credential_id)
-        .map(|bytes| bytes.len() == DEVICE_KEY_ID_LEN)
+        .map(|bytes| bytes.len() == device_kind.id_len)
         .unwrap_or(false)
 }
 
@@ -453,18 +488,19 @@ mod tests {
         assert!(keys.find_by_credential_id(&[0xcc, 0x33]).is_none());
     }
 
-    /// A device key of `kind` with `id`, written as the backends write it.
-    fn device(kind: &str, id: &str) -> StoredFidoCredential {
+    /// A device key of `device_kind`, with `id`.
+    fn device(device_kind: &DeviceKind, id: &str) -> StoredFidoCredential {
         StoredFidoCredential {
-            kind: kind.into(),
-            derivation: DERIVATION_ECDH_P256_V1.into(),
+            kind: device_kind.kind.into(),
+            derivation: device_kind.derivation.into(),
             credential_id: id.into(),
             ..foreign("unused")
         }
     }
 
-    fn device_id() -> String {
-        format!("{}04{}", "11".repeat(16), "22".repeat(64))
+    /// An id of the right length for `device_kind`.
+    fn device_id(device_kind: &DeviceKind) -> String {
+        "5a".repeat(device_kind.id_len)
     }
 
     #[test]
@@ -474,37 +510,38 @@ mod tests {
         // in `credential_ids_bytes`, which fails as a whole. On a Mac that
         // turned one bad entry into a silo nobody could open, with a working
         // security key sitting right there.
-        assert!(
-            device_key_id_well_formed(&device_id()),
-            "the shape the backends write has to pass"
-        );
-
-        for bad in [
-            "not-hex-at-all",
-            "abc",                                                // odd length
-            &format!("{}04{}", "11".repeat(16), "22".repeat(60)), // short point
-            &"aa".repeat(200),                                    // too long
-        ] {
-            assert!(!device_key_id_well_formed(bad), "{bad}: should fail");
-            for kind in [KIND_SECURE_ENCLAVE, KIND_ANDROID_KEYSTORE] {
+        for here in [&SECURE_ENCLAVE, &ANDROID_KEYSTORE] {
+            assert!(
+                device_key_id_well_formed(here, &device_id(here)),
+                "{}: the shape its backend writes has to pass",
+                here.kind
+            );
+            for bad in [
+                "not-hex-at-all".to_string(),
+                "abc".to_string(),
+                "5a".repeat(here.id_len - 1),
+                "5a".repeat(here.id_len + 1),
+            ] {
+                assert!(!device_key_id_well_formed(here, &bad), "{bad}: should fail");
                 assert!(
-                    !usable_on(Some(kind), kind, DERIVATION_ECDH_P256_V1, bad),
-                    "{kind} {bad}: usable on its own platform"
+                    !usable_on(Some(here), here.kind, here.derivation, &bad),
+                    "{} {bad}: usable on its own platform",
+                    here.kind
                 );
             }
-            let keys = StoredFidoKeys {
-                keys: vec![fido2("aa11"), device(KIND_SECURE_ENCLAVE, bad)],
-            };
-            assert_eq!(keys.active().count(), 2, "{bad}: both are enrolled");
-            assert_eq!(keys.usable().count(), 1, "{bad}: only the FIDO2 key");
-            assert_eq!(
-                keys.credential_ids_bytes()
-                    .unwrap_or_else(|_| panic!("{bad}: took the allow-list down"))
-                    .len(),
-                1,
-                "{bad}: the working key still reaches the authenticator"
-            );
         }
+        let keys = StoredFidoKeys {
+            keys: vec![fido2("aa11"), device(&SECURE_ENCLAVE, "abc")],
+        };
+        assert_eq!(keys.active().count(), 2, "both are enrolled");
+        assert_eq!(keys.usable().count(), 1, "only the FIDO2 key");
+        assert_eq!(
+            keys.credential_ids_bytes()
+                .expect("a bad id took the allow-list down")
+                .len(),
+            1,
+            "the working key still reaches the authenticator"
+        );
     }
 
     #[test]
@@ -522,22 +559,30 @@ mod tests {
     fn each_device_key_is_usable_on_its_own_platform_and_nowhere_else() {
         // Every platform's answer, checked here because the suite runs in
         // full on Windows only.
-        let id = device_id();
-        let apple = Some(KIND_SECURE_ENCLAVE);
-        let android = Some(KIND_ANDROID_KEYSTORE);
+        let apple = Some(&SECURE_ENCLAVE);
+        let android = Some(&ANDROID_KEYSTORE);
+        let enclave_id = device_id(&SECURE_ENCLAVE);
+        let keystore_id = device_id(&ANDROID_KEYSTORE);
         let ecdh = DERIVATION_ECDH_P256_V1;
+        let aes = DERIVATION_KEYSTORE_AES_GCM_V1;
 
-        assert!(usable_on(apple, KIND_SECURE_ENCLAVE, ecdh, &id));
-        assert!(!usable_on(apple, KIND_ANDROID_KEYSTORE, ecdh, &id));
-        assert!(usable_on(android, KIND_ANDROID_KEYSTORE, ecdh, &id));
-        assert!(!usable_on(android, KIND_SECURE_ENCLAVE, ecdh, &id));
-        for kind in [KIND_SECURE_ENCLAVE, KIND_ANDROID_KEYSTORE] {
-            assert!(!usable_on(None, kind, ecdh, &id), "{kind} on a desktop");
-            assert!(
-                !usable_on(Some(kind), kind, DERIVATION_HMAC_V1, &id),
-                "{kind} with a derivation it does not use"
-            );
-        }
+        assert!(usable_on(apple, KIND_SECURE_ENCLAVE, ecdh, &enclave_id));
+        assert!(usable_on(android, KIND_ANDROID_KEYSTORE, aes, &keystore_id));
+
+        // Another platform's kind, a derivation the kind does not use, and
+        // an id of the other kind's length are all refused.
+        assert!(!usable_on(apple, KIND_ANDROID_KEYSTORE, aes, &keystore_id));
+        assert!(!usable_on(android, KIND_SECURE_ENCLAVE, ecdh, &enclave_id));
+        assert!(!usable_on(
+            android,
+            KIND_ANDROID_KEYSTORE,
+            ecdh,
+            &keystore_id
+        ));
+        assert!(!usable_on(apple, KIND_SECURE_ENCLAVE, aes, &enclave_id));
+        assert!(!usable_on(android, KIND_ANDROID_KEYSTORE, aes, &enclave_id));
+        assert!(!usable_on(None, KIND_SECURE_ENCLAVE, ecdh, &enclave_id));
+        assert!(!usable_on(None, KIND_ANDROID_KEYSTORE, aes, &keystore_id));
         for platform in [None, apple, android] {
             assert!(usable_on(platform, KIND_FIDO2, DERIVATION_HMAC_V1, "aa11"));
         }
@@ -546,8 +591,8 @@ mod tests {
         let keys = StoredFidoKeys {
             keys: vec![
                 fido2("aa11"),
-                device(KIND_SECURE_ENCLAVE, &id),
-                device(KIND_ANDROID_KEYSTORE, &id),
+                device(&SECURE_ENCLAVE, &enclave_id),
+                device(&ANDROID_KEYSTORE, &keystore_id),
             ],
         };
         assert_eq!(keys.active().count(), 3, "all are enrolled on the silo");
@@ -555,7 +600,7 @@ mod tests {
         assert_eq!(keys.usable().count(), expected);
         assert_eq!(
             keys.credential_ids_bytes()
-                .expect("an 81-byte hex id decodes like any other")
+                .expect("a device key id decodes like any other")
                 .len(),
             expected
         );

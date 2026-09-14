@@ -187,9 +187,10 @@ const KEY_ENVELOPE_FOREIGN: &str = r#"{"kind":"touch-id-of-the-future","credenti
 /// and skips it; a Mac or an iPhone lists it as usable.
 const KEY_ENVELOPE_SECURE_ENCLAVE: &str = r#"{"kind":"secure-enclave","derivation":"ecdh-p256-hkdf-sha256-v1","credential_id":"000102030405060708090a0b0c0d0e0f046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5","public_key":"047cf27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc4766997807775510db8ed040293d9ac69f7430dbba7dade63ce982299e04b79d227873d1","key_slot":3,"rp_id":"silentsilo.com","label":"MacBook Air Touch ID","wrapped_dek":"beefcafe","platform":true,"revoked":false}"#;
 
-/// An Android Keystore envelope: the same derivation and id shape as the
-/// Secure Enclave one, under its own kind.
-const KEY_ENVELOPE_ANDROID_KEYSTORE: &str = r#"{"kind":"android-keystore","derivation":"ecdh-p256-hkdf-sha256-v1","credential_id":"101112131415161718191a1b1c1d1e1f045ecbe4d1a6330a44c8f7ef951d4bf165e6c6b721efada985fb41661bc6e7fd6c8734640c4998ff7e374b06ce1a64a2ecd82ab036384fb83d9a79b127a27d5032","public_key":"04e2534a3532d08fbba02dde659ee62bd0031fe2db785596ef509302446b030852e0f1575a4c633cc719dfee5fda862d764efc96c3f30ee0055c42c23f184ed8c6","key_slot":4,"rp_id":"silentsilo.com","label":"Galaxy S23 Ultra","wrapped_dek":"cafebeef","platform":true,"revoked":false}"#;
+/// An Android Keystore envelope. The credential id is the 16-byte tag
+/// naming the Keystore key, the 12-byte nonce, then the wrapped 32-byte key
+/// and its GCM tag. There is no public key to record.
+const KEY_ENVELOPE_ANDROID_KEYSTORE: &str = r#"{"kind":"android-keystore","derivation":"keystore-aes-256-gcm-v1","credential_id":"101112131415161718191a1b1c1d1e1f202122232425262728292a2b303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f","public_key":"","key_slot":4,"rp_id":"silentsilo.com","label":"Galaxy S23 Ultra","wrapped_dek":"cafebeef","platform":true,"revoked":false}"#;
 
 #[test]
 fn the_secure_enclave_envelope_still_decodes() {
@@ -236,10 +237,14 @@ fn the_android_keystore_envelope_still_decodes() {
     );
     assert_eq!(
         key.derivation,
-        silentsilo_vault::DERIVATION_ECDH_P256_V1,
+        silentsilo_vault::DERIVATION_KEYSTORE_AES_GCM_V1,
         "the derivation moved"
     );
-    assert_eq!(key.credential_id.len(), 2 * 81, "the id is tag plus point");
+    assert_eq!(
+        key.credential_id.len(),
+        2 * 76,
+        "the id is tag, nonce and wrapped key"
+    );
     assert!(key.platform, "sealed to the phone");
 
     let enclave: StoredFidoCredential =

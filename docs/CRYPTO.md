@@ -190,16 +190,26 @@ to an enrolled security key rather than as the end of the attempt.
 The iOS build uses the same kind and the same scheme, behind Face ID or
 Touch ID.
 
-## Android unlock (Keystore, ECDH)
+## Android unlock (Keystore, AES-GCM)
 
-The Android build uses the same derivation under kind `android-keystore`.
-The device key is a P-256 key made in the Keystore with the key agreement
-purpose (Android 12 and newer), in StrongBox when the phone has it and in
-the TEE otherwise, and usable only after a strong biometric. The Keystore
-performs the agreement; the HKDF, salt, info string and credential id layout
-are exactly those of `secure-enclave`, and `public_key` is the Keystore key's
-point. What is said above about the unauthenticated ephemeral point holds
-here unchanged.
+| Field | Value |
+|-------|-------|
+| Kind / derivation | `android-keystore` / `keystore-aes-256-gcm-v1` |
+| Device key | AES-256, Keystore, StrongBox when the phone has it and the TEE otherwise; one operation per `BIOMETRIC_STRONG` authentication; invalidated when biometrics are enrolled |
+| Wrap key | 32 random bytes chosen at enrolment |
+| Stored | AES-256-GCM of the wrap key under the device key, 12-byte nonce, associated data `silentsilo-dek-v1:{vault_uuid}` |
+| Credential id | 16-byte tag naming the Keystore key, the nonce, then the 48-byte ciphertext and tag |
+
+Flow: enrolment makes the Keystore key, draws the wrap key, and encrypts it
+behind one biometric prompt; unlock decrypts it behind another. The biometric
+is bound to that single operation through the prompt's crypto object, which
+Android offers for ciphers, signatures and MACs but not for key agreement.
+That is why this kind does not reuse the enclave's derivation.
+
+The ciphertext rides in the credential id, in the clear in storage like the
+enclave's ephemeral point. It is useless without the Keystore key, which
+never leaves the phone. Altering it gives denial of service and nothing
+else: GCM refuses it, and unlock falls through to the recovery code.
 
 ## Inbox (write without read)
 
@@ -237,11 +247,11 @@ One record per enrolled credential, stored locally alongside the vault:
 | Field | Content |
 |-------|---------|
 | `kind` | `fido2`, `secure-enclave` or `android-keystore`. A client that does not know the value carries the record and never offers the key |
-| `derivation` | `hmac-secret-v1` or `ecdh-p256-hkdf-sha256-v1`, how `wrap_key` is reached |
-| `credential_id` | Hex. A FIDO credential id, or for a device key the 16-byte tag followed by the 65-byte ephemeral point |
+| `derivation` | `hmac-secret-v1`, `ecdh-p256-hkdf-sha256-v1` or `keystore-aes-256-gcm-v1`, how `wrap_key` is reached |
+| `credential_id` | Hex. A FIDO credential id; for `secure-enclave` the 16-byte tag and the 65-byte ephemeral point; for `android-keystore` the tag, nonce and wrapped key |
 | `wrapped_dek` | Sealed envelope (below) holding the Master DEK under that key's wrap key |
 | `key_slot` | Enrollment order, `0` for the first key |
-| `public_key` | Hex. COSE/DER for `fido2`, the device key's uncompressed SEC1 point for a device key |
+| `public_key` | Hex. COSE/DER for `fido2`, the enclave key's uncompressed SEC1 point for `secure-enclave`, empty for `android-keystore` |
 | `policy` | Empty, or `org` for a key an organisation administers |
 
 Each record independently wraps the same Master DEK, which is what lets any

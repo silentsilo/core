@@ -17,9 +17,10 @@ vault code against every key written now.
 
 ### Added
 
-- A third key kind, `android-keystore`, with the derivation and id shape of
-  `secure-enclave`. Usable on Android only; every other build carries it and
-  skips it.
+- A third key kind, `android-keystore`, with derivation
+  `keystore-aes-256-gcm-v1`: a wrap key encrypted under a Keystore AES key
+  that allows one use per strong biometric. Usable on Android only; every
+  other build carries it and skips it.
 - `secure-enclave` keys are usable on iOS as well as macOS.
 - The byte vectors hold an Android Keystore envelope, and
   `silentsilo-fixture` depends on the 1.0.0 vault to check that an installed

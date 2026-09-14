@@ -160,10 +160,15 @@ published to `keys/….env`. There are three values:
   `public_key` is the device key's own uncompressed point. `platform` is
   true, as for Hello, and means the same thing: the key does not survive the
   device.
-- `android-keystore`, with the same derivation and the same id shape, for the
-  Android build: a P-256 key in the phone's Keystore (StrongBox where the
-  phone has one), gated on a strong biometric. A kind of its own so a Mac
-  never offers a phone's key to its enclave, nor a phone a Mac's key.
+- `android-keystore`, with derivation `keystore-aes-256-gcm-v1`, for the
+  Android build: an AES-256 key in the phone's Keystore (StrongBox where the
+  phone has one) that allows one operation per strong biometric. The wrap key
+  is 32 random bytes chosen at enrolment and encrypted under it with
+  AES-256-GCM, associated data `silentsilo-dek-v1:{vault_id}`. `credential_id`
+  is a 16-byte tag naming the Keystore key, the 12-byte nonce, then the
+  48-byte ciphertext and tag, all hex; `public_key` is empty. Not the enclave's
+  key agreement, because Android binds a single use of a key to a biometric
+  only for ciphers, signatures and MACs, and every StrongBox chip does AES.
 
 Core 1.1.0 wrote the ephemeral point into `public_key` of a `secure-enclave`
 envelope. No release of any client carried that code, so no such envelope
