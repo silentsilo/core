@@ -44,7 +44,7 @@ if (-not $ready) { throw 'MinIO did not come up; check `docker compose logs mini
 # a credentials problem shows up here rather than as a puzzling test failure.
 docker run --rm --network host `
     -e MC_HOST_local=http://silentsilo:silentsilo123@127.0.0.1:9000 `
-    minio/mc mb --ignore-existing local/vault-test | Out-Null
+    quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z mb --ignore-existing local/vault-test | Out-Null
 
 $env:SILENTSILO_TEST_S3_ENDPOINT = 'http://127.0.0.1:9000'
 $env:SILENTSILO_TEST_S3_KEY = 'silentsilo'

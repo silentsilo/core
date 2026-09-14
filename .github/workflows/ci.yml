@@ -230,12 +230,14 @@ jobs:
           sudo apt-get install -y libdbus-1-dev pkg-config
       # Started as steps rather than service containers: two of the three
       # images need a command, and services cannot give one.
+      # MinIO left Docker Hub in September 2026; its images are pinned on
+      # quay.io so a tag that disappears fails here by name.
       - name: Start the storage backends
         run: |
           docker run -d --name minio -p 9000:9000 \
             -e MINIO_ROOT_USER=silentsilo \
             -e MINIO_ROOT_PASSWORD=silentsilo123 \
-            minio/minio server /data
+            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
           docker run -d --name webdav -p 8088:80 \
             -e USERNAME=silentsilo -e PASSWORD=silentsilo123 \
             bytemark/webdav
@@ -251,7 +253,7 @@ jobs:
           # problem rather than a missing alias.
           docker run --rm --network host \
             -e MC_HOST_local=http://silentsilo:silentsilo123@127.0.0.1:9000 \
-            minio/mc mb --ignore-existing local/vault-test
+            quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z mb --ignore-existing local/vault-test
       - run: cargo test -p silentsilo-s3 --locked --test live_roundtrip
       - run: cargo test -p silentsilo-store --locked --test contract
       - run: cargo test -p silentsilo-sync --locked

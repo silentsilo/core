@@ -6,7 +6,7 @@
 //! ```text
 //! docker run -d --name silentsilo-minio -p 9100:9000 \
 //!   -e MINIO_ROOT_USER=silentsilo -e MINIO_ROOT_PASSWORD=silentsilo123 \
-//!   minio/minio server /data
+//!   quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
 //! # create a bucket named `vault-test`, then:
 //! SILENTSILO_TEST_S3_ENDPOINT=http://localhost:9100 \
 //! SILENTSILO_TEST_S3_KEY=silentsilo \
