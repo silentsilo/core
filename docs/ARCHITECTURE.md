@@ -45,12 +45,14 @@ flowchart TD
         FIDO["silentsilo-fido"]
         CORE["silentsilo-core<br/>shared types"]
     end
+    APP["silentsilo-app<br/>sessions, sync pass order (being moved in)"]
     EXTRACT["silentsilo-extract<br/>standalone recovery binary"]
     FIXTURE["silentsilo-fixture<br/>format compatibility corpus"]
     TESTKIT["silentsilo-testkit<br/>dev-only: hostile conditions, skip detector"]
-    CLIENT["client applications<br/>(silentsilo/desktop, later mobile)"]
+    CLIENT["client applications<br/>(silentsilo/desktop, silentsilo/mobile)"]
 
-    CLIENT --> VFS & VAULT & SYNC & FIDO
+    CLIENT --> APP & VFS & VAULT & SYNC & FIDO
+    APP --> SYNC & VFS & VAULT & STORE
     SYNC --> VFS & VAULT & CRYPTO & STORE
     VFS --> VAULT & CRYPTO & CORE
     VAULT --> CRYPTO
@@ -66,6 +68,13 @@ user interface, `silentsilo-sync` is transport and knows no UI,
 `silentsilo-crypto` knows nothing above bytes. Nothing in this repository may
 depend on a client application or on its OS integration crate. CI enforces
 that with the `no-ui-deps` job.
+
+`silentsilo-app` is the application logic every client shares, moving in
+from the desktop's command layer one area at a time: so far the session map,
+closing a silo, and the sync pass. A client gives it a `Host` for events,
+diagnostics and its saved storage settings. The order and invariants of the
+pass are described in the desktop repository's `docs/ARCHITECTURE.md` until
+the move is done.
 
 The extract binary deliberately reuses the same crates rather than
 reimplementing the read path: a second interpretation of the log is a second

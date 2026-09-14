@@ -1,0 +1,22 @@
+[package]
+name = "silentsilo-app"
+description = "The application logic every SilentSilo client shares: sessions and the sync pass"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+silentsilo-core = { workspace = true }
+silentsilo-crypto = { workspace = true }
+silentsilo-store = { workspace = true }
+silentsilo-sync = { workspace = true }
+silentsilo-vault = { workspace = true }
+silentsilo-vfs = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }

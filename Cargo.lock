@@ -3902,6 +3902,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "silentsilo-app"
+version = "1.2.0"
+dependencies = [
+ "serde",
+ "silentsilo-core 1.2.0",
+ "silentsilo-crypto 1.2.0",
+ "silentsilo-store 1.2.0",
+ "silentsilo-sync 1.2.0",
+ "silentsilo-vault 1.2.0",
+ "silentsilo-vfs 1.2.0",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "silentsilo-core"
 version = "1.0.0"
 source = "git+https://github.com/silentsilo/core?tag=v1.0.0#c6694cc193e3210638a2f8cf9562884993a9c1c5"
