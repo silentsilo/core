@@ -122,7 +122,13 @@ impl WebDavStore {
             .await
             .map_err(Self::map_send)?;
         let status = response.status();
-        if !status.is_success() && status != StatusCode::METHOD_NOT_ALLOWED {
+        // Another writer can be creating the same collection at this moment,
+        // and some servers answer that race with 403 rather than 405. What
+        // matters is whether it exists now, so a refusal is checked.
+        if !status.is_success()
+            && status != StatusCode::METHOD_NOT_ALLOWED
+            && !self.collection_exists(url).await
+        {
             return Err(Self::map_status(status, path));
         }
 
@@ -130,6 +136,16 @@ impl WebDavStore {
             seen.insert(path.to_string());
         }
         Ok(())
+    }
+
+    /// Whether a collection is there, asked with a depth-0 `PROPFIND`.
+    async fn collection_exists(&self, url: &str) -> bool {
+        let url = format!("{}/", url.trim_end_matches('/'));
+        self.request(Method::from_bytes(b"PROPFIND").unwrap(), &url)
+            .header("Depth", "0")
+            .send()
+            .await
+            .is_ok_and(|r| r.status().is_success())
     }
 
     /// Creates every collection a key needs, outermost first.
