@@ -23,6 +23,8 @@ release notes should say.
 - `silentsilo_app::files::import_file`, adding a file from this device, moved
   from the desktop's import, and `decrypt_to_file`, for opening a file
   outside a preview.
+- `inbox::send_item_from` and `encrypt_stream` in the crate root, for content
+  read from a descriptor another app handed over rather than opened by path.
 
 ## [1.3.0] - The shared application crate
 

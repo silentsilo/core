@@ -322,11 +322,26 @@ pub async fn send_item(
     item: &OutgoingItem<'_>,
     sign: &ItemSigner<'_>,
 ) -> Result<(), SyncError> {
+    let mut source =
+        std::fs::File::open(item.source).map_err(|e| SyncError::Vault(e.to_string()))?;
+    send_item_from(client, identity, item, &mut source, sign).await
+}
+
+/// [`send_item`] reading the content from `source` instead of opening
+/// `item.source`: a descriptor another app handed over has no path this
+/// app may open.
+pub async fn send_item_from(
+    client: &dyn ObjectStore,
+    identity: &SenderIdentity,
+    item: &OutgoingItem<'_>,
+    source: &mut (dyn std::io::Read + Send),
+    sign: &ItemSigner<'_>,
+) -> Result<(), SyncError> {
     let content_key = silentsilo_crypto::generate_content_key();
     let blob_id = Uuid::new_v4();
     let staged = tempfile::NamedTempFile::new().map_err(|e| SyncError::Vault(e.to_string()))?;
-    let encrypted = silentsilo_crypto::encrypt_file(
-        item.source,
+    let encrypted = silentsilo_crypto::encrypt_stream(
+        &mut { source },
         staged.path(),
         &content_key,
         item.item_id,

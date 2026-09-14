@@ -159,7 +159,7 @@ async fn an_imported_file_reads_back_and_reaches_storage() {
         &phone.state,
         &phone.silo,
         root,
-        &source,
+        &mut std::fs::File::open(&source).unwrap(),
         "Contract.pdf",
         None,
     )

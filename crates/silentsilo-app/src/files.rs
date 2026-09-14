@@ -119,15 +119,16 @@ pub async fn decrypt_to_file(
 /// pass uploads it. Moved from the desktop's `encrypt_import` and
 /// `commit_import`.
 ///
-/// `name` and `mime_type` are given rather than read from `source`: on a
-/// phone the source is an open descriptor with no name of its own. A name
-/// already in the folder has its content replaced, as a drop onto an
-/// existing file does on the desktop.
+/// `source` is read rather than opened, and `name` and `mime_type` are given:
+/// on a phone the source is a descriptor another app handed over, with no
+/// name of its own and no path this app may open. A name already in the
+/// folder has its content replaced, as a drop onto an existing file does on
+/// the desktop.
 pub fn import_file(
     state: &AppState,
     silo: &SiloEntry,
     folder_id: Uuid,
-    source: &std::path::Path,
+    source: &mut dyn std::io::Read,
     name: &str,
     mime_type: Option<&str>,
 ) -> Result<FileEntry, String> {
@@ -155,9 +156,14 @@ pub fn import_file(
     let content_key = silentsilo_crypto::generate_content_key();
     let blob_key =
         silentsilo_crypto::wrap_content_key(&content_key, &kek).map_err(|e| e.to_string())?;
-    let sealed =
-        silentsilo_crypto::encrypt_file(source, &blob_path, &content_key, file_id, blob_id)
-            .map_err(|e| e.to_string())?;
+    let sealed = silentsilo_crypto::encrypt_stream(
+        &mut { source },
+        &blob_path,
+        &content_key,
+        file_id,
+        blob_id,
+    )
+    .map_err(|e| e.to_string())?;
     let _ = silentsilo_vault::record_blob_present(root, blob_id, sealed.size_bytes as i64, false);
     let mime = mime_type
         .filter(|m| !m.is_empty())
