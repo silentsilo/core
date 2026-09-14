@@ -11,6 +11,21 @@ release notes should say.
 
 ## [Unreleased]
 
+### Added
+
+- `silentsilo-app`, the application logic the clients share, moving in from
+  the desktop's command layer: the session map and closing a silo, the sync
+  pass, joining and unlocking with the recovery code, device key enrolment
+  and unlock, the storage settings types, and reading a file for a preview.
+  Characterization tests pin each against folder targets.
+- The sync pass keeps enrolled keys in step between devices: keys another
+  device enrolled are added locally, and a revocation leaves a sealed marker
+  under `keys/revoked/` that every other device honours instead of
+  publishing the key again. A test runs 1.0.0's key listing over a store
+  holding a marker.
+- `silentsilo_vault::set_work_base`, for a phone app to keep working copies
+  and fallback secrets in its private storage.
+
 ## [1.2.0] - Groundwork for the mobile builds
 
 No existing format version changed, so the 1.0.0 fixtures still describe the

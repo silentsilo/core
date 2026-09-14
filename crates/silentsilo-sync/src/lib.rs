@@ -28,7 +28,9 @@ use uuid::Uuid;
 
 mod error;
 pub mod inbox;
+mod key_sync;
 pub use error::SyncError;
+pub use key_sync::{KeyReconcile, REVOKED_PREFIX, reconcile_key_envelopes};
 
 /// Where operation objects live inside the vault prefix.
 pub const OPS_PREFIX: &str = "ops/";

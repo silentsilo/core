@@ -552,3 +552,72 @@ async fn an_installed_1_0_0_client_leaves_the_inbox_alone() {
         .unwrap();
     assert_eq!(scan.ready.len(), 1, "{:?}", scan.refused);
 }
+
+// ── Revocation markers ──────────────────────────────────────────────
+
+/// `keys/revoked/bb22.sealed` as a device wrote it after revoking key
+/// `bb22`: a sealed payload under the content KEK (32 bytes of `0x4b`).
+const REVOCATION_MARKER: &str = concat!(
+    "53534541011d556c0c16490a216984b5ca1ecc945038c04fac0550073293b2a9a91c3a583307d83314df441732063c60",
+    "bb06071eb18cb15238f8a029ed1c037dcf7ce29831eed14b7696b3181a10ea6da7e8c7760851b805a10a56cd2f",
+);
+
+#[tokio::test]
+async fn the_revocation_marker_still_revokes() {
+    use silentsilo_store::ObjectStore;
+    use silentsilo_vault::{StoredFidoCredential, StoredFidoKeys};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = silentsilo_store::FolderStore::new(dir.path().to_path_buf());
+    store
+        .put(
+            "keys/revoked/bb22.sealed",
+            hex::decode(REVOCATION_MARKER).unwrap(),
+        )
+        .await
+        .unwrap();
+    let key: StoredFidoCredential = serde_json::from_str(KEY_ENVELOPE).unwrap();
+    let mut phone = key.clone();
+    phone.credential_id = "bb22".into();
+    let mut local = StoredFidoKeys {
+        keys: vec![key, phone],
+    };
+
+    let kek = silentsilo_crypto::ContentKek::from_bytes([0x4b; 32]);
+    let outcome = silentsilo_sync::reconcile_key_envelopes(&store, &kek, &mut local, 0)
+        .await
+        .expect("reconciles");
+    assert_eq!(
+        outcome.revoked,
+        vec!["bb22".to_string()],
+        "the marker moved"
+    );
+    assert!(local.keys[1].revoked);
+}
+
+/// What 1.0.0 does with a store holding a revocation marker beside the
+/// envelopes: reads the envelopes, skips the marker, and a join still works.
+#[tokio::test]
+async fn an_installed_1_0_0_client_skips_revocation_markers() {
+    use silentsilo_store_v1_0_0::ObjectStore as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let old_store = silentsilo_store_v1_0_0::FolderStore::new(dir.path().to_path_buf());
+    old_store
+        .put("keys/aa11.env", KEY_ENVELOPE.as_bytes().to_vec())
+        .await
+        .unwrap();
+    old_store
+        .put(
+            "keys/revoked/bb22.sealed",
+            hex::decode(REVOCATION_MARKER).unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let envelopes = silentsilo_sync_v1_0_0::fetch_key_envelopes(&old_store)
+        .await
+        .expect("1.0.0 lists the keys without failing on the marker");
+    assert_eq!(envelopes.len(), 1);
+    assert_eq!(envelopes[0].credential_id, "aa11");
+}

@@ -71,10 +71,12 @@ that with the `no-ui-deps` job.
 
 `silentsilo-app` is the application logic every client shares, moving in
 from the desktop's command layer one area at a time: so far the session map,
-closing a silo, and the sync pass. A client gives it a `Host` for events,
-diagnostics and its saved storage settings. The order and invariants of the
-pass are described in the desktop repository's `docs/ARCHITECTURE.md` until
-the move is done.
+closing a silo, the sync pass, the recovery and device key flows, and file
+previews. A client gives it a `Host` for events, diagnostics and its saved
+storage settings. The order and invariants of the pass are described in the
+desktop repository's `docs/ARCHITECTURE.md` until the move is done, with one
+step that exists only here so far: before pushing, the pass reconciles the
+enrolled keys with `keys/` (`silentsilo-sync/key_sync.rs`, `FORMATS.md`).
 
 The extract binary deliberately reuses the same crates rather than
 reimplementing the read path: a second interpretation of the log is a second

@@ -334,6 +334,34 @@ pub async fn run_sync_pass(
         }
     }
 
+    // Other devices' keys in, and this device's revocations out as markers,
+    // before the push publishes anything: publishing first would put back a
+    // key another device just revoked. Never on a silo with no keys file.
+    let mut marked: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if silentsilo_vault::is_fido_enrolled(&root)
+        && let Ok(mut local) = load_fido_keys(&root)
+    {
+        let mut changed = false;
+        for target in &targets {
+            match sync::reconcile_key_envelopes(&*target.store, &kek, &mut local, now).await {
+                Ok(outcome) => {
+                    changed |= outcome.changed();
+                    marked.extend(outcome.marked);
+                }
+                Err(e) => host.warn("keys", &format!("{}: {e}", target.label)),
+            }
+        }
+        if changed
+            && let Err(e) = silentsilo_vault::save_fido_keys(
+                &root,
+                &local,
+                silentsilo_vault::Authority::Machine,
+            )
+        {
+            host.warn("keys", &format!("could not save the reconciled keys: {e}"));
+        }
+    }
+
     // ── Out, to every target ────────────────────────────────────────
     // Each target is pushed to on its own: `push_ops` asks whether a record
     // is already there, and a wrapper answering for all of them would skip
@@ -370,13 +398,15 @@ pub async fn run_sync_pass(
         )
         .await;
 
-        // A revocation storage has now confirmed: the tombstone has done its
-        // job and the local list can drop it.
+        // A revocation storage has now confirmed, with its marker in place
+        // for the other devices: the tombstone has done its job and the local
+        // list can drop it.
         if !outcome.revoked.is_empty()
             && let Some(list) = keys.as_mut()
         {
-            list.keys
-                .retain(|k| !outcome.revoked.contains(&k.credential_id));
+            list.keys.retain(|k| {
+                !(outcome.revoked.contains(&k.credential_id) && marked.contains(&k.credential_id))
+            });
             // Dropping tombstones only. The keys being forgotten here were
             // already retired, with whatever proof that took at the time, so
             // this takes nothing away that the silo still had.

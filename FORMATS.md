@@ -28,6 +28,7 @@ Anything else needs a version discriminator first.
 | Content KEK | `keys/content.kek` | Sealed payload under the vault DEK | Refuses, naming the version |
 | Inbox key | `inbox/keys/….sealed` | `INBOX_VERSION = 1` inside a sealed payload under the content KEK, `silentsilo-sync/inbox.rs` | 1.0.0 never lists `inbox/`. A build with the inbox skips a key it cannot read |
 | Inbox sender | `inbox/senders/….sealed` | `INBOX_VERSION = 1`, sealed under the content KEK | As above |
+| Revocation marker | `keys/revoked/….sealed` | `version: 1` inside a sealed payload under the content KEK, `silentsilo-sync/key_sync.rs` | 1.0.0 lists it with the key envelopes and skips it as unreadable |
 | Inbox item | `inbox/items/….sslo` and `….env` | The blob as in `blobs/`; the envelope carries `INBOX_VERSION = 1` | 1.0.0 never lists `inbox/`. A build with the inbox leaves an item of another version where it is and says to update |
 
 ## Reading a backup from scratch
@@ -193,6 +194,20 @@ So the rule for anything reading these:
   build cannot use is still a key on the silo. Retiring another platform's
   key because it looks unusable is how a household ends up with one device
   locked out.
+- **Every device learns the others' keys and revocations** (core 1.3.0). Each
+  sync pass, before it publishes, reads `keys/`: an envelope for a key this
+  device has never had is added to its `keys/fido.json`, and a revocation
+  marker `keys/revoked/<credential_id>.sealed` (JSON `version`,
+  `credential_id`, `revoked_at`, sealed under the content KEK) turns a key
+  this device still has into a tombstone, so it is not published again. A
+  device that revokes writes the marker before it deletes the envelope, and
+  drops its tombstone only once the marker is in storage. Three limits, each
+  deliberate: an envelope is not authenticated, so a key added this way
+  carries no organisation policy on a silo that has none; a silo with no
+  keys file is never given one, because it opens with its device secret; and
+  an organisation's key is not tombstoned on another device's say-so, since
+  retiring one needs its proof. 1.0.0 skips the markers, so a 1.0.0 client
+  neither sees keys enrolled after it joined nor honours a marker.
 - **Unlocking goes over the keys of a kind this build knows.** That is
   `StoredFidoKeys::usable`, and it is what the authenticator allow-list, the
   "do you have a spare key" nudge and the last-key removal guard are all
