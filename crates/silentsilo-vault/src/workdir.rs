@@ -19,6 +19,14 @@ const WORK_NAMESPACE: Uuid = Uuid::from_bytes([
 /// domain server at logon, which would defeat the point of moving plaintext
 /// out of a synced folder in the first place.
 pub fn work_base() -> PathBuf {
+    // Debug builds only: the test suites point this at a directory of their
+    // own (`.cargo/config.toml`), so a test run never leaves a working copy
+    // or a secret in the real one. A release build has no switch that moves
+    // plaintext somewhere else.
+    #[cfg(debug_assertions)]
+    if let Some(dir) = std::env::var_os("SILENTSILO_TEST_WORK_BASE").filter(|d| !d.is_empty()) {
+        return PathBuf::from(dir);
+    }
     #[cfg(windows)]
     {
         if let Ok(local) = std::env::var("LOCALAPPDATA") {

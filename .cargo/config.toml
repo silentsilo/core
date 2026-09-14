@@ -1,0 +1,4 @@
+# Tests write working copies and fallback secrets here, not under the real
+# %LOCALAPPDATA%\SilentSilo\work. Read by debug builds only; see workdir.rs.
+[env]
+SILENTSILO_TEST_WORK_BASE = { value = "target/test-work", relative = true }
