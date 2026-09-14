@@ -531,9 +531,9 @@ pub async fn run_sync_pass(
         })
         .collect();
     let inbox = crate::inbox_import::import_inbox(
-        state,
-        host,
-        silo,
+        &crate::inbox_import::Session { state, id: silo.id },
+        &|detail: &str| host.warn("inbox", detail),
+        &root,
         &inbox_targets,
         &kek,
         vault_id,
