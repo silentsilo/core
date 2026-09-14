@@ -11,6 +11,13 @@ release notes should say.
 
 ## [Unreleased]
 
+## [1.3.0] - The shared application crate
+
+No existing format version changed, so the 1.0.0 fixtures still describe the
+current era. The one new object, the revocation marker, is pinned by a byte
+vector and skipped by 1.0.0, which a test runs. Desktop keeps pinning 1.2.0
+until it moves onto `silentsilo-app`.
+
 ### Added
 
 - `silentsilo-app`, the application logic the clients share, moving in from
