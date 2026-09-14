@@ -112,6 +112,43 @@ jobs:
           done
           exit $fail
 
+  # The crates the phone apps link, built for the phones. Without this a
+  # change could break Android or iOS and nothing here would say so until
+  # the mobile build moved its pin. Warnings are errors: code that is dead
+  # on a phone is how a platform quietly falls behind.
+  mobile-targets:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: aarch64-linux-android
+          - os: macos-latest
+            target: aarch64-apple-ios
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mobile-${{ matrix.target }}
+      # The runner image ships an NDK; SQLite and aws-lc compile with it.
+      - name: Android NDK compilers
+        if: matrix.target == 'aarch64-linux-android'
+        run: |
+          bin="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "CC_aarch64_linux_android=$bin/aarch64-linux-android31-clang" >> "$GITHUB_ENV"
+          echo "AR_aarch64_linux_android=$bin/llvm-ar" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$bin/aarch64-linux-android31-clang" >> "$GITHUB_ENV"
+      - run: cargo check --locked --target ${{ matrix.target }} -p silentsilo-core -p silentsilo-crypto -p silentsilo-store -p silentsilo-vault -p silentsilo-vfs -p silentsilo-sync
+      - run: cargo check --locked --target ${{ matrix.target }} -p silentsilo-fido --no-default-features --features enclave
+
   # Compile-checks the CTAP2/USB-HID security-key backend. This is the code
   # path Windows never builds (it uses the OS WebAuthn API instead), so
   # without this job a change could break the Linux and macOS path unnoticed.

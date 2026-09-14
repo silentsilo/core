@@ -18,6 +18,7 @@ pub use types::{
     Authenticator, CredentialInfo, Enrollment, EnrollmentChallenge, FidoStatus, UnlockMaterial,
 };
 
+#[cfg(feature = "hardware")]
 const RP_ID: &str = "silentsilo.com";
 
 /// On Windows, bind the main app window HWND so WebAuthn can show its security-key UI.
