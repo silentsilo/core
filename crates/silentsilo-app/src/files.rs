@@ -1,5 +1,6 @@
 //! A file's content, decrypted for showing inside the app.
 
+use silentsilo_core::FileEntry;
 use silentsilo_store::ObjectStore;
 use silentsilo_vault::SiloEntry;
 use silentsilo_vfs::Vfs;
@@ -28,6 +29,50 @@ pub async fn read_file(
     file_id: Uuid,
     max_bytes: i64,
 ) -> Result<FileContent, String> {
+    let size = {
+        let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
+        let session = sessions
+            .get(&silo.id)
+            .ok_or_else(|| silentsilo_core::CoreError::VaultLocked.to_string())?;
+        Vfs::new(session)
+            .get_file(file_id)
+            .map_err(|e| e.to_string())?
+            .size_bytes
+    };
+    if size > max_bytes {
+        return Err("This file is too large to show here.".into());
+    }
+
+    let dir = open_scratch_dir(&silo.path);
+    silentsilo_vault::create_private_dir(&dir).map_err(|e| e.to_string())?;
+    let dest = dir.join(format!("preview-{}", Uuid::new_v4()));
+    let decrypted = decrypt_to_file(state, host, silo, file_id, &dest)
+        .await
+        .and_then(|file| {
+            std::fs::read(&dest)
+                .map(|bytes| (file, bytes))
+                .map_err(|e| e.to_string())
+        });
+    let _ = std::fs::remove_file(&dest);
+    let (file, bytes) = decrypted?;
+
+    Ok(FileContent {
+        name: file.name,
+        mime_type: file.mime_type,
+        bytes,
+    })
+}
+
+/// Decrypts one file to `dest`, downloading its content first when this
+/// device does not hold it. The caller chose `dest` and removes it; a place
+/// every lock wipes, such as [`open_scratch_dir`], is the right one.
+pub async fn decrypt_to_file(
+    state: &AppState,
+    host: &dyn Host,
+    silo: &SiloEntry,
+    file_id: Uuid,
+    dest: &std::path::Path,
+) -> Result<FileEntry, String> {
     let (file, wrapped, kek) = {
         let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
         let session = sessions
@@ -39,9 +84,6 @@ pub async fn read_file(
         (file, wrapped, session.kek.clone())
     };
     state.touch(silo.id);
-    if file.size_bytes > max_bytes {
-        return Err("This file is too large to show here.".into());
-    }
 
     let root = &silo.path;
     let blob_path = silentsilo_vault::VaultPaths::new(root.clone()).blob_path(file.blob_id);
@@ -64,17 +106,79 @@ pub async fn read_file(
 
     let key = silentsilo_crypto::unwrap_content_key(&wrapped, &kek)
         .map_err(|_| "This content's key could not be read, so it cannot be opened.".to_string())?;
-    let dir = open_scratch_dir(root);
-    silentsilo_vault::create_private_dir(&dir).map_err(|e| e.to_string())?;
-    let dest = dir.join(format!("preview-{}", Uuid::new_v4()));
-    let decrypted = silentsilo_crypto::decrypt_blob(&blob_path, &dest, &key, file.blob_id)
-        .map_err(|e| e.to_string())
-        .and_then(|_| std::fs::read(&dest).map_err(|e| e.to_string()));
-    let _ = std::fs::remove_file(&dest);
+    if let Err(e) = silentsilo_crypto::decrypt_blob(&blob_path, dest, &key, file.blob_id) {
+        let _ = std::fs::remove_file(dest);
+        return Err(e.to_string());
+    }
+    Ok(file)
+}
 
-    Ok(FileContent {
-        name: file.name,
-        mime_type: file.mime_type,
-        bytes: decrypted?,
-    })
+/// Adds a file from this device to `folder_id`: sealed into the blob store
+/// with no lock held, since encrypting a large file under the sessions lock
+/// freezes the interface, then one short lock for its record. The next sync
+/// pass uploads it. Moved from the desktop's `encrypt_import` and
+/// `commit_import`.
+///
+/// `name` and `mime_type` are given rather than read from `source`: on a
+/// phone the source is an open descriptor with no name of its own. A name
+/// already in the folder has its content replaced, as a drop onto an
+/// existing file does on the desktop.
+pub fn import_file(
+    state: &AppState,
+    silo: &SiloEntry,
+    folder_id: Uuid,
+    source: &std::path::Path,
+    name: &str,
+    mime_type: Option<&str>,
+) -> Result<FileEntry, String> {
+    let kek = {
+        let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
+        sessions
+            .get(&silo.id)
+            .ok_or_else(|| silentsilo_core::CoreError::VaultLocked.to_string())?
+            .kek
+            .clone()
+    };
+    state.touch(silo.id);
+
+    let root = &silo.path;
+    let file_id = Uuid::now_v7();
+    let blob_id = Uuid::new_v4();
+    let blob_path = silentsilo_vault::VaultPaths::new(root.clone()).blob_path(blob_id);
+    if let Some(parent) = blob_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+
+    // A key for this blob alone, wrapped under the content KEK and stored in
+    // the record rather than in the file. That is what lets a later key
+    // rotation leave every byte of content where it is.
+    let content_key = silentsilo_crypto::generate_content_key();
+    let blob_key =
+        silentsilo_crypto::wrap_content_key(&content_key, &kek).map_err(|e| e.to_string())?;
+    let sealed =
+        silentsilo_crypto::encrypt_file(source, &blob_path, &content_key, file_id, blob_id)
+            .map_err(|e| e.to_string())?;
+    let _ = silentsilo_vault::record_blob_present(root, blob_id, sealed.size_bytes as i64, false);
+    let mime = mime_type
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
+        .or_else(|| silentsilo_vfs::guess_mime(std::path::Path::new(name)));
+
+    let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
+    let session = sessions
+        .get(&silo.id)
+        .ok_or_else(|| silentsilo_core::CoreError::VaultLocked.to_string())?;
+    Vfs::new(session)
+        .add_file(
+            folder_id,
+            name,
+            blob_id,
+            // Counted during encryption, so the row matches the sealed bytes
+            // even when the source changed while it was being read.
+            sealed.plain_bytes as i64,
+            &hex::encode(sealed.header.content_hash),
+            mime.as_deref(),
+            &blob_key,
+        )
+        .map_err(|e| e.to_string())
 }

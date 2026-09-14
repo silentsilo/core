@@ -20,6 +20,9 @@ release notes should say.
   `SyncReport::inbox_refused`.
 - `set_local_protector`, for sealing the local secret files where there is
   no DPAPI. Files written before it was set still read.
+- `silentsilo_app::files::import_file`, adding a file from this device, moved
+  from the desktop's import, and `decrypt_to_file`, for opening a file
+  outside a preview.
 
 ## [1.3.0] - The shared application crate
 

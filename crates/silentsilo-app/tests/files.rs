@@ -134,3 +134,54 @@ async fn a_file_on_this_device_or_only_in_storage_reads_back_whole() {
         .unwrap();
     assert_eq!(err, "This file is too large to show here.");
 }
+
+#[tokio::test]
+async fn an_imported_file_reads_back_and_reaches_storage() {
+    let storage = tempfile::tempdir().unwrap();
+    let host = OneTarget(BackupTarget {
+        config: StoreConfig::Folder {
+            path: storage.path().to_path_buf(),
+        },
+        label: String::new(),
+        role: TargetRole::Working,
+    });
+    let phone = device(Uuid::new_v4(), None, &host);
+    let source = phone._dir.path().join("scan");
+    std::fs::write(&source, b"%PDF-1.7 a contract").unwrap();
+    let root = {
+        let sessions = phone.state.sessions.lock().unwrap();
+        Vfs::new(&sessions[&phone.silo.id])
+            .root_folder_id()
+            .unwrap()
+    };
+
+    let file = silentsilo_app::files::import_file(
+        &phone.state,
+        &phone.silo,
+        root,
+        &source,
+        "Contract.pdf",
+        None,
+    )
+    .unwrap();
+    assert_eq!(file.mime_type.as_deref(), Some("application/pdf"));
+    assert_eq!(file.size_bytes, 19);
+
+    let shown = read_file(&phone.state, &host, &phone.silo, file.id, 1024)
+        .await
+        .unwrap();
+    assert_eq!(shown.bytes, b"%PDF-1.7 a contract");
+
+    run_sync_pass(&phone.state, &host, &phone.silo)
+        .await
+        .unwrap();
+    let store = silentsilo_store::FolderStore::new(storage.path().to_path_buf());
+    use silentsilo_store::ObjectStore;
+    assert!(
+        store
+            .head(&format!("blobs/{}.sslo", file.blob_id))
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
