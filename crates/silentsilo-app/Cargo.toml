@@ -14,6 +14,7 @@ silentsilo-sync = { workspace = true }
 silentsilo-vault = { workspace = true }
 silentsilo-vfs = { workspace = true }
 serde = { workspace = true }
+hex = "0.4"
 tokio = { workspace = true, features = ["time"] }
 uuid = { workspace = true }
 

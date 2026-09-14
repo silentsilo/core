@@ -10,6 +10,7 @@
 //! invariants are described in the desktop repository's `docs/ARCHITECTURE.md`
 //! and in this repository's `docs/ARCHITECTURE.md`.
 
+pub mod flows;
 mod host;
 mod state;
 mod sync_pass;

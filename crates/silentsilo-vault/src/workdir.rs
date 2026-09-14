@@ -13,12 +13,24 @@ const WORK_NAMESPACE: Uuid = Uuid::from_bytes([
     0x5c, 0x1e, 0x7a, 0x30, 0x9b, 0x44, 0x4e, 0x1a, 0xa2, 0x77, 0x63, 0x0f, 0x8d, 0x21, 0x4b, 0x90,
 ]);
 
+static WORK_BASE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Sets where [`work_base`] points, for a platform with no per-user local
+/// directory of its own, such as a phone app's private storage. The first
+/// call wins; the desktop never calls it.
+pub fn set_work_base(dir: PathBuf) -> bool {
+    WORK_BASE.set(dir).is_ok()
+}
+
 /// The machine-local base for every silo's scratch space.
 ///
 /// Local rather than roaming on Windows: a roaming profile is copied to a
 /// domain server at logon, which would defeat the point of moving plaintext
 /// out of a synced folder in the first place.
 pub fn work_base() -> PathBuf {
+    if let Some(dir) = WORK_BASE.get() {
+        return dir.clone();
+    }
     // Debug builds only: the test suites point this at a directory of their
     // own (`.cargo/config.toml`), so a test run never leaves a working copy
     // or a secret in the real one. A release build has no switch that moves
