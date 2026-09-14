@@ -27,6 +27,7 @@ use std::path::Path;
 use uuid::Uuid;
 
 mod error;
+pub mod inbox;
 pub use error::SyncError;
 
 /// Where operation objects live inside the vault prefix.

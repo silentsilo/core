@@ -24,3 +24,8 @@ uuid = { workspace = true }
 # The vault as 1.0.0 shipped it, so what an installed client does with keys
 # written today is answered by its own code.
 silentsilo-vault-v1_0_0 = { package = "silentsilo-vault", git = "https://github.com/silentsilo/core", tag = "v1.0.0" }
+silentsilo-sync-v1_0_0 = { package = "silentsilo-sync", git = "https://github.com/silentsilo/core", tag = "v1.0.0" }
+silentsilo-store-v1_0_0 = { package = "silentsilo-store", git = "https://github.com/silentsilo/core", tag = "v1.0.0" }
+silentsilo-crypto-v1_0_0 = { package = "silentsilo-crypto", git = "https://github.com/silentsilo/core", tag = "v1.0.0" }
+hex = "0.4"
+blake3 = { workspace = true }

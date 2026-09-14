@@ -401,6 +401,66 @@ impl<'a> Vfs<'a> {
         self.get_file(id)
     }
 
+    /// Whether a file with this id was ever recorded here, trashed included.
+    pub fn file_id_known(&self, id: Uuid) -> CoreResult<bool> {
+        self.conn()
+            .query_row(
+                "SELECT 1 FROM files WHERE id = ?1",
+                [id.to_string()],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|found| found.is_some())
+            .map_err(|e| CoreError::Database(e.to_string()))
+    }
+
+    /// The folder at `segments` below the root, created where missing. Names
+    /// come from another device, so they are repaired, not refused.
+    pub fn ensure_folder_path(&self, segments: &[String]) -> CoreResult<FolderEntry> {
+        let mut folder = self.get_folder(self.root_folder_id()?)?;
+        for segment in segments {
+            folder = self.create_or_get_folder(folder.id, &crate::names::sanitize(segment))?;
+        }
+        Ok(folder)
+    }
+
+    /// A file whose content is already in storage, under an id the caller
+    /// chose. Never replaces a same-named file: replay gives it a free name.
+    /// `None` when the id is already known, so a repeated import records
+    /// nothing twice.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_imported_file(
+        &self,
+        id: Uuid,
+        folder_id: Uuid,
+        name: &str,
+        blob_id: Uuid,
+        size_bytes: i64,
+        content_hash: &str,
+        mime_type: Option<&str>,
+        blob_key: &str,
+    ) -> CoreResult<Option<FileEntry>> {
+        if self.file_id_known(id)? {
+            return Ok(None);
+        }
+        let _folder = self.get_folder(folder_id)?;
+        crate::oplog::emit(
+            self.conn(),
+            crate::oplog::VaultOp::AddFile {
+                id,
+                folder_id,
+                name: crate::names::sanitize(name),
+                blob_id,
+                size_bytes,
+                content_hash: content_hash.to_string(),
+                mime_type: mime_type.map(str::to_string),
+                blob_key: blob_key.to_string(),
+            },
+        )?;
+        bump_revision(self.conn()).map_err(|e| CoreError::Database(e.to_string()))?;
+        self.get_file(id).map(Some)
+    }
+
     pub fn get_file(&self, file_id: Uuid) -> CoreResult<FileEntry> {
         self.conn()
             .query_row(
@@ -1778,6 +1838,83 @@ mod tests {
         assert_ne!(in_root.id, in_docs.id);
         assert_eq!(vfs.get_file(in_root.id).unwrap().size_bytes, 100);
         assert_eq!(vfs.get_file(in_docs.id).unwrap().size_bytes, 200);
+    }
+
+    #[test]
+    fn an_imported_file_keeps_its_id_takes_a_free_name_and_is_recorded_once() {
+        // The inbox import names the file by the item id, so a retried or
+        // concurrent import converges, and a photo called like an existing
+        // file lands beside it instead of replacing it.
+        let (_dir, session) = new_session();
+        let vfs = Vfs::new(&session);
+        let folder = vfs
+            .ensure_folder_path(&["Phone".into(), "Photos".into()])
+            .unwrap();
+        assert_eq!(folder.path, "/Phone/Photos");
+        assert_eq!(
+            vfs.ensure_folder_path(&["Phone".into(), "Photos".into()])
+                .unwrap()
+                .id,
+            folder.id,
+            "an existing path is reused"
+        );
+
+        let existing = vfs
+            .add_file(
+                folder.id,
+                "IMG_1.jpg",
+                Uuid::new_v4(),
+                10,
+                "hash-a",
+                None,
+                "",
+            )
+            .unwrap();
+        let id = Uuid::now_v7();
+        let blob = Uuid::new_v4();
+        let imported = vfs
+            .record_imported_file(id, folder.id, "IMG_1.jpg", blob, 20, "hash-b", None, "k")
+            .unwrap()
+            .expect("recorded");
+        assert_eq!(imported.id, id);
+        assert_ne!(
+            imported.name, "IMG_1.jpg",
+            "the existing file keeps its name"
+        );
+        assert_eq!(vfs.get_file(existing.id).unwrap().size_bytes, 10);
+
+        assert!(
+            vfs.record_imported_file(id, folder.id, "IMG_1.jpg", blob, 20, "hash-b", None, "k")
+                .unwrap()
+                .is_none(),
+            "a second import of the same item records nothing"
+        );
+        vfs.trash_file(id).unwrap();
+        assert!(vfs.file_id_known(id).unwrap(), "trashed is still known");
+    }
+
+    #[test]
+    fn imported_names_are_repaired_rather_than_refused() {
+        let (_dir, session) = new_session();
+        let vfs = Vfs::new(&session);
+        let folder = vfs
+            .ensure_folder_path(&["..".into(), "a/b".into()])
+            .unwrap();
+        assert!(!folder.path.contains("/../"), "{}", folder.path);
+        let file = vfs
+            .record_imported_file(
+                Uuid::now_v7(),
+                folder.id,
+                "x/../y",
+                Uuid::new_v4(),
+                1,
+                "h",
+                None,
+                "",
+            )
+            .unwrap()
+            .unwrap();
+        assert!(!file.name.contains('/'), "{}", file.name);
     }
 
     #[test]

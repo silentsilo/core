@@ -26,6 +26,14 @@ vault code against every key written now.
   client offers only its FIDO2 keys and keeps every other key intact through
   a load and save of `keys/fido.json`.
 
+- The inbox: a device that cannot open the silo seals content to the silo's
+  inbox key and signs it, and an unlocked device imports it as an ordinary
+  file. New objects under `inbox/`, described in `FORMATS.md` with byte
+  vectors. Nothing new reaches `ops/` or `blobs/`, and a test runs 1.0.0's
+  sweep and key rotation over a store holding items.
+- `ObjectStore::copy`: S3 CopyObject, WebDAV COPY and a local copy for
+  folders; SFTP and servers without COPY go through a temporary file.
+
 ### Changed
 
 - `public_key` in a `secure-enclave` envelope is the enclave key's point, not

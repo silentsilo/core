@@ -3943,7 +3943,10 @@ dependencies = [
  "aes-gcm 0.10.3",
  "blake3",
  "hex",
+ "hkdf 0.12.4",
+ "p256",
  "rand 0.9.5",
+ "sha2 0.10.9",
  "silentsilo-core 1.1.0",
  "tempfile",
  "thiserror",
@@ -3962,9 +3965,9 @@ dependencies = [
  "silentsilo-core 1.1.0",
  "silentsilo-crypto 1.1.0",
  "silentsilo-store 1.1.0",
- "silentsilo-sync",
+ "silentsilo-sync 1.1.0",
  "silentsilo-vault 1.1.0",
- "silentsilo-vfs",
+ "silentsilo-vfs 1.1.0",
  "tempfile",
  "tokio",
  "uuid",
@@ -3998,15 +4001,20 @@ dependencies = [
 name = "silentsilo-fixture"
 version = "1.1.0"
 dependencies = [
+ "blake3",
+ "hex",
  "rusqlite",
  "serde_json",
  "silentsilo-core 1.1.0",
+ "silentsilo-crypto 1.0.0",
  "silentsilo-crypto 1.1.0",
+ "silentsilo-store 1.0.0",
  "silentsilo-store 1.1.0",
- "silentsilo-sync",
+ "silentsilo-sync 1.0.0",
+ "silentsilo-sync 1.1.0",
  "silentsilo-vault 1.0.0",
  "silentsilo-vault 1.1.0",
- "silentsilo-vfs",
+ "silentsilo-vfs 1.1.0",
  "tempfile",
  "tokio",
  "uuid",
@@ -4085,9 +4093,28 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-sync"
+version = "1.0.0"
+source = "git+https://github.com/silentsilo/core?tag=v1.0.0#c6694cc193e3210638a2f8cf9562884993a9c1c5"
+dependencies = [
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "silentsilo-core 1.0.0",
+ "silentsilo-crypto 1.0.0",
+ "silentsilo-store 1.0.0",
+ "silentsilo-vault 1.0.0",
+ "silentsilo-vfs 1.0.0",
+ "tempfile",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "silentsilo-sync"
 version = "1.1.0"
 dependencies = [
  "async-trait",
+ "hex",
  "rusqlite",
  "serde",
  "serde_json",
@@ -4097,11 +4124,12 @@ dependencies = [
  "silentsilo-store 1.1.0",
  "silentsilo-testkit",
  "silentsilo-vault 1.1.0",
- "silentsilo-vfs",
+ "silentsilo-vfs 1.1.0",
  "tempfile",
  "thiserror",
  "tokio",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -4151,6 +4179,25 @@ dependencies = [
  "uuid",
  "windows 0.61.3",
  "zeroize",
+]
+
+[[package]]
+name = "silentsilo-vfs"
+version = "1.0.0"
+source = "git+https://github.com/silentsilo/core?tag=v1.0.0#c6694cc193e3210638a2f8cf9562884993a9c1c5"
+dependencies = [
+ "base64",
+ "blake3",
+ "chrono",
+ "mime_guess",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "silentsilo-core 1.0.0",
+ "silentsilo-crypto 1.0.0",
+ "silentsilo-vault 1.0.0",
+ "unicode-normalization",
+ "uuid",
 ]
 
 [[package]]

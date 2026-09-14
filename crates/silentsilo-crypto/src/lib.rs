@@ -3,6 +3,7 @@
 mod blob;
 mod dek;
 mod error;
+pub mod inbox;
 mod sealed;
 
 pub use blob::{

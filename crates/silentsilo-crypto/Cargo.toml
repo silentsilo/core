@@ -13,6 +13,9 @@ uuid = { workspace = true }
 silentsilo-core = { workspace = true }
 thiserror = { workspace = true }
 hex = "0.4"
+p256 = { version = "0.14", default-features = false, features = ["alloc", "ecdh", "ecdsa"] }
+hkdf = "0.12"
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

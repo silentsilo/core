@@ -201,6 +201,35 @@ are exactly those of `secure-enclave`, and `public_key` is the Keystore key's
 point. What is said above about the unauthenticated ephemeral point holds
 here unchanged.
 
+## Inbox (write without read)
+
+A device that cannot open the silo, a phone backing up photos in the
+background, adds to it without holding any key that opens anything. The
+layout is in `FORMATS.md`, "The inbox".
+
+| Field | Value |
+|-------|-------|
+| Inbox key | P-256, one or more per silo, secret sealed under the content KEK |
+| Item key | HKDF-SHA256 of ECDH(ephemeral, inbox key), salt `silentsilo-inbox-v1:{vault_uuid}`, info `silentsilo inbox item key v1` |
+| Item seal | AES-256-GCM, 96-bit random nonce, the item header as AAD |
+| Sender signature | ECDSA P-256 over SHA-256, raw `r` then `s`, low `s`, over the header and the sealed bytes |
+| Content | An ordinary `.sslo` blob under a fresh content key carried inside the seal |
+
+The sender's signing key is not gated on a biometric, because it has to sign
+in the background. On a phone it stays in the Keystore or the Secure Enclave
+and cannot be exported.
+
+| Who | Can | Cannot |
+|-----|-----|--------|
+| The thief of a locked phone | Send items until the phone's key is removed from the silo | Read anything, including what the phone itself sent |
+| Malware on an unlocked phone without the biometric | The same; and the photos, which were in the clear on the phone anyway | Open the silo |
+| Anyone with write access to storage | Delete items not yet imported; put back a copy of an item already imported, which is skipped, or of one imported and since purged from the trash, which reappears; put back a removed device key's envelope, which lets that device send again | Forge an item without a sender key; register a sender without the content KEK |
+| The storage provider | See how many items wait, their sizes, and when they arrived | See their contents, or which device sent them |
+
+A sender is expected to keep each item marked sent until it sees the file in the silo,
+and to send it again when it disappears unimported, because the photo is
+still on the phone.
+
 ## Enrolled key records (`keys/fido.json`)
 
 One record per enrolled credential, stored locally alongside the vault:
@@ -532,6 +561,8 @@ obtains a copy of the bucket, reads all of the following without any key:
 | `blobs/<uuid>.sslo` | How many files there are and the size of each, to within a fraction of a percent, since there is no padding |
 | `keys/<credential_id>` | The credential id, the public key, the slot, whether it is a platform authenticator, and **the label the user typed**, all in the clear around the wrapped DEK |
 | `recovery.env` | That a recovery code exists, and when it was created |
+| `inbox/items/<item_id>.*` | How many items wait to be imported, their sizes and when they were sent; not which device sent them |
+| `inbox/senders/`, `inbox/keys/` | How many devices may send, and how many inbox keys exist |
 
 None of this breaks the encryption, and none of it is unusual for a design
 that stores one object per change. It is listed because "the provider sees

@@ -384,3 +384,166 @@ fn an_installed_1_0_0_client_carries_device_keys_and_unlocks_with_its_own() {
         "1.0.0 changed a key on its way through"
     );
 }
+
+// ── The inbox ───────────────────────────────────────────────────────
+
+/// One photo sent to a silo's inbox, exactly as a sender wrote it: vault
+/// `0f1e2d3c-…`, content KEK of 32 bytes of `0x4b`, sender signing key of
+/// 32 bytes of `0x22`, plaintext `hello`. The two sealed records use random
+/// nonces, so these bytes are the record of one real run rather than
+/// something the code can regenerate.
+const INBOX_VAULT: &str = "0f1e2d3c-4b5a-4978-8796-a5b4c3d2e1f0";
+const INBOX_OBJECTS: [(&str, &str); 4] = [
+    (
+        "inbox/keys/01a09eb7-471c-7d43-837b-664649bc46bf.sealed",
+        concat!(
+            "5353454101540bc923c1dd0c22d7bf741e8fb742bbe0d8b1cd0210e45ecf06c26e71824880fad466e15d5a190967b9be",
+            "2a2fe21793e83dfaf6235b8fba30fff543ed736cd96c6828d14700a7e2e8f2f02988065d50bc13a500d6d6b759c55e4f",
+            "5da3031b8b0e29c86c10f08502c36c1d596cc455433af3058115e51b8998f582f0b318a8efe3b3459f382b6489c28850",
+            "eaeaeab83d133496f2a48c8494d6de4f3c1c7d3bfa0787ced618652ff5cfa058f6e3ddea330ed48c47db6fcee7c443f8",
+            "95d55fb85275",
+        ),
+    ),
+    (
+        "inbox/senders/5e4d3c2b-1a09-4f8e-9d7c-6b5a49382716.sealed",
+        concat!(
+            "53534541014f4739ea29f5ef1151fe9814848e917af38f4e680283cd64ccef4e403b1ff664b638b876f7a9e683857526",
+            "fc4afc79062c146a61de4cf40c3a134c5197df6da379d0d1a4c01ad044b1c680c183bd20bb28b9cdaabbbd65037f645c",
+            "252591534e279f06c6cc7a400cba8532ee44833454aa4287dbcc3fc2ecb1b435bc6424aa3500ad211a798d25c120d4d7",
+            "ebdb3e6723e0aa96437e6dccc95d05843ffa3254b578d30115709613564cefc02b05d963212c3a72b3e3dc6d023cb0d9",
+            "88ae32d3fcaa49a5e98e15abcbd5ac3a8ec0db9d00ffce974f6092ebc72a2497bcff88e21beb30b57f804d426467f880",
+            "1845f1d39fe10581d6df34e8b92a8e37d26b34824fc17497ad359b1ec72ec9dc58896f6d5ddd1543c31ed06aedbfa456",
+            "7551decd5dc22d3c199e0020717f116405cad2ba6b0e153ad981459be185ba93c4",
+        ),
+    ),
+    (
+        "inbox/items/01920000-0000-7000-8000-000000000001.sslo",
+        concat!(
+            "53534c4f00010040000001920000000070008000000000000001eb70fb1f4792444b9c61969f6d27a48dea8f163db386",
+            "82925e4491c5e58d4bb3506ef8c14eb78a86e908c5624a67200f1405d33d6a043d818dd1b3a7717818a3858519dcd169",
+            "c496631fcef6dc",
+        ),
+    ),
+    (
+        "inbox/items/01920000-0000-7000-8000-000000000001.env",
+        concat!(
+            "7b2276657273696f6e223a312c226974656d5f6964223a2230313932303030302d303030302d373030302d383030302d",
+            "303030303030303030303031222c22626c6f625f6964223a2265623730666231662d343739322d343434622d39633631",
+            "2d393639663664323761343864222c226b65795f6964223a2230316130396562372d343731632d376434332d38333762",
+            "2d363634363439626334366266222c2273656e745f6174223a313738393336393230362c22626c6f625f73697a65223a",
+            "3130332c22657068656d6572616c223a2230343664326561616634323564353564663234323864653363316564656436",
+            "626432366635623837326562323866626536316562353038666632623964333032646662666430613765346332366233",
+            "303538636266623937336230636563393731366665616665623366356334646161366536633931336133353135366233",
+            "643534222c227365616c6564223a22323562326662303137383265303839383363393163366132346130653365396461",
+            "333864313938643332336265303665626461363162303563336239313933326664303239303262383632613263663433",
+            "353334336331613333333031303961623332306534613332383966653538343036663132613437363435393434316362",
+            "373836356138663234303737623365663862343864376165373937666438653636306334623831333666346561643435",
+            "363966356637326435356638383133633936643833343732343631626135643636313331663630393232336364383465",
+            "666639343832353438376431353831663034383133363332316232356166323165616139663433653133643666343935",
+            "343662393465666264633331656433363562633238313530376561346638303334393363363564626332633535336532",
+            "383736396435373232373835393562316565613630303663666135386564356630386263333130343936316166326430",
+            "333032326161373561306439346336326236353330663339643330356137656461383634613961633437613965616266",
+            "613166306538333639346435636665663065346135643865393665646364343934313366653330386235626665303333",
+            "306332323733376232653961663265316466336632353362633661363435366263653031396563393432616266643161",
+            "313235666431356531323330363666353234346465346435373034373739363539646138623465643162636530656662",
+            "633430323734383032353261313536653461306438366333616664373932306362643530636235373864663835373330",
+            "6139653632366135383736323737376537656635373331326164633436373032616238222c227369676e617475726522",
+            "3a2239343833663032353032663337666338366434306164613837383366323764663139383939613966343131613230",
+            "613035313439373536353064376665653434336430616564656531353432353561346465626133666262333830313735",
+            "31323834346364663136383931316436386564396635316638626636646437656635227d",
+        ),
+    ),
+];
+
+/// Every inbox object above in a folder store, plus the envelope of the
+/// sender's device key, which is what keeps the sender allowed.
+async fn inbox_store() -> (tempfile::TempDir, silentsilo_store::FolderStore) {
+    use silentsilo_store::ObjectStore;
+    let dir = tempfile::tempdir().unwrap();
+    let store = silentsilo_store::FolderStore::new(dir.path().to_path_buf());
+    for (key, bytes) in INBOX_OBJECTS {
+        store.put(key, hex::decode(bytes).unwrap()).await.unwrap();
+    }
+    store
+        .put("keys/a1b2c3d4.env", b"{}".to_vec())
+        .await
+        .unwrap();
+    (dir, store)
+}
+
+#[tokio::test]
+async fn the_inbox_item_still_imports() {
+    use silentsilo_store::ObjectStore;
+    use silentsilo_sync::inbox::{scan_inbox, stage_item};
+
+    let (_dir, store) = inbox_store().await;
+    let kek = silentsilo_crypto::ContentKek::from_bytes([0x4b; 32]);
+    let vault = uuid::Uuid::parse_str(INBOX_VAULT).unwrap();
+
+    let scan = scan_inbox(&store, vault, &kek).await.expect("scans");
+    assert!(scan.refused.is_empty(), "{:?}", scan.refused);
+    let item = &scan.ready[0];
+    assert_eq!(item.name, "IMG_0001.jpg", "the name moved");
+    assert_eq!(item.mime_type.as_deref(), Some("image/jpeg"));
+    assert_eq!(item.size_bytes, 5);
+    assert_eq!(item.content_hash, blake3::hash(b"hello").to_hex().as_str());
+    assert_eq!(item.folder, vec!["Phone".to_string(), "Photos".to_string()]);
+    assert_eq!(item.source, "photos");
+    assert_eq!(item.taken_at, Some(1_789_000_000));
+    assert_eq!(item.sender_label, "Galaxy S23 Ultra");
+
+    stage_item(&store, item).await.expect("stages");
+    let dir = tempfile::tempdir().unwrap();
+    let sealed = dir.path().join("b.sslo");
+    let plain = dir.path().join("b");
+    store
+        .get_to_file(&format!("blobs/{}.sslo", item.blob_id), &sealed)
+        .await
+        .unwrap();
+    let key = silentsilo_crypto::unwrap_content_key(&item.blob_key(&kek).unwrap(), &kek).unwrap();
+    silentsilo_crypto::decrypt_blob(&sealed, &plain, &key, item.blob_id).expect("opens");
+    assert_eq!(std::fs::read(plain).unwrap(), b"hello");
+}
+
+/// What 1.0.0 does to a store with items waiting: its orphan sweep and its
+/// key rotation run over it, and the items still import afterwards.
+#[tokio::test]
+async fn an_installed_1_0_0_client_leaves_the_inbox_alone() {
+    use silentsilo_store_v1_0_0::ObjectStore as _;
+    use std::collections::HashSet;
+
+    let (dir, _store) = inbox_store().await;
+    let old_store = silentsilo_store_v1_0_0::FolderStore::new(dir.path().to_path_buf());
+    // An unreferenced blob beside them, so the sweep has work to do.
+    old_store
+        .put(
+            "blobs/6f1d0a52-9d0e-4b1a-8c7e-3f2a1b0c9d8e.sslo",
+            vec![1; 10],
+        )
+        .await
+        .unwrap();
+
+    let nothing = HashSet::new();
+    let first = silentsilo_sync_v1_0_0::sweep_orphan_blobs(&old_store, &nothing, &nothing)
+        .await
+        .unwrap();
+    let candidates = first.candidates.into_iter().collect();
+    let second = silentsilo_sync_v1_0_0::sweep_orphan_blobs(&old_store, &nothing, &candidates)
+        .await
+        .unwrap();
+    assert_eq!(second.deleted, 1, "the sweep did run");
+
+    let old_dek = silentsilo_crypto_v1_0_0::generate_dek();
+    let new_dek = silentsilo_crypto_v1_0_0::generate_dek();
+    silentsilo_sync_v1_0_0::reseal_under_new_key(&old_store, &old_dek, &new_dek, &mut |_, _| {})
+        .await
+        .unwrap();
+
+    let store = silentsilo_store::FolderStore::new(dir.path().to_path_buf());
+    let kek = silentsilo_crypto::ContentKek::from_bytes([0x4b; 32]);
+    let vault = uuid::Uuid::parse_str(INBOX_VAULT).unwrap();
+    let scan = silentsilo_sync::inbox::scan_inbox(&store, vault, &kek)
+        .await
+        .unwrap();
+    assert_eq!(scan.ready.len(), 1, "{:?}", scan.refused);
+}

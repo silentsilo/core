@@ -26,6 +26,9 @@ Anything else needs a version discriminator first.
 | Recovery envelope | `recovery.env` | `RECOVERY_ENVELOPE_VERSION = 1`, plus stored KDF parameters | Refuses on a newer structure; a parameter change needs no bump |
 | Key envelopes | `keys/….env` | **No file version.** Plain JSON of one enrolled key, carrying `kind` (what unwraps its `wrapped_dek`) and `derivation` (how that key was derived from the authenticator) | Ignores an envelope whose `kind` or `derivation` it does not know, and refuses by name when none is left it can use |
 | Content KEK | `keys/content.kek` | Sealed payload under the vault DEK | Refuses, naming the version |
+| Inbox key | `inbox/keys/….sealed` | `INBOX_VERSION = 1` inside a sealed payload under the content KEK, `silentsilo-sync/inbox.rs` | 1.0.0 never lists `inbox/`. A build with the inbox skips a key it cannot read |
+| Inbox sender | `inbox/senders/….sealed` | `INBOX_VERSION = 1`, sealed under the content KEK | As above |
+| Inbox item | `inbox/items/….sslo` and `….env` | The blob as in `blobs/`; the envelope carries `INBOX_VERSION = 1` | 1.0.0 never lists `inbox/`. A build with the inbox leaves an item of another version where it is and says to update |
 
 ## Reading a backup from scratch
 
@@ -78,6 +81,10 @@ recovery code.
    Check the plaintext against the hash in the header: the header is not
    authenticated, so that comparison is what catches content swapped for
    other valid content.
+
+`inbox/` holds content a device sent but no unlocked device has imported
+yet. It is not part of the tree, and a reader rebuilding the silo may ignore
+it. To recover those items too, follow "The inbox" below.
 
 Two things worth stating because they are easy to get wrong. Records are
 never rewritten, so a record's fingerprint covers a body that does not
@@ -268,6 +275,89 @@ rather than who is calling.
 an envelope assembled by something that does not write the field, the extraction
 tool included, must read as an ordinary key rather than be refused. A silo that
 will not load is the worst outcome this format has.
+
+## The inbox
+
+A device that cannot open the silo still adds to it: a phone backing up
+photos in the background holds no key that opens anything. It seals each
+item to the silo's inbox key and signs it, and an unlocked device imports it
+later as an ordinary file. Added in core 1.2.0.
+
+```text
+inbox/keys/<key_id>.sealed        the inbox secret
+inbox/senders/<sender_id>.sealed  a device allowed to send
+inbox/items/<item_id>.sslo        the content, an ordinary blob
+inbox/items/<item_id>.env         the signed envelope naming it
+```
+
+**Keys and senders** are sealed payloads under the content KEK, not the DEK.
+The KEK never rotates, so a rotation by a client that has never heard of the
+inbox cannot strand items waiting in it; 1.0.0's rotation re-seals `ops/`,
+`snapshots/` and `keys/content.kek` and nothing else. Inside, JSON:
+
+```json
+{"version":1,"key_id":"…","secret_key":"<32 bytes hex>","created_at":1789000000}
+{"version":1,"sender_id":"…","public_key":"<65 bytes hex>","credential_id":"…","label":"Galaxy S23 Ultra","created_at":1789000000}
+```
+
+`key_id` and `sender_id` must match the object's name. Several inbox keys may
+exist; every item names the one it is sealed to. A sender's `public_key` is an
+ECDSA P-256 key, and `credential_id` names the device key the sender belongs
+to: the sender is accepted only while `keys/<credential_id>.env` is in
+storage, so removing a device's key from the silo stops its sending too.
+
+**An item** is the content as an ordinary `.sslo` blob, with the item id as
+its file id and a fresh content key, and an envelope:
+
+```json
+{"version":1,"item_id":"…","blob_id":"…","key_id":"…","sent_at":1789000000,
+ "blob_size":103,"ephemeral":"<65 bytes hex>","sealed":"<hex>","signature":"<64 bytes hex>"}
+```
+
+The envelope does not name its sender. The storage provider reads it, and
+which device sent which photo is not the provider's to know; the importer
+finds the sender by trying each registered sender's key.
+
+The header both the seal and the signature cover is, at fixed widths and
+big-endian: `silentsilo inbox item v1` and a zero byte, `item_id`, `blob_id`,
+`key_id` and `sender_id` as 16 bytes each, `sent_at` as a signed 64-bit
+integer, `blob_size` as an unsigned one, then the 65-byte ephemeral point.
+
+- `sealed` is `nonce(12) || ciphertext || tag(16)`: AES-256-GCM with the header
+  as associated data, under HKDF-SHA256 of the P-256 agreement between the
+  ephemeral key and the inbox key, salt `silentsilo-inbox-v1:{vault_id}`, info
+  `silentsilo inbox item key v1`.
+- `signature` is raw `r || s` with `s` low, ECDSA P-256 over SHA-256 of the
+  header followed by the sealed bytes.
+
+The plaintext of `sealed` is JSON: `content_key` (hex), `name`, `mime_type`,
+`size_bytes`, `content_hash` (BLAKE3 of the plaintext, hex), `taken_at`,
+`folder` (one folder name per element, below the root) and `source`
+(`photos` or `contacts`).
+
+**Import** runs on an unlocked device, in an order that loses nothing when it
+stops anywhere:
+
+1. Check the envelope: its version, that its name matches `item_id`, a
+   registered sender whose signature it carries, that sender's device key
+   still in storage, and that the inbox key opens it. An item failing any of
+   these stays where it is and is reported.
+2. If the silo already has a file with id `item_id`, go to 5.
+3. Check the `.sslo` is `blob_size` bytes and copy it to `blobs/<blob_id>.sslo`.
+   A copy, not a move: stopping here leaves an unreferenced blob the sweep
+   will collect, and the original still in the inbox.
+4. Record an ordinary `AddFile` with `id = item_id`, its content key wrapped
+   under the content KEK, and push it.
+5. Delete the `.sslo`, then the envelope.
+
+Nothing here is a new operation. What reaches `ops/` and `blobs/` is exactly
+what an upload writes, so every client since 1.0.0 reads an imported photo
+like any other file. Two devices importing the same item converge, because a
+second `AddFile` with an id already present is obsolete in every version.
+
+What 1.0.0 does with a store holding items, its orphan sweep and its key
+rotation included, is checked by a test that runs 1.0.0's own code, and the
+byte vectors hold one real item.
 
 ## The index is not a format
 

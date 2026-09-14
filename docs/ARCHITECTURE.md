@@ -214,6 +214,14 @@ row written concurrently on another device may still need the bytes. All
 transfers stream through disk (`put_from_file`/`get_to_file`); nothing
 holds a whole blob in memory.
 
+### The inbox
+
+A device that cannot open the silo sends content to `inbox/`, and an
+unlocked device imports it (`silentsilo-sync/src/inbox.rs`, formats in
+`FORMATS.md`). The import copies the item into `blobs/` before it records
+the file and deletes the item only after. Nothing waiting may live under
+`blobs/`: the sweep would delete it after two passes, on any version.
+
 ## Recovery matrix
 
 What gets someone out of which hole, all of it built from the same pieces
