@@ -401,6 +401,22 @@ impl<'a> Vfs<'a> {
         self.get_file(id)
     }
 
+    /// The live file whose current content is `blob_id`, if any: what a
+    /// transfer of that blob is called on screen.
+    pub fn file_for_blob(&self, blob_id: Uuid) -> CoreResult<Option<(Uuid, String)>> {
+        self.conn()
+            .query_row(
+                "SELECT id, name FROM files WHERE blob_id = ?1 AND deleted_at IS NULL LIMIT 1",
+                [blob_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map(|found| {
+                found.and_then(|(id, name)| Uuid::parse_str(&id).ok().map(|id| (id, name)))
+            })
+            .map_err(|e| CoreError::Database(e.to_string()))
+    }
+
     /// Whether a file with this id was ever recorded here, trashed included.
     pub fn file_id_known(&self, id: Uuid) -> CoreResult<bool> {
         self.conn()

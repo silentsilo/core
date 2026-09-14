@@ -81,8 +81,19 @@ pub async fn push_ops(
     dek: &MasterDek,
     records: &[OpRecord],
 ) -> Result<usize, SyncError> {
+    push_ops_reporting(client, dek, records, &mut |_, _| {}).await
+}
+
+/// [`push_ops`], saying how far it got before each record.
+pub async fn push_ops_reporting(
+    client: &dyn ObjectStore,
+    dek: &MasterDek,
+    records: &[OpRecord],
+    progress: &mut (dyn FnMut(usize, usize) + Send),
+) -> Result<usize, SyncError> {
     let mut pushed = 0;
-    for record in records {
+    for (done, record) in records.iter().enumerate() {
+        progress(done, records.len());
         let key = op_key(record);
         // Records are immutable, so anything already up there is identical
         // and re-uploading it would only cost bandwidth.
@@ -606,9 +617,22 @@ pub async fn push_blobs(
     target: Uuid,
     blob_ids: &[Uuid],
 ) -> Result<BlobPushOutcome, SyncError> {
+    push_blobs_reporting(client, vault_root, target, blob_ids, &mut |_, _, _| {}).await
+}
+
+/// [`push_blobs`], naming each blob before it is checked and sent, with how
+/// many came before it.
+pub async fn push_blobs_reporting(
+    client: &dyn ObjectStore,
+    vault_root: &Path,
+    target: Uuid,
+    blob_ids: &[Uuid],
+    progress: &mut (dyn FnMut(usize, usize, Uuid) + Send),
+) -> Result<BlobPushOutcome, SyncError> {
     let mut outcome = BlobPushOutcome::default();
 
-    for blob_id in blob_ids {
+    for (done, blob_id) in blob_ids.iter().enumerate() {
+        progress(done, blob_ids.len(), *blob_id);
         let path = vault_root.join("blobs").join(format!("{blob_id}.sslo"));
         if !path.is_file() {
             // Already evicted, or trashed and purged between listing and
@@ -1811,6 +1835,28 @@ pub async fn push_everything_to(
     target: &TargetPush<'_>,
     silo: &SiloState<'_>,
 ) -> TargetPushOutcome {
+    push_everything_to_reporting(target, silo, &mut |_| {}).await
+}
+
+/// Where a push to one target is, for a status line.
+#[derive(Debug, Clone, Copy)]
+pub enum PushStep {
+    /// About to send record `done + 1` of `total`.
+    Ops { done: usize, total: usize },
+    /// About to check, and if missing send, this blob.
+    Blob {
+        done: usize,
+        total: usize,
+        blob_id: Uuid,
+    },
+}
+
+/// [`push_everything_to`], reporting each record and blob as it goes.
+pub async fn push_everything_to_reporting(
+    target: &TargetPush<'_>,
+    silo: &SiloState<'_>,
+    progress: &mut (dyn FnMut(PushStep) + Send),
+) -> TargetPushOutcome {
     let mut outcome = TargetPushOutcome::default();
     macro_rules! attempt {
         ($e:expr) => {
@@ -1839,7 +1885,11 @@ pub async fn push_everything_to(
         }
     }
 
-    match push_ops(target.store, silo.dek, target.owed).await {
+    match push_ops_reporting(target.store, silo.dek, target.owed, &mut |done, total| {
+        progress(PushStep::Ops { done, total })
+    })
+    .await
+    {
         Ok(count) => outcome.ops_pushed = count,
         Err(e) => {
             outcome.failed = Some(e.to_string());
@@ -1847,7 +1897,22 @@ pub async fn push_everything_to(
         }
     }
 
-    match push_pending_blobs(target.store, silo.vault_root, target.id).await {
+    let pending = list_undelivered_blob_ids(silo.vault_root, target.id);
+    match push_blobs_reporting(
+        target.store,
+        silo.vault_root,
+        target.id,
+        &pending,
+        &mut |done, total, blob_id| {
+            progress(PushStep::Blob {
+                done,
+                total,
+                blob_id,
+            })
+        },
+    )
+    .await
+    {
         Ok(blobs) => {
             outcome.blobs_uploaded = blobs.uploaded;
             outcome.blobs_failed = blobs.failed.len();

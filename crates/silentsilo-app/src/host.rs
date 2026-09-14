@@ -1,7 +1,7 @@
 use silentsilo_vault::BackupTarget;
 use uuid::Uuid;
 
-use crate::sync_pass::SyncReport;
+use crate::sync_pass::{SyncProgress, SyncReport};
 
 /// Something the interface is told about. Each client maps these to its own
 /// event names and payloads; the desktop keeps the names it always had.
@@ -12,6 +12,8 @@ pub enum AppEvent {
     /// Remote changes landed, so any listing on screen is stale
     /// (`vault-changed`).
     VaultChanged,
+    /// Where a running pass is (`sync-progress`). Ends with `SyncReport`.
+    SyncProgress(SyncProgress),
 }
 
 /// What only the client running this code can do.

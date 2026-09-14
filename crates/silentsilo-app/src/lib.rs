@@ -23,4 +23,4 @@ pub use state::{
     AppState, MAX_OPEN_SILOS, SessionGuard, SessionSnapshot, open_scratch_dir, wipe_open_scratch,
 };
 pub use store_config::{SftpAuthInput, StoreConfigInput, StoreConfigView};
-pub use sync_pass::{SyncReport, TargetStatus, run_sync_pass, sync_now};
+pub use sync_pass::{SyncProgress, SyncReport, TargetStatus, run_sync_pass, sync_now};

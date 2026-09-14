@@ -53,6 +53,7 @@ pub struct InboxOutcome {
 /// `silo_root` is where content is fetched to when `keep_local` is set,
 /// which makes the next push copy it to the targets that do not have it.
 /// `warn` gets what went wrong with single items; they stay for next time.
+/// `progress` hears how many of a target's ready items came before each.
 #[allow(clippy::too_many_arguments)]
 pub async fn import_inbox(
     silo: &dyn OpenSilo,
@@ -62,6 +63,7 @@ pub async fn import_inbox(
     kek: &ContentKek,
     vault_id: Uuid,
     keep_local: bool,
+    progress: &(dyn Fn(usize, usize) + Sync),
 ) -> InboxOutcome {
     let mut outcome = InboxOutcome::default();
     for target in targets {
@@ -79,7 +81,9 @@ pub async fn import_inbox(
             ));
         }
 
-        for item in scan.ready {
+        let total = scan.ready.len();
+        for (done, item) in scan.ready.into_iter().enumerate() {
+            progress(done, total);
             let mut known = false;
             if silo
                 .with_vfs(&mut |vfs| {

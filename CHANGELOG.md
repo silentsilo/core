@@ -23,6 +23,10 @@ release notes should say.
 - `silentsilo_app::files::import_file`, adding a file from this device, moved
   from the desktop's import, and `decrypt_to_file`, for opening a file
   outside a preview.
+- A sync pass reports where it is while it runs (`AppEvent::SyncProgress`:
+  sending changes, uploading, fetching changes, downloading, importing, with
+  the file being moved). `push_everything_to_reporting` and friends in
+  `silentsilo-sync` are the steps it is built from.
 - `fetch_blob_from_targets`: content downloaded from a copy is noted as held
   there, so it no longer shows as waiting to back up until the next push.
 - `silentsilo_app::inbox_import`, public, for a client whose sync pass is

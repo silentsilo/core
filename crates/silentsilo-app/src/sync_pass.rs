@@ -76,6 +76,55 @@ pub struct SyncReport {
     pub inbox_refused: Vec<String>,
 }
 
+/// Where a running pass is, for a status line and a marker on the file being
+/// moved. A pass ends with its `SyncReport`, which is also the signal that
+/// nothing is moving any more.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SyncProgress {
+    pub silo_id: String,
+    /// `sending-changes`, `uploading`, `fetching-changes`, `downloading` or
+    /// `importing`.
+    pub phase: &'static str,
+    /// How many of `total` came before this step.
+    pub done: usize,
+    pub total: usize,
+    /// The file this step moves, when it is one the silo lists.
+    pub file_id: Option<String>,
+    pub name: Option<String>,
+}
+
+/// Tells the interface where the pass is. A blob is named by the file it
+/// belongs to, read without touching the silo's idle timer: a background
+/// pass is not use.
+fn report_progress(
+    state: &AppState,
+    host: &dyn Host,
+    silo_id: Uuid,
+    phase: &'static str,
+    done: usize,
+    total: usize,
+    blob_id: Option<Uuid>,
+) {
+    let file = blob_id.and_then(|blob| {
+        let sessions = state.sessions.lock().ok()?;
+        let session = sessions.get(&silo_id)?;
+        Vfs::new(session).file_for_blob(blob).ok().flatten()
+    });
+    host.emit(AppEvent::SyncProgress(SyncProgress {
+        silo_id: silo_id.to_string(),
+        phase,
+        done,
+        total,
+        file_id: file.as_ref().map(|(id, _)| id.to_string()),
+        name: file.map(|(_, name)| name),
+    }));
+}
+
+/// Records go by in the thousands; a status line needs a tenth of that.
+fn worth_saying(done: usize, total: usize) -> bool {
+    done.is_multiple_of(10) || done + 1 == total
+}
+
 /// How one target fared this pass, so "the second one is behind" can be said
 /// rather than hidden behind a single green tick.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -394,7 +443,7 @@ pub async fn run_sync_pass(
             base: base.as_ref(),
             vault_root: &root,
         };
-        let outcome = sync::push_everything_to(
+        let outcome = sync::push_everything_to_reporting(
             &sync::TargetPush {
                 id: target.id,
                 store: &*target.store,
@@ -402,6 +451,26 @@ pub async fn run_sync_pass(
                 owed: &target.owed,
             },
             &silo_state,
+            &mut |step| match step {
+                sync::PushStep::Ops { done, total } => {
+                    if worth_saying(done, total) {
+                        report_progress(state, host, silo.id, "sending-changes", done, total, None);
+                    }
+                }
+                sync::PushStep::Blob {
+                    done,
+                    total,
+                    blob_id,
+                } => report_progress(
+                    state,
+                    host,
+                    silo.id,
+                    "uploading",
+                    done,
+                    total,
+                    Some(blob_id),
+                ),
+            },
         )
         .await;
 
@@ -451,7 +520,19 @@ pub async fn run_sync_pass(
     let mut incoming = Vec::new();
     let mut unreadable: Vec<sync::UnreadableOp> = Vec::new();
     for target in &targets {
-        match sync::fetch_missing_ops(&*target.store, &dek, &known, local_horizon).await {
+        match sync::fetch_missing_ops_reporting(
+            &*target.store,
+            &dek,
+            &known,
+            local_horizon,
+            &mut |done, total| {
+                if worth_saying(done, total) {
+                    report_progress(state, host, silo.id, "fetching-changes", done, total, None);
+                }
+            },
+        )
+        .await
+        {
             Ok(mut got) => {
                 incoming.append(&mut got.records);
                 unreadable.append(&mut got.unreadable);
@@ -539,6 +620,9 @@ pub async fn run_sync_pass(
         &kek,
         vault_id,
         every_target.len() > 1,
+        &|done: usize, total: usize| {
+            report_progress(state, host, silo.id, "importing", done, total, None)
+        },
     )
     .await;
 
@@ -691,7 +775,17 @@ async fn fetch_missing_for_full_copy(
     };
 
     let mut fetched = 0;
-    for blob_id in missing.into_iter().take(FULL_COPY_FETCH_PER_PASS) {
+    let batch: Vec<Uuid> = missing.into_iter().take(FULL_COPY_FETCH_PER_PASS).collect();
+    for (done, blob_id) in batch.iter().copied().enumerate() {
+        report_progress(
+            state,
+            host,
+            silo.id,
+            "downloading",
+            done,
+            batch.len(),
+            Some(blob_id),
+        );
         // One object that will not come down must not stop the rest. It was
         // a `break`, so a single blob missing from the bucket, or one whose
         // bytes are damaged, held every later blob back on every pass
