@@ -49,9 +49,24 @@ to come back for the data, not against someone who already took it.
 Rotating the vault key is what closes that, and it is implemented. It gives
 every object in storage a new envelope and re-wraps the key under only the
 credentials carried through, so a removed key stops opening anything written
-before or after. Two things it still cannot do: reach a target that refuses
-overwrites, where the old objects keep their old envelopes; and take back what
-someone has already copied. Nothing anywhere undoes that second one.
+before or after. Three things it still cannot do: reach a target that refuses
+overwrites, where the old objects keep their old envelopes; take back what
+someone has already copied; and reach what is sealed under the content KEK
+rather than the DEK.
+
+The content KEK does not rotate. Anyone who once held the DEK can unwrap it,
+and after a rotation it still opens the inbox keys (`inbox/keys/`), so items
+phones send afterwards, and the sender records and revocation markers, which
+it could also write. A client refuses to follow revocation markers that would
+leave no key at all, so a forged set cannot lock every device out; it can
+still remove some keys, or register a sender. Moving these under a key that
+rotates is a format change and is not done in v1.
+
+Replacing or disabling the recovery code deletes or replaces its envelope in
+storage but does not rotate the DEK either. Whoever kept the old
+`recovery.env` (bucket versioning keeps it too) and has the old code can
+still unwrap the current DEK. Rotate the key after replacing a code that may
+have been exposed.
 
 ## Key hierarchy
 
@@ -61,11 +76,13 @@ Device secret ─────────┼─► wrap_key [32] ──► seale
 Recovery code ─────────┘
 
 Master DEK [32]  ──► sealed envelope: vault.db.enc, operation records,
-                  │    password entries
+                  │    snapshots
                   └► wraps the content KEK
 
 Content KEK [32] ──► wraps one content key per blob, carried inside the
-                     operation record that names the blob
+                  │    operation record that names the blob
+                  └► seals password entries, inbox keys, inbox senders,
+                       revocation markers
 
 Content key [32] ──► AES-256-GCM chunked blob encryption (.sslo)
 ```
@@ -493,11 +510,11 @@ This was originally intended to be SQLCipher (page-level encryption baked into S
 
 Logins live as rows in `vault.db` rather than as a file in the tree. Each entry, including its TOTP secret, is one row.
 
-Unlike the rest of the index, an entry is **sealed individually** with the Master DEK (AES-256-GCM, random nonce, base64 in the column) rather than relying only on the encryption of the database as a whole. The reason is the working copy: while a silo is unlocked, `vault.db` exists as plaintext on the local disk. That is a reasonable place for file names and not one for credentials, so anything reading that file, a backup agent sweeping the working directory or a crash leaving it behind, finds ciphertext. Entries are plaintext only in process memory, and only while the panel holds them.
+Unlike the rest of the index, an entry is **sealed individually** with the content KEK (AES-256-GCM, random nonce, base64 in the column) rather than relying only on the encryption of the database as a whole. The KEK and not the DEK, so a key rotation never has to re-seal every entry. The reason is the working copy: while a silo is unlocked, `vault.db` exists as plaintext on the local disk. That is a reasonable place for file names and not one for credentials, so anything reading that file, a backup agent sweeping the working directory or a crash leaving it behind, finds ciphertext. Entries are plaintext only in process memory, and only while the panel holds them.
 
 | Where | Password entries |
 |-------|------------------|
-| `vault.db` working copy (unlocked) | Sealed under the Master DEK |
+| `vault.db` working copy (unlocked) | Sealed under the content KEK |
 | `vault.db.enc` at rest | Sealed, inside the encrypted database |
 | Operation records in storage | Sealed, then sealed again by sync |
 | Process memory, panel open | Plaintext |
@@ -569,6 +586,7 @@ obtains a copy of the bucket, reads all of the following without any key:
 | `ops/<lamport>-<device_id>-<op_id>.op` | How many operations exist, their order, when they were made, and how many devices the vault has, from the device ids in the key names |
 | An operation body | Its length, which bounds the size of the file name inside and hints at the kind of operation |
 | `blobs/<uuid>.sslo` | How many files there are and the size of each, to within a fraction of a percent, since there is no padding |
+| A blob header | The BLAKE3 hash of the plaintext, in the clear: a provider holding a candidate file can confirm it is stored, and the same file stored in two silos carries the same hash. Also the file id, a UUIDv7 whose leading bits are the time it was first added, which links the versions of one file |
 | `keys/<credential_id>` | The credential id, the public key, the slot, whether it is a platform authenticator, and **the label the user typed**, all in the clear around the wrapped DEK |
 | `recovery.env` | That a recovery code exists, and when it was created |
 | `inbox/items/<item_id>.*` | How many items wait to be imported, their sizes and when they were sent; not which device sent them |
@@ -580,8 +598,9 @@ opaque blobs" is not the whole truth, and because a label like "Alex's work
 YubiKey" is the user's own words leaving their machine unencrypted.
 
 Reducing the exposure is possible and is not done today: sealing labels under
-the DEK, using a per-pass pseudonym instead of a stable device id, and padding
-blobs to a fixed granularity. Each costs something, none is free, and none is
+the DEK, using a per-pass pseudonym instead of a stable device id, padding
+blobs to a fixed granularity, and keying the header hash with the content key
+(a new blob format version, which readers have to know before writers use it). Each costs something, none is free, and none is
 implemented in v1.
 
 Anyone using plain HTTP for S3 or WebDAV also exposes the access key and the
