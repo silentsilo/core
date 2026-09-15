@@ -210,7 +210,8 @@ pub fn enrol_device_key(
         rp_id: "silentsilo.com".into(),
         label: key.label.clone(),
         wrapped_dek: hex::encode(&envelope),
-        platform: true,
+        // A security key added from a phone travels; the phone's own does not.
+        platform: key.kind != silentsilo_vault::KIND_FIDO2,
         revoked: false,
     };
     keys.keys.push(stored.clone());

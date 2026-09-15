@@ -13,6 +13,14 @@ release notes should say.
 
 ### Added
 
+- `silentsilo_fido::ctap2`: CTAP2 spoken directly over a link the platform
+  provides (NFC APDUs, USB HID reports), for Android, where Credential
+  Manager's PRF hashes the salt and cannot reproduce the wrap key. Makes a
+  credential with `hmac-secret` (with the key's PIN when it asks) and
+  derives the same unverified `hmac-secret-v1` wrap key as the desktop, so a
+  key enrolled on either opens the silo on both. Default feature `ctap2`.
+- `flows::enrol_device_key` records a `fido2` key as removable
+  (`platform: false`).
 - The sync pass in `silentsilo-app` imports the inbox: items a locked phone
   sent become ordinary files in the folder the item names, and leave the
   inbox a pass later, once their record has reached every target. Items from

@@ -3995,13 +3995,16 @@ dependencies = [
 name = "silentsilo-fido"
 version = "1.3.0"
 dependencies = [
+ "aes 0.8.4",
  "base64",
  "blake3",
+ "cbc 0.1.2",
  "ciborium",
  "core-foundation 0.10.1",
  "ctap-hid-fido2",
  "hex",
  "hkdf 0.12.4",
+ "hmac 0.12.1",
  "objc2-local-authentication",
  "p256",
  "rand 0.9.5",
