@@ -299,6 +299,19 @@ Read this before "fixing" any of it.
 - **Purge does not delete bucket blobs.** The sweep does, two-pass, after
   convergence. Deleting at purge time froze "referenced" at what one device
   knew and destroyed content another device still pointed at.
+- **Compaction and the sweep skip a partial pass.** A record held back, an
+  unreadable object or a copy that could not be read means this device's
+  idea of what is referenced is short, so neither runs. The same complete
+  passes record `received_through` (`vfs::snapshot`), and the horizon check
+  compares that, not the highest local Lamport value, which counts this
+  device's own offline writes.
+- **An opened record under another record's name is skipped.** The name is
+  where the order and the horizon filter come from; storage copying a
+  genuine record to a later name would otherwise replay it there. Snapshots
+  likewise count only when their sealed horizon matches the name.
+- **A large purge is several records.** Readers refuse records over their
+  size ceiling, so a purge is split files first, then folders deepest first,
+  and each record stands on its own for a 1.0.0 reader.
 - **Seeding size-skips only `blobs/`.** Everything else is rewritten in
   place at identical length by rotation, so "same key, same size" would
   skip the one write that matters.
