@@ -82,14 +82,10 @@ pub async fn import_inbox(
         }
 
         let total = scan.ready.len();
-        // Started at a random item: devices importing at once would
-        // otherwise copy the same video in the same order, each through its
-        // own connection, and only then find the other had it.
-        let mut ready = scan.ready;
-        if total > 1 {
-            ready.rotate_left((Uuid::new_v4().as_u128() % total as u128) as usize);
-        }
-        for (done, item) in ready.into_iter().enumerate() {
+        // In listing order on every device. Same-named files take their
+        // "(2)" suffixes in the order they are recorded, so devices that
+        // import at once must record in the same order to agree on names.
+        for (done, item) in scan.ready.into_iter().enumerate() {
             progress(done, total);
             let mut known = false;
             if silo
