@@ -20,7 +20,8 @@ release notes should say.
 - `silentsilo_fido::passkey`: passkeys kept in a silo, as a `passkey`
   field inside a password entry (`FORMATS.md`, Passkeys). Makes ES256
   passkeys with "none" attestation and signs sign-ins with a zero counter.
-  Default feature `passkey`.
+  Answers browsers only: an app caller is refused until something checks
+  the site's Digital Asset Links. Default feature `passkey`.
 - `flows::key_join_begin` and `key_join_open`: joining a silo from its
   storage with a published key instead of the recovery code. The recovery
   envelope comes along when the silo has one.

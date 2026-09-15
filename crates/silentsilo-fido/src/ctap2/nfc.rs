@@ -12,6 +12,8 @@ const FIDO_AID: [u8; 8] = [0xA0, 0x00, 0x00, 0x06, 0x47, 0x2F, 0x00, 0x01];
 const SW_OK: u16 = 0x9000;
 /// The key is still working and wants to be asked again.
 const SW_KEEPALIVE: u16 = 0x9100;
+/// How long a key may keep asking to wait, as over USB.
+const KEEPALIVE_LIMIT: std::time::Duration = std::time::Duration::from_secs(45);
 
 pub struct Nfc<A: Apdu> {
     link: A,
@@ -56,7 +58,14 @@ impl<A: Apdu> Nfc<A> {
                 return Err(CtapError::Protocol(format!("chaining refused ({sw:04x})")));
             }
         }
+        let mut rounds = 0;
         while sw >> 8 == 0x61 {
+            // A CTAP answer is a few kilobytes; a key that keeps offering
+            // more is not answering.
+            rounds += 1;
+            if rounds > 64 {
+                return Err(CtapError::Protocol("the answer does not end".into()));
+            }
             let (more, next) = self.send(&[0x00, 0xC0, 0x00, 0x00, sw as u8])?;
             answer.extend_from_slice(&more);
             sw = next;
@@ -96,7 +105,11 @@ impl<A: Apdu> Ctap for Nfc<A> {
         payload.extend_from_slice(cbor);
         // P1 0x80: this side answers keep-alives with NFCCTAP_GETRESPONSE.
         let (mut answer, mut sw) = self.exchange(0x80, 0x10, 0x80, &payload)?;
+        let started = std::time::Instant::now();
         while sw == SW_KEEPALIVE {
+            if started.elapsed() > KEEPALIVE_LIMIT {
+                return Err(CtapError::Timeout);
+            }
             std::thread::sleep(std::time::Duration::from_millis(100));
             (answer, sw) = self.exchange(0x80, 0x11, 0x00, &[])?;
         }

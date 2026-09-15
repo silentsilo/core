@@ -156,6 +156,17 @@ fn int_entry(value: &Value, key: i64) -> Option<&Value> {
 /// which is all CTAP's canonical encoding allows. Needed to find where the
 /// credential's public key ends inside authenticator data.
 fn item_len(raw: &[u8]) -> Option<usize> {
+    item_len_within(raw, 0)
+}
+
+/// Nesting deeper than any authenticator data holds is refused rather than
+/// followed down the stack.
+const MAX_DEPTH: usize = 16;
+
+fn item_len_within(raw: &[u8], depth: usize) -> Option<usize> {
+    if depth > MAX_DEPTH {
+        return None;
+    }
     let first = *raw.first()?;
     let major = first >> 5;
     let info = first & 0x1f;
@@ -182,11 +193,11 @@ fn item_len(raw: &[u8]) -> Option<usize> {
             let items = if major == 5 { arg.checked_mul(2)? } else { arg };
             let mut at = head;
             for _ in 0..items {
-                at += item_len(raw.get(at..)?)?;
+                at += item_len_within(raw.get(at..)?, depth + 1)?;
             }
             Some(at)
         }
-        6 => Some(head + item_len(raw.get(head..)?)?),
+        6 => Some(head + item_len_within(raw.get(head..)?, depth + 1)?),
         _ => None,
     }
 }
@@ -584,7 +595,7 @@ fn pin_token(
     pin: &str,
 ) -> Result<(Shared, Zeroizing<Vec<u8>>), CtapError> {
     let shared = Shared::agree(dev, protocol)?;
-    let pin_hash = sha256(pin.as_bytes());
+    let pin_hash = Zeroizing::new(sha256(pin.as_bytes()));
     let request = map(vec![
         (int(1), int(protocol as i64)),
         (int(2), int(PIN_GET_PIN_TOKEN)),
@@ -778,6 +789,9 @@ mod tests {
         padded.extend_from_slice(&[0xa1, 0x01, 0x02]);
         assert_eq!(item_len(&padded), Some(raw.len()));
         assert_eq!(item_len(&[0x58]), None, "a truncated item is not measured");
+        let mut deep = vec![0x81; 10_000];
+        deep.push(0x00);
+        assert_eq!(item_len(&deep), None, "nesting is not followed without end");
     }
 
     #[test]

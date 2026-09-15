@@ -84,12 +84,14 @@ pub enum PasskeyError {
     WrongOrigin { origin: String, rp_id: String },
     #[error("a passkey for this account is already in the silo")]
     Excluded,
+    #[error("only a browser can use passkeys from SilentSilo for now")]
+    AppCaller,
 }
 
 /// Who is asking, as the platform vouches for it.
 pub struct Caller<'a> {
     /// `https://site` for a browser the platform trusts, or
-    /// `android:apk-key-hash:...` for an app.
+    /// `android:apk-key-hash:...` for an app, which is refused.
     pub origin: &'a str,
     /// An app's package name, added to client data as Android does.
     pub package: Option<&'a str>,
@@ -162,19 +164,38 @@ fn decode_b64(raw: &str, what: &str) -> Result<Vec<u8>, PasskeyError> {
         .map_err(|_| PasskeyError::Invalid(format!("{what} is not base64url")))
 }
 
-/// The host of an https origin.
+/// A DNS name: dot-separated labels of letters, digits and hyphens.
+fn is_domain(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 253
+        && name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+}
+
+/// The host of an https origin, if it is a plain domain.
 fn origin_host(origin: &str) -> Option<&str> {
     let rest = origin.strip_prefix("https://")?;
     let host = rest.split(['/', ':']).next()?;
-    (!host.is_empty()).then_some(host)
+    is_domain(host).then_some(host)
 }
 
-/// A browser origin must be the relying party's domain or below it. An app
-/// origin names the app's signing key, which the relying party checks
-/// against its own list, so it passes here.
+/// The origin must be a browser's, on the relying party's domain or below
+/// it, and the relying party more than a bare top-level name.
+///
+/// An app names itself by its signing key, and only the relying party's
+/// Digital Asset Links say whether that app is its own. Nothing here fetches
+/// them, so an app could sign in to any site's account with a passkey it
+/// merely asked for. Refused until that check exists.
 fn check_origin(origin: &str, rp_id: &str) -> Result<(), PasskeyError> {
-    if origin.starts_with("android:apk-key-hash:") {
-        return Ok(());
+    if origin.starts_with("android:") {
+        return Err(PasskeyError::AppCaller);
     }
     let wrong = || PasskeyError::WrongOrigin {
         origin: origin.to_string(),
@@ -182,6 +203,9 @@ fn check_origin(origin: &str, rp_id: &str) -> Result<(), PasskeyError> {
     };
     let host = origin_host(origin).ok_or_else(wrong)?.to_ascii_lowercase();
     let rp = rp_id.to_ascii_lowercase();
+    if !is_domain(&rp) || !rp.contains('.') {
+        return Err(wrong());
+    }
     if host == rp || host.ends_with(&format!(".{rp}")) {
         Ok(())
     } else {
@@ -572,25 +596,66 @@ mod tests {
     }
 
     #[test]
-    fn an_app_caller_gets_its_package_in_client_data_and_a_newer_record_is_left_alone() {
+    fn an_app_caller_is_refused_and_a_newer_record_is_left_alone() {
         let app = Caller {
             origin: "android:apk-key-hash:abc",
             package: Some("com.example.app"),
-            client_data_hash: None,
+            client_data_hash: Some([7; 32]),
         };
-        let made = register(CREATE, &app, &[], 1).unwrap();
-        let reg: serde_json::Value = serde_json::from_str(&made.response_json).unwrap();
-        let client: serde_json::Value =
-            serde_json::from_slice(&b64(&reg["response"]["clientDataJSON"])).unwrap();
-        assert_eq!(client["androidPackageName"], "com.example.app");
+        assert_eq!(
+            register(CREATE, &app, &[], 1).err(),
+            Some(PasskeyError::AppCaller)
+        );
+        let made = register(CREATE, &browser(), &[], 1).unwrap();
+        assert_eq!(
+            assert(&made.record, GET, &app).err(),
+            Some(PasskeyError::AppCaller)
+        );
+        assert_eq!(
+            usable_for(
+                GET,
+                "android:apk-key-hash:abc",
+                std::slice::from_ref(&made.record)
+            )
+            .err(),
+            Some(PasskeyError::AppCaller)
+        );
 
         let mut newer = made.record.clone();
         newer.version = PASSKEY_VERSION + 1;
         assert!(
-            usable_for(GET, "android:apk-key-hash:abc", &[newer])
+            usable_for(GET, "https://example.com", &[newer])
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn a_bare_suffix_or_a_malformed_origin_is_not_a_relying_party() {
+        let tld = CREATE.replace(r#""id": "example.com""#, r#""id": "com""#);
+        assert!(matches!(
+            register(&tld, &browser(), &[], 1),
+            Err(PasskeyError::WrongOrigin { .. })
+        ));
+        for origin in [
+            "http://example.com",
+            "https://exa mple.com",
+            "https://example.com%2e.evil.net",
+            "https://.example.com",
+            "https://",
+        ] {
+            let caller = Caller {
+                origin,
+                ..browser()
+            };
+            assert!(
+                matches!(
+                    register(CREATE, &caller, &[], 1),
+                    Err(PasskeyError::WrongOrigin { .. })
+                ),
+                "{origin}"
+            );
+        }
     }
 
     #[test]
