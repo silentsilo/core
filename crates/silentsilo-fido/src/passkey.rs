@@ -496,9 +496,13 @@ mod tests {
         assert_eq!(made.record.user_handle, "dXNlci0x");
 
         assert_eq!(
-            usable_for(GET, "https://example.com", &[made.record.clone()])
-                .unwrap()
-                .len(),
+            usable_for(
+                GET,
+                "https://example.com",
+                std::slice::from_ref(&made.record)
+            )
+            .unwrap()
+            .len(),
             1
         );
         let signed_in: serde_json::Value =
@@ -552,7 +556,7 @@ mod tests {
             ),
         );
         assert_eq!(
-            register(&exclude, &browser(), &[made.record.clone()], 1).err(),
+            register(&exclude, &browser(), std::slice::from_ref(&made.record), 1).err(),
             Some(PasskeyError::Excluded)
         );
 
