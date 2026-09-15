@@ -373,3 +373,26 @@ async fn content_swept_while_its_record_waited_is_copied_again_before_the_item_g
     assert!(store.head(&blob).await.unwrap().is_some());
     assert!(store.head(&envelope(item_id)).await.unwrap().is_none());
 }
+
+#[tokio::test]
+async fn an_envelope_whose_content_is_gone_is_removed_so_the_phone_can_send_again() {
+    let storage = tempfile::tempdir().unwrap();
+    let host = Targets(vec![folder_target(&storage)]);
+    let store = FolderStore::new(storage.path().to_path_buf());
+    let device = Device::new(&host).await;
+    let phone = phone(&store, &device, "aa11").await;
+    let item_id = send_photo(&store, &phone, b"a photo").await;
+    store
+        .delete(&format!("inbox/items/{item_id}.sslo"))
+        .await
+        .unwrap();
+
+    assert_eq!(device.pass(&host).await.inbox_imported, 0);
+    assert!(store.head(&envelope(item_id)).await.unwrap().is_none());
+    let sessions = device.state.sessions.lock().unwrap();
+    assert!(
+        !Vfs::new(&sessions[&device.silo.id])
+            .file_id_known(item_id)
+            .unwrap()
+    );
+}

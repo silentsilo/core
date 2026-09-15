@@ -36,6 +36,7 @@ const CMD_GET_ASSERTION: u8 = 0x02;
 const CMD_GET_INFO: u8 = 0x04;
 const CMD_CLIENT_PIN: u8 = 0x06;
 
+const PIN_GET_RETRIES: i64 = 0x01;
 const PIN_GET_KEY_AGREEMENT: i64 = 0x02;
 const PIN_GET_PIN_TOKEN: i64 = 0x05;
 
@@ -59,9 +60,16 @@ pub enum CtapError {
     NoCredentials,
     #[error("this security key asks for its PIN")]
     PinRequired,
+    /// With the tries the key has left, when it said.
     #[error("wrong PIN")]
-    PinInvalid,
-    #[error("the security key's PIN is blocked; it needs a reset or the key's own tool")]
+    PinInvalid { retries: Option<u8> },
+    /// Three wrong PINs since the key was powered: taking it away from the
+    /// phone or unplugging it allows more tries.
+    #[error("too many wrong PINs in a row")]
+    PinAuthBlocked,
+    /// No tries left at all. Only resetting the key clears it, and a reset
+    /// erases every credential on it.
+    #[error("the security key's PIN is blocked")]
     PinBlocked,
     #[error("no touch was received in time")]
     Timeout,
@@ -73,8 +81,9 @@ impl CtapError {
     fn from_status(status: u8) -> Self {
         match status {
             0x2E => Self::NoCredentials,
-            0x31 | 0x33 => Self::PinInvalid,
-            0x32 | 0x34 => Self::PinBlocked,
+            0x31 => Self::PinInvalid { retries: None },
+            0x32 => Self::PinBlocked,
+            0x34 => Self::PinAuthBlocked,
             0x36 => Self::PinRequired,
             0x2F | 0x27 => Self::Timeout,
             other => Self::Status(other),
@@ -567,12 +576,31 @@ fn pin_token(
         (int(3), shared.platform_key.clone()),
         (int(6), bytes(&shared.encrypt(&pin_hash[..16]))),
     ]);
-    let answer = decode(&dev.command(CMD_CLIENT_PIN, &encode(&request))?)?;
+    let answer = match dev.command(CMD_CLIENT_PIN, &encode(&request)) {
+        Err(CtapError::PinInvalid { .. }) => {
+            return Err(CtapError::PinInvalid {
+                retries: pin_retries(dev, protocol),
+            });
+        }
+        other => decode(&other?)?,
+    };
     let sealed = int_entry(&answer, 2)
         .and_then(Value::as_bytes)
         .ok_or_else(|| CtapError::Protocol("no PIN token".into()))?;
     let token = shared.decrypt(sealed)?;
     Ok((shared, token))
+}
+
+/// How many PIN tries the key has left, when it says.
+pub fn pin_retries(dev: &mut dyn Ctap, protocol: u8) -> Option<u8> {
+    let request = map(vec![
+        (int(1), int(protocol as i64)),
+        (int(2), int(PIN_GET_RETRIES)),
+    ]);
+    let answer = decode(&dev.command(CMD_CLIENT_PIN, &encode(&request)).ok()?).ok()?;
+    int_entry(&answer, 3)
+        .and_then(Value::as_integer)
+        .and_then(|i| u8::try_from(i).ok())
 }
 
 /// A credential made for a silo.

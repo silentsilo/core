@@ -149,6 +149,7 @@ impl SoftKey {
                             bytes(&Self::cbc(p, &aes, &self.token, true)),
                         )]))
                     }
+                    PIN_GET_RETRIES => Ok(map(vec![(int(3), int(7))])),
                     other => panic!("clientPin {other}"),
                 }
             }
@@ -341,7 +342,7 @@ fn a_key_with_a_pin_asks_for_it_at_enrolment_only() {
     ));
     assert!(matches!(
         make_credential(&mut key, VAULT, Some("0000")),
-        Err(CtapError::PinInvalid)
+        Err(CtapError::PinInvalid { .. })
     ));
     let made = make_credential(&mut key, VAULT, Some("4821")).unwrap();
     let unlocked =
@@ -574,6 +575,6 @@ fn a_silo_wrapped_by_a_platform_that_verified_opens_with_the_pin() {
     );
     assert!(matches!(
         unlock_candidates(&mut key, ids, VAULT, Some("0000")),
-        Err(CtapError::PinInvalid)
+        Err(CtapError::PinInvalid { .. })
     ));
 }

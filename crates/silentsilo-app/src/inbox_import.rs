@@ -117,7 +117,21 @@ pub async fn import_inbox(
                 Err(e) => Err(e),
             };
             if let Err(e) = staged {
-                warn(&format!("{}: {e}", target.label));
+                // An envelope whose content is in neither place brings
+                // nothing back, and staying would repeat this every pass.
+                // Gone, it lets the phone that sent it notice and send the
+                // item again.
+                if target.may_finish
+                    && let Ok(false) = source_present(target.store, item.item_id).await
+                {
+                    warn(&format!(
+                        "{}: {} lost its content before import; removed so it can be sent again",
+                        target.label, item.name
+                    ));
+                    let _ = finish_item(target.store, item.item_id).await;
+                } else {
+                    warn(&format!("{}: {e}", target.label));
+                }
                 continue;
             }
             let blob_key = match item.blob_key(kek) {
