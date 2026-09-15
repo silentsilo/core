@@ -4,8 +4,8 @@
 use std::sync::Mutex;
 
 use silentsilo_app::flows::{
-    DeviceKey, enrol_device_key, join_finish, open_with_device_key, open_with_recovery,
-    recovery_envelope_for, recovery_join_begin, recovery_join_provision,
+    DeviceKey, enrol_device_key, join_finish, key_join_begin, key_join_open, open_with_device_key,
+    open_with_recovery, recovery_envelope_for, recovery_join_begin, recovery_join_provision,
 };
 use silentsilo_app::{AppEvent, AppState, Host, run_sync_pass};
 use silentsilo_store::{FolderStore, StoreConfig};
@@ -205,4 +205,40 @@ async fn a_phone_key_enrolled_after_joining_opens_the_silo_on_its_own() {
     assert_eq!(meta.vault_id, origin.vault_id);
     assert!(open_with_device_key(root.clone(), "bb22", &[8; 32], origin.vault_id).is_err());
     assert!(open_with_device_key(root, "cc33", &[9; 32], origin.vault_id).is_err());
+}
+
+#[tokio::test]
+async fn a_published_key_joins_the_silo_and_a_wrong_wrap_key_leaves_nothing() {
+    let origin = origin().await;
+    let store = FolderStore::new(origin.storage.clone());
+    let offer = key_join_begin(&store).await.unwrap();
+    assert_eq!(offer.vault_id, origin.vault_id);
+    assert!(offer.keys.iter().any(|k| k.credential_id == "aa11"));
+
+    assert!(
+        key_join_open(&store, &offer, "aa11", &[8; 32])
+            .await
+            .is_err()
+    );
+    assert!(
+        key_join_open(&store, &offer, "bb22", &[7; 32])
+            .await
+            .is_err()
+    );
+
+    let joined = key_join_open(&store, &offer, "aa11", &[7; 32])
+        .await
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("silo");
+    let session = recovery_join_provision(&store, &joined, root.clone(), "secret-b")
+        .await
+        .unwrap();
+    let plan = silentsilo_sync::fetch_join_plan_reporting(&store, joined.dek(), &mut |_, _| {})
+        .await
+        .unwrap();
+    let session = join_finish(session, plan).unwrap().0;
+    assert!(folder_names(&session).contains(&"From A".to_string()));
+    // The recovery envelope came along, so the code opens this copy too.
+    assert!(silentsilo_vault::load_recovery_envelope(&root).is_ok());
 }

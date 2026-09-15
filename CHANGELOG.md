@@ -13,6 +13,9 @@ release notes should say.
 
 ### Added
 
+- `flows::key_join_begin` and `key_join_open`: joining a silo from its
+  storage with a published key instead of the recovery code. The recovery
+  envelope comes along when the silo has one.
 - `silentsilo_fido::ctap2`: CTAP2 spoken directly over a link the platform
   provides (NFC APDUs, USB HID reports), for Android, where Credential
   Manager's PRF hashes the salt and cannot reproduce the wrap key. Makes a

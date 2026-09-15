@@ -10,6 +10,9 @@
 //! 4. the client records the silo as the open one;
 //! 5. `silentsilo_sync::fetch_join_plan_reporting`, then [`join_finish`] on
 //!    a blocking thread, then the session enters the app state.
+//!
+//! Joining with a security key replaces step 1 with [`key_join_begin`], the
+//! key's ceremony against the envelopes it lists, and [`key_join_open`].
 
 use std::path::{Path, PathBuf};
 
@@ -24,11 +27,13 @@ use silentsilo_vault::{
 use silentsilo_vfs::Vfs;
 use uuid::Uuid;
 
-/// What the recovery code opened, before anything local exists.
+/// What the recovery code, or a security key, opened before anything local
+/// exists.
 pub struct RecoveryJoin {
     pub vault_id: Uuid,
     dek: MasterDek,
-    envelope: RecoveryEnvelope,
+    /// Absent for a key join on a silo that never set up a code.
+    envelope: Option<RecoveryEnvelope>,
 }
 
 impl RecoveryJoin {
@@ -57,6 +62,58 @@ pub async fn recovery_join_begin(
         .map_err(|_| "That recovery code doesn't match this silo.".to_string())?;
     Ok(RecoveryJoin {
         vault_id: manifest.vault_id,
+        dek,
+        envelope: Some(envelope),
+    })
+}
+
+/// A silo in storage and the key envelopes a device could join it with.
+pub struct KeyJoinOffer {
+    pub vault_id: Uuid,
+    pub keys: Vec<StoredFidoCredential>,
+}
+
+/// Reads the silo a store holds and its published key envelopes. Nothing
+/// local is created.
+pub async fn key_join_begin(store: &dyn ObjectStore) -> Result<KeyJoinOffer, String> {
+    let manifest = sync::read_manifest(store)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "That bucket doesn't hold a silo.".to_string())?;
+    let keys = sync::fetch_key_envelopes(store)
+        .await
+        .map_err(|e| e.to_string())?;
+    if keys.is_empty() {
+        return Err(
+            "No keys have been published to this storage yet. Sync once from a device that has the silo."
+                .into(),
+        );
+    }
+    Ok(KeyJoinOffer {
+        vault_id: manifest.vault_id,
+        keys,
+    })
+}
+
+/// The join a key opened: `wrap_key` is what the key produced for
+/// `credential_id`. The recovery envelope comes along when there is one.
+pub async fn key_join_open(
+    store: &dyn ObjectStore,
+    offer: &KeyJoinOffer,
+    credential_id: &str,
+    wrap_key: &[u8; 32],
+) -> Result<RecoveryJoin, String> {
+    let wrapped = offer
+        .keys
+        .iter()
+        .find(|k| k.credential_id == credential_id && !k.wrapped_dek.is_empty())
+        .map(|k| k.wrapped_dek.as_str())
+        .ok_or_else(|| "That security key isn't one of this silo's keys.".to_string())?;
+    let dek = silentsilo_vault::unwrap_dek_hex(wrapped, wrap_key)
+        .map_err(|_| "That security key could not open the silo.".to_string())?;
+    let envelope = sync::fetch_recovery_envelope(store).await.ok().flatten();
+    Ok(RecoveryJoin {
+        vault_id: offer.vault_id,
         dek,
         envelope,
     })
@@ -113,7 +170,9 @@ pub async fn recovery_join_provision(
             silentsilo_vault::Authority::Machine,
         );
     }
-    save_recovery_envelope(&root, &join.envelope).map_err(|e| e.to_string())?;
+    if let Some(envelope) = &join.envelope {
+        save_recovery_envelope(&root, envelope).map_err(|e| e.to_string())?;
+    }
 
     session.backup_locally().map_err(|e| e.to_string())?;
     Ok(session)
