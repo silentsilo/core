@@ -137,6 +137,13 @@ release notes should say.
 - The recovery envelope's key derivation could ask for 1 GiB and 64 passes,
   enough to get a phone's app killed during a join. The ceiling is 256 MiB
   and 10 passes, four times what any build writes.
+- A preview checked the size a file's record states, which a phone sending
+  to the inbox sets, before reading the decrypted file whole. The decrypted
+  length is checked too.
+- The extractor wrote a second file over the first when two wanted one
+  path (a folder really named `_trash`, or two entries with the same title
+  and attachment). The second is kept beside it, and Windows device names
+  such as `CON` are written with a leading underscore.
 
 ## [1.3.0] - The shared application crate
 

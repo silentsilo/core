@@ -46,9 +46,15 @@ pub async fn read_file(
     let dir = open_scratch_dir(&silo.path);
     silentsilo_vault::create_private_dir(&dir).map_err(|e| e.to_string())?;
     let dest = dir.join(format!("preview-{}", Uuid::new_v4()));
+    // The size above is the one recorded, which a phone sending to the
+    // inbox chose; the decrypted length is checked before it is read whole.
     let decrypted = decrypt_to_file(state, host, silo, file_id, &dest)
         .await
         .and_then(|file| {
+            let len = std::fs::metadata(&dest).map_err(|e| e.to_string())?.len();
+            if len > max_bytes.max(0) as u64 {
+                return Err("This file is too large to show here.".to_string());
+            }
             std::fs::read(&dest)
                 .map(|bytes| (file, bytes))
                 .map_err(|e| e.to_string())

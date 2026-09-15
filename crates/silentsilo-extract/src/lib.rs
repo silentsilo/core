@@ -432,6 +432,10 @@ async fn write_one(
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
+    // Two things can want one path: a folder really called `_trash` or
+    // `_passwords` beside the ones written here, or two entries with the
+    // same title and attachment name. The second is kept beside the first.
+    let target = &free_path(target);
 
     // Streamed through a temporary file, because `decrypt_blob` reads from a
     // path and a blob is whatever size the user stored: holding a ten
@@ -466,9 +470,47 @@ fn safe_join(dest: &Path, relative: &str) -> Option<PathBuf> {
         if part.contains('\\') || part.contains(':') {
             return None;
         }
-        out.push(part);
+        // `CON` or `nul.txt` is a device on Windows, not a file.
+        if cfg!(windows) && reserved_on_windows(part) {
+            out.push(format!("_{part}"));
+        } else {
+            out.push(part);
+        }
     }
     out.starts_with(dest).then_some(out)
+}
+
+fn reserved_on_windows(name: &str) -> bool {
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim_end()
+        .to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.len() == 4
+            && stem.as_bytes()[3].is_ascii_digit())
+}
+
+/// `path`, or `name (2).ext` and on beside it when something is there.
+fn free_path(path: &Path) -> PathBuf {
+    if !path.exists() {
+        return path.to_path_buf();
+    }
+    let parent = path.parent().unwrap_or(Path::new(""));
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => name.split_at(i),
+        _ => (name.as_str(), ""),
+    };
+    (2..)
+        .map(|n| parent.join(format!("{stem} ({n}){ext}")))
+        .find(|candidate| !candidate.exists())
+        .expect("an unused name")
 }
 
 /// The tree as text, for the listing command.
@@ -537,5 +579,31 @@ mod safe_join_tests {
         let joined = safe_join(dest, "Acte/2026/contract.pdf").expect("an ordinary path");
         assert!(joined.starts_with(dest));
         assert!(joined.ends_with("Acte/2026/contract.pdf"));
+    }
+}
+
+#[cfg(test)]
+mod collision_tests {
+    use super::{free_path, reserved_on_windows};
+
+    #[test]
+    fn a_path_already_taken_gets_a_numbered_neighbour() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("scan.pdf");
+        assert_eq!(free_path(&first), first);
+        std::fs::write(&first, b"a").unwrap();
+        assert_eq!(free_path(&first), dir.path().join("scan (2).pdf"));
+        std::fs::write(dir.path().join("scan (2).pdf"), b"b").unwrap();
+        assert_eq!(free_path(&first), dir.path().join("scan (3).pdf"));
+    }
+
+    #[test]
+    fn device_names_are_recognised_with_or_without_an_extension() {
+        for name in ["CON", "nul.txt", "Com1", "lpt9.log", "aux "] {
+            assert!(reserved_on_windows(name), "{name}");
+        }
+        for name in ["console", "com10", "nullable.txt", "report"] {
+            assert!(!reserved_on_windows(name), "{name}");
+        }
     }
 }
