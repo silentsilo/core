@@ -379,6 +379,41 @@ What 1.0.0 does with a store holding items, its orphan sweep and its key
 rotation included, is checked by a test that runs 1.0.0's own code, and the
 byte vectors hold one real item.
 
+## Passkeys
+
+A passkey lives in a password entry, as the optional `passkey` field of the
+entry JSON that `UpsertPassword` carries whole (`silentsilo-fido/passkey.rs`):
+
+```json
+"passkey": {
+  "version": 1,
+  "rp_id": "example.com",
+  "credential_id": "<base64url, no padding>",
+  "user_handle": "<base64url>",
+  "user_name": "alice",
+  "user_display_name": "Alice",
+  "algorithm": -7,
+  "private_key": "<base64url of the 32-byte P-256 scalar>",
+  "created_at": 1789000000000
+}
+```
+
+The entry around it is a `login` whose `url` is `https://<rp_id>`; its
+`password` may be empty. The signature counter is not stored: synced
+passkeys answer 0, and a stored counter would make every sign-in a write
+that conflicts across devices.
+
+A field rather than an operation of its own, and the reason is 1.0.0's
+compaction. A record type 1.0.0 does not know is stored and skipped, but its
+snapshot leaves it out and its prune deletes it from the bucket, so a
+passkey kept that way would be gone from storage the first time a 1.0.0
+desktop compacted. A field it does not know rides inside the entry through
+replay, snapshots and edits: both frontends save an entry by spreading the
+loaded object, so fields they do not name are written back.
+
+A reader offers only passkeys whose `version` it knows and leaves the others
+in their entries. An older client shows the entry as a login.
+
 ## The index is not a format
 
 Every table in `vault.db` except `vault_meta` and `oplog` is a cache of the

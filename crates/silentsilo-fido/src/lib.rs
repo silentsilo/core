@@ -8,6 +8,8 @@ mod backend;
 pub mod ctap2;
 #[cfg(feature = "enclave")]
 pub mod enclave;
+#[cfg(feature = "passkey")]
+pub mod passkey;
 // Only the hardware backends build client data; its deps are optional and
 // follow the same feature.
 #[cfg(feature = "hardware")]

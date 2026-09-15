@@ -43,7 +43,7 @@ core-foundation = { version = "0.10", optional = true }
 objc2-local-authentication = { version = "0.3", optional = true }
 
 [features]
-default = ["hardware", "enclave", "ctap2"]
+default = ["hardware", "enclave", "ctap2", "passkey"]
 hardware = [
     "dep:rand",
     "dep:blake3",
@@ -82,6 +82,17 @@ ctap2 = [
     "dep:aes",
     "dep:cbc",
     "dep:hmac",
+]
+
+# Passkeys kept in a silo: WebAuthn's authenticator half, for the phone's
+# passkey provider.
+passkey = [
+    "dep:rand",
+    "dep:sha2",
+    "dep:p256",
+    "p256/ecdsa",
+    "dep:ciborium",
+    "dep:base64",
 ]
 
 [[example]]
