@@ -200,10 +200,24 @@ impl SoftKey {
                 assert!(
                     int_entry(&request, 5)
                         .and_then(|o| entry(o, &text("uv")))
-                        .is_none()
-                        && get(6).is_none(),
-                    "an unlock must not verify"
+                        .is_none(),
+                    "verification goes by PIN token"
                 );
+                let verified = match get(6).and_then(Value::as_bytes) {
+                    Some(auth) => {
+                        let p = get(7)
+                            .and_then(Value::as_integer)
+                            .map(i64::try_from)
+                            .unwrap()
+                            .unwrap();
+                        let cdh = get(2).and_then(Value::as_bytes).unwrap();
+                        if !Self::verify(p, &self.token, cdh, auth) {
+                            return Err(0x33);
+                        }
+                        true
+                    }
+                    None => false,
+                };
                 let found = allow.iter().find_map(|c| {
                     let id = entry(c, &text("id")).and_then(Value::as_bytes)?;
                     self.credentials
@@ -212,6 +226,7 @@ impl SoftKey {
                         .cloned()
                 });
                 let (id, cred_random) = found.ok_or(0x2Eu8)?;
+                let cred_random = Self::secret(&cred_random, verified);
                 let ext = entry(get(4).unwrap(), &text("hmac-secret")).unwrap();
                 let p = int_entry(ext, 4)
                     .and_then(Value::as_integer)
@@ -221,8 +236,11 @@ impl SoftKey {
                 let salt_enc = int_entry(ext, 2).and_then(Value::as_bytes).unwrap();
                 let salt_auth = int_entry(ext, 3).and_then(Value::as_bytes).unwrap();
                 assert!(Self::verify(p, &hmac_key, salt_enc, salt_auth), "saltAuth");
-                let salt = Self::cbc(p, &aes, salt_enc, false);
-                let output = Self::hmac(&cred_random, &salt);
+                let salts = Self::cbc(p, &aes, salt_enc, false);
+                let output: Vec<u8> = salts
+                    .chunks(32)
+                    .flat_map(|salt| Self::hmac(&cred_random, salt))
+                    .collect();
                 let mut data = sha256(RP_ID.as_bytes()).to_vec();
                 data.push(0x01 | 0x80);
                 data.extend_from_slice(&[0, 0, 0, 1]);
@@ -246,11 +264,27 @@ impl SoftKey {
         }
     }
 
+    /// `CredRandomWithUV` stands apart from the unverified one.
+    fn secret(cred_random: &[u8; 32], verified: bool) -> [u8; 32] {
+        if verified {
+            Self::hmac(cred_random, b"uv")
+        } else {
+            *cred_random
+        }
+    }
+
     /// What the silo's wrap key must be for this credential, by definition.
     fn expected_wrap_key(&self, id: &[u8]) -> [u8; 32] {
+        self.expected(id, false, false)
+    }
+
+    fn expected(&self, id: &[u8], verified: bool, prf: bool) -> [u8; 32] {
         let (_, cred_random) = self.credentials.iter().find(|(k, _)| k == id).unwrap();
-        let salt = sha256(format!("silentsilo-dek-v1:{VAULT}").as_bytes());
-        *blake3::hash(&Self::hmac(cred_random, &salt)).as_bytes()
+        let mut salt = sha256(format!("silentsilo-dek-v1:{VAULT}").as_bytes());
+        if prf {
+            salt = sha256(&[b"WebAuthn PRF\x00".as_slice(), &salt].concat());
+        }
+        *blake3::hash(&Self::hmac(&Self::secret(cred_random, verified), &salt)).as_bytes()
     }
 }
 
@@ -492,4 +526,54 @@ fn over_usb_messages_span_reports_and_keepalives_are_waited_out() {
     let unlocked =
         derive_unlock_material(&mut hid, std::slice::from_ref(&made.credential_id), VAULT).unwrap();
     assert_eq!(unlocked.credential_id, made.credential_id);
+}
+
+#[test]
+fn a_silo_wrapped_by_a_platform_that_verified_opens_with_the_pin() {
+    let mut key = SoftKey::new(&[2, 1]);
+    key.pin = Some("4821".into());
+    let made = make_credential(&mut key, VAULT, Some("4821")).unwrap();
+    let ids = std::slice::from_ref(&made.credential_id);
+
+    let plain = unlock_candidates(&mut key, ids, VAULT, None).unwrap();
+    assert!(!plain.verified && plain.pin_set);
+    let shapes = |c: &UnlockCandidates| {
+        c.wrap_keys
+            .iter()
+            .map(|(s, k)| (*s, **k))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        shapes(&plain),
+        vec![
+            (
+                SaltShape::Raw,
+                key.expected(&made.credential_id, false, false)
+            ),
+            (
+                SaltShape::Prf,
+                key.expected(&made.credential_id, false, true)
+            ),
+        ]
+    );
+
+    let with_pin = unlock_candidates(&mut key, ids, VAULT, Some("4821")).unwrap();
+    assert!(with_pin.verified);
+    assert_eq!(
+        shapes(&with_pin),
+        vec![
+            (
+                SaltShape::Raw,
+                key.expected(&made.credential_id, true, false)
+            ),
+            (
+                SaltShape::Prf,
+                key.expected(&made.credential_id, true, true)
+            ),
+        ]
+    );
+    assert!(matches!(
+        unlock_candidates(&mut key, ids, VAULT, Some("0000")),
+        Err(CtapError::PinInvalid)
+    ));
 }

@@ -326,6 +326,8 @@ pub struct Info {
     pub pin_set: bool,
     /// Largest allow-list the key takes at once.
     pub max_credentials_in_list: usize,
+    /// Longest credential id the key takes.
+    pub max_credential_id_length: Option<usize>,
 }
 
 impl Info {
@@ -379,12 +381,16 @@ pub fn get_info(dev: &mut dyn Ctap) -> Result<Info, CtapError> {
         .and_then(|i| usize::try_from(i).ok())
         .filter(|n| *n > 0)
         .unwrap_or(1);
+    let max_credential_id_length = int_entry(&answer, 8)
+        .and_then(Value::as_integer)
+        .and_then(|i| usize::try_from(i).ok());
     Ok(Info {
         versions: strings(1),
         extensions: strings(2),
         pin_protocols,
         pin_set: option("clientPin") == Some(true),
         max_credentials_in_list,
+        max_credential_id_length,
     })
 }
 
@@ -393,15 +399,59 @@ fn silo_salt(vault_id: &str) -> [u8; 32] {
     sha256(dek_salt_for_vault(vault_id).as_bytes())
 }
 
-/// Touch or tap: asks the key for the wrap key of whichever of
-/// `credential_ids` it holds. Unverified, like every other platform's
-/// unlock: `hmac-secret` keeps a separate secret for verified assertions,
-/// and a PIN here would reach one the silo was never wrapped under.
+/// What was given to `hmac-secret` as the salt when the silo was wrapped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaltShape {
+    /// SHA-256 of `silentsilo-dek-v1:{vault_id}`, as CTAP receives it.
+    Raw,
+    /// The same bytes as a WebAuthn PRF input, which a platform hashes again
+    /// before the key sees them.
+    Prf,
+}
+
+/// Wrap keys one assertion produced, one per salt shape, for the caller to
+/// try against the silo's envelope.
+pub struct UnlockCandidates {
+    pub credential_id: Vec<u8>,
+    /// Asserted with the PIN, which reaches the key's other secret.
+    pub verified: bool,
+    /// The key has a PIN, so a verified assertion is possible.
+    pub pin_set: bool,
+    pub wrap_keys: Vec<(SaltShape, Zeroizing<[u8; 32]>)>,
+}
+
+/// Touch or tap: the raw-salt, unverified wrap key of whichever of
+/// `credential_ids` the key holds.
 pub fn derive_unlock_material(
     dev: &mut dyn Ctap,
     credential_ids: &[Vec<u8>],
     vault_id: &str,
 ) -> Result<UnlockMaterial, CtapError> {
+    let found = unlock_candidates(dev, credential_ids, vault_id, None)?;
+    let (_, key) = found
+        .wrap_keys
+        .iter()
+        .find(|(shape, _)| *shape == SaltShape::Raw)
+        .ok_or_else(|| CtapError::Protocol("no raw hmac-secret output".into()))?;
+    Ok(UnlockMaterial {
+        wrap_key: **key,
+        credential_id: found.credential_id,
+    })
+}
+
+/// One assertion asking `hmac-secret` for both salt shapes at once.
+///
+/// `hmac-secret` keeps two secrets per credential, one for assertions with
+/// user verification and one without, so a silo wrapped where the platform
+/// verified (a computer that asked for the key's PIN) opens only with `pin`
+/// given here too. Which shape and which secret the silo was wrapped under
+/// is found by trying the candidates against its envelope.
+pub fn unlock_candidates(
+    dev: &mut dyn Ctap,
+    credential_ids: &[Vec<u8>],
+    vault_id: &str,
+    pin: Option<&str>,
+) -> Result<UnlockCandidates, CtapError> {
     if credential_ids.is_empty() {
         return Err(CtapError::NoCredentials);
     }
@@ -410,11 +460,26 @@ pub fn derive_unlock_material(
         return Err(CtapError::Unsupported("it has no hmac-secret".into()));
     }
     let protocol = info.protocol()?;
-    let salt = silo_salt(vault_id);
+    let raw = silo_salt(vault_id);
+    let prf = sha256(&[b"WebAuthn PRF\x00".as_slice(), &raw].concat());
+    let salts = [raw.as_slice(), &prf].concat();
+    // An id longer than the key takes cannot be one of its own.
+    let fitting: Vec<Vec<u8>> = credential_ids
+        .iter()
+        .filter(|id| {
+            info.max_credential_id_length
+                .is_none_or(|max| id.len() <= max)
+        })
+        .cloned()
+        .collect();
+    let token = match pin {
+        Some(pin) => Some(pin_token(dev, protocol, pin)?),
+        None => None,
+    };
 
-    for batch in credential_ids.chunks(info.max_credentials_in_list) {
+    for batch in fitting.chunks(info.max_credentials_in_list) {
         let shared = Shared::agree(dev, protocol)?;
-        let salt_enc = shared.encrypt(&salt);
+        let salt_enc = shared.encrypt(&salts);
         let salt_auth = shared.authenticate(shared.hmac_key.as_ref(), &salt_enc);
         let mut hmac_secret = vec![
             (int(1), shared.platform_key.clone()),
@@ -433,16 +498,25 @@ pub fn derive_unlock_material(
                 ])
             })
             .collect();
-        let request = map(vec![
+        let client_data_hash = sha256(&random_bytes::<32>());
+        let mut request = vec![
             (int(1), text(RP_ID)),
-            (int(2), bytes(&sha256(&random_bytes::<32>()))),
+            (int(2), bytes(&client_data_hash)),
             (int(3), Value::Array(allow)),
             (int(4), map(vec![(text("hmac-secret"), map(hmac_secret))])),
             (int(5), map(vec![(text("up"), Value::Bool(true))])),
-        ]);
-        let answer = match dev.command(CMD_GET_ASSERTION, &encode(&request)) {
+        ];
+        if let Some((token_run, token)) = &token {
+            request.push((
+                int(6),
+                bytes(&token_run.authenticate(token, &client_data_hash)),
+            ));
+            request.push((int(7), int(protocol as i64)));
+        }
+        let answer = match dev.command(CMD_GET_ASSERTION, &encode(&map(request))) {
             Err(CtapError::NoCredentials) => continue,
-            other => decode(&other?)?,
+            Err(e) => return Err(e),
+            Ok(answer) => decode(&answer)?,
         };
 
         // The key may leave the credential out when the list named one.
@@ -455,24 +529,50 @@ pub fn derive_unlock_material(
         let auth_data = int_entry(&answer, 2)
             .and_then(Value::as_bytes)
             .ok_or_else(|| CtapError::Protocol("no authenticator data".into()))?;
-        let extensions = parse_auth_data(auth_data)?.extensions.ok_or_else(|| {
-            CtapError::Unsupported("the key returned no hmac-secret for this credential".into())
-        })?;
+        let missing =
+            || CtapError::Unsupported("the key returned no hmac-secret for this credential".into());
+        let extensions = parse_auth_data(auth_data)?.extensions.ok_or_else(missing)?;
         let sealed = entry(&extensions, &text("hmac-secret"))
             .and_then(Value::as_bytes)
-            .ok_or_else(|| {
-                CtapError::Unsupported("the key returned no hmac-secret for this credential".into())
-            })?;
+            .ok_or_else(missing)?;
         let output = shared.decrypt(sealed)?;
-        if output.len() < 32 {
+        if output.len() < 64 {
             return Err(CtapError::Protocol("hmac-secret output too short".into()));
         }
-        return Ok(UnlockMaterial {
-            wrap_key: *blake3::hash(&output[..32]).as_bytes(),
+        let wrap = |part: &[u8]| Zeroizing::new(*blake3::hash(part).as_bytes());
+        return Ok(UnlockCandidates {
             credential_id,
+            verified: token.is_some(),
+            pin_set: info.pin_set,
+            wrap_keys: vec![
+                (SaltShape::Raw, wrap(&output[..32])),
+                (SaltShape::Prf, wrap(&output[32..64])),
+            ],
         });
     }
     Err(CtapError::NoCredentials)
+}
+
+/// A PIN token, and the protocol run that authenticates with it.
+fn pin_token(
+    dev: &mut dyn Ctap,
+    protocol: u8,
+    pin: &str,
+) -> Result<(Shared, Zeroizing<Vec<u8>>), CtapError> {
+    let shared = Shared::agree(dev, protocol)?;
+    let pin_hash = sha256(pin.as_bytes());
+    let request = map(vec![
+        (int(1), int(protocol as i64)),
+        (int(2), int(PIN_GET_PIN_TOKEN)),
+        (int(3), shared.platform_key.clone()),
+        (int(6), bytes(&shared.encrypt(&pin_hash[..16]))),
+    ]);
+    let answer = decode(&dev.command(CMD_CLIENT_PIN, &encode(&request))?)?;
+    let sealed = int_entry(&answer, 2)
+        .and_then(Value::as_bytes)
+        .ok_or_else(|| CtapError::Protocol("no PIN token".into()))?;
+    let token = shared.decrypt(sealed)?;
+    Ok((shared, token))
 }
 
 /// A credential made for a silo.
@@ -483,9 +583,10 @@ pub struct NewCredential {
     pub public_key: Vec<u8>,
 }
 
-/// Makes a credential with `hmac-secret` for the silo. `pin` only when the
-/// key answered [`CtapError::PinRequired`]: verifying here does not change
-/// which secret unlock reaches later.
+/// Makes a credential with `hmac-secret` for the silo. A key with a PIN
+/// needs it: Windows verifies every ceremony on such a key, so the wrap key
+/// must come from a verified assertion too, or the computer could not open
+/// what the phone enrolled.
 pub fn make_credential(
     dev: &mut dyn Ctap,
     vault_id: &str,
@@ -495,24 +596,15 @@ pub fn make_credential(
     if !info.hmac_secret() {
         return Err(CtapError::Unsupported("it has no hmac-secret".into()));
     }
+    if info.pin_set && pin.is_none() {
+        return Err(CtapError::PinRequired);
+    }
     let protocol = info.protocol()?;
     let client_data_hash = sha256(&random_bytes::<32>());
 
     let pin_auth = match pin {
         Some(pin) => {
-            let shared = Shared::agree(dev, protocol)?;
-            let pin_hash = sha256(pin.as_bytes());
-            let request = map(vec![
-                (int(1), int(protocol as i64)),
-                (int(2), int(PIN_GET_PIN_TOKEN)),
-                (int(3), shared.platform_key.clone()),
-                (int(6), bytes(&shared.encrypt(&pin_hash[..16]))),
-            ]);
-            let answer = decode(&dev.command(CMD_CLIENT_PIN, &encode(&request))?)?;
-            let sealed = int_entry(&answer, 2)
-                .and_then(Value::as_bytes)
-                .ok_or_else(|| CtapError::Protocol("no PIN token".into()))?;
-            let token = shared.decrypt(sealed)?;
+            let (shared, token) = pin_token(dev, protocol, pin)?;
             Some(shared.authenticate(&token, &client_data_hash))
         }
         None => None,
