@@ -420,6 +420,21 @@ impl<'a> Vfs<'a> {
             .map_err(|e| CoreError::Database(e.to_string()))
     }
 
+    /// The content a file with this id records, trashed included. None when
+    /// no such file was ever recorded here.
+    pub fn recorded_blob(&self, id: Uuid) -> CoreResult<Option<Uuid>> {
+        let raw: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT blob_id FROM files WHERE id = ?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        raw.map(|raw| parse_id(&raw)).transpose()
+    }
+
     /// Whether a file with this id was ever recorded here, trashed included.
     pub fn file_id_known(&self, id: Uuid) -> CoreResult<bool> {
         self.conn()

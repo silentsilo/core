@@ -242,3 +242,36 @@ async fn a_published_key_joins_the_silo_and_a_wrong_wrap_key_leaves_nothing() {
     // The recovery envelope came along, so the code opens this copy too.
     assert!(silentsilo_vault::load_recovery_envelope(&root).is_ok());
 }
+
+#[tokio::test]
+async fn a_removed_key_whose_envelope_came_back_does_not_join() {
+    let origin = origin().await;
+    let store = FolderStore::new(origin.storage.clone());
+    let offer = key_join_begin(&store).await.unwrap();
+    let joined = key_join_open(&store, &offer, "aa11", &[7; 32])
+        .await
+        .unwrap();
+
+    // Another device removed it and wrote the marker; the envelope stayed.
+    let sealed = silentsilo_sync::fetch_content_kek(&store)
+        .await
+        .unwrap()
+        .unwrap();
+    let kek = silentsilo_vault::unwrap_kek_bytes(&sealed, joined.dek()).unwrap();
+    let mut keys = offer.keys.clone();
+    for key in &mut keys {
+        key.revoked = key.credential_id == "aa11";
+    }
+    let mut local = silentsilo_vault::StoredFidoKeys { keys };
+    silentsilo_sync::reconcile_key_envelopes(&store, &kek, &mut local, 0)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        key_join_open(&store, &offer, "aa11", &[7; 32])
+            .await
+            .err()
+            .unwrap(),
+        "That security key was removed from this silo."
+    );
+}

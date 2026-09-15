@@ -111,6 +111,20 @@ pub async fn key_join_open(
         .ok_or_else(|| "That security key isn't one of this silo's keys.".to_string())?;
     let dek = silentsilo_vault::unwrap_dek_hex(wrapped, wrap_key)
         .map_err(|_| "That security key could not open the silo.".to_string())?;
+    // A removed key's envelope can come back: a device that had not heard
+    // of the removal publishes it again. The revocation marker decides.
+    if let Some(sealed) = sync::fetch_content_kek(store)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        let kek = silentsilo_vault::unwrap_kek_bytes(&sealed, &dek).map_err(|e| e.to_string())?;
+        if sync::is_key_revoked(store, &kek, credential_id)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            return Err("That security key was removed from this silo.".into());
+        }
+    }
     let envelope = sync::fetch_recovery_envelope(store).await.ok().flatten();
     Ok(RecoveryJoin {
         vault_id: offer.vault_id,

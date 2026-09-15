@@ -44,6 +44,25 @@ fn marker_key(credential_id: &str) -> String {
     format!("{REVOKED_PREFIX}{credential_id}.sealed")
 }
 
+/// Whether storage holds a marker revoking `credential_id` that opens with
+/// `kek`. One that does not open proves nothing: anyone holding the storage
+/// credentials can write an object there.
+pub async fn is_key_revoked(
+    client: &dyn ObjectStore,
+    kek: &ContentKek,
+    credential_id: &str,
+) -> Result<bool, SyncError> {
+    let key = marker_key(credential_id);
+    if client.head(&key).await?.is_none() {
+        return Ok(false);
+    }
+    let bytes = client.get(&key).await?;
+    Ok(unseal_with_key(&bytes, kek.as_bytes())
+        .ok()
+        .and_then(|plain| serde_json::from_slice::<RevocationMarker>(&plain).ok())
+        .is_some_and(|m| m.credential_id == credential_id))
+}
+
 /// What one reconciliation changed.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct KeyReconcile {

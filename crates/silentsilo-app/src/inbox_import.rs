@@ -66,6 +66,18 @@ pub async fn import_inbox(
     progress: &(dyn Fn(usize, usize) + Sync),
 ) -> InboxOutcome {
     let mut outcome = InboxOutcome::default();
+    // Content ids the silo already uses. An item naming one would be copied
+    // over that content, so it is refused instead.
+    let mut referenced = std::collections::HashSet::new();
+    if silo
+        .with_vfs(&mut |vfs| {
+            referenced = vfs.referenced_blobs_with_attachments()?;
+            Ok(())
+        })
+        .is_err()
+    {
+        return outcome;
+    }
     for target in targets {
         let scan = match scan_inbox(target.store, vault_id, kek).await {
             Ok(scan) => scan,
@@ -87,10 +99,10 @@ pub async fn import_inbox(
         // import at once must record in the same order to agree on names.
         for (done, item) in scan.ready.into_iter().enumerate() {
             progress(done, total);
-            let mut known = false;
+            let mut recorded = None;
             if silo
                 .with_vfs(&mut |vfs| {
-                    known = vfs.file_id_known(item.item_id)?;
+                    recorded = vfs.recorded_blob(item.item_id)?;
                     Ok(())
                 })
                 .is_err()
@@ -98,13 +110,23 @@ pub async fn import_inbox(
                 // Locked while the pass ran.
                 return outcome;
             }
-            if known {
+            if let Some(recorded) = recorded {
+                // Copied back only over the content this item's own record
+                // names. A record with other content has no use for it.
                 if target.may_finish
-                    && ensure_staged(target.store, &item, warn, target.label).await
+                    && (recorded != item.blob_id
+                        || ensure_staged(target.store, &item, warn, target.label).await)
                     && let Err(e) = finish_item(target.store, item.item_id).await
                 {
                     warn(&format!("{}: {e}", target.label));
                 }
+                continue;
+            }
+            if referenced.contains(&item.blob_id) {
+                outcome.refused.push(format!(
+                    "{}: {} (its content id belongs to another file)",
+                    target.label, item.name
+                ));
                 continue;
             }
 
@@ -162,6 +184,7 @@ pub async fn import_inbox(
                 warn(&format!("{}: {e}", item.name));
                 continue;
             }
+            referenced.insert(item.blob_id);
             if added {
                 outcome.imported += 1;
             }

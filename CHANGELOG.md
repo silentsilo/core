@@ -78,6 +78,11 @@ release notes should say.
   checked, and copied again, before the item goes.
 - Content another device already copied out of the inbox is not copied
   again.
+- An inbox item naming a content id the silo already uses is refused
+  rather than copied over that content, and an item already recorded is
+  copied back only over the content its own record names.
+- `flows::key_join_open` refuses a key whose revocation marker is in
+  storage, even when its envelope was published again.
 
 ## [1.3.0] - The shared application crate
 

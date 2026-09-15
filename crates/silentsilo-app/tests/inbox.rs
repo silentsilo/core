@@ -396,3 +396,42 @@ async fn an_envelope_whose_content_is_gone_is_removed_so_the_phone_can_send_agai
             .unwrap()
     );
 }
+
+#[tokio::test]
+async fn an_item_naming_content_another_file_holds_is_refused_and_copies_nothing_over_it() {
+    let storage = tempfile::tempdir().unwrap();
+    let host = Targets(vec![folder_target(&storage)]);
+    let store = FolderStore::new(storage.path().to_path_buf());
+    let device = Device::new(&host).await;
+    let phone = phone(&store, &device, "aa11").await;
+    let item_id = send_photo(&store, &phone, b"a photo").await;
+
+    // A file already recorded over the content id the item names.
+    let scan = silentsilo_sync::inbox::scan_inbox(&store, device.silo.id, &device.kek())
+        .await
+        .unwrap();
+    let blob_id = scan.ready[0].blob_id;
+    let blob = format!("blobs/{blob_id}.sslo");
+    store.put(&blob, b"mine".to_vec()).await.unwrap();
+    {
+        let sessions = device.state.sessions.lock().unwrap();
+        let vfs = Vfs::new(&sessions[&device.silo.id]);
+        let root = vfs.root_folder_id().unwrap();
+        vfs.add_file(root, "mine.txt", blob_id, 4, "h", None, "k")
+            .unwrap();
+    }
+
+    for _ in 0..2 {
+        let report = device.pass(&host).await;
+        assert_eq!(report.inbox_imported, 0);
+        assert_eq!(report.inbox_refused.len(), 1);
+    }
+    assert_eq!(store.get(&blob).await.unwrap(), b"mine");
+    assert!(store.head(&envelope(item_id)).await.unwrap().is_some());
+    let sessions = device.state.sessions.lock().unwrap();
+    assert!(
+        !Vfs::new(&sessions[&device.silo.id])
+            .file_id_known(item_id)
+            .unwrap()
+    );
+}
