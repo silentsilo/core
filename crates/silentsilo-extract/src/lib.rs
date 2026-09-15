@@ -134,6 +134,16 @@ pub fn passwords_csv(backup: &Backup) -> Option<String> {
     Some(format!("{}\n", lines.join("\n")))
 }
 
+/// The password entries whole, as the silo keeps them: what a CSV has no
+/// column for (passkeys, cards, identities, custom fields) is here.
+/// `None` when there are no entries.
+pub fn passwords_json(backup: &Backup) -> Option<String> {
+    if backup.passwords.is_empty() {
+        return None;
+    }
+    serde_json::to_string_pretty(&backup.passwords).ok()
+}
+
 #[derive(Debug)]
 pub enum ExtractError {
     Storage(String),
@@ -299,8 +309,9 @@ pub struct Extracted {
 }
 
 /// Writes every file out under `dest`, rebuilding the folder structure.
-/// Password entries land beside them, in `_passwords/passwords.csv`, in
-/// plaintext, with their attachments under `_passwords/attachments/`: the
+/// Password entries land beside them, in `_passwords/passwords.csv` and
+/// whole in `_passwords/entries.json`, in plaintext, with their attachments
+/// under `_passwords/attachments/`: the
 /// situation this runs in is a machine that is gone, and the logins are as
 /// much the owner's as the files.
 pub async fn extract(
@@ -312,7 +323,7 @@ pub async fn extract(
     let mut out = Extracted::default();
     let attachments = backup.attachments();
     let total =
-        backup.entries.len() + attachments.len() + usize::from(!backup.passwords.is_empty());
+        backup.entries.len() + attachments.len() + 2 * usize::from(!backup.passwords.is_empty());
     let mut done = 0;
 
     for entry in &backup.entries {
@@ -350,6 +361,19 @@ pub async fn extract(
             Err(e) => out
                 .failed
                 .push(("_passwords/passwords.csv".into(), e.to_string())),
+        }
+    }
+    if let Some(json) = passwords_json(backup) {
+        progress(done, total, "_passwords/entries.json");
+        done += 1;
+        let dir = dest.join("_passwords");
+        let write = std::fs::create_dir_all(&dir)
+            .and_then(|()| std::fs::write(dir.join("entries.json"), json));
+        match write {
+            Ok(()) => out.written += 1,
+            Err(e) => out
+                .failed
+                .push(("_passwords/entries.json".into(), e.to_string())),
         }
     }
 

@@ -276,6 +276,11 @@ async fn passwords_and_attachments_come_out_with_the_files() {
     assert!(csv.starts_with("name,url,username,password,totp,category,note\n"));
     assert!(csv.contains("\"example.com\""), "{csv}");
     assert!(csv.contains("\"hunter2\""), "{csv}");
+    let whole: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out_dir.path().join("_passwords").join("entries.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(whole[0]["password"], "hunter2");
 
     assert_eq!(
         std::fs::read(

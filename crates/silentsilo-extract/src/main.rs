@@ -142,8 +142,9 @@ async fn run(args: Args, from: PathBuf, code: String) -> ExitCode {
             println!("Wrote {} files to {}", out.written, dest.display());
             if backup.password_count() > 0 {
                 println!(
-                    "The password entries are in _passwords/passwords.csv, in PLAIN TEXT. \
-                     Import them into a password manager and delete the file."
+                    "The password entries are in _passwords/passwords.csv, and whole \
+                     (passkeys, cards and all) in _passwords/entries.json, in PLAIN TEXT. \
+                     Import them into a password manager and delete both files."
                 );
             }
             if out.failed.is_empty() {

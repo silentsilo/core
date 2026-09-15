@@ -83,6 +83,9 @@ release notes should say.
   copied back only over the content its own record names.
 - `flows::key_join_open` refuses a key whose revocation marker is in
   storage, even when its envelope was published again.
+- The extractor wrote password entries only as CSV, which has no column
+  for passkeys, cards or identities. They are also written whole, to
+  `_passwords/entries.json`.
 
 ## [1.3.0] - The shared application crate
 
