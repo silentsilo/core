@@ -1137,6 +1137,207 @@ impl<'a> Vfs<'a> {
         self.get_folder(folder_id)
     }
 
+    /// Moves a file into another folder.
+    ///
+    /// There is no move record, and one would not be safe to add: a record
+    /// type 1.0.0 does not know is dropped by its compaction, so a move made
+    /// here would come undone for anyone restoring from its snapshot. Built
+    /// from records every version applies instead: the file recorded again
+    /// under a new id in the destination, over the same content, and the old
+    /// record purged. The content is not copied and stays referenced
+    /// throughout. An edit another device makes to the old file before it
+    /// hears of the move lands on the purged record and is lost; the same
+    /// happens today to an edit of a file someone else deleted.
+    pub fn move_file(&self, file_id: Uuid, folder_id: Uuid) -> CoreResult<FileEntry> {
+        let file = self.get_file(file_id)?;
+        if file.folder_id == folder_id {
+            return Ok(file);
+        }
+        let _destination = self.get_folder(folder_id)?;
+        let new_id = self.copy_file_row(file_id, folder_id)?;
+        self.trash_file(file_id)?;
+        self.purge_items(&[file_id])?;
+        self.get_file(new_id)
+    }
+
+    /// Moves a folder, and everything in it, into another folder. Built the
+    /// way [`Self::move_file`] is: the tree recorded again under new ids,
+    /// trashed entries included and trashed again, then the old tree purged.
+    pub fn move_folder(&self, folder_id: Uuid, parent_id: Uuid) -> CoreResult<FolderEntry> {
+        let db = |e: rusqlite::Error| CoreError::Database(e.to_string());
+        let folder = self.get_folder(folder_id)?;
+        if folder.path == "/" || folder.path == "/Inbox" {
+            return Err(CoreError::InvalidPath("protected folder".into()));
+        }
+        if folder.parent_id == Some(parent_id) {
+            return Ok(folder);
+        }
+        let destination = self.get_folder(parent_id)?;
+        if destination.path == folder.path
+            || destination.path.starts_with(&format!("{}/", folder.path))
+        {
+            return Err(CoreError::InvalidPath(
+                "a folder cannot move into itself".into(),
+            ));
+        }
+
+        // The tree, parents before children, trashed rows included.
+        let subtree = crate::like::subtree(&folder.path);
+        let mut stmt = self
+            .conn()
+            .prepare(
+                "SELECT id, parent_id, name, deleted_at IS NOT NULL, favorite FROM folders
+                  WHERE id = ?1 OR path LIKE ?2 ESCAPE '!'
+                  ORDER BY length(path)",
+            )
+            .map_err(db)?;
+        let folders: Vec<(Uuid, Option<Uuid>, String, bool, bool)> = stmt
+            .query_map(params![folder_id.to_string(), &subtree], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, i64>(4)? != 0,
+                ))
+            })
+            .map_err(db)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db)?
+            .into_iter()
+            .map(|(id, parent, name, trashed, favorite)| {
+                Ok((
+                    parse_id(&id)?,
+                    parent.as_deref().map(parse_id).transpose()?,
+                    name,
+                    trashed,
+                    favorite,
+                ))
+            })
+            .collect::<CoreResult<_>>()?;
+        drop(stmt);
+
+        let mut mapped: std::collections::HashMap<Uuid, Uuid> = std::collections::HashMap::new();
+        let mut trashed_copies: Vec<(Uuid, bool)> = Vec::new();
+        for (old, parent, name, trashed, favorite) in &folders {
+            let new_parent = if *old == folder_id {
+                parent_id
+            } else {
+                *parent.and_then(|p| mapped.get(&p)).ok_or_else(|| {
+                    CoreError::Invalid("a folder outside the tree being moved".into())
+                })?
+            };
+            let new_id = Uuid::now_v7();
+            crate::oplog::emit(
+                self.conn(),
+                crate::oplog::VaultOp::CreateFolder {
+                    id: new_id,
+                    parent_id: new_parent,
+                    name: name.clone(),
+                },
+            )?;
+            if *favorite {
+                self.set_folder_favorite(new_id, true)?;
+            }
+            mapped.insert(*old, new_id);
+            if *trashed {
+                trashed_copies.push((new_id, true));
+            }
+        }
+
+        let mut stmt = self
+            .conn()
+            .prepare(
+                "SELECT f.id, f.folder_id, f.deleted_at IS NOT NULL FROM files f
+                   JOIN folders d ON d.id = f.folder_id
+                  WHERE d.id = ?1 OR d.path LIKE ?2 ESCAPE '!'",
+            )
+            .map_err(db)?;
+        let files: Vec<(String, String, bool)> = stmt
+            .query_map(params![folder_id.to_string(), &subtree], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(db)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db)?;
+        drop(stmt);
+        for (id, parent, trashed) in files {
+            let (id, parent) = (parse_id(&id)?, parse_id(&parent)?);
+            let new_folder = *mapped
+                .get(&parent)
+                .ok_or_else(|| CoreError::Invalid("a file outside the tree being moved".into()))?;
+            let new_id = self.copy_file_row(id, new_folder)?;
+            if trashed {
+                trashed_copies.push((new_id, false));
+            }
+        }
+
+        // Trashed deepest first is not needed: trashing a folder trashes
+        // what is under it, and a file already trashed stays trashed.
+        for (id, is_folder) in trashed_copies {
+            let op = if is_folder {
+                crate::oplog::VaultOp::TrashFolder { id }
+            } else {
+                crate::oplog::VaultOp::TrashFile { id }
+            };
+            crate::oplog::emit(self.conn(), op)?;
+        }
+
+        self.trash_folder(folder_id)?;
+        self.purge_items(&[folder_id])?;
+        bump_revision(self.conn()).map_err(|e| CoreError::Database(e.to_string()))?;
+        self.get_folder(mapped[&folder_id])
+    }
+
+    /// Records a file again under a new id in `folder_id`, over the same
+    /// content and content key, keeping its star. Returns the new id.
+    fn copy_file_row(&self, file_id: Uuid, folder_id: Uuid) -> CoreResult<Uuid> {
+        let (name, blob_id, size_bytes, mime_type, content_hash, favorite): (
+            String,
+            String,
+            i64,
+            Option<String>,
+            Option<String>,
+            i64,
+        ) = self
+            .conn()
+            .query_row(
+                "SELECT name, blob_id, size_bytes, mime_type, content_hash, favorite
+                   FROM files WHERE id = ?1",
+                [file_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .map_err(|_| CoreError::NotFound(file_id.to_string()))?;
+        let blob_key = self.blob_key(file_id)?;
+        let new_id = Uuid::now_v7();
+        crate::oplog::emit(
+            self.conn(),
+            crate::oplog::VaultOp::AddFile {
+                id: new_id,
+                folder_id,
+                name,
+                blob_id: parse_id(&blob_id)?,
+                size_bytes,
+                content_hash: content_hash.unwrap_or_default(),
+                mime_type,
+                blob_key,
+            },
+        )?;
+        if favorite != 0 {
+            self.set_file_favorite(new_id, true)?;
+        }
+        Ok(new_id)
+    }
+
     pub fn trash_file(&self, file_id: Uuid) -> CoreResult<()> {
         let (_record, outcome) = crate::oplog::emit(
             self.conn(),
@@ -1886,6 +2087,72 @@ mod tests {
         assert_ne!(in_root.id, in_docs.id);
         assert_eq!(vfs.get_file(in_root.id).unwrap().size_bytes, 100);
         assert_eq!(vfs.get_file(in_docs.id).unwrap().size_bytes, 200);
+    }
+
+    #[test]
+    fn moving_keeps_the_content_and_takes_everything_under_a_folder_along() {
+        let (_dir, session) = new_session();
+        let vfs = Vfs::new(&session);
+        let root = vfs.root_folder_id().unwrap();
+        let docs = vfs.create_folder(root, "Docs").unwrap();
+        let taxes = vfs.create_folder(docs.id, "Taxes").unwrap();
+        let archive = vfs.create_folder(root, "Archive").unwrap();
+        let blob = Uuid::new_v4();
+        let kept = vfs
+            .add_file(
+                taxes.id,
+                "2025.pdf",
+                blob,
+                10,
+                "h",
+                Some("application/pdf"),
+                "wrapped",
+            )
+            .unwrap();
+        vfs.set_file_favorite(kept.id, true).unwrap();
+        let gone = vfs
+            .add_file(taxes.id, "old.pdf", Uuid::new_v4(), 5, "h2", None, "w2")
+            .unwrap();
+        vfs.trash_file(gone.id).unwrap();
+
+        assert!(
+            vfs.move_folder(docs.id, taxes.id).is_err(),
+            "not into itself"
+        );
+        let moved = vfs.move_folder(docs.id, archive.id).unwrap();
+        assert_eq!(moved.path, "/Archive/Docs");
+        let names = |id| {
+            vfs.list_folder(id)
+                .unwrap()
+                .into_iter()
+                .map(|e| match e {
+                    silentsilo_core::VaultEntry::Folder(f) => (f.name, f.id),
+                    silentsilo_core::VaultEntry::File(f) => (f.name, f.id),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(names(root).iter().all(|(n, _)| n != "Docs"));
+        let taxes_now = names(moved.id)[0].1;
+        let files = names(taxes_now);
+        assert_eq!(
+            files.len(),
+            1,
+            "the trashed file stays in the trash: {files:?}"
+        );
+        let file = vfs.get_file(files[0].1).unwrap();
+        assert_eq!((file.blob_id, file.favorite), (blob, true));
+        assert_eq!(vfs.blob_key(file.id).unwrap(), "wrapped");
+        assert!(vfs.list_trash().unwrap().iter().any(
+            |t| matches!(&t.entry, silentsilo_core::VaultEntry::File(f) if f.name == "old.pdf")
+        ));
+
+        let back = vfs.move_file(file.id, root).unwrap();
+        assert_eq!((back.folder_id, back.blob_id), (root, blob));
+        assert!(
+            vfs.referenced_blobs_with_attachments()
+                .unwrap()
+                .contains(&blob)
+        );
     }
 
     #[test]

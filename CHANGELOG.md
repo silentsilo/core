@@ -13,6 +13,10 @@ release notes should say.
 
 ### Added
 
+- `Vfs::move_file` and `move_folder`, built from records every version
+  applies (the entry recorded again in the destination over the same
+  content, then the old record purged), not a new record type that a 1.0.0
+  compaction would drop.
 - `silentsilo_fido::passkey`: passkeys kept in a silo, as a `passkey`
   field inside a password entry (`FORMATS.md`, Passkeys). Makes ES256
   passkeys with "none" attestation and signs sign-ins with a zero counter.
