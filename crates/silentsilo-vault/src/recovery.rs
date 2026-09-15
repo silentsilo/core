@@ -126,7 +126,7 @@ pub fn seal_under_code_for_fixtures(
 fn seal_under_code(dek: &MasterDek, code: &str) -> Result<RecoveryEnvelope, VaultError> {
     let salt: [u8; 16] = rand::random();
     let kdf = KdfParams::recovery_code();
-    let key = kdf.derive(normalize_code(code).as_bytes(), &salt)?;
+    let key = zeroize::Zeroizing::new(kdf.derive(normalize_code(code).as_bytes(), &salt)?);
     let wrapped = wrap_dek_bytes(dek, &key)?;
 
     Ok(RecoveryEnvelope {
@@ -153,9 +153,11 @@ pub fn unwrap_with_code(envelope: &RecoveryEnvelope, code: &str) -> Result<Maste
         )));
     }
     let salt = hex::decode(&envelope.salt).map_err(|_| VaultError::InvalidCredentials)?;
-    let key = envelope
-        .kdf
-        .derive(normalize_code(code).as_bytes(), &salt)?;
+    let key = zeroize::Zeroizing::new(
+        envelope
+            .kdf
+            .derive(normalize_code(code).as_bytes(), &salt)?,
+    );
     unwrap_dek_hex(&envelope.wrapped_dek, &key)
 }
 

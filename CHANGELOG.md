@@ -156,6 +156,9 @@ release notes should say.
 - A USB security key answering every channel request with the wrong nonce
   kept the setup going for good, and a short authenticator answer could
   crash Windows enrolment. Both are bounded.
+- The key derived from a recovery code, and a device key's wrap key once
+  recorded, are wiped after use; the device secret no longer appears in
+  `{:?}` output.
 
 ## [1.3.0] - The shared application crate
 

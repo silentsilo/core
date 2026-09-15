@@ -257,6 +257,7 @@ pub fn open_with_recovery(
 }
 
 /// A key made on this device, ready to record: what its platform returned.
+/// The wrap key is wiped when this is dropped.
 pub struct DeviceKey {
     pub kind: String,
     pub derivation: String,
@@ -264,6 +265,12 @@ pub struct DeviceKey {
     pub public_key: String,
     pub wrap_key: [u8; 32],
     pub label: String,
+}
+
+impl Drop for DeviceKey {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.wrap_key);
+    }
 }
 
 /// Records a device key on an open silo. The first key on a silo also

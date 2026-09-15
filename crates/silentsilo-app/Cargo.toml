@@ -17,6 +17,7 @@ serde = { workspace = true }
 hex = "0.4"
 tokio = { workspace = true, features = ["time"] }
 uuid = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 hex = "0.4"

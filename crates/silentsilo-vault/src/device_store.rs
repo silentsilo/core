@@ -20,11 +20,20 @@ const DPAPI_MAGIC: &[u8] = b"SSDPAPI1";
 /// cryptographic input, not an auth token, which is why it lives in the OS
 /// keyring and is wiped on drop. The id beside it is not a secret and is
 /// skipped: `Uuid` has no `Zeroize`.
-#[derive(Debug, Clone, Serialize, Deserialize, zeroize::ZeroizeOnDrop)]
+#[derive(Clone, Serialize, Deserialize, zeroize::ZeroizeOnDrop)]
 pub struct LocalVaultAuth {
     #[zeroize(skip)]
     pub vault_id: Uuid,
     pub device_secret: String,
+}
+
+/// Never prints the secret.
+impl std::fmt::Debug for LocalVaultAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalVaultAuth")
+            .field("vault_id", &self.vault_id)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Machine-local, never inside the silo folder: the folder is made to be
