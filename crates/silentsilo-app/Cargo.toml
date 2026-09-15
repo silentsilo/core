@@ -21,6 +21,8 @@ zeroize = { workspace = true }
 
 [dev-dependencies]
 hex = "0.4"
+rusqlite = { workspace = true }
 serde_json = { workspace = true }
+silentsilo-testkit = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }

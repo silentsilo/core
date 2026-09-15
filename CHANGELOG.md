@@ -159,6 +159,33 @@ release notes should say.
 - The key derived from a recovery code, and a device key's wrap key once
   recorded, are wiped after use; the device secret no longer appears in
   `{:?}` output.
+- Devices could disagree for good about what is in the trash. Trashing and
+  restoring updated rows as each record arrived, so a folder trashed on one
+  device and a file in it restored or created on another ended up in the
+  trash on some devices and out of it on others. An entry's place in the
+  trash is now worked out from every trash and restore record that concerns
+  it, in total order, whichever arrived first.
+- A password edit fetched late overwrote a newer one, or brought a deleted
+  entry back, on the devices that received it last. The newest edit or
+  deletion in total order wins everywhere.
+- A rename fetched after a newer one undid it on that device, and renaming a
+  file to the name it already showed skipped recording the rename, which
+  made names differ between devices later.
+- Purging entries left what remained of their name groups with the suffixes
+  they had, so devices that applied the purge before or after a later claim
+  showed different names. The groups are ranked again.
+- A conflict copy made when the earlier of two edits arrived last carried
+  the other edit's content key, so its content never opened. It carries its
+  own.
+- Which content a file held and which conflict copies stood beside it
+  depended on arrival order: an edit arriving after the edit that built on
+  it made a copy of a version that was never a conflict, on that device
+  only. Both are now worked out from every edit of the file, and a copy's
+  name follows the file's name and the losing edit's date.
+- A record creating something a purge had already named, arriving after
+  the purge, brought it back on that device alone. It is ignored.
+- `SCHEMA_VERSION` is 2: the derived tables are rebuilt once from the log on
+  the first open.
 
 ## [1.3.0] - The shared application crate
 

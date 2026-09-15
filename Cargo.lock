@@ -3906,12 +3906,14 @@ name = "silentsilo-app"
 version = "1.3.0"
 dependencies = [
  "hex",
+ "rusqlite",
  "serde",
  "serde_json",
  "silentsilo-core 1.3.0",
  "silentsilo-crypto 1.3.0",
  "silentsilo-store 1.3.0",
  "silentsilo-sync 1.3.0",
+ "silentsilo-testkit",
  "silentsilo-vault 1.3.0",
  "silentsilo-vfs 1.3.0",
  "tempfile",

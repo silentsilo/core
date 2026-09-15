@@ -107,7 +107,7 @@ in this list; that lives on the machine instead, in the table after this one.
 | Which silo this is | `silo.json` | `MARKER_VERSION = 1`, `silentsilo-vault/registry.rs` | Refuses a newer one; unlock uses it to tell a leftover working copy from this silo's |
 | Enrolled keys | `keys/fido.json` | `SILO_FILE_VERSION`, plus a `kind` per key | |
 | Recovery envelope | `keys/recovery.json` | Its own, as above | Its version means the shape of one wrapped key, not the file |
-| Index | `vault.db.enc` | `SCHEMA_VERSION = 1`, `silentsilo-vfs/schema.rs` | Not a format: see below |
+| Index | `vault.db.enc` | `SCHEMA_VERSION = 2`, `silentsilo-vfs/schema.rs` | Not a format: see below |
 | Index, mid-rotation | `vault.db.enc.next` | Same envelope as `vault.db.enc` | Transient; unlock adopts it, see below |
 | Base snapshot | `vault_base` table in `vault.db` | `SNAPSHOT_VERSION = 1`, `silentsilo-vfs/snapshot.rs` | Refuses, naming the version |
 

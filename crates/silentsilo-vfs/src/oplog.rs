@@ -436,6 +436,69 @@ pub fn init_oplog_derived(conn: &Connection) -> rusqlite::Result<()> {
         -- Any device may name any device (you name the laptop from the
         -- desktop), and the label carries where it sits in the total order
         -- so a rename arriving late cannot undo a newer one.
+        -- Where the last change to each password entry, an edit or a
+        -- deletion, sits in the total order. Without it an edit fetched late
+        -- overwrote a newer one, or brought back a deleted entry, on the
+        -- devices that happened to receive it last.
+        -- Every trash and restore record, by target. An entry's place in the
+        -- trash is worked out from all of them in total order, its own and
+        -- its folders', so a restore fetched before or after a folder's
+        -- trashing lands the same everywhere. Kept for a target not here yet,
+        -- so the entry arrives already where the records put it.
+        CREATE TABLE IF NOT EXISTS trash_events (
+            op_id     TEXT PRIMARY KEY,
+            target    TEXT NOT NULL,
+            is_folder INTEGER NOT NULL,
+            trash     INTEGER NOT NULL,
+            lamport   INTEGER NOT NULL,
+            device_id TEXT NOT NULL,
+            at        INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_trash_events_target ON trash_events(target);
+
+        -- Which file each conflict copy was made from, and when the losing
+        -- edit was written, so the copy's name follows the file's name.
+        CREATE TABLE IF NOT EXISTS conflict_copies (
+            copy_id  TEXT PRIMARY KEY,
+            file_id  TEXT NOT NULL,
+            claim_op TEXT NOT NULL,
+            at       INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_conflict_copies_file ON conflict_copies(file_id);
+
+        -- Ids a purge named, whether or not they were here yet. A record
+        -- creating one that arrives after the purge must not bring it back.
+        -- Every record that wrote a file's content, with what it built on.
+        -- The file holds the latest edit nothing built on; every other such
+        -- edit is a conflict copy. Worked out from the whole set, so the
+        -- same records give the same files in any arrival order.
+        CREATE TABLE IF NOT EXISTS content_versions (
+            op_id        TEXT PRIMARY KEY,
+            file_id      TEXT NOT NULL,
+            lamport      INTEGER NOT NULL,
+            device_id    TEXT NOT NULL,
+            blob_id      TEXT NOT NULL,
+            replaces     TEXT,
+            has_base     INTEGER NOT NULL,
+            size_bytes   INTEGER NOT NULL,
+            content_hash TEXT NOT NULL,
+            mime_type    TEXT,
+            blob_key     TEXT NOT NULL,
+            at           INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_content_versions_file ON content_versions(file_id);
+
+        CREATE TABLE IF NOT EXISTS purged_ids (
+            id TEXT PRIMARY KEY
+        );
+
+        CREATE TABLE IF NOT EXISTS password_order (
+            id        TEXT PRIMARY KEY,
+            lamport   INTEGER NOT NULL,
+            device_id TEXT NOT NULL,
+            op_id     TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS device_labels (
             device_id   TEXT PRIMARY KEY,
             label       TEXT NOT NULL DEFAULT '',
@@ -475,6 +538,11 @@ pub fn drop_oplog_derived(conn: &Connection) -> rusqlite::Result<()> {
         "
         DROP TABLE IF EXISTS name_claims;
         DROP TABLE IF EXISTS device_labels;
+        DROP TABLE IF EXISTS password_order;
+        DROP TABLE IF EXISTS trash_events;
+        DROP TABLE IF EXISTS conflict_copies;
+        DROP TABLE IF EXISTS purged_ids;
+        DROP TABLE IF EXISTS content_versions;
         ",
     )
 }
@@ -720,40 +788,6 @@ fn read_content_state(conn: &Connection, id: Uuid) -> CoreResult<Option<ContentS
     .map_err(db)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn write_content(
-    conn: &Connection,
-    id: Uuid,
-    blob_id: &Uuid,
-    size_bytes: i64,
-    content_hash: &str,
-    mime_type: &Option<String>,
-    blob_key: &str,
-    at: i64,
-    record: &OpRecord,
-) -> CoreResult<()> {
-    conn.execute(
-        "UPDATE files SET blob_id = ?2, size_bytes = ?3, mime_type = ?4, content_hash = ?5,
-                          updated_at = ?6, content_op_id = ?7, content_lamport = ?8,
-                          content_device_id = ?9, blob_key = ?10
-         WHERE id = ?1",
-        params![
-            id.to_string(),
-            blob_id.to_string(),
-            size_bytes,
-            mime_type,
-            content_hash,
-            at,
-            record.op_id.to_string(),
-            record.lamport as i64,
-            record.device_id.to_string(),
-            blob_key,
-        ],
-    )
-    .map_err(db)?;
-    Ok(())
-}
-
 /// Puts the losing side of a concurrent edit beside the winner. The id is
 /// derived from the losing record, so every device builds the same copy;
 /// the name goes through `claim_name` like any other.
@@ -767,10 +801,12 @@ fn conflict_copy(
     let copy_id = Uuid::new_v5(&op_id, b"silentsilo-conflict-copy");
 
     // Already here from an earlier pass, or from replaying the same pair in
-    // the other order.
+    // the other order. Or made before and purged since: a third edit
+    // arriving late must not bring it back on this device alone.
     let exists: Option<i64> = conn
         .query_row(
-            "SELECT 1 FROM files WHERE id = ?1",
+            "SELECT 1 FROM files WHERE id = ?1
+             UNION ALL SELECT 1 FROM purged_ids WHERE id = ?1",
             [copy_id.to_string()],
             |row| row.get(0),
         )
@@ -801,7 +837,19 @@ fn conflict_copy(
             blob_key: losing.blob_key.clone(),
         },
     );
-    let wanted = conflict_name(&losing.name, at);
+    // Named after what the file asked to be called and dated by the losing
+    // record, both the same on every device. The name on screen can carry a
+    // rank suffix, and the pass that found the conflict is whichever record
+    // happened to arrive second.
+    let desired: Option<String> = conn
+        .query_row(
+            "SELECT desired FROM name_claims WHERE entry_id = ?1",
+            [file_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(db)?;
+    let wanted = conflict_name(desired.as_deref().unwrap_or(&losing.name), at);
     let final_name = claim_name(conn, copy_id, false, losing.folder_id, &wanted, &claimant)?;
 
     conn.execute(
@@ -830,10 +878,339 @@ fn conflict_copy(
             "conflict copy {copy_id} wanted {final_name:?}: {e}"
         ))
     })?;
+    settle_file_trash(conn, copy_id)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO conflict_copies(copy_id, file_id, claim_op, at)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![
+            copy_id.to_string(),
+            file_id.to_string(),
+            op_id.to_string(),
+            at
+        ],
+    )
+    .map_err(db)?;
+    // The copy's own first version, for edits made to the copy later.
+    insert_version(
+        conn,
+        &format!("{op_id}:copy"),
+        copy_id,
+        (lamport, device_id),
+        losing.blob_id,
+        None,
+        true,
+        losing.size_bytes,
+        &losing.content_hash,
+        &losing.mime_type,
+        &losing.blob_key,
+        at,
+    )?;
+    Ok(())
+}
 
-    // Untouched: the losing content is now a file of its own, and the file it
-    // came from keeps the winning content under its own name.
-    let _ = file_id;
+#[allow(clippy::too_many_arguments)]
+fn insert_version(
+    conn: &Connection,
+    op_id: &str,
+    file_id: Uuid,
+    (lamport, device_id): (u64, Uuid),
+    blob_id: Uuid,
+    replaces: Option<Uuid>,
+    has_base: bool,
+    size_bytes: i64,
+    content_hash: &str,
+    mime_type: &Option<String>,
+    blob_key: &str,
+    at: i64,
+) -> CoreResult<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO content_versions(op_id, file_id, lamport, device_id, blob_id,
+                replaces, has_base, size_bytes, content_hash, mime_type, blob_key, at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            op_id,
+            file_id.to_string(),
+            lamport as i64,
+            device_id.to_string(),
+            blob_id.to_string(),
+            replaces.map(|r| r.to_string()),
+            has_base as i64,
+            size_bytes,
+            content_hash,
+            mime_type,
+            blob_key,
+            at,
+        ],
+    )
+    .map_err(|e| CoreError::Database(e.to_string()))?;
+    Ok(())
+}
+
+#[derive(Clone)]
+struct Version {
+    op_id: String,
+    lamport: i64,
+    device_id: String,
+    blob_id: String,
+    replaces: Option<String>,
+    has_base: bool,
+    size_bytes: i64,
+    content_hash: String,
+    mime_type: Option<String>,
+    blob_key: String,
+    at: i64,
+}
+
+impl Version {
+    fn order(&self) -> (i64, &str, &str) {
+        (self.lamport, self.device_id.as_str(), self.op_id.as_str())
+    }
+}
+
+/// Works out which content a file holds and which conflict copies it has,
+/// from every record that wrote its content.
+///
+/// An edit is superseded when another edit built on its content, or, for a
+/// record from a build that did not say what it built on, when any later
+/// edit exists. The file holds the latest edit nothing supersedes; each other
+/// one is a copy beside it. Before this the copies depended on arrival: an
+/// edit arriving after the one that built on it made a copy of a version
+/// that was never a conflict, on that device only.
+fn settle_content(conn: &Connection, file_id: Uuid) -> CoreResult<()> {
+    let db = |e: rusqlite::Error| CoreError::Database(e.to_string());
+    let Some(current) = read_content_state(conn, file_id)? else {
+        return Ok(());
+    };
+    let load = |conn: &Connection| -> CoreResult<Vec<Version>> {
+        conn.prepare(
+            "SELECT op_id, lamport, device_id, blob_id, replaces, has_base, size_bytes,
+                    content_hash, mime_type, blob_key, at
+               FROM content_versions WHERE file_id = ?1",
+        )
+        .map_err(db)?
+        .query_map([file_id.to_string()], |row| {
+            Ok(Version {
+                op_id: row.get(0)?,
+                lamport: row.get(1)?,
+                device_id: row.get(2)?,
+                blob_id: row.get(3)?,
+                replaces: row.get(4)?,
+                has_base: row.get::<_, i64>(5)? != 0,
+                size_bytes: row.get(6)?,
+                content_hash: row.get(7)?,
+                mime_type: row.get(8)?,
+                blob_key: row.get(9)?,
+                at: row.get(10)?,
+            })
+        })
+        .map_err(db)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(db)
+    };
+    let mut versions = load(conn)?;
+    // A file restored from a snapshot holds content no version names.
+    if !versions
+        .iter()
+        .any(|v| v.blob_id == current.blob_id.to_string())
+    {
+        let (lamport, device_id, op_id) = current.written_by;
+        insert_version(
+            conn,
+            &format!("{op_id}:{file_id}:held"),
+            file_id,
+            (lamport, device_id),
+            current.blob_id,
+            None,
+            true,
+            current.size_bytes,
+            &current.content_hash,
+            &current.mime_type,
+            &current.blob_key,
+            current.created_at,
+        )?;
+        versions = load(conn)?;
+    }
+
+    let superseded = |v: &Version| {
+        versions.iter().any(|w| {
+            w.op_id != v.op_id
+                && if w.has_base {
+                    w.replaces.as_deref() == Some(v.blob_id.as_str())
+                } else {
+                    w.order() > v.order()
+                }
+        })
+    };
+    let mut leaves: Vec<&Version> = versions.iter().filter(|v| !superseded(v)).collect();
+    if leaves.is_empty() {
+        leaves = versions.iter().collect();
+    }
+    leaves.sort_by(|a, b| a.order().cmp(&b.order()));
+    let Some(winner) = leaves.last().copied() else {
+        return Ok(());
+    };
+
+    if current.blob_id.to_string() != winner.blob_id {
+        conn.execute(
+            "UPDATE files SET blob_id = ?2, size_bytes = ?3, mime_type = ?4, content_hash = ?5,
+                              updated_at = MAX(updated_at, ?6), content_op_id = ?7,
+                              content_lamport = ?8, content_device_id = ?9, blob_key = ?10
+             WHERE id = ?1",
+            params![
+                file_id.to_string(),
+                winner.blob_id,
+                winner.size_bytes,
+                winner.mime_type,
+                winner.content_hash,
+                winner.at,
+                winner.op_id,
+                winner.lamport,
+                winner.device_id,
+                winner.blob_key,
+            ],
+        )
+        .map_err(db)?;
+    }
+
+    // Copies for the other leaves.
+    let wanted: Vec<&Version> = leaves[..leaves.len() - 1].to_vec();
+    for leaf in &wanted {
+        let (Ok(op_id), Ok(device_id), Ok(blob_id)) = (
+            Uuid::parse_str(&leaf.op_id),
+            Uuid::parse_str(&leaf.device_id),
+            Uuid::parse_str(&leaf.blob_id),
+        ) else {
+            continue;
+        };
+        let losing = ContentState {
+            blob_id,
+            size_bytes: leaf.size_bytes,
+            content_hash: leaf.content_hash.clone(),
+            mime_type: leaf.mime_type.clone(),
+            blob_key: leaf.blob_key.clone(),
+            written_by: (leaf.lamport as u64, device_id, op_id),
+            ..current.clone()
+        };
+        conflict_copy(conn, file_id, &losing, leaf.at)?;
+    }
+
+    // A copy of an edit something has since built on is no conflict any
+    // more, unless someone already did something with the copy itself.
+    let existing: Vec<(String, String)> = conn
+        .prepare("SELECT copy_id, claim_op FROM conflict_copies WHERE file_id = ?1")
+        .map_err(db)?
+        .query_map([file_id.to_string()], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(db)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(db)?;
+    for (copy_id, claim_op) in existing {
+        if wanted.iter().any(|leaf| leaf.op_id == claim_op) {
+            continue;
+        }
+        let untouched: bool = conn
+            .query_row(
+                "SELECT
+                    EXISTS(SELECT 1 FROM files WHERE id = ?1)
+                    AND EXISTS(SELECT 1 FROM name_claims WHERE entry_id = ?1 AND op_id = ?2)
+                    AND NOT EXISTS(SELECT 1 FROM trash_events WHERE target = ?1)
+                    AND NOT EXISTS(SELECT 1 FROM content_versions WHERE file_id = ?1 AND op_id != ?2 || ':copy')
+                    AND NOT EXISTS(SELECT 1 FROM files WHERE id = ?1 AND favorite = 1)",
+                params![copy_id, claim_op],
+                |row| row.get(0),
+            )
+            .map_err(db)?;
+        if !untouched {
+            continue;
+        }
+        let copy = parse_uuid(&copy_id)?;
+        let group = current_group(conn, copy)?;
+        conn.execute("DELETE FROM files WHERE id = ?1", [&copy_id])
+            .map_err(db)?;
+        conn.execute(
+            "DELETE FROM content_versions WHERE file_id = ?1",
+            [&copy_id],
+        )
+        .map_err(db)?;
+        conn.execute("DELETE FROM conflict_copies WHERE copy_id = ?1", [&copy_id])
+            .map_err(db)?;
+        release_claim(conn, copy)?;
+        if let Some(group) = group {
+            let mut groups = vec![group.clone()];
+            if let Some(base) = suffix_base(&group.key) {
+                groups.push(ClaimGroupKey { key: base, ..group });
+            }
+            settle_groups(conn, &groups, current.created_at)?;
+        }
+    }
+    Ok(())
+}
+
+/// Renames a file's conflict copies after the file. A copy's name comes
+/// from the file's name, and which name that was depended on whether the
+/// rename or the conflict arrived first; following the file's latest name
+/// makes it the same everywhere. A copy the user renamed since keeps
+/// their name.
+fn follow_file_name(conn: &Connection, file_id: Uuid, record_at: i64) -> CoreResult<()> {
+    let db = |e: rusqlite::Error| CoreError::Database(e.to_string());
+    let Some(desired): Option<String> = conn
+        .query_row(
+            "SELECT desired FROM name_claims WHERE entry_id = ?1",
+            [file_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(db)?
+    else {
+        return Ok(());
+    };
+    let copies: Vec<(String, String, i64)> = conn
+        .prepare("SELECT copy_id, claim_op, at FROM conflict_copies WHERE file_id = ?1")
+        .map_err(db)?
+        .query_map([file_id.to_string()], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .map_err(db)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(db)?;
+    for (copy_id, claim_op, at) in copies {
+        let claim: Option<(String, String, i64, String)> = conn
+            .query_row(
+                "SELECT c.desired, f.folder_id, c.lamport, c.device_id
+                   FROM name_claims c JOIN files f ON f.id = c.entry_id
+                  WHERE c.entry_id = ?1 AND c.op_id = ?2",
+                params![copy_id, claim_op],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(db)?;
+        let Some((current, folder_id, lamport, device_id)) = claim else {
+            continue;
+        };
+        let wanted = conflict_name(&desired, at);
+        if current == wanted {
+            continue;
+        }
+        let claimant = OpRecord::authored(
+            parse_uuid(&claim_op)?,
+            lamport as u64,
+            parse_uuid(&device_id)?,
+            record_at,
+            0,
+            None,
+            VaultOp::RenameFile {
+                id: parse_uuid(&copy_id)?,
+                name: wanted.clone(),
+            },
+        );
+        claim_name(
+            conn,
+            parse_uuid(&copy_id)?,
+            false,
+            parse_uuid(&folder_id)?,
+            &wanted,
+            &claimant,
+        )?;
+    }
     Ok(())
 }
 
@@ -1074,6 +1451,36 @@ fn claim_group(
     Ok(out)
 }
 
+fn was_purged(conn: &Connection, id: Uuid) -> CoreResult<bool> {
+    conn.query_row(
+        "SELECT 1 FROM purged_ids WHERE id = ?1",
+        [id.to_string()],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|found| found.is_some())
+    .map_err(|e| CoreError::Database(e.to_string()))
+}
+
+/// Whether the entry's name was last claimed by a record later in the total
+/// order than `record`. A rename fetched late must not undo a newer one.
+fn claim_is_newer(conn: &Connection, entry_id: Uuid, record: &OpRecord) -> CoreResult<bool> {
+    let current: Option<(i64, String, String)> = conn
+        .query_row(
+            "SELECT lamport, device_id, op_id FROM name_claims WHERE entry_id = ?1",
+            [entry_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|e| CoreError::Database(e.to_string()))?;
+    let incoming = (
+        record.lamport as i64,
+        record.device_id.to_string(),
+        record.op_id.to_string(),
+    );
+    Ok(current.is_some_and(|current| current > incoming))
+}
+
 /// Records that `entry_id` wants to be called `desired`, and returns the
 /// name it actually gets. Names are assigned by rank within the group of
 /// everything that ever asked for the same name in the same folder, ordered
@@ -1129,15 +1536,17 @@ fn claim_name(
     if let Some(previous) = previous.filter(|p| *p != mine) {
         groups.push(previous);
     }
-    // A name that is some other group's suffixed name moves that group on.
-    if let Some(base) = suffix_base(&mine.key) {
-        let base = ClaimGroupKey {
-            scope_id,
-            is_folder,
-            key: base,
-        };
-        if !groups.contains(&base) {
-            groups.push(base);
+    // A name that is some other group's suffixed name moves that group on,
+    // and so does leaving one: the suffix it held back may be free now.
+    for group in groups.clone() {
+        if let Some(base) = suffix_base(&group.key) {
+            let base = ClaimGroupKey {
+                key: base,
+                ..group.clone()
+            };
+            if !groups.contains(&base) {
+                groups.push(base);
+            }
         }
     }
 
@@ -1292,6 +1701,254 @@ fn apply_and_record(
     }
 }
 
+/// Whether `record` is later in the total order than the last change applied
+/// to password `id`, and if so, records it as that change.
+fn password_change_is_newest(conn: &Connection, id: Uuid, record: &OpRecord) -> CoreResult<bool> {
+    let db = |e: rusqlite::Error| CoreError::Database(e.to_string());
+    let current: Option<(i64, String, String)> = conn
+        .query_row(
+            "SELECT lamport, device_id, op_id FROM password_order WHERE id = ?1",
+            [id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(db)?;
+    let incoming = (
+        record.lamport as i64,
+        record.device_id.to_string(),
+        record.op_id.to_string(),
+    );
+    if current.is_some_and(|current| current >= incoming) {
+        return Ok(false);
+    }
+    conn.execute(
+        "INSERT INTO password_order(id, lamport, device_id, op_id) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(id) DO UPDATE SET
+            lamport = excluded.lamport,
+            device_id = excluded.device_id,
+            op_id = excluded.op_id",
+        params![id.to_string(), incoming.0, incoming.1, incoming.2],
+    )
+    .map_err(db)?;
+    Ok(true)
+}
+
+// ── Where things are in the trash ───────────────────────────────────
+//
+// Trashing and restoring used to update rows as each record arrived, and the
+// result depended on the order they arrived in: a folder trashed on one
+// device and a file inside it restored on another, or created there, ended
+// up in the trash on some devices and out of it on others, for good. Now
+// every such record is kept (`trash_events`) and a row's state is the fold of
+// the ones that concern it, its own and its folders', in total order. A
+// trash record trashes what is not already trashed, keeping the earlier
+// time; a restore record takes it out. The same rules the cascades applied,
+// minus the dependence on arrival.
+
+/// Records a trash or restore record against its target, once.
+pub(crate) fn record_trash_event(
+    conn: &Connection,
+    record: &OpRecord,
+    target: Uuid,
+    is_folder: bool,
+    trash: bool,
+) -> CoreResult<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO trash_events(op_id, target, is_folder, trash, lamport, device_id, at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            record.op_id.to_string(),
+            target.to_string(),
+            is_folder as i64,
+            trash as i64,
+            record.lamport as i64,
+            record.device_id.to_string(),
+            record.at,
+        ],
+    )
+    .map_err(|e| CoreError::Database(e.to_string()))?;
+    Ok(())
+}
+
+#[derive(Clone)]
+struct TrashEvent {
+    key: (i64, String, String),
+    trash: bool,
+    at: i64,
+}
+
+fn trash_events_of(
+    conn: &Connection,
+    target: &str,
+    is_folder: bool,
+) -> CoreResult<Vec<TrashEvent>> {
+    let db = |e: rusqlite::Error| CoreError::Database(e.to_string());
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT lamport, device_id, op_id, trash, at FROM trash_events
+              WHERE target = ?1 AND is_folder = ?2",
+        )
+        .map_err(db)?;
+    let rows = stmt
+        .query_map(params![target, is_folder as i64], |row| {
+            Ok(TrashEvent {
+                key: (row.get(0)?, row.get(1)?, row.get(2)?),
+                trash: row.get::<_, i64>(3)? != 0,
+                at: row.get(4)?,
+            })
+        })
+        .map_err(db)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db)
+}
+
+/// A folder and every folder above it, nearest first.
+fn folder_chain(conn: &Connection, folder_id: &str) -> CoreResult<Vec<String>> {
+    let mut out = Vec::new();
+    let mut at = Some(folder_id.to_string());
+    while let Some(id) = at {
+        if out.contains(&id) {
+            break;
+        }
+        at = conn
+            .query_row(
+                "SELECT parent_id FROM folders WHERE id = ?1",
+                [&id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(|e| CoreError::Database(e.to_string()))?
+            .flatten();
+        out.push(id);
+    }
+    Ok(out)
+}
+
+/// The trash state the records give: `None` when out of the trash, else
+/// when it went in, and the time of the record that decided it.
+fn fold_trash(mut events: Vec<TrashEvent>) -> (Option<i64>, Option<i64>) {
+    events.sort_by(|a, b| a.key.cmp(&b.key));
+    let mut state = None;
+    let mut decided = None;
+    for event in events {
+        if event.trash {
+            if state.is_none() {
+                state = Some(event.at);
+                decided = Some(event.at);
+            }
+        } else if state.is_some() {
+            state = None;
+            decided = Some(event.at);
+        }
+    }
+    (state, decided)
+}
+
+fn write_trash_state(
+    conn: &Connection,
+    table: &str,
+    id: &str,
+    current: Option<i64>,
+    (state, decided): (Option<i64>, Option<i64>),
+) -> CoreResult<bool> {
+    if state == current {
+        return Ok(false);
+    }
+    conn.execute(
+        &format!(
+            "UPDATE {table} SET deleted_at = ?2, updated_at = MAX(updated_at, ?3) WHERE id = ?1"
+        ),
+        params![id, state, decided.unwrap_or(0)],
+    )
+    .map_err(|e| CoreError::Database(e.to_string()))?;
+    Ok(true)
+}
+
+/// Works out one file's trash state again. False when it is not here or
+/// did not change.
+fn settle_file_trash(conn: &Connection, file_id: Uuid) -> CoreResult<bool> {
+    let row: Option<(String, Option<i64>)> = conn
+        .query_row(
+            "SELECT folder_id, deleted_at FROM files WHERE id = ?1",
+            [file_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| CoreError::Database(e.to_string()))?;
+    let Some((folder_id, current)) = row else {
+        return Ok(false);
+    };
+    let id = file_id.to_string();
+    let mut events = trash_events_of(conn, &id, false)?;
+    for folder in folder_chain(conn, &folder_id)? {
+        events.extend(trash_events_of(conn, &folder, true)?);
+    }
+    write_trash_state(conn, "files", &id, current, fold_trash(events))
+}
+
+/// Works out the trash state of a folder and everything under it again.
+fn settle_folder_trash(conn: &Connection, folder_id: Uuid) -> CoreResult<bool> {
+    let db = |e: rusqlite::Error| CoreError::Database(e.to_string());
+    let Some(path) = folder_path(conn, folder_id)? else {
+        return Ok(false);
+    };
+    let subtree = crate::like::subtree(&path);
+    let root = folder_id.to_string();
+
+    // Folders of the subtree, parents before children, with what is above.
+    let folders: Vec<(String, Option<String>, Option<i64>)> = conn
+        .prepare(
+            "SELECT id, parent_id, deleted_at FROM folders
+              WHERE id = ?1 OR path GLOB ?2 ORDER BY length(path)",
+        )
+        .map_err(db)?
+        .query_map(params![root, subtree], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .map_err(db)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(db)?;
+    let mut above: Vec<TrashEvent> = Vec::new();
+    if let Some((_, Some(parent), _)) = folders.first() {
+        for folder in folder_chain(conn, parent)? {
+            above.extend(trash_events_of(conn, &folder, true)?);
+        }
+    }
+
+    // The events that reach each folder: its parent's, then its own.
+    let mut reaching: std::collections::HashMap<String, Vec<TrashEvent>> =
+        std::collections::HashMap::new();
+    let mut changed = false;
+    for (id, parent, current) in &folders {
+        let mut events = match parent.as_ref().and_then(|p| reaching.get(p)) {
+            Some(from_parent) => from_parent.clone(),
+            None => above.clone(),
+        };
+        events.extend(trash_events_of(conn, id, true)?);
+        changed |= write_trash_state(conn, "folders", id, *current, fold_trash(events.clone()))?;
+        reaching.insert(id.clone(), events);
+    }
+
+    let files: Vec<(String, String, Option<i64>)> = conn
+        .prepare(
+            "SELECT f.id, f.folder_id, f.deleted_at FROM files f
+               JOIN folders d ON d.id = f.folder_id
+              WHERE d.id = ?1 OR d.path GLOB ?2",
+        )
+        .map_err(db)?
+        .query_map(params![root, subtree], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .map_err(db)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(db)?;
+    for (id, folder, current) in files {
+        let mut events = reaching.get(&folder).cloned().unwrap_or_default();
+        events.extend(trash_events_of(conn, &id, false)?);
+        changed |= write_trash_state(conn, "files", &id, current, fold_trash(events))?;
+    }
+    Ok(changed)
+}
+
 fn apply_inner(conn: &Connection, record: &OpRecord) -> CoreResult<ApplyOutcome> {
     let at = record.at;
     let db = |e: rusqlite::Error| CoreError::Database(e.to_string());
@@ -1322,7 +1979,7 @@ fn apply_inner(conn: &Connection, record: &OpRecord) -> CoreResult<ApplyOutcome>
             // Two records creating one id only comes from a corrupted or
             // hostile bucket, but failing on it would wedge sync for good.
             // The folder is already there, so there is nothing to do.
-            if folder_path(conn, *id)?.is_some() {
+            if folder_path(conn, *id)?.is_some() || was_purged(conn, *id)? {
                 return Ok(ApplyOutcome::Obsolete);
             }
             let final_name = claim_name(conn, *id, true, *parent_id, &sanitize(name), record)?;
@@ -1333,6 +1990,7 @@ fn apply_inner(conn: &Connection, record: &OpRecord) -> CoreResult<ApplyOutcome>
                 params![id.to_string(), parent_id.to_string(), final_name, path, at],
             )
             .map_err(db)?;
+            settle_folder_trash(conn, *id)?;
             Ok(renamed_or_applied(name, &final_name))
         }
 
@@ -1352,7 +2010,7 @@ fn apply_inner(conn: &Connection, record: &OpRecord) -> CoreResult<ApplyOutcome>
             // Two records creating one id only comes from a corrupted or
             // hostile bucket, but failing on it would wedge sync for good;
             // like the folder arm, the file being there means nothing to do.
-            if read_content_state(conn, *id)?.is_some() {
+            if read_content_state(conn, *id)?.is_some() || was_purged(conn, *id)? {
                 return Ok(ApplyOutcome::Obsolete);
             }
             let final_name = claim_name(conn, *id, false, *folder_id, &sanitize(name), record)?;
@@ -1378,6 +2036,21 @@ fn apply_inner(conn: &Connection, record: &OpRecord) -> CoreResult<ApplyOutcome>
                 ],
             )
             .map_err(db)?;
+            settle_file_trash(conn, *id)?;
+            insert_version(
+                conn,
+                &record.op_id.to_string(),
+                *id,
+                (record.lamport, record.device_id),
+                *blob_id,
+                None,
+                true,
+                *size_bytes,
+                content_hash,
+                mime_type,
+                blob_key,
+                at,
+            )?;
             Ok(renamed_or_applied(name, &final_name))
         }
 
@@ -1390,56 +2063,26 @@ fn apply_inner(conn: &Connection, record: &OpRecord) -> CoreResult<ApplyOutcome>
             blob_key,
             replaces,
         } => {
-            let Some(current) = read_content_state(conn, *id)? else {
+            if read_content_state(conn, *id)?.is_none() {
                 return Ok(ApplyOutcome::Obsolete);
-            };
-
-            // Written on top of what the file still holds, so this is the
-            // ordinary case: one person editing a file, twice or once.
-            let diverged = replaces.is_some_and(|base| base != current.blob_id);
-            if !diverged {
-                write_content(
-                    conn,
-                    *id,
-                    blob_id,
-                    *size_bytes,
-                    content_hash,
-                    mime_type,
-                    blob_key,
-                    at,
-                    record,
-                )?;
-                return Ok(ApplyOutcome::Applied);
             }
-
-            // Two edits from the same starting point, neither seeing the
-            // other. The later one in the total order keeps the file, the
-            // earlier one is put beside it; arrival order decides nothing.
-            let incoming = (record.lamport, record.device_id, record.op_id);
-            if incoming > current.written_by {
-                conflict_copy(conn, *id, &current, record.at)?;
-                write_content(
-                    conn,
-                    *id,
-                    blob_id,
-                    *size_bytes,
-                    content_hash,
-                    mime_type,
-                    blob_key,
-                    at,
-                    record,
-                )?;
-            } else {
-                let losing = ContentState {
-                    blob_id: *blob_id,
-                    size_bytes: *size_bytes,
-                    content_hash: content_hash.clone(),
-                    mime_type: mime_type.clone(),
-                    written_by: incoming,
-                    ..current.clone()
-                };
-                conflict_copy(conn, *id, &losing, record.at)?;
-            }
+            // Every edit is kept, and what the file holds and which copies
+            // stand beside it are worked out from all of them.
+            insert_version(
+                conn,
+                &record.op_id.to_string(),
+                *id,
+                (record.lamport, record.device_id),
+                *blob_id,
+                *replaces,
+                replaces.is_some(),
+                *size_bytes,
+                content_hash,
+                mime_type,
+                blob_key,
+                at,
+            )?;
+            settle_content(conn, *id)?;
             Ok(ApplyOutcome::Applied)
         }
 
@@ -1452,16 +2095,20 @@ fn apply_inner(conn: &Connection, record: &OpRecord) -> CoreResult<ApplyOutcome>
                 )
                 .optional()
                 .map_err(db)?;
-            let Some((folder_id, current)) = existing else {
+            let Some((folder_id, _current)) = existing else {
                 return Ok(ApplyOutcome::Obsolete);
             };
-            if current == *name {
-                return Ok(ApplyOutcome::Applied);
+            // No shortcut when the name already reads the same: that can be
+            // a rank suffix, and the claim still has to record what was asked
+            // for, or devices disagree about it later.
+            if claim_is_newer(conn, *id, record)? {
+                return Ok(ApplyOutcome::Obsolete);
             }
             let folder_id = parse_uuid(&folder_id)?;
             // No update here: the claim settles every row it touches,
             // including this one.
             let final_name = claim_name(conn, *id, false, folder_id, &sanitize(name), record)?;
+            follow_file_name(conn, *id, at)?;
             Ok(renamed_or_applied(name, &final_name))
         }
 
@@ -1481,8 +2128,9 @@ fn apply_inner(conn: &Connection, record: &OpRecord) -> CoreResult<ApplyOutcome>
             let Some(parent_id) = parent_id else {
                 return Ok(ApplyOutcome::Obsolete);
             };
-            if current == *name {
-                return Ok(ApplyOutcome::Applied);
+            let _ = current;
+            if claim_is_newer(conn, *id, record)? {
+                return Ok(ApplyOutcome::Obsolete);
             }
             let parent_id = parse_uuid(&parent_id)?;
             // No update here, and no rewriting of descendant paths: the claim
@@ -1492,77 +2140,23 @@ fn apply_inner(conn: &Connection, record: &OpRecord) -> CoreResult<ApplyOutcome>
             Ok(renamed_or_applied(name, &final_name))
         }
 
-        VaultOp::TrashFile { id } => {
-            let changed = conn
-                .execute(
-                    "UPDATE files SET deleted_at = ?2, updated_at = ?2
-                     WHERE id = ?1 AND deleted_at IS NULL",
-                    params![id.to_string(), at],
-                )
-                .map_err(db)?;
-            Ok(if changed == 0 {
-                ApplyOutcome::Obsolete
-            } else {
+        VaultOp::TrashFile { id } | VaultOp::RestoreFile { id } => {
+            let trash = matches!(op, VaultOp::TrashFile { .. });
+            record_trash_event(conn, record, *id, false, trash)?;
+            Ok(if settle_file_trash(conn, *id)? {
                 ApplyOutcome::Applied
+            } else {
+                ApplyOutcome::Obsolete
             })
         }
 
-        VaultOp::TrashFolder { id } => {
-            let Some(path) = folder_path(conn, *id)? else {
+        VaultOp::TrashFolder { id } | VaultOp::RestoreFolder { id } => {
+            let trash = matches!(op, VaultOp::TrashFolder { .. });
+            record_trash_event(conn, record, *id, true, trash)?;
+            if folder_path(conn, *id)?.is_none() {
                 return Ok(ApplyOutcome::Obsolete);
-            };
-            let subtree = crate::like::subtree(&path);
-            conn.execute(
-                "UPDATE folders SET deleted_at = ?2, updated_at = ?2
-                 WHERE (id = ?1 OR path GLOB ?3) AND deleted_at IS NULL",
-                params![id.to_string(), at, subtree],
-            )
-            .map_err(db)?;
-            conn.execute(
-                "UPDATE files SET deleted_at = ?1, updated_at = ?1
-                 WHERE deleted_at IS NULL AND folder_id IN (
-                     SELECT id FROM folders WHERE id = ?2 OR path GLOB ?3
-                 )",
-                params![at, id.to_string(), subtree],
-            )
-            .map_err(db)?;
-            Ok(ApplyOutcome::Applied)
-        }
-
-        VaultOp::RestoreFile { id } => {
-            let changed = conn
-                .execute(
-                    "UPDATE files SET deleted_at = NULL, updated_at = ?2
-                     WHERE id = ?1 AND deleted_at IS NOT NULL",
-                    params![id.to_string(), at],
-                )
-                .map_err(db)?;
-            Ok(if changed == 0 {
-                ApplyOutcome::Obsolete
-            } else {
-                ApplyOutcome::Applied
-            })
-        }
-
-        VaultOp::RestoreFolder { id } => {
-            let Some(path) = folder_path(conn, *id)? else {
-                return Ok(ApplyOutcome::Obsolete);
-            };
-            let subtree = crate::like::subtree(&path);
-            conn.execute(
-                "UPDATE folders SET deleted_at = NULL, updated_at = ?2
-                 WHERE (id = ?1 OR path GLOB ?3) AND deleted_at IS NOT NULL",
-                params![id.to_string(), at, subtree],
-            )
-            .map_err(db)?;
-            conn.execute(
-                "UPDATE files SET deleted_at = NULL, updated_at = ?1
-                 WHERE deleted_at IS NOT NULL AND folder_id IN (
-                     SELECT id FROM folders WHERE id = ?2 OR path GLOB ?3
-                 )",
-                params![at, id.to_string(), subtree],
-            )
-            .map_err(db)?;
+            }
+            settle_folder_trash(conn, *id)?;
             Ok(ApplyOutcome::Applied)
         }
 
@@ -1581,6 +2175,13 @@ fn apply_inner(conn: &Connection, record: &OpRecord) -> CoreResult<ApplyOutcome>
             // refused, and every later pass refused with it. It goes with its
             // folder instead, which is also what a record naming the folder
             // arriving after the purge already amounts to (Obsolete).
+            for id in file_ids.iter().chain(folder_ids) {
+                conn.execute(
+                    "INSERT OR IGNORE INTO purged_ids(id) VALUES (?1)",
+                    [id.to_string()],
+                )
+                .map_err(db)?;
+            }
             let mut extra_files: Vec<Uuid> = Vec::new();
             let mut extra_folders: Vec<Uuid> = Vec::new();
             for id in folder_ids {
@@ -1634,15 +2235,46 @@ fn apply_inner(conn: &Connection, record: &OpRecord) -> CoreResult<ApplyOutcome>
             })?;
 
             // Names come free once the rows are gone, so a later entry can
-            // take them.
+            // take them. What is left of each group is ranked again at once:
+            // a device that applied a later claim before this purge had
+            // given it a suffix, one that applied it after had not, and the
+            // two never agreed on the name. So is a group whose suffixed
+            // names skipped one of these, now free.
+            let mut groups: Vec<ClaimGroupKey> = Vec::new();
             for id in file_ids
                 .iter()
                 .chain(folder_ids)
                 .chain(&extra_files)
                 .chain(&extra_folders)
             {
+                if let Some(group) = current_group(conn, *id)? {
+                    if let Some(base) = suffix_base(&group.key) {
+                        let base = ClaimGroupKey {
+                            key: base,
+                            ..group.clone()
+                        };
+                        if !groups.contains(&base) {
+                            groups.push(base);
+                        }
+                    }
+                    if !groups.contains(&group) {
+                        groups.push(group);
+                    }
+                }
                 release_claim(conn, *id)?;
+                conn.execute(
+                    "DELETE FROM trash_events WHERE target = ?1",
+                    [id.to_string()],
+                )
+                .map_err(db)?;
+                conn.execute(
+                    "DELETE FROM content_versions WHERE file_id = ?1",
+                    [id.to_string()],
+                )
+                .map_err(db)?;
             }
+            groups.retain(|g| folder_path(conn, g.scope_id).ok().flatten().is_some());
+            settle_groups(conn, &groups, at)?;
             Ok(ApplyOutcome::Applied)
         }
 
@@ -1650,7 +2282,10 @@ fn apply_inner(conn: &Connection, record: &OpRecord) -> CoreResult<ApplyOutcome>
             // No name claim and no folder to resolve, so the whole clash
             // machinery the tree needs does not apply here. Later in the
             // total order simply wins, which is what editing the same entry
-            // on two devices should mean.
+            // on two devices should mean, whichever arrives first.
+            if !password_change_is_newest(conn, *id, record)? {
+                return Ok(ApplyOutcome::Obsolete);
+            }
             conn.execute(
                 "INSERT INTO passwords(id, data, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?3)
@@ -1664,6 +2299,9 @@ fn apply_inner(conn: &Connection, record: &OpRecord) -> CoreResult<ApplyOutcome>
         }
 
         VaultOp::DeletePassword { id } => {
+            if !password_change_is_newest(conn, *id, record)? {
+                return Ok(ApplyOutcome::Obsolete);
+            }
             let removed = conn
                 .execute("DELETE FROM passwords WHERE id = ?1", [id.to_string()])
                 .map_err(db)?;

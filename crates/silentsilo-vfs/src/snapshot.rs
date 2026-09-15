@@ -403,6 +403,19 @@ pub fn restore(conn: &Connection, snapshot: &Snapshot) -> CoreResult<()> {
         .map_err(db)?;
     }
 
+    // A snapshot says what was in the trash, not which records put it
+    // there. Each trashed row stands in as one trash record of its own,
+    // before anything the log still holds, so later records fold onto the
+    // same state a device that kept the whole log reaches.
+    conn.execute(
+        "INSERT OR IGNORE INTO trash_events(op_id, target, is_folder, trash, lamport, device_id, at)
+         SELECT 'snapshot:' || id, id, 1, 1, 0, '', deleted_at FROM folders WHERE deleted_at IS NOT NULL
+         UNION ALL
+         SELECT 'snapshot:' || id, id, 0, 1, 0, '', deleted_at FROM files WHERE deleted_at IS NOT NULL",
+        [],
+    )
+    .map_err(db)?;
+
     for row in &snapshot.device_labels {
         conn.execute(
             "INSERT INTO device_labels(device_id, label, lamport, author, system_name, platform)

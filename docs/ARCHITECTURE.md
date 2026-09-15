@@ -309,6 +309,16 @@ Read this before "fixing" any of it.
   where the order and the horizon filter come from; storage copying a
   genuine record to a later name would otherwise replay it there. Snapshots
   likewise count only when their sealed horizon matches the name.
+- **Arrival order decides nothing, across passes too.** `replay` sorts a
+  batch, but records reach a device over many passes in whatever order
+  storage and other devices deliver them. So the derived state is worked out
+  from kept records rather than from what happened to be applied first:
+  trash state from every trash and restore record (`trash_events`), a
+  file's content and conflict copies from every edit (`content_versions`),
+  password edits and renames guarded by total order (`password_order`, the
+  claim's own order), purged ids remembered (`purged_ids`).
+  `tests/arrival_order.rs` applies records one at a time in random causal
+  orders; `silentsilo-app/tests/fleet.rs` runs three devices on one storage.
 - **A large purge is several records.** Readers refuse records over their
   size ceiling, so a purge is split files first, then folders deepest first,
   and each record stands on its own for a 1.0.0 reader.
