@@ -184,7 +184,11 @@ Name resolution is the subtle part. Uniqueness is per folder,
 case-insensitive and Unicode-composed (`names::fold`). The `name_claims`
 table records which operation claimed which name; ranks within a claim
 group assign `name`, `name (2)`, and so on, as a pure function of the
-record set. Typed names are validated (`names::check`) and NFC-composed at
+record set. A suffixed name that another entry in the folder asked for
+outright is skipped, so `report (2).pdf` given to a second `report.pdf`
+never meets a file really called that. Subtree queries use `GLOB`, not
+`LIKE`: `LIKE` folds ASCII case and would treat `x (2)` and `X (2)` as one
+subtree. Typed names are validated (`names::check`) and NFC-composed at
 the boundary; replayed names are repaired (`names::sanitize`) because a
 record can never be refused. Concurrent edits of one file resolve by total
 order, with the loser preserved as a deterministic conflict copy (id

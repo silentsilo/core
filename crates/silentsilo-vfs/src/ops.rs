@@ -967,7 +967,7 @@ impl<'a> Vfs<'a> {
                    JOIN folders d ON d.id = f.folder_id
                   WHERE f.deleted_at IS NULL
                     AND d.deleted_at IS NULL
-                    AND (d.id = ?1 OR d.path LIKE ?2 ESCAPE '!')",
+                    AND (d.id = ?1 OR d.path GLOB ?2)",
             )
             .map_err(|e| CoreError::Database(e.to_string()))?;
 
@@ -1215,7 +1215,7 @@ impl<'a> Vfs<'a> {
             .conn()
             .prepare(
                 "SELECT id, parent_id, name, favorite FROM folders
-                  WHERE (id = ?1 OR path LIKE ?2 ESCAPE '!') AND deleted_at IS NULL
+                  WHERE (id = ?1 OR path GLOB ?2) AND deleted_at IS NULL
                   ORDER BY length(path)",
             )
             .map_err(db)?;
@@ -1264,7 +1264,7 @@ impl<'a> Vfs<'a> {
             .prepare(
                 "SELECT f.id, f.folder_id FROM files f
                    JOIN folders d ON d.id = f.folder_id
-                  WHERE (d.id = ?1 OR d.path LIKE ?2 ESCAPE '!')
+                  WHERE (d.id = ?1 OR d.path GLOB ?2)
                     AND f.deleted_at IS NULL AND d.deleted_at IS NULL",
             )
             .map_err(db)?;
@@ -1640,7 +1640,7 @@ impl<'a> Vfs<'a> {
                 let subtree = crate::like::subtree(&path);
                 let mut stmt = self
                     .conn()
-                    .prepare("SELECT id FROM folders WHERE id = ?1 OR path LIKE ?2 ESCAPE '!'")
+                    .prepare("SELECT id FROM folders WHERE id = ?1 OR path GLOB ?2")
                     .map_err(db)?;
                 let rows = stmt
                     .query_map(params![&raw, &subtree], |row| row.get::<_, String>(0))
@@ -1654,7 +1654,7 @@ impl<'a> Vfs<'a> {
                     .prepare(
                         "SELECT f.id, f.blob_id FROM files f
                            JOIN folders d ON d.id = f.folder_id
-                          WHERE d.id = ?1 OR d.path LIKE ?2 ESCAPE '!'",
+                          WHERE d.id = ?1 OR d.path GLOB ?2",
                     )
                     .map_err(db)?;
                 let rows = stmt

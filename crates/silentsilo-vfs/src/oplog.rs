@@ -883,14 +883,62 @@ fn split_extension(name: &str) -> (&str, &str) {
     }
 }
 
-/// The name an entry gets when it is `rank`-th among everything competing
-/// for `desired` — rank 0 keeps the plain name, 1 becomes ` (2)`, and so on.
-fn ranked_name(desired: &str, rank: usize) -> String {
-    if rank == 0 {
-        return desired.to_string();
+/// The names the members of a claim group get, in rank order: rank 0 keeps
+/// the plain name, the others take ` (2)`, ` (3)` and on.
+///
+/// A suffixed name some other entry in the scope asked for outright is
+/// skipped. Without that, `report (2).pdf` given to the second `report.pdf`
+/// collided with a file really called that, the insert failed, and every
+/// replay after it failed the same way; "x (2)" and "X (2)" also ended up
+/// side by side. Skipping depends only on which names were asked for, so the
+/// result stays a function of the records, whatever order they came in.
+fn group_names(
+    conn: &Connection,
+    scope_id: Uuid,
+    is_folder: bool,
+    members: &[Claim],
+) -> CoreResult<Vec<String>> {
+    let mut names = Vec::with_capacity(members.len());
+    let Some(first) = members.first() else {
+        return Ok(names);
+    };
+    names.push(first.desired.clone());
+    let (stem, ext) = split_extension(&first.desired);
+    let mut suffix = 2usize;
+    for member in &members[1..] {
+        let (own_stem, own_ext) = split_extension(&member.desired);
+        loop {
+            let probe = format!("{stem} ({suffix}){ext}");
+            suffix += 1;
+            if !group_exists(conn, scope_id, is_folder, &crate::names::fold(&probe))? {
+                names.push(format!("{own_stem} ({}){own_ext}", suffix - 1));
+                break;
+            }
+        }
     }
-    let (stem, ext) = split_extension(desired);
-    format!("{stem} ({}){ext}", rank + 1)
+    Ok(names)
+}
+
+fn group_exists(conn: &Connection, scope_id: Uuid, is_folder: bool, key: &str) -> CoreResult<bool> {
+    conn.query_row(
+        "SELECT 1 FROM name_claims WHERE scope_id = ?1 AND is_folder = ?2 AND key = ?3 LIMIT 1",
+        params![scope_id.to_string(), is_folder as i64, key],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|found| found.is_some())
+    .map_err(|e| CoreError::Database(e.to_string()))
+}
+
+/// The group whose suffixed names `key` would be one of: `report.pdf` for
+/// `report (2).pdf`. A claim for that name moves the suffixed entry along.
+fn suffix_base(key: &str) -> Option<String> {
+    let (stem, ext) = split_extension(key);
+    let inner = stem.strip_suffix(')')?;
+    let open = inner.rfind(" (")?;
+    let digits = &inner[open + 2..];
+    (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| format!("{}{ext}", &inner[..open]))
 }
 
 #[derive(Debug, Clone)]
@@ -967,8 +1015,8 @@ fn settle_groups(conn: &Connection, groups: &[ClaimGroupKey], at: i64) -> CoreRe
     let mut moves: Vec<(&ClaimGroupKey, Claim, String)> = Vec::new();
     for group in groups {
         let members = claim_group(conn, group.scope_id, group.is_folder, &group.key)?;
-        for (rank, claim) in members.iter().enumerate() {
-            let target = ranked_name(&claim.desired, rank);
+        let names = group_names(conn, group.scope_id, group.is_folder, &members)?;
+        for (claim, target) in members.iter().zip(names) {
             // No row yet: an entry being created this instant, or one whose
             // rename arrived before its creation did. Nothing to move.
             if let Some(current) = current_name(conn, claim.entry_id, group.is_folder)?
@@ -1081,15 +1129,30 @@ fn claim_name(
     if let Some(previous) = previous.filter(|p| *p != mine) {
         groups.push(previous);
     }
-
-    let my_rank = claim_group(conn, mine.scope_id, mine.is_folder, &mine.key)?
-        .iter()
-        .position(|c| c.entry_id == entry_id)
-        .unwrap_or(0);
+    // A name that is some other group's suffixed name moves that group on.
+    if let Some(base) = suffix_base(&mine.key) {
+        let base = ClaimGroupKey {
+            scope_id,
+            is_folder,
+            key: base,
+        };
+        if !groups.contains(&base) {
+            groups.push(base);
+        }
+    }
 
     settle_groups(conn, &groups, record.at)?;
 
-    Ok(ranked_name(desired, my_rank))
+    let members = claim_group(conn, mine.scope_id, mine.is_folder, &mine.key)?;
+    let rank = members
+        .iter()
+        .position(|c| c.entry_id == entry_id)
+        .unwrap_or(0);
+    let names = group_names(conn, mine.scope_id, mine.is_folder, &members)?;
+    Ok(names
+        .into_iter()
+        .nth(rank)
+        .unwrap_or_else(|| desired.to_string()))
 }
 
 /// Applies a rank-shift rename to an entry that already exists. A claim whose
@@ -1125,7 +1188,7 @@ fn rename_existing_entry(
         let old_prefix = format!("{old_path}/");
         conn.execute(
             "UPDATE folders SET path = ?2 || substr(path, ?3), updated_at = ?4
-             WHERE path LIKE ?1 ESCAPE '!' AND id != ?5",
+             WHERE path GLOB ?1 AND id != ?5",
             params![
                 crate::like::below_prefix(&old_prefix),
                 format!("{new_path}/"),
@@ -1451,14 +1514,14 @@ fn apply_inner(conn: &Connection, record: &OpRecord) -> CoreResult<ApplyOutcome>
             let subtree = crate::like::subtree(&path);
             conn.execute(
                 "UPDATE folders SET deleted_at = ?2, updated_at = ?2
-                 WHERE (id = ?1 OR path LIKE ?3 ESCAPE '!') AND deleted_at IS NULL",
+                 WHERE (id = ?1 OR path GLOB ?3) AND deleted_at IS NULL",
                 params![id.to_string(), at, subtree],
             )
             .map_err(db)?;
             conn.execute(
                 "UPDATE files SET deleted_at = ?1, updated_at = ?1
                  WHERE deleted_at IS NULL AND folder_id IN (
-                     SELECT id FROM folders WHERE id = ?2 OR path LIKE ?3 ESCAPE '!'
+                     SELECT id FROM folders WHERE id = ?2 OR path GLOB ?3
                  )",
                 params![at, id.to_string(), subtree],
             )
@@ -1488,14 +1551,14 @@ fn apply_inner(conn: &Connection, record: &OpRecord) -> CoreResult<ApplyOutcome>
             let subtree = crate::like::subtree(&path);
             conn.execute(
                 "UPDATE folders SET deleted_at = NULL, updated_at = ?2
-                 WHERE (id = ?1 OR path LIKE ?3 ESCAPE '!') AND deleted_at IS NOT NULL",
+                 WHERE (id = ?1 OR path GLOB ?3) AND deleted_at IS NOT NULL",
                 params![id.to_string(), at, subtree],
             )
             .map_err(db)?;
             conn.execute(
                 "UPDATE files SET deleted_at = NULL, updated_at = ?1
                  WHERE deleted_at IS NOT NULL AND folder_id IN (
-                     SELECT id FROM folders WHERE id = ?2 OR path LIKE ?3 ESCAPE '!'
+                     SELECT id FROM folders WHERE id = ?2 OR path GLOB ?3
                  )",
                 params![at, id.to_string(), subtree],
             )
@@ -1526,7 +1589,7 @@ fn apply_inner(conn: &Connection, record: &OpRecord) -> CoreResult<ApplyOutcome>
                 };
                 let subtree = crate::like::subtree(&path);
                 let mut stmt = conn
-                    .prepare("SELECT id FROM folders WHERE path LIKE ?1 ESCAPE '!'")
+                    .prepare("SELECT id FROM folders WHERE path GLOB ?1")
                     .map_err(db)?;
                 for row in stmt
                     .query_map([&subtree], |row| row.get::<_, String>(0))
@@ -1540,7 +1603,7 @@ fn apply_inner(conn: &Connection, record: &OpRecord) -> CoreResult<ApplyOutcome>
                 let mut stmt = conn
                     .prepare(
                         "SELECT f.id FROM files f JOIN folders d ON d.id = f.folder_id
-                          WHERE d.id = ?1 OR d.path LIKE ?2 ESCAPE '!'",
+                          WHERE d.id = ?1 OR d.path GLOB ?2",
                     )
                     .map_err(db)?;
                 for row in stmt
@@ -3932,6 +3995,89 @@ pub(crate) mod tests {
         .unwrap();
 
         assert_eq!(d.snapshot(), vec!["folder / deleted=false"]);
+    }
+
+    #[test]
+    fn a_suffixed_name_skips_one_already_asked_for() {
+        // A has "report.pdf" and "report (2).pdf"; B adds "report.pdf" too.
+        // Its copy must not take "report (2).pdf", in either arrival order.
+        let run = |order: &[u64]| {
+            let d = Device::new();
+            let root = d.root();
+            let ids = [
+                Uuid::from_u128(1),
+                Uuid::from_u128(2),
+                Uuid::from_u128(3),
+                Uuid::from_u128(4),
+            ];
+            let ops = [
+                d.make(1, add_file(ids[0], root, "report.pdf")),
+                d.make(2, add_file(ids[1], root, "report (2).pdf")),
+                d.make(3, add_file(ids[2], root, "report.pdf")),
+                d.make(4, new_folder(ids[3], root, "x")),
+            ];
+            for &i in order {
+                apply_op(d.conn(), &ops[i as usize]).unwrap();
+            }
+            d.snapshot()
+        };
+        let forward = run(&[0, 1, 2, 3]);
+        assert_eq!(forward, run(&[2, 0, 3, 1]));
+        assert_eq!(forward, run(&[1, 2, 0, 3]));
+        let joined = forward.join("\n");
+        assert!(joined.contains("report (2).pdf"), "{joined}");
+        assert!(joined.contains("report (3).pdf"), "{joined}");
+
+        // A folder named after a suffixed one, arriving later.
+        let d = Device::new();
+        let root = d.root();
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        apply_op(d.conn(), &d.make(1, new_folder(a, root, "x"))).unwrap();
+        apply_op(d.conn(), &d.make(3, new_folder(b, root, "X"))).unwrap();
+        apply_op(d.conn(), &d.make(2, new_folder(c, root, "x (2)"))).unwrap();
+        let joined = d.snapshot().join("\n");
+        assert!(joined.contains("/x (2)"), "{joined}");
+        assert!(joined.contains("/X (3)"), "{joined}");
+    }
+
+    #[test]
+    fn a_purge_leaves_a_sibling_that_differs_only_in_case_alone() {
+        let d = Device::new();
+        let root = d.root();
+        let (lower, upper, sub, deep) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        apply_op(d.conn(), &d.make(1, new_folder(lower, root, "x (2)"))).unwrap();
+        apply_op(d.conn(), &d.make(2, new_folder(upper, root, "X (2)"))).unwrap();
+        apply_op(d.conn(), &d.make(3, new_folder(sub, upper, "sub"))).unwrap();
+        apply_op(d.conn(), &d.make(4, add_file(deep, sub, "deep.txt"))).unwrap();
+        apply_op(
+            d.conn(),
+            &d.make(
+                5,
+                VaultOp::Purge {
+                    folder_ids: vec![lower],
+                    file_ids: vec![],
+                },
+            ),
+        )
+        .unwrap();
+
+        let count = |table: &str, id: Uuid| -> i64 {
+            d.conn()
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE id = ?1"),
+                    [id.to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(count("folders", lower), 0);
+        assert_eq!(count("folders", sub), 1);
+        assert_eq!(count("files", deep), 1);
     }
 }
 

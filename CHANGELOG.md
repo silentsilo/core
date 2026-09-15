@@ -86,6 +86,16 @@ release notes should say.
 - The extractor wrote password entries only as CSV, which has no column
   for passkeys, cards or identities. They are also written whole, to
   `_passwords/entries.json`.
+- A file or folder given a " (2)" suffix could take a name another entry
+  in the folder already asked for, and the replay then failed on every pass
+  on every device. Suffixed names skip names already asked for.
+- Subtree queries folded case, so purging or renaming "x (2)" also reached
+  into "X (2)". They compare case for case now.
+- The storage settings kept the saved SFTP password when the server
+  answered with a different host key. A new key needs the password again.
+- A WebDAV folder whose name has a space or a letter such as "ș" listed
+  nothing, so sync and key reconciliation saw an empty store. WebDAV also
+  gives up on a server that stops answering.
 
 ## [1.3.0] - The shared application crate
 

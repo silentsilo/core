@@ -49,11 +49,22 @@ impl WebDavStore {
             url::Url::parse(&url).map_err(|e| StoreError::Other(format!("bad address: {e}")))?;
 
         Ok(Self {
+            // A server that stops answering must not hold a sync pass forever.
+            // Per read, not per request, so a large upload is not cut off.
             client: Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(30))
+                .read_timeout(std::time::Duration::from_secs(120))
                 .build()
                 .map_err(|e| StoreError::Other(e.to_string()))?,
             known_collections: std::sync::Mutex::new(std::collections::HashSet::new()),
-            base_path: format!("{}/", parsed.path().trim_end_matches('/')),
+            // Decoded, as hrefs are before they are compared with it: a
+            // folder named "My Silo" is `/My%20Silo` in the URL.
+            base_path: format!(
+                "{}/",
+                percent_encoding::percent_decode_str(parsed.path())
+                    .decode_utf8_lossy()
+                    .trim_end_matches('/')
+            ),
             base: format!("{url}/"),
             username: config.username,
             password: config.password,
@@ -496,6 +507,21 @@ fn normalise_href(href: &str, base_path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_collection_with_a_space_or_diacritics_still_lists_keys() {
+        let store = WebDavStore::new(WebDavConfig {
+            url: "https://dav.example.com/dav/My Silo ș/".into(),
+            username: String::new(),
+            password: String::new(),
+        })
+        .unwrap();
+        assert_eq!(store.base_path, "/dav/My Silo ș/");
+        assert_eq!(
+            normalise_href("/dav/My%20Silo%20%C8%99/ops/000001.op", &store.base_path),
+            "ops/000001.op"
+        );
+    }
 
     #[test]
     fn an_absolute_href_is_reduced_to_a_key() {

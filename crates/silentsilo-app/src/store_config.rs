@@ -175,12 +175,22 @@ impl StoreConfigInput {
                 host_fingerprint,
             } => {
                 // The same server and account only: another directory on it
-                // keeps the password, another host does not get it.
+                // keeps the password, another host does not get it. Nor does
+                // the same address answering with another host key, which is
+                // what a machine in the middle looks like.
+                let same_key = |c: &silentsilo_store::SftpConfig| match host_fingerprint.as_deref()
+                {
+                    Some(given) if !given.trim().is_empty() => {
+                        c.host_fingerprint.as_deref() == Some(given.trim())
+                    }
+                    _ => true,
+                };
                 let stored = match existing {
                     Some(StoreConfig::Sftp(c))
                         if c.host == host.trim()
                             && c.port == port
-                            && c.username == username.trim() =>
+                            && c.username == username.trim()
+                            && same_key(&c) =>
                     {
                         Some(c)
                     }
@@ -467,7 +477,21 @@ mod deserialisation_tests {
             "hostFingerprint": "SHA256:def"
         }))
         .unwrap();
-        assert!(elsewhere.into_config(Some(sftp)).is_err());
+        assert!(elsewhere.into_config(Some(sftp.clone())).is_err());
+        let rekeyed = |fingerprint: &str| -> StoreConfigInput {
+            serde_json::from_value(serde_json::json!({
+                "kind": "sftp", "host": "nas.example.com", "port": 22, "username": "alex",
+                "path": "backups/silo", "auth": { "method": "password", "password": null },
+                "hostFingerprint": fingerprint
+            }))
+            .unwrap()
+        };
+        assert!(
+            rekeyed("SHA256:def")
+                .into_config(Some(sftp.clone()))
+                .is_err()
+        );
+        assert!(rekeyed("SHA256:abc").into_config(Some(sftp)).is_ok());
 
         let dav = StoreConfig::WebDav(silentsilo_store::WebDavConfig {
             url: "https://cloud.example.com/dav/silo".into(),
