@@ -147,7 +147,7 @@ jobs:
           echo "AR_aarch64_linux_android=$bin/llvm-ar" >> "$GITHUB_ENV"
           echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$bin/aarch64-linux-android31-clang" >> "$GITHUB_ENV"
       - run: cargo check --locked --target ${{ matrix.target }} -p silentsilo-core -p silentsilo-crypto -p silentsilo-store -p silentsilo-vault -p silentsilo-vfs -p silentsilo-sync -p silentsilo-app
-      - run: cargo check --locked --target ${{ matrix.target }} -p silentsilo-fido --no-default-features --features enclave
+      - run: cargo check --locked --target ${{ matrix.target }} -p silentsilo-fido --no-default-features --features enclave,ctap2
 
   # Compile-checks the CTAP2/USB-HID security-key backend. This is the code
   # path Windows never builds (it uses the OS WebAuthn API instead), so
