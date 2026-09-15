@@ -166,6 +166,10 @@ impl<'a> Vfs<'a> {
     }
 
     pub fn create_folder(&self, parent_id: Uuid, name: &str) -> CoreResult<FolderEntry> {
+        self.create_folder_as(Uuid::now_v7(), parent_id, name)
+    }
+
+    fn create_folder_as(&self, id: Uuid, parent_id: Uuid, name: &str) -> CoreResult<FolderEntry> {
         let name = &normalized_input(name)?;
         // Fail early if the parent is gone, rather than emitting an
         // operation that every device would just discard as obsolete.
@@ -191,7 +195,6 @@ impl<'a> Vfs<'a> {
         }
         drop(stmt);
 
-        let id = Uuid::now_v7();
         let (_record, _outcome) = crate::oplog::emit(
             self.conn(),
             crate::oplog::VaultOp::CreateFolder {
@@ -432,12 +435,41 @@ impl<'a> Vfs<'a> {
 
     /// The folder at `segments` below the root, created where missing. Names
     /// come from another device, so they are repaired, not refused.
+    ///
+    /// A folder made here takes an id derived from its parent and name, so
+    /// two devices importing the same item before either has synced make the
+    /// same folder. Random ids made two folders, one renamed "(2)", and each
+    /// device kept the files in its own.
     pub fn ensure_folder_path(&self, segments: &[String]) -> CoreResult<FolderEntry> {
         let mut folder = self.get_folder(self.root_folder_id()?)?;
         for segment in segments {
-            folder = self.create_or_get_folder(folder.id, &crate::names::sanitize(segment))?;
+            let name = crate::names::sanitize(segment);
+            let derived = Uuid::new_v5(&folder.id, crate::names::fold(&name).as_bytes());
+            // A row with that id already, trashed most likely: a record
+            // for it would be dropped as a duplicate, so a fresh id.
+            let id = if self.folder_row_exists(derived)? {
+                Uuid::now_v7()
+            } else {
+                derived
+            };
+            folder = match self.create_folder_as(id, folder.id, &name) {
+                Err(CoreError::NameConflict(_)) => self.create_or_get_folder(folder.id, &name)?,
+                other => other?,
+            };
         }
         Ok(folder)
+    }
+
+    fn folder_row_exists(&self, id: Uuid) -> CoreResult<bool> {
+        self.conn()
+            .query_row(
+                "SELECT 1 FROM folders WHERE id = ?1",
+                [id.to_string()],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|found| found.is_some())
+            .map_err(|e| CoreError::Database(e.to_string()))
     }
 
     /// A file whose content is already in storage, under an id the caller

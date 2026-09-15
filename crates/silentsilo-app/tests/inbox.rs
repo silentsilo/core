@@ -271,3 +271,105 @@ async fn an_archive_copy_keeps_its_items_and_they_are_not_imported_twice() {
     }
     assert!(store.head(&envelope(item_id)).await.unwrap().is_some());
 }
+
+/// A second device on the same silo and the same storage.
+async fn twin(host: &Targets, first: &Device) -> Device {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("silo");
+    let (dek, kek) = {
+        let sessions = first.state.sessions.lock().unwrap();
+        let s = &sessions[&first.silo.id];
+        (s.dek.clone(), s.kek.clone())
+    };
+    let session =
+        VaultSession::provision_with_dek(root.clone(), first.silo.id, "t", dek, kek).unwrap();
+    Vfs::new(&session).ensure_initialized().unwrap();
+    let silo = SiloEntry {
+        id: first.silo.id,
+        name: "T".into(),
+        path: root,
+        last_opened: 0,
+        auto_lock_minutes: None,
+    };
+    let state = AppState::default();
+    state.open_session(host, first.silo.id, session).unwrap();
+    let device = Device {
+        _dir: dir,
+        state,
+        silo,
+    };
+    device.pass(host).await;
+    device
+}
+
+fn view(device: &Device) -> Vec<(String, String, String)> {
+    let sessions = device.state.sessions.lock().unwrap();
+    let conn = &sessions[&device.silo.id].conn;
+    let mut stmt = conn
+        .prepare("SELECT f.id, d.path, f.name FROM files f JOIN folders d ON d.id = f.folder_id WHERE f.deleted_at IS NULL ORDER BY f.id")
+        .unwrap();
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+#[tokio::test]
+async fn two_devices_importing_the_same_items_agree_on_where_they_are() {
+    let storage = tempfile::tempdir().unwrap();
+    let host = Targets(vec![folder_target(&storage)]);
+    let store = FolderStore::new(storage.path().to_path_buf());
+    let a = Device::new(&host).await;
+    let b = twin(&host, &a).await;
+    let phone = phone(&store, &a, "aa11").await;
+    for i in 0..3u8 {
+        send_photo(&store, &phone, &[i; 64]).await;
+    }
+
+    // Both import before either has pushed.
+    assert_eq!(a.pass(&host).await.inbox_imported, 3);
+    assert_eq!(b.pass(&host).await.inbox_imported, 3);
+    for _ in 0..3 {
+        let (ra, rb) = (a.pass(&host).await, b.pass(&host).await);
+        assert!(
+            ra.renamed.is_empty() && rb.renamed.is_empty(),
+            "{ra:?} {rb:?}"
+        );
+    }
+
+    let seen = view(&a);
+    assert_eq!(seen.len(), 3);
+    assert!(
+        seen.iter().all(|(_, path, _)| path == "/Phone/Photos"),
+        "{seen:?}"
+    );
+    assert_eq!(seen, view(&b));
+    assert!(store.list("inbox/items/").await.unwrap().is_empty());
+    let quiet = a.pass(&host).await;
+    assert_eq!((quiet.ops_pushed, quiet.ops_applied), (0, 0));
+}
+
+#[tokio::test]
+async fn content_swept_while_its_record_waited_is_copied_again_before_the_item_goes() {
+    let storage = tempfile::tempdir().unwrap();
+    let host = Targets(vec![folder_target(&storage)]);
+    let store = FolderStore::new(storage.path().to_path_buf());
+    let device = Device::new(&host).await;
+    let phone = phone(&store, &device, "aa11").await;
+    let item_id = send_photo(&store, &phone, b"a photo").await;
+
+    assert_eq!(device.pass(&host).await.inbox_imported, 1);
+    let blob = {
+        let sessions = device.state.sessions.lock().unwrap();
+        let file = Vfs::new(&sessions[&device.silo.id])
+            .get_file(item_id)
+            .unwrap();
+        format!("blobs/{}.sslo", file.blob_id)
+    };
+    // What another device's sweep does to content nothing it knows names.
+    store.delete(&blob).await.unwrap();
+
+    device.pass(&host).await;
+    assert!(store.head(&blob).await.unwrap().is_some());
+    assert!(store.head(&envelope(item_id)).await.unwrap().is_none());
+}

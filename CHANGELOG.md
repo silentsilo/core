@@ -34,6 +34,20 @@ release notes should say.
 - `inbox::send_item_from` and `encrypt_stream` in the crate root, for content
   read from a descriptor another app handed over rather than opened by path.
 
+### Fixed
+
+- Two devices importing the same inbox items before either synced put
+  them in two folders ("Phone" and "Phone (2)") and disagreed about which
+  held the files. Folders made by the import now take ids derived from
+  their parent and name.
+- An inbox item finished by another device during a scan failed the whole
+  scan with "no such file". It is skipped.
+- An item recorded by a device that then stayed locked could leave the inbox
+  after another device's sweep removed its copied content. The content is
+  checked, and copied again, before the item goes.
+- Content another device already copied out of the inbox is not copied
+  again.
+
 ## [1.3.0] - The shared application crate
 
 No existing format version changed, so the 1.0.0 fixtures still describe the

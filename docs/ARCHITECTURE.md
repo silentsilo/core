@@ -248,6 +248,21 @@ target keeps its items; they are skipped as already known. With more than one
 target the importer fetches the content down, so its next push spreads it to
 the targets the phone did not send to.
 
+Several unlocked devices import the same items at once, and nothing stops
+that. What keeps them agreeing:
+
+- the file id is the item id, and the folders the import creates take ids
+  derived from parent and name (`Vfs::ensure_folder_path`), so both devices
+  write the same file into the same folder. Random folder ids made a
+  "(2)" folder, and each device kept the files in its own;
+- content already in `blobs/` at the signed size is not copied again;
+- an item another device finished between the listing and the read is
+  skipped, not an error that stops the scan;
+- before an item leaves the inbox its content is checked in `blobs/` and
+  copied again when missing. A device that recorded an item and stayed locked
+  for days can find that copy swept by another device, which does not know
+  the file yet.
+
 ## Recovery matrix
 
 What gets someone out of which hole, all of it built from the same pieces

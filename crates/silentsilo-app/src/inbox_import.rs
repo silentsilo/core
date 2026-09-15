@@ -15,7 +15,7 @@ use std::path::Path;
 
 use silentsilo_crypto::ContentKek;
 use silentsilo_store::ObjectStore;
-use silentsilo_sync::inbox::{finish_item, scan_inbox, stage_item};
+use silentsilo_sync::inbox::{finish_item, is_staged, scan_inbox, source_present, stage_item};
 use silentsilo_vfs::Vfs;
 use uuid::Uuid;
 
@@ -82,7 +82,14 @@ pub async fn import_inbox(
         }
 
         let total = scan.ready.len();
-        for (done, item) in scan.ready.into_iter().enumerate() {
+        // Started at a random item: devices importing at once would
+        // otherwise copy the same video in the same order, each through its
+        // own connection, and only then find the other had it.
+        let mut ready = scan.ready;
+        if total > 1 {
+            ready.rotate_left((Uuid::new_v4().as_u128() % total as u128) as usize);
+        }
+        for (done, item) in ready.into_iter().enumerate() {
             progress(done, total);
             let mut known = false;
             if silo
@@ -97,6 +104,7 @@ pub async fn import_inbox(
             }
             if known {
                 if target.may_finish
+                    && ensure_staged(target.store, &item, warn, target.label).await
                     && let Err(e) = finish_item(target.store, item.item_id).await
                 {
                     warn(&format!("{}: {e}", target.label));
@@ -104,7 +112,15 @@ pub async fn import_inbox(
                 continue;
             }
 
-            if let Err(e) = stage_item(target.store, &item).await {
+            // Another device importing the same item may have copied it
+            // already. The same signed blob id, so the same bytes: a second
+            // copy through a phone is only time and data.
+            let staged = match is_staged(target.store, &item).await {
+                Ok(true) => Ok(()),
+                Ok(false) => stage_item(target.store, &item).await,
+                Err(e) => Err(e),
+            };
+            if let Err(e) = staged {
                 warn(&format!("{}: {e}", target.label));
                 continue;
             }
@@ -154,6 +170,39 @@ pub async fn import_inbox(
         }
     }
     outcome
+}
+
+/// Checked before an item leaves the inbox. The content copied out of it
+/// waits in `blobs/` for its record, and a device that recorded it and then
+/// stayed locked for days can find it swept by another device. The inbox
+/// still has it, so it is copied again. False keeps the item for next time.
+async fn ensure_staged(
+    store: &dyn ObjectStore,
+    item: &silentsilo_sync::inbox::ReadyItem,
+    warn: &(dyn Fn(&str) + Sync),
+    label: &str,
+) -> bool {
+    match is_staged(store, item).await {
+        Ok(true) => return true,
+        Ok(false) => {}
+        Err(e) => {
+            warn(&format!("{label}: {e}"));
+            return false;
+        }
+    }
+    match stage_item(store, item).await {
+        Ok(()) => true,
+        Err(e) => {
+            // With neither copy there is nothing an envelope can bring back,
+            // and keeping it would repeat this on every pass.
+            if let Ok(false) = source_present(store, item.item_id).await {
+                warn(&format!("{label}: {} is gone from storage", item.name));
+                return true;
+            }
+            warn(&format!("{label}: {e}"));
+            false
+        }
+    }
 }
 
 /// A silo open in this crate's [`AppState`].

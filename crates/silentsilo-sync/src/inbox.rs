@@ -41,7 +41,7 @@ use silentsilo_crypto::inbox::{
     EcSecret, ItemHeader, ItemIds, POINT_LEN, SIGNATURE_LEN, open_item, seal_item, verify_signature,
 };
 use silentsilo_crypto::{ContentKek, ContentKey, seal_with_key, unseal_with_key};
-use silentsilo_store::ObjectStore;
+use silentsilo_store::{ObjectStore, StoreError};
 use uuid::Uuid;
 use zeroize::Zeroize;
 
@@ -255,7 +255,12 @@ async fn load_senders(
 ) -> Result<Vec<Sender>, SyncError> {
     let mut out = Vec::new();
     for entry in client.list(INBOX_SENDERS_PREFIX).await? {
-        let bytes = client.get(&entry.key).await?;
+        let bytes = match client.get(&entry.key).await {
+            Ok(bytes) => bytes,
+            // Removed since the listing: that sender is no longer allowed.
+            Err(StoreError::NotFound(_)) => continue,
+            Err(e) => return Err(e.into()),
+        };
         let Ok(plain) = unseal_with_key(&bytes, kek.as_bytes()) else {
             continue;
         };
@@ -463,7 +468,13 @@ pub async fn scan_inbox(
                 .push(refuse("the envelope is too large".into()));
             continue;
         }
-        let bytes = client.get(&entry.key).await?;
+        let bytes = match client.get(&entry.key).await {
+            Ok(bytes) => bytes,
+            // Finished by another device since the listing. Failing the
+            // whole scan for it stalled every other item on this pass.
+            Err(StoreError::NotFound(_)) => continue,
+            Err(e) => return Err(e.into()),
+        };
         let envelope = match serde_json::from_slice::<ItemEnvelope>(&bytes) {
             Ok(envelope) => envelope,
             Err(e) => {
@@ -570,6 +581,21 @@ pub async fn stage_item(client: &dyn ObjectStore, item: &ReadyItem) -> Result<()
     let dest = format!("{BLOBS_PREFIX}{}.sslo", item.blob_id);
     client.copy(&source, &dest).await?;
     Ok(())
+}
+
+/// Whether the item's content is where the silo keeps content, at the size
+/// the envelope names.
+pub async fn is_staged(client: &dyn ObjectStore, item: &ReadyItem) -> Result<bool, SyncError> {
+    let dest = format!("{BLOBS_PREFIX}{}.sslo", item.blob_id);
+    Ok(client
+        .head(&dest)
+        .await?
+        .is_some_and(|size| size >= 0 && size as u64 == item.blob_size))
+}
+
+/// Whether the item's content is still in the inbox.
+pub async fn source_present(client: &dyn ObjectStore, item_id: Uuid) -> Result<bool, SyncError> {
+    Ok(client.head(&item_blob_object(item_id)).await?.is_some())
 }
 
 /// Removes an item the silo has recorded. The content goes first: an

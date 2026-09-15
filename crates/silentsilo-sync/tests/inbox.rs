@@ -393,3 +393,56 @@ async fn an_existing_inbox_key_is_reused() {
     assert_eq!(public, s.identity.inbox_public);
     assert_eq!(s.store.list("inbox/keys/").await.unwrap().len(), 1);
 }
+
+/// A store where another device finishes an item between the listing and
+/// the read: the listing still names it, the object is gone.
+struct FinishedMeanwhile<'a> {
+    inner: &'a FolderStore,
+    item_id: Uuid,
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for FinishedMeanwhile<'_> {
+    async fn put(&self, key: &str, body: Vec<u8>) -> Result<(), silentsilo_store::StoreError> {
+        self.inner.put(key, body).await
+    }
+    async fn get(&self, key: &str) -> Result<Vec<u8>, silentsilo_store::StoreError> {
+        self.inner.get(key).await
+    }
+    async fn head(&self, key: &str) -> Result<Option<i64>, silentsilo_store::StoreError> {
+        self.inner.head(key).await
+    }
+    async fn delete(&self, key: &str) -> Result<(), silentsilo_store::StoreError> {
+        self.inner.delete(key).await
+    }
+    async fn list(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<silentsilo_store::StoredObject>, silentsilo_store::StoreError> {
+        let listed = self.inner.list(prefix).await?;
+        if prefix == INBOX_ITEMS_PREFIX {
+            finish_item(self.inner, self.item_id).await.unwrap();
+        }
+        Ok(listed)
+    }
+    fn describe(&self) -> String {
+        self.inner.describe()
+    }
+}
+
+#[tokio::test]
+async fn an_item_finished_elsewhere_during_the_scan_does_not_stop_the_others() {
+    let s = setup().await;
+    let gone = s.send().await;
+    let kept = s.send().await;
+    let store = FinishedMeanwhile {
+        inner: &s.store,
+        item_id: gone,
+    };
+    let scan = scan_inbox(&store, s.session.vault_id, &s.session.kek)
+        .await
+        .unwrap();
+    let ready: Vec<Uuid> = scan.ready.iter().map(|i| i.item_id).collect();
+    assert_eq!(ready, vec![kept]);
+    assert!(scan.refused.is_empty());
+}
