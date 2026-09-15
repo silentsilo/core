@@ -633,6 +633,9 @@ pub async fn run_sync_pass(
     // first target being behind must not stop a full copy from filling up.
     let reachable: Vec<(Uuid, &dyn ObjectStore)> =
         targets.iter().map(|t| (t.id, &*t.store)).collect();
+    if every_copy_reached {
+        sync::recheck_absent_blobs(&reachable, &root).await;
+    }
     let pulled = fetch_missing_for_full_copy(state, host, silo, &reachable).await;
     // What came down, from the inbox or for the full copy, is on the copy it
     // came from, and no longer counts as waiting to back up there.
@@ -762,9 +765,11 @@ async fn fetch_missing_for_full_copy(
         let Some(session) = sessions.get(&silo.id) else {
             return 0;
         };
+        // Content no copy holds would be asked for, and fail, every pass.
         let here: std::collections::HashSet<Uuid> =
             silentsilo_vault::list_local_blob_ids(&silo.path)
                 .into_iter()
+                .chain(silentsilo_vault::list_absent_blob_ids(&silo.path))
                 .collect();
         // With attachments: a full copy that left them out would restore
         // every file and no attachment.

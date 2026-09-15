@@ -70,7 +70,14 @@ fn open_cache_db(vault_root: &Path) -> Result<Connection, VaultError> {
             blob_id TEXT NOT NULL,
             PRIMARY KEY (target, blob_id)
         );
-        CREATE INDEX IF NOT EXISTS idx_blob_delivery_blob ON blob_delivery(blob_id);",
+        CREATE INDEX IF NOT EXISTS idx_blob_delivery_blob ON blob_delivery(blob_id);
+        -- Content every configured target was asked for and none holds.
+        -- Remembered so a screen stops offering to download what cannot
+        -- come, and re-asked by later passes in case a device uploads it.
+        CREATE TABLE IF NOT EXISTS blob_absent (
+            blob_id    TEXT PRIMARY KEY,
+            checked_at INTEGER NOT NULL
+        );",
     )?;
     Ok(conn)
 }
@@ -147,6 +154,43 @@ pub fn settle_blob_delivery(vault_root: &Path, targets: &[Uuid]) -> Result<(), V
         [],
     )?;
     Ok(())
+}
+
+/// Records that no configured target holds this blob.
+pub fn record_blob_absent(vault_root: &Path, blob_id: Uuid) -> Result<(), VaultError> {
+    let conn = open_cache_db(vault_root)?;
+    conn.execute(
+        "INSERT INTO blob_absent(blob_id, checked_at) VALUES (?1, ?2)
+         ON CONFLICT(blob_id) DO UPDATE SET checked_at = excluded.checked_at",
+        params![blob_id.to_string(), now()],
+    )?;
+    Ok(())
+}
+
+/// The blob was found after all, on a target or on this disk.
+pub fn clear_blob_absent(vault_root: &Path, blob_id: Uuid) -> Result<(), VaultError> {
+    let conn = open_cache_db(vault_root)?;
+    conn.execute(
+        "DELETE FROM blob_absent WHERE blob_id = ?1",
+        params![blob_id.to_string()],
+    )?;
+    Ok(())
+}
+
+/// Blobs last found on no target.
+pub fn list_absent_blob_ids(vault_root: &Path) -> Vec<Uuid> {
+    let Ok(conn) = open_cache_db(vault_root) else {
+        return Vec::new();
+    };
+    let Ok(mut stmt) = conn.prepare("SELECT blob_id FROM blob_absent ORDER BY checked_at") else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
+        return Vec::new();
+    };
+    rows.filter_map(|r| r.ok())
+        .filter_map(|id| Uuid::parse_str(&id).ok())
+        .collect()
 }
 
 /// Update the last-accessed time for a blob that was just read (opened/exported).

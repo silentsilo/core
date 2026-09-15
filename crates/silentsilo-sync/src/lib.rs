@@ -1149,12 +1149,61 @@ pub async fn fetch_blob_from_targets(
         match fetch_blob(*client, vault_root, blob_id).await {
             Ok(size) => {
                 let _ = record_blob_delivered(vault_root, blob_id, *target);
+                let _ = silentsilo_vault::clear_blob_absent(vault_root, blob_id);
                 return Ok(size);
             }
             Err(e) => last = e,
         }
     }
+    // Asked outright: the errors above do not keep whether the object was
+    // missing or the target unreachable, and only the first is worth
+    // remembering.
+    if absent_from_every(targets, blob_id).await {
+        let _ = silentsilo_vault::record_blob_absent(vault_root, blob_id);
+        return Err(SyncError::Storage(
+            "this file's content is in none of the backups".into(),
+        ));
+    }
     Err(last)
+}
+
+/// True only when every target answered, and none holds the blob.
+async fn absent_from_every(targets: &[(Uuid, &dyn ObjectStore)], blob_id: Uuid) -> bool {
+    if targets.is_empty() {
+        return false;
+    }
+    for (_, client) in targets {
+        if !matches!(client.head(&blob_key(blob_id)).await, Ok(None)) {
+            return false;
+        }
+    }
+    true
+}
+
+/// How many remembered-absent blobs one pass asks about again.
+const ABSENT_RECHECK_PER_PASS: usize = 100;
+
+/// Asks the targets again about content last found on none of them, since
+/// a device that still had it may have uploaded it since. Returns how many
+/// turned up.
+pub async fn recheck_absent_blobs(
+    targets: &[(Uuid, &dyn ObjectStore)],
+    vault_root: &Path,
+) -> usize {
+    let mut found = 0;
+    for blob_id in silentsilo_vault::list_absent_blob_ids(vault_root)
+        .into_iter()
+        .take(ABSENT_RECHECK_PER_PASS)
+    {
+        for (_, client) in targets {
+            if let Ok(Some(_)) = client.head(&blob_key(blob_id)).await {
+                let _ = silentsilo_vault::clear_blob_absent(vault_root, blob_id);
+                found += 1;
+                break;
+            }
+        }
+    }
+    found
 }
 
 // ── Snapshots ───────────────────────────────────────────────────────

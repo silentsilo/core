@@ -44,6 +44,9 @@ release notes should say.
 
 ### Fixed
 
+- Content no configured target holds is remembered locally when a download
+  finds it on none of them (`list_absent_blob_ids`), asked about again by
+  each pass that reached every copy, and skipped by the full-copy fetch.
 - Two devices importing the same inbox items before either synced put
   them in two folders ("Phone" and "Phone (2)") and disagreed about which
   held the files. Folders made by the import now take ids derived from
