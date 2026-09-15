@@ -1072,8 +1072,14 @@ fn settle_content(conn: &Connection, file_id: Uuid) -> CoreResult<()> {
         .map_err(db)?;
     }
 
-    // Copies for the other leaves.
-    let wanted: Vec<&Version> = leaves[..leaves.len() - 1].to_vec();
+    // Copies for the other leaves, one per distinct content: the same edit
+    // written twice (a rebuild writes unpushed work again) is no conflict.
+    let mut wanted: Vec<&Version> = Vec::new();
+    for leaf in leaves[..leaves.len() - 1].iter().rev() {
+        if leaf.blob_id != winner.blob_id && !wanted.iter().any(|w| w.blob_id == leaf.blob_id) {
+            wanted.push(leaf);
+        }
+    }
     for leaf in &wanted {
         let (Ok(op_id), Ok(device_id), Ok(blob_id)) = (
             Uuid::parse_str(&leaf.op_id),
@@ -1449,6 +1455,141 @@ fn claim_group(
         });
     }
     Ok(out)
+}
+
+fn parent_of(conn: &Connection, folder_id: Uuid) -> CoreResult<Option<Uuid>> {
+    let raw: Option<Option<String>> = conn
+        .query_row(
+            "SELECT parent_id FROM folders WHERE id = ?1",
+            [folder_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| CoreError::Database(e.to_string()))?;
+    raw.flatten().map(|p| parse_uuid(&p)).transpose()
+}
+
+fn file_folder(conn: &Connection, file_id: Uuid) -> CoreResult<Option<Uuid>> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT folder_id FROM files WHERE id = ?1",
+            [file_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| CoreError::Database(e.to_string()))?;
+    raw.map(|p| parse_uuid(&p)).transpose()
+}
+
+fn root_folder(conn: &Connection) -> CoreResult<Uuid> {
+    let raw: String = conn
+        .query_row(
+            "SELECT id FROM folders WHERE parent_id IS NULL ORDER BY path LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| CoreError::Database(e.to_string()))?;
+    parse_uuid(&raw)
+}
+
+/// Moves an entry whose folder is being purged to the top of the silo,
+/// keeping the name it asked for and its place in the order.
+fn rescue_entry(
+    conn: &Connection,
+    id: Uuid,
+    is_folder: bool,
+    root: Uuid,
+    at: i64,
+) -> CoreResult<()> {
+    let db = |e: rusqlite::Error| CoreError::Database(e.to_string());
+    let claim: Option<(String, i64, String, String)> = conn
+        .query_row(
+            "SELECT desired, lamport, device_id, op_id FROM name_claims WHERE entry_id = ?1",
+            [id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(db)?;
+    let current_name: String = conn
+        .query_row(
+            if is_folder {
+                "SELECT name FROM folders WHERE id = ?1"
+            } else {
+                "SELECT name FROM files WHERE id = ?1"
+            },
+            [id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(db)?;
+    let (desired, lamport, device_id, op_id) =
+        claim.unwrap_or((current_name, 0, Uuid::nil().to_string(), id.to_string()));
+    if is_folder {
+        conn.execute(
+            "UPDATE folders SET parent_id = ?2 WHERE id = ?1",
+            params![id.to_string(), root.to_string()],
+        )
+        .map_err(db)?;
+        // Parked at the top, subtree and all, while the names settle.
+        rename_existing_entry(
+            conn,
+            &Claim {
+                entry_id: id,
+                desired: desired.clone(),
+            },
+            true,
+            root,
+            &parked_name(id),
+            at,
+        )?;
+    } else {
+        // Parked while the names settle: the top may already hold its name.
+        conn.execute(
+            "UPDATE files SET folder_id = ?2, name = ?3 WHERE id = ?1",
+            params![id.to_string(), root.to_string(), parked_name(id)],
+        )
+        .map_err(db)?;
+    }
+    let claimant = OpRecord::authored(
+        parse_uuid(&op_id).unwrap_or(id),
+        lamport as u64,
+        parse_uuid(&device_id).unwrap_or(Uuid::nil()),
+        at,
+        0,
+        None,
+        if is_folder {
+            VaultOp::RenameFolder {
+                id,
+                name: desired.clone(),
+            }
+        } else {
+            VaultOp::RenameFile {
+                id,
+                name: desired.clone(),
+            }
+        },
+    );
+    let final_name = claim_name(conn, id, is_folder, root, &desired, &claimant)?;
+    // `claim_name` leaves the entry's own row for the caller.
+    if is_folder {
+        rename_existing_entry(
+            conn,
+            &Claim {
+                entry_id: id,
+                desired: desired.clone(),
+            },
+            true,
+            root,
+            &final_name,
+            at,
+        )?;
+    } else {
+        conn.execute(
+            "UPDATE files SET name = ?2 WHERE id = ?1",
+            params![id.to_string(), final_name],
+        )
+        .map_err(db)?;
+    }
+    Ok(())
 }
 
 fn was_purged(conn: &Connection, id: Uuid) -> CoreResult<bool> {
@@ -1973,6 +2114,13 @@ fn apply_inner(conn: &Connection, record: &OpRecord) -> CoreResult<ApplyOutcome>
             parent_id,
             name,
         } => {
+            // Created in a folder a purge has since removed: kept, at the top.
+            let parent_id =
+                &if folder_path(conn, *parent_id)?.is_none() && was_purged(conn, *parent_id)? {
+                    root_folder(conn)?
+                } else {
+                    *parent_id
+                };
             let Some(parent_path) = folder_path(conn, *parent_id)? else {
                 return Ok(ApplyOutcome::Obsolete);
             };
@@ -2004,6 +2152,12 @@ fn apply_inner(conn: &Connection, record: &OpRecord) -> CoreResult<ApplyOutcome>
             mime_type,
             blob_key,
         } => {
+            let folder_id =
+                &if folder_path(conn, *folder_id)?.is_none() && was_purged(conn, *folder_id)? {
+                    root_folder(conn)?
+                } else {
+                    *folder_id
+                };
             if folder_path(conn, *folder_id)?.is_none() {
                 return Ok(ApplyOutcome::Obsolete);
             }
@@ -2170,11 +2324,33 @@ fn apply_inner(conn: &Connection, record: &OpRecord) -> CoreResult<ApplyOutcome>
             // makes the order irrelevant: by the enclosing commit every row
             // named in the operation is gone.
             // The operation names the rows its device knew. Another device
-            // may have put something under a named folder meanwhile, and that
-            // row would be left pointing at a folder that is gone: the commit
-            // refused, and every later pass refused with it. It goes with its
-            // folder instead, which is also what a record naming the folder
-            // arriving after the purge already amounts to (Obsolete).
+            // may have put something under a named folder meanwhile, which
+            // the person emptying the trash never saw. Deleting it with the
+            // folder lost that device's work for good; it is moved to the top
+            // of the silo instead, and so is anything created in a purged
+            // folder by a record that arrives after the purge.
+            // A purged file's conflict copies go with it. They come from its
+            // edits, and a device that received those edits after the purge
+            // never made them.
+            let mut file_ids: Vec<Uuid> = file_ids.clone();
+            let mut copies: Vec<Uuid> = Vec::new();
+            for id in &file_ids {
+                let mut stmt = conn
+                    .prepare("SELECT copy_id FROM conflict_copies WHERE file_id = ?1")
+                    .map_err(db)?;
+                for row in stmt
+                    .query_map([id.to_string()], |row| row.get::<_, String>(0))
+                    .map_err(db)?
+                {
+                    copies.push(parse_uuid(&row.map_err(db)?)?);
+                }
+            }
+            for copy in copies {
+                if !file_ids.contains(&copy) {
+                    file_ids.push(copy);
+                }
+            }
+            let file_ids = &file_ids;
             for id in file_ids.iter().chain(folder_ids) {
                 conn.execute(
                     "INSERT OR IGNORE INTO purged_ids(id) VALUES (?1)",
@@ -2219,6 +2395,38 @@ fn apply_inner(conn: &Connection, record: &OpRecord) -> CoreResult<ApplyOutcome>
                     }
                 }
             }
+
+            // Only the topmost of them move; what is inside a moved folder
+            // goes along with it.
+            let top_folders: Vec<Uuid> = extra_folders
+                .iter()
+                .copied()
+                .filter(|id| {
+                    parent_of(conn, *id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|parent| folder_ids.contains(&parent))
+                })
+                .collect();
+            let top_files: Vec<Uuid> = extra_files
+                .iter()
+                .copied()
+                .filter(|id| {
+                    file_folder(conn, *id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|folder| folder_ids.contains(&folder))
+                })
+                .collect();
+            let root = root_folder(conn)?;
+            for id in &top_folders {
+                rescue_entry(conn, *id, true, root, at)?;
+            }
+            for id in &top_files {
+                rescue_entry(conn, *id, false, root, at)?;
+            }
+            let extra_folders: Vec<Uuid> = Vec::new();
+            let extra_files: Vec<Uuid> = Vec::new();
 
             with_savepoint(conn, "purge_rows", || {
                 conn.execute_batch("PRAGMA defer_foreign_keys = ON;")
@@ -2275,6 +2483,12 @@ fn apply_inner(conn: &Connection, record: &OpRecord) -> CoreResult<ApplyOutcome>
             }
             groups.retain(|g| folder_path(conn, g.scope_id).ok().flatten().is_some());
             settle_groups(conn, &groups, at)?;
+            for id in &top_folders {
+                settle_folder_trash(conn, *id)?;
+            }
+            for id in &top_files {
+                settle_file_trash(conn, *id)?;
+            }
             Ok(ApplyOutcome::Applied)
         }
 
@@ -4602,10 +4816,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_purge_takes_what_another_device_added_under_the_folder_meanwhile() {
+    fn a_purge_keeps_what_another_device_added_under_the_folder_meanwhile() {
         // Device A purged "Temp" knowing only x.txt; device B had added y.txt
         // and a subfolder under it. Leaving those rows would fail the commit,
-        // and every pass after it.
+        // and deleting them lost B's work: they move to the top.
         let d = Device::new();
         let root = d.root();
         let (folder, known, added, sub, deep) = (
@@ -4632,7 +4846,37 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        assert_eq!(d.snapshot(), vec!["folder / deleted=false"]);
+        assert_eq!(
+            d.snapshot(),
+            vec![
+                "folder / deleted=false",
+                "folder /Sub deleted=false",
+                "file /::y.txt deleted=false",
+                "file /Sub::z.txt deleted=false",
+            ]
+        );
+
+        // The same records in the other order: the folder purged first, B's
+        // records arriving after. Nothing is lost there either.
+        let late = Device::new();
+        let root = late.root();
+        apply_op(late.conn(), &late.make(1, new_folder(folder, root, "Temp"))).unwrap();
+        apply_op(late.conn(), &late.make(2, add_file(known, folder, "x.txt"))).unwrap();
+        apply_op(
+            late.conn(),
+            &late.make(
+                6,
+                VaultOp::Purge {
+                    folder_ids: vec![folder],
+                    file_ids: vec![known],
+                },
+            ),
+        )
+        .unwrap();
+        apply_op(late.conn(), &late.make(3, add_file(added, folder, "y.txt"))).unwrap();
+        apply_op(late.conn(), &late.make(4, new_folder(sub, folder, "Sub"))).unwrap();
+        apply_op(late.conn(), &late.make(5, add_file(deep, sub, "z.txt"))).unwrap();
+        assert_eq!(late.snapshot(), d.snapshot());
     }
 
     #[test]

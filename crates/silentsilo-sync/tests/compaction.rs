@@ -1124,3 +1124,26 @@ async fn a_record_copied_under_another_name_is_skipped_not_replayed() {
     assert_eq!(got.records.len(), 1);
     assert_eq!(got.records[0].op_id, genuine.op_id);
 }
+
+#[tokio::test]
+async fn a_rebuild_keeps_what_the_device_wrote_and_never_pushed() {
+    let (_dir, store, dek, awake, mut asleep, _) = silo_compacted_behind_a_sleeping_device().await;
+    // Written while it slept, never pushed: a rebuild used to drop it.
+    asleep.author(added(asleep.root(), "written-offline.txt"));
+    rebootstrap_from_snapshot(&mut asleep.session.conn, &store, &dek)
+        .await
+        .unwrap();
+    assert!(
+        asleep.tree().iter().any(|r| r.contains("written-offline")),
+        "the rebuild dropped unpushed work: {:?}",
+        asleep.tree()
+    );
+
+    asleep.sync(&store, &dek).await.unwrap();
+    awake.sync(&store, &dek).await.unwrap();
+    assert!(
+        awake.tree().iter().any(|r| r.contains("written-offline")),
+        "the kept change never reached the other device: {:?}",
+        awake.tree()
+    );
+}

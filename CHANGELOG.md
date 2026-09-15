@@ -186,6 +186,13 @@ release notes should say.
   the purge, brought it back on that device alone. It is ignored.
 - `SCHEMA_VERSION` is 2: the derived tables are rebuilt once from the log on
   the first open.
+- Emptying the trash deleted what another device had meanwhile put in a
+  purged folder, which nobody had seen go to the trash. It is moved to the
+  top of the silo instead, and so is anything a record arriving after the
+  purge creates in that folder. A purged file's conflict copies go with it.
+- A rebuild after falling below a snapshot horizon dropped the changes this
+  device had not pushed yet. They are written again on top of the rebuilt
+  silo.
 
 ## [1.3.0] - The shared application crate
 

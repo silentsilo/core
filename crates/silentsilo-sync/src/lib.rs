@@ -485,14 +485,34 @@ pub fn apply_rebuild(
     incoming: Vec<OpRecord>,
 ) -> Result<RebootstrapOutcome, SyncError> {
     let fetched = incoming.len();
+    // What this device wrote and no copy has yet. A rebuild used to drop it:
+    // work done offline, gone because the others compacted meanwhile.
+    let unpushed = silentsilo_vfs::pending_ops(conn)?;
     let device_id = silentsilo_vfs::snapshot::rebootstrap(conn, snapshot)?;
     let replay_report = replay(conn, incoming)?;
+
+    // Written again, under the new identity and after everything fetched, so
+    // it sorts as the latest change. A record some copy did hold came back
+    // with the fetch and is not written twice.
+    let known = silentsilo_vfs::all_op_ids(conn)?;
+    let mut kept_local = 0;
+    for record in unpushed {
+        if known.contains(&record.op_id) {
+            continue;
+        }
+        if let silentsilo_vfs::OpBody::Known(op) = record.op
+            && silentsilo_vfs::emit(conn, op).is_ok()
+        {
+            kept_local += 1;
+        }
+    }
 
     Ok(RebootstrapOutcome {
         horizon: snapshot.horizon,
         device_id,
         fetched,
         replay: replay_report,
+        kept_local,
     })
 }
 
@@ -610,6 +630,8 @@ pub struct RebootstrapOutcome {
     pub device_id: Uuid,
     pub fetched: usize,
     pub replay: ReplayReport,
+    /// Changes this device had not pushed, written again on top.
+    pub kept_local: usize,
 }
 
 // ── Blob content ────────────────────────────────────────────────────

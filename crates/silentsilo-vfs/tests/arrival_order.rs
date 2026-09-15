@@ -102,6 +102,8 @@ fn batch(rng: &mut Rng, root: Uuid) -> Vec<(OpRecord, Vec<usize>)> {
     // Each file with the records that wrote its content and their blobs, so
     // edits can build on an earlier edit as well as on the original.
     let mut files: Vec<(Uuid, Vec<(usize, Uuid)>)> = Vec::new();
+    // Where each file was created, for a purge to name what it holds.
+    let mut parents: std::collections::HashMap<Uuid, Uuid> = std::collections::HashMap::new();
     let mut last_of_device: Vec<Option<usize>> = vec![None; devices.len()];
     let mut lamports = vec![0u64; devices.len()];
     let mut out: Vec<(OpRecord, Vec<usize>)> = Vec::new();
@@ -118,7 +120,25 @@ fn batch(rng: &mut Rng, root: Uuid) -> Vec<(OpRecord, Vec<usize>)> {
                 id
             }
         };
-        let op = match rng.below(12) {
+        let op = match rng.below(13) {
+            12 if !folders.is_empty() => {
+                // Emptying the trash of a folder: it and some of what this
+                // device knew inside it. Whatever else is in there by now
+                // came from someone else.
+                let (id, at) = folders[rng.below(folders.len())];
+                deps.push(at);
+                let mut file_ids = Vec::new();
+                for (file, history) in &files {
+                    if parents.get(file) == Some(&id) && rng.below(2) == 0 {
+                        deps.push(history[0].0);
+                        file_ids.push(*file);
+                    }
+                }
+                VaultOp::Purge {
+                    folder_ids: vec![id],
+                    file_ids,
+                }
+            }
             0 | 1 => {
                 let id = rng.uuid();
                 let parent = pick_folder(rng, &mut deps);
@@ -133,6 +153,7 @@ fn batch(rng: &mut Rng, root: Uuid) -> Vec<(OpRecord, Vec<usize>)> {
                 let id = rng.uuid();
                 let blob = rng.uuid();
                 let folder = pick_folder(rng, &mut deps);
+                parents.insert(id, folder);
                 files.push((id, vec![(i, blob)]));
                 VaultOp::AddFile {
                     id,
@@ -266,8 +287,27 @@ fn records_applied_one_by_one_in_any_causal_order_converge() {
         let records = batch(&mut rng, root);
 
         let reference = device(vault);
-        replay(&reference, records.iter().map(|(r, _)| r.clone()).collect())
-            .unwrap_or_else(|e| panic!("seed {seed}: sorted replay failed: {e}"));
+        if let Err(e) = replay(&reference, records.iter().map(|(r, _)| r.clone()).collect()) {
+            let mut sorted: Vec<OpRecord> = records.iter().map(|(r, _)| r.clone()).collect();
+            sorted.sort_by_key(|r| r.sort_key());
+            let trace = device(vault);
+            let mut lines = Vec::new();
+            for r in &sorted {
+                let outcome = apply_op(&trace, r);
+                lines.push(format!("L{} {:?} -> {:?}", r.lamport, r.op, outcome));
+                if outcome.is_err() {
+                    break;
+                }
+            }
+            panic!(
+                "seed {seed}: sorted replay failed: {e}
+{}",
+                lines.join(
+                    "
+"
+                )
+            );
+        }
         let expected = state(&reference);
 
         for attempt in 0..4 {

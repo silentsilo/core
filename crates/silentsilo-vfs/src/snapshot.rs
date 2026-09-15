@@ -721,9 +721,9 @@ pub fn compact_covered(conn: &mut Connection, snapshot: &Snapshot) -> CoreResult
 /// part that is easy to get wrong: the old id's chain positions are derived
 /// from the log being dropped, and reusing it would put two different
 /// records at one position in one device's chain, exactly what
-/// [`crate::verify_chains`] exists to catch. Unpushed records below the
-/// horizon do not survive; [`prune_to`] reports them beforehand so the
-/// caller can say so.
+/// [`crate::verify_chains`] exists to catch. The log goes with it; the
+/// sync crate's `apply_rebuild` reads unpushed records first and writes them
+/// again on top, which is why nothing here keeps them.
 pub fn rebootstrap(conn: &mut Connection, snapshot: &Snapshot) -> CoreResult<Uuid> {
     let tx = conn.transaction().map_err(db)?;
 

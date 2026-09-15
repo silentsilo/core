@@ -319,6 +319,10 @@ Read this before "fixing" any of it.
   claim's own order), purged ids remembered (`purged_ids`).
   `tests/arrival_order.rs` applies records one at a time in random causal
   orders; `silentsilo-app/tests/fleet.rs` runs three devices on one storage.
+- **A purge never deletes what its author did not name.** Entries another
+  device put in a purged folder meanwhile move to the top of the silo, as do
+  entries a later record creates there (`purged_ids`). A rebuild writes this
+  device's unpushed records again on top (`sync::apply_rebuild`).
 - **A large purge is several records.** Readers refuse records over their
   size ceiling, so a purge is split files first, then folders deepest first,
   and each record stands on its own for a 1.0.0 reader.
