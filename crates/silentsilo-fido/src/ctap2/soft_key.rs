@@ -18,6 +18,8 @@ struct SoftKey {
     credentials: Vec<(Vec<u8>, [u8; 32])>,
     agreement: Option<SecretKey>,
     token: [u8; 32],
+    /// Verification demanded whether or not a PIN is set.
+    always_uv: bool,
 }
 
 impl SoftKey {
@@ -29,6 +31,7 @@ impl SoftKey {
             credentials: Vec::new(),
             agreement: None,
             token: random_bytes(),
+            always_uv: false,
         }
     }
 
@@ -159,6 +162,9 @@ impl SoftKey {
                     .and_then(Value::as_text)
                     .unwrap();
                 assert_eq!(rp, RP_ID);
+                if self.always_uv && self.pin.is_none() {
+                    return Err(0x36);
+                }
                 if self.pin.is_some() {
                     let auth = get(8).and_then(Value::as_bytes).ok_or(0x36u8)?;
                     let p = get(9)
@@ -333,7 +339,7 @@ fn the_allow_list_is_split_to_the_keys_limit_and_a_stranger_is_named() {
 }
 
 #[test]
-fn a_key_with_a_pin_asks_for_it_at_enrolment_only() {
+fn a_key_with_a_pin_needs_it_to_enrol() {
     let mut key = SoftKey::new(&[2, 1]);
     key.pin = Some("4821".into());
     assert!(matches!(
@@ -536,7 +542,7 @@ fn a_silo_wrapped_by_a_platform_that_verified_opens_with_the_pin() {
     let made = make_credential(&mut key, VAULT, Some("4821")).unwrap();
     let ids = std::slice::from_ref(&made.credential_id);
 
-    let plain = unlock_candidates(&mut key, ids, VAULT, None).unwrap();
+    let plain = unlock_candidates(&mut key, ids, VAULT, None, true).unwrap();
     assert!(!plain.verified && plain.pin_set);
     let shapes = |c: &UnlockCandidates| {
         c.wrap_keys
@@ -558,7 +564,7 @@ fn a_silo_wrapped_by_a_platform_that_verified_opens_with_the_pin() {
         ]
     );
 
-    let with_pin = unlock_candidates(&mut key, ids, VAULT, Some("4821")).unwrap();
+    let with_pin = unlock_candidates(&mut key, ids, VAULT, Some("4821"), false).unwrap();
     assert!(with_pin.verified);
     assert_eq!(
         shapes(&with_pin),
@@ -574,7 +580,33 @@ fn a_silo_wrapped_by_a_platform_that_verified_opens_with_the_pin() {
         ]
     );
     assert!(matches!(
-        unlock_candidates(&mut key, ids, VAULT, Some("0000")),
+        unlock_candidates(&mut key, ids, VAULT, Some("0000"), true),
         Err(CtapError::PinInvalid { .. })
+    ));
+}
+
+#[test]
+fn a_key_without_a_pin_never_asks_for_one_and_ignores_one_given() {
+    let mut key = SoftKey::new(&[2, 1]);
+    // A PIN from the screen for a key that has none changes nothing.
+    let made = make_credential(&mut key, VAULT, Some("1234")).unwrap();
+    let ids = std::slice::from_ref(&made.credential_id);
+    for pin in [None, Some("1234")] {
+        let found = unlock_candidates(&mut key, ids, VAULT, pin, true).unwrap();
+        assert!(!found.verified && !found.pin_set);
+        assert_eq!(
+            *found.wrap_keys[0].1,
+            key.expected_wrap_key(&made.credential_id)
+        );
+    }
+}
+
+#[test]
+fn a_key_that_insists_on_a_pin_it_does_not_have_says_so() {
+    let mut key = SoftKey::new(&[2, 1]);
+    key.always_uv = true;
+    assert!(matches!(
+        make_credential(&mut key, VAULT, None),
+        Err(CtapError::PinNotSet)
     ));
 }

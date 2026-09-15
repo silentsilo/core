@@ -71,8 +71,15 @@ pub enum CtapError {
     /// erases every credential on it.
     #[error("the security key's PIN is blocked")]
     PinBlocked,
+    /// The key insists on a PIN and has none set.
+    #[error("the security key needs a PIN set before it can be used")]
+    PinNotSet,
     #[error("no touch was received in time")]
     Timeout,
+    /// The key counts one touch, or one tap over NFC, per operation that
+    /// needs presence, and this one came after it was used.
+    #[error("the key wants another touch")]
+    TouchAgain,
     #[error("the security key refused (status 0x{0:02x})")]
     Status(u8),
 }
@@ -84,6 +91,7 @@ impl CtapError {
             0x31 => Self::PinInvalid { retries: None },
             0x32 => Self::PinBlocked,
             0x34 => Self::PinAuthBlocked,
+            0x35 => Self::PinNotSet,
             0x36 => Self::PinRequired,
             0x2F | 0x27 => Self::Timeout,
             other => Self::Status(other),
@@ -436,7 +444,7 @@ pub fn derive_unlock_material(
     credential_ids: &[Vec<u8>],
     vault_id: &str,
 ) -> Result<UnlockMaterial, CtapError> {
-    let found = unlock_candidates(dev, credential_ids, vault_id, None)?;
+    let found = unlock_candidates(dev, credential_ids, vault_id, None, true)?;
     let (_, key) = found
         .wrap_keys
         .iter()
@@ -455,11 +463,16 @@ pub fn derive_unlock_material(
 /// verified (a computer that asked for the key's PIN) opens only with `pin`
 /// given here too. Which shape and which secret the silo was wrapped under
 /// is found by trying the candidates against its envelope.
+///
+/// `touch` false asks for no user presence: for a second assertion in one
+/// ceremony whose first already had the touch. A key over NFC refuses a
+/// second presence in one tap, and `hmac-secret` does not depend on it.
 pub fn unlock_candidates(
     dev: &mut dyn Ctap,
     credential_ids: &[Vec<u8>],
     vault_id: &str,
     pin: Option<&str>,
+    touch: bool,
 ) -> Result<UnlockCandidates, CtapError> {
     if credential_ids.is_empty() {
         return Err(CtapError::NoCredentials);
@@ -481,7 +494,8 @@ pub fn unlock_candidates(
         })
         .cloned()
         .collect();
-    let token = match pin {
+    // A key without a PIN has nothing to check one against.
+    let token = match pin.filter(|_| info.pin_set) {
         Some(pin) => Some(pin_token(dev, protocol, pin)?),
         None => None,
     };
@@ -513,7 +527,7 @@ pub fn unlock_candidates(
             (int(2), bytes(&client_data_hash)),
             (int(3), Value::Array(allow)),
             (int(4), map(vec![(text("hmac-secret"), map(hmac_secret))])),
-            (int(5), map(vec![(text("up"), Value::Bool(true))])),
+            (int(5), map(vec![(text("up"), Value::Bool(touch))])),
         ];
         if let Some((token_run, token)) = &token {
             request.push((
@@ -524,6 +538,7 @@ pub fn unlock_candidates(
         }
         let answer = match dev.command(CMD_GET_ASSERTION, &encode(&map(request))) {
             Err(CtapError::NoCredentials) => continue,
+            Err(CtapError::PinAuthBlocked) => return Err(CtapError::TouchAgain),
             Err(e) => return Err(e),
             Ok(answer) => decode(&answer)?,
         };
@@ -627,6 +642,8 @@ pub fn make_credential(
     if info.pin_set && pin.is_none() {
         return Err(CtapError::PinRequired);
     }
+    // A key without a PIN has nothing to check one against.
+    let pin = pin.filter(|_| info.pin_set);
     let protocol = info.protocol()?;
     let client_data_hash = sha256(&random_bytes::<32>());
 
@@ -668,7 +685,12 @@ pub fn make_credential(
         request.push((int(8), bytes(&auth)));
         request.push((int(9), int(protocol as i64)));
     }
-    let answer = decode(&dev.command(CMD_MAKE_CREDENTIAL, &encode(&map(request)))?)?;
+    let answer = match dev.command(CMD_MAKE_CREDENTIAL, &encode(&map(request))) {
+        Err(CtapError::PinAuthBlocked) => return Err(CtapError::TouchAgain),
+        // Asked for verification by a key with no PIN to verify with.
+        Err(CtapError::PinRequired) if !info.pin_set => return Err(CtapError::PinNotSet),
+        other => decode(&other?)?,
+    };
     let auth_data = int_entry(&answer, 2)
         .and_then(Value::as_bytes)
         .ok_or_else(|| CtapError::Protocol("no authenticator data".into()))?;
