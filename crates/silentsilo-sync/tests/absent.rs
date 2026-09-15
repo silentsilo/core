@@ -13,7 +13,7 @@ async fn a_blob_no_target_holds_is_remembered_until_one_does() {
     let blob = Uuid::new_v4();
 
     assert!(
-        fetch_blob_from_targets(&[target], silo.path(), blob)
+        fetch_blob_from_targets(&[target], silo.path(), blob, true)
             .await
             .is_err()
     );
@@ -33,7 +33,7 @@ async fn a_blob_no_target_holds_is_remembered_until_one_does() {
     // Remembered again, then cleared by a download that works.
     store.delete(&format!("blobs/{blob}.sslo")).await.unwrap();
     assert!(
-        fetch_blob_from_targets(&[target], silo.path(), blob)
+        fetch_blob_from_targets(&[target], silo.path(), blob, true)
             .await
             .is_err()
     );
@@ -41,8 +41,18 @@ async fn a_blob_no_target_holds_is_remembered_until_one_does() {
         .put(&format!("blobs/{blob}.sslo"), b"bytes".to_vec())
         .await
         .unwrap();
-    fetch_blob_from_targets(&[target], silo.path(), blob)
+    fetch_blob_from_targets(&[target], silo.path(), blob, true)
         .await
         .unwrap();
+    assert!(silentsilo_vault::list_absent_blob_ids(silo.path()).is_empty());
+
+    // A list that leaves a copy out records nothing.
+    store.delete(&format!("blobs/{blob}.sslo")).await.unwrap();
+    std::fs::remove_file(silo.path().join("blobs").join(format!("{blob}.sslo"))).ok();
+    assert!(
+        fetch_blob_from_targets(&[target], silo.path(), blob, false)
+            .await
+            .is_err()
+    );
     assert!(silentsilo_vault::list_absent_blob_ids(silo.path()).is_empty());
 }

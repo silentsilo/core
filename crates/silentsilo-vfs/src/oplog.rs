@@ -1512,14 +1512,58 @@ fn apply_inner(conn: &Connection, record: &OpRecord) -> CoreResult<ApplyOutcome>
             // the ids happen to be ordered that way. Deferring the check
             // makes the order irrelevant: by the enclosing commit every row
             // named in the operation is gone.
+            // The operation names the rows its device knew. Another device
+            // may have put something under a named folder meanwhile, and that
+            // row would be left pointing at a folder that is gone: the commit
+            // refused, and every later pass refused with it. It goes with its
+            // folder instead, which is also what a record naming the folder
+            // arriving after the purge already amounts to (Obsolete).
+            let mut extra_files: Vec<Uuid> = Vec::new();
+            let mut extra_folders: Vec<Uuid> = Vec::new();
+            for id in folder_ids {
+                let Some(path) = folder_path(conn, *id)? else {
+                    continue;
+                };
+                let subtree = crate::like::subtree(&path);
+                let mut stmt = conn
+                    .prepare("SELECT id FROM folders WHERE path LIKE ?1 ESCAPE '!'")
+                    .map_err(db)?;
+                for row in stmt
+                    .query_map([&subtree], |row| row.get::<_, String>(0))
+                    .map_err(db)?
+                {
+                    let child = parse_uuid(&row.map_err(db)?)?;
+                    if !folder_ids.contains(&child) {
+                        extra_folders.push(child);
+                    }
+                }
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT f.id FROM files f JOIN folders d ON d.id = f.folder_id
+                          WHERE d.id = ?1 OR d.path LIKE ?2 ESCAPE '!'",
+                    )
+                    .map_err(db)?;
+                for row in stmt
+                    .query_map(params![id.to_string(), &subtree], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .map_err(db)?
+                {
+                    let child = parse_uuid(&row.map_err(db)?)?;
+                    if !file_ids.contains(&child) {
+                        extra_files.push(child);
+                    }
+                }
+            }
+
             with_savepoint(conn, "purge_rows", || {
                 conn.execute_batch("PRAGMA defer_foreign_keys = ON;")
                     .map_err(db)?;
-                for id in file_ids {
+                for id in file_ids.iter().chain(&extra_files) {
                     conn.execute("DELETE FROM files WHERE id = ?1", [id.to_string()])
                         .map_err(db)?;
                 }
-                for id in folder_ids {
+                for id in folder_ids.iter().chain(&extra_folders) {
                     conn.execute("DELETE FROM folders WHERE id = ?1", [id.to_string()])
                         .map_err(db)?;
                 }
@@ -1528,7 +1572,12 @@ fn apply_inner(conn: &Connection, record: &OpRecord) -> CoreResult<ApplyOutcome>
 
             // Names come free once the rows are gone, so a later entry can
             // take them.
-            for id in file_ids.iter().chain(folder_ids) {
+            for id in file_ids
+                .iter()
+                .chain(folder_ids)
+                .chain(&extra_files)
+                .chain(&extra_folders)
+            {
                 release_claim(conn, *id)?;
             }
             Ok(ApplyOutcome::Applied)
@@ -3843,6 +3892,40 @@ pub(crate) mod tests {
                 VaultOp::Purge {
                     folder_ids: vec![folder],
                     file_ids: vec![file],
+                },
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(d.snapshot(), vec!["folder / deleted=false"]);
+    }
+
+    #[test]
+    fn a_purge_takes_what_another_device_added_under_the_folder_meanwhile() {
+        // Device A purged "Temp" knowing only x.txt; device B had added y.txt
+        // and a subfolder under it. Leaving those rows would fail the commit,
+        // and every pass after it.
+        let d = Device::new();
+        let root = d.root();
+        let (folder, known, added, sub, deep) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        apply_op(d.conn(), &d.make(1, new_folder(folder, root, "Temp"))).unwrap();
+        apply_op(d.conn(), &d.make(2, add_file(known, folder, "x.txt"))).unwrap();
+        apply_op(d.conn(), &d.make(3, add_file(added, folder, "y.txt"))).unwrap();
+        apply_op(d.conn(), &d.make(4, new_folder(sub, folder, "Sub"))).unwrap();
+        apply_op(d.conn(), &d.make(5, add_file(deep, sub, "z.txt"))).unwrap();
+        apply_op(
+            d.conn(),
+            &d.make(
+                6,
+                VaultOp::Purge {
+                    folder_ids: vec![folder],
+                    file_ids: vec![known],
                 },
             ),
         )

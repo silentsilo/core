@@ -104,7 +104,8 @@ pub async fn decrypt_to_file(
         }
         let stores: Vec<(Uuid, &dyn ObjectStore)> =
             targets.iter().map(|(id, t)| (*id, &**t)).collect();
-        silentsilo_sync::fetch_blob_from_targets(&stores, root, file.blob_id)
+        let every_copy = stores.len() == every_target.len();
+        silentsilo_sync::fetch_blob_from_targets(&stores, root, file.blob_id, every_copy)
             .await
             .map_err(|e| format!("could not download the file content: {e}"))?;
         let _ = silentsilo_vault::settle_blob_delivery(root, &every_target);

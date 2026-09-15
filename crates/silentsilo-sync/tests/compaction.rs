@@ -575,6 +575,7 @@ async fn a_downloaded_blob_is_not_owed_to_the_copy_it_came_from() {
         &[(target, &only as &dyn ObjectStore)],
         vault.path(),
         blob,
+        true,
     )
     .await
     .unwrap();

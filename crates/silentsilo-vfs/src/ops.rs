@@ -1144,25 +1144,37 @@ impl<'a> Vfs<'a> {
     /// here would come undone for anyone restoring from its snapshot. Built
     /// from records every version applies instead: the file recorded again
     /// under a new id in the destination, over the same content, and the old
-    /// record purged. The content is not copied and stays referenced
-    /// throughout. An edit another device makes to the old file before it
-    /// hears of the move lands on the purged record and is lost; the same
-    /// happens today to an edit of a file someone else deleted.
+    /// record moved to the trash.
+    ///
+    /// Trashed, not purged. A purge names the rows this device knows, and a
+    /// file another device has meanwhile added under a purged folder would
+    /// be left pointing at nothing: its record dropped on some devices, the
+    /// replay refused on others. An edit another device makes to the old
+    /// file lands on the trashed row, where it can still be found, and the
+    /// old id stays known, so an inbox item already imported is not imported
+    /// again. Emptying the trash removes the old rows as it removes any.
     pub fn move_file(&self, file_id: Uuid, folder_id: Uuid) -> CoreResult<FileEntry> {
         let file = self.get_file(file_id)?;
         if file.folder_id == folder_id {
             return Ok(file);
         }
         let _destination = self.get_folder(folder_id)?;
+        let tx = self
+            .conn()
+            .unchecked_transaction()
+            .map_err(|e| CoreError::Database(e.to_string()))?;
         let new_id = self.copy_file_row(file_id, folder_id)?;
         self.trash_file(file_id)?;
-        self.purge_items(&[file_id])?;
+        tx.commit()
+            .map_err(|e| CoreError::Database(e.to_string()))?;
         self.get_file(new_id)
     }
 
-    /// Moves a folder, and everything in it, into another folder. Built the
-    /// way [`Self::move_file`] is: the tree recorded again under new ids,
-    /// trashed entries included and trashed again, then the old tree purged.
+    /// Moves a folder, and everything live in it, into another folder. Built
+    /// the way [`Self::move_file`] is: the live tree recorded again under new
+    /// ids, then the old folder trashed with whatever it held, trashed
+    /// entries included, which stay restorable from there. One transaction,
+    /// so a failure part way leaves no half-copied tree.
     pub fn move_folder(&self, folder_id: Uuid, parent_id: Uuid) -> CoreResult<FolderEntry> {
         let db = |e: rusqlite::Error| CoreError::Database(e.to_string());
         let folder = self.get_folder(folder_id)?;
@@ -1180,52 +1192,42 @@ impl<'a> Vfs<'a> {
                 "a folder cannot move into itself".into(),
             ));
         }
+        let tx = self.conn().unchecked_transaction().map_err(db)?;
 
-        // The tree, parents before children, trashed rows included.
+        // The live tree, parents before children.
         let subtree = crate::like::subtree(&folder.path);
         let mut stmt = self
             .conn()
             .prepare(
-                "SELECT id, parent_id, name, deleted_at IS NOT NULL, favorite FROM folders
-                  WHERE id = ?1 OR path LIKE ?2 ESCAPE '!'
+                "SELECT id, parent_id, name, favorite FROM folders
+                  WHERE (id = ?1 OR path LIKE ?2 ESCAPE '!') AND deleted_at IS NULL
                   ORDER BY length(path)",
             )
             .map_err(db)?;
-        let folders: Vec<(Uuid, Option<Uuid>, String, bool, bool)> = stmt
+        let folders: Vec<(String, Option<String>, String, i64)> = stmt
             .query_map(params![folder_id.to_string(), &subtree], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, bool>(3)?,
-                    row.get::<_, i64>(4)? != 0,
-                ))
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })
             .map_err(db)?
             .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(db)?
-            .into_iter()
-            .map(|(id, parent, name, trashed, favorite)| {
-                Ok((
-                    parse_id(&id)?,
-                    parent.as_deref().map(parse_id).transpose()?,
-                    name,
-                    trashed,
-                    favorite,
-                ))
-            })
-            .collect::<CoreResult<_>>()?;
+            .map_err(db)?;
         drop(stmt);
 
         let mut mapped: std::collections::HashMap<Uuid, Uuid> = std::collections::HashMap::new();
-        let mut trashed_copies: Vec<(Uuid, bool)> = Vec::new();
-        for (old, parent, name, trashed, favorite) in &folders {
-            let new_parent = if *old == folder_id {
+        for (old, parent, name, favorite) in folders {
+            let old = parse_id(&old)?;
+            let new_parent = if old == folder_id {
                 parent_id
             } else {
-                *parent.and_then(|p| mapped.get(&p)).ok_or_else(|| {
-                    CoreError::Invalid("a folder outside the tree being moved".into())
-                })?
+                let parent = parent
+                    .as_deref()
+                    .map(parse_id)
+                    .transpose()?
+                    .and_then(|p| mapped.get(&p).copied());
+                // A live folder under a trashed one is not reachable; it
+                // stays with the trashed tree.
+                let Some(parent) = parent else { continue };
+                parent
             };
             let new_id = Uuid::now_v7();
             crate::oplog::emit(
@@ -1233,59 +1235,43 @@ impl<'a> Vfs<'a> {
                 crate::oplog::VaultOp::CreateFolder {
                     id: new_id,
                     parent_id: new_parent,
-                    name: name.clone(),
+                    name,
                 },
             )?;
-            if *favorite {
+            if favorite != 0 {
                 self.set_folder_favorite(new_id, true)?;
             }
-            mapped.insert(*old, new_id);
-            if *trashed {
-                trashed_copies.push((new_id, true));
-            }
+            mapped.insert(old, new_id);
         }
 
         let mut stmt = self
             .conn()
             .prepare(
-                "SELECT f.id, f.folder_id, f.deleted_at IS NOT NULL FROM files f
+                "SELECT f.id, f.folder_id FROM files f
                    JOIN folders d ON d.id = f.folder_id
-                  WHERE d.id = ?1 OR d.path LIKE ?2 ESCAPE '!'",
+                  WHERE (d.id = ?1 OR d.path LIKE ?2 ESCAPE '!')
+                    AND f.deleted_at IS NULL AND d.deleted_at IS NULL",
             )
             .map_err(db)?;
-        let files: Vec<(String, String, bool)> = stmt
+        let files: Vec<(String, String)> = stmt
             .query_map(params![folder_id.to_string(), &subtree], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                Ok((row.get(0)?, row.get(1)?))
             })
             .map_err(db)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(db)?;
         drop(stmt);
-        for (id, parent, trashed) in files {
+        for (id, parent) in files {
             let (id, parent) = (parse_id(&id)?, parse_id(&parent)?);
-            let new_folder = *mapped
-                .get(&parent)
-                .ok_or_else(|| CoreError::Invalid("a file outside the tree being moved".into()))?;
-            let new_id = self.copy_file_row(id, new_folder)?;
-            if trashed {
-                trashed_copies.push((new_id, false));
-            }
-        }
-
-        // Trashed deepest first is not needed: trashing a folder trashes
-        // what is under it, and a file already trashed stays trashed.
-        for (id, is_folder) in trashed_copies {
-            let op = if is_folder {
-                crate::oplog::VaultOp::TrashFolder { id }
-            } else {
-                crate::oplog::VaultOp::TrashFile { id }
+            let Some(new_folder) = mapped.get(&parent).copied() else {
+                continue;
             };
-            crate::oplog::emit(self.conn(), op)?;
+            self.copy_file_row(id, new_folder)?;
         }
 
         self.trash_folder(folder_id)?;
-        self.purge_items(&[folder_id])?;
         bump_revision(self.conn()).map_err(|e| CoreError::Database(e.to_string()))?;
+        tx.commit().map_err(db)?;
         self.get_folder(mapped[&folder_id])
     }
 
@@ -2142,9 +2128,13 @@ mod tests {
         let file = vfs.get_file(files[0].1).unwrap();
         assert_eq!((file.blob_id, file.favorite), (blob, true));
         assert_eq!(vfs.blob_key(file.id).unwrap(), "wrapped");
+        // The old tree waits in the trash, the trashed file with it, and the
+        // moved file's old id stays known.
         assert!(vfs.list_trash().unwrap().iter().any(
-            |t| matches!(&t.entry, silentsilo_core::VaultEntry::File(f) if f.name == "old.pdf")
+            |t| matches!(&t.entry, silentsilo_core::VaultEntry::Folder(f) if f.name == "Docs")
         ));
+        assert!(vfs.file_id_known(kept.id).unwrap());
+        assert!(vfs.file_id_known(gone.id).unwrap());
 
         let back = vfs.move_file(file.id, root).unwrap();
         assert_eq!((back.folder_id, back.blob_id), (root, blob));

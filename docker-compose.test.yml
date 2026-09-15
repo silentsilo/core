@@ -25,4 +25,7 @@ services:
   sftp:
     image: atmoz/sftp:alpine
     ports: ["2222:22"]
-    command: silentsilo:silentsilo123:::silo
+    # OpenSSH 9.8 and later penalise a source that connects without logging
+    # in, which is what reading a host key does, so the suites lock
+    # themselves out a few tests in.
+    entrypoint: ["/bin/sh", "-c", "echo 'PerSourcePenalties no' >> /etc/ssh/sshd_config && exec /entrypoint silentsilo:silentsilo123:::silo"]

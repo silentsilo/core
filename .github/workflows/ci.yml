@@ -253,8 +253,10 @@ jobs:
           docker run -d --name webdav -p 8088:80 \
             -e USERNAME=silentsilo -e PASSWORD=silentsilo123 \
             bytemark/webdav
-          docker run -d --name sftp -p 2222:22 \
-            atmoz/sftp:alpine silentsilo:silentsilo123:::silo
+          # OpenSSH 9.8+ penalises connections that never log in, which
+          # is what reading a host key does.
+          docker run -d --name sftp -p 2222:22 --entrypoint /bin/sh \
+            atmoz/sftp:alpine -c "echo 'PerSourcePenalties no' >> /etc/ssh/sshd_config && exec /entrypoint silentsilo:silentsilo123:::silo"
           for i in $(seq 1 60); do
             if curl -fsS http://127.0.0.1:9000/minio/health/live; then break; fi
             sleep 1

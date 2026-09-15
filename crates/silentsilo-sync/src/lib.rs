@@ -1139,10 +1139,15 @@ pub async fn fetch_blob_from_any(
 /// the note it counted as waiting to back up until the next push had asked
 /// every target about it. Settle with every configured target afterwards
 /// (`settle_blob_delivery`) for the count to change.
+///
+/// `every_copy` says `targets` are all the silo's configured copies. Only
+/// then does a blob none of them holds get remembered as absent: a copy
+/// that would not open, left out of the list, might be the one that has it.
 pub async fn fetch_blob_from_targets(
     targets: &[(Uuid, &dyn ObjectStore)],
     vault_root: &Path,
     blob_id: Uuid,
+    every_copy: bool,
 ) -> Result<u64, SyncError> {
     let mut last = SyncError::Storage("no backup target could be reached".into());
     for (target, client) in targets {
@@ -1158,7 +1163,7 @@ pub async fn fetch_blob_from_targets(
     // Asked outright: the errors above do not keep whether the object was
     // missing or the target unreachable, and only the first is worth
     // remembering.
-    if absent_from_every(targets, blob_id).await {
+    if every_copy && absent_from_every(targets, blob_id).await {
         let _ = silentsilo_vault::record_blob_absent(vault_root, blob_id);
         return Err(SyncError::Storage(
             "this file's content is in none of the backups".into(),
@@ -1184,8 +1189,11 @@ async fn absent_from_every(targets: &[(Uuid, &dyn ObjectStore)], blob_id: Uuid) 
 const ABSENT_RECHECK_PER_PASS: usize = 100;
 
 /// Asks the targets again about content last found on none of them, since
-/// a device that still had it may have uploaded it since. Returns how many
-/// turned up.
+/// a device that still had it may have uploaded it since. Any one target
+/// holding it clears it, so this runs against whichever copies answered.
+/// The longest unchecked go first and one still missing goes to the back,
+/// so a long list is walked through rather than its head asked forever.
+/// Returns how many turned up.
 pub async fn recheck_absent_blobs(
     targets: &[(Uuid, &dyn ObjectStore)],
     vault_root: &Path,
@@ -1195,12 +1203,18 @@ pub async fn recheck_absent_blobs(
         .into_iter()
         .take(ABSENT_RECHECK_PER_PASS)
     {
+        let mut here = false;
         for (_, client) in targets {
             if let Ok(Some(_)) = client.head(&blob_key(blob_id)).await {
-                let _ = silentsilo_vault::clear_blob_absent(vault_root, blob_id);
-                found += 1;
+                here = true;
                 break;
             }
+        }
+        if here {
+            let _ = silentsilo_vault::clear_blob_absent(vault_root, blob_id);
+            found += 1;
+        } else {
+            let _ = silentsilo_vault::record_blob_absent(vault_root, blob_id);
         }
     }
     found

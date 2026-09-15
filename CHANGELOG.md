@@ -15,8 +15,8 @@ release notes should say.
 
 - `Vfs::move_file` and `move_folder`, built from records every version
   applies (the entry recorded again in the destination over the same
-  content, then the old record purged), not a new record type that a 1.0.0
-  compaction would drop.
+  content, then the old record trashed, in one transaction), not a new
+  record type that a 1.0.0 compaction would drop.
 - `silentsilo_fido::passkey`: passkeys kept in a silo, as a `passkey`
   field inside a password entry (`FORMATS.md`, Passkeys). Makes ES256
   passkeys with "none" attestation and signs sign-ins with a zero counter.
@@ -61,8 +61,11 @@ release notes should say.
   S3 endpoint and access key, WebDAV server and user, or SFTP host, port and
   user.
 - Content no configured target holds is remembered locally when a download
-  finds it on none of them (`list_absent_blob_ids`), asked about again by
-  each pass that reached every copy, and skipped by the full-copy fetch.
+  finds it on every configured copy (`list_absent_blob_ids`), asked about
+  again by each pass, and skipped by the full-copy fetch.
+- A purge replayed on a device that had meanwhile added something under the
+  purged folder left that row pointing at a missing folder, and every later
+  replay failed. What sits under a purged folder goes with it.
 - Two devices importing the same inbox items before either synced put
   them in two folders ("Phone" and "Phone (2)") and disagreed about which
   held the files. Folders made by the import now take ids derived from

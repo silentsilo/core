@@ -633,10 +633,9 @@ pub async fn run_sync_pass(
     // first target being behind must not stop a full copy from filling up.
     let reachable: Vec<(Uuid, &dyn ObjectStore)> =
         targets.iter().map(|t| (t.id, &*t.store)).collect();
-    if every_copy_reached {
-        sync::recheck_absent_blobs(&reachable, &root).await;
-    }
-    let pulled = fetch_missing_for_full_copy(state, host, silo, &reachable).await;
+    sync::recheck_absent_blobs(&reachable, &root).await;
+    let pulled =
+        fetch_missing_for_full_copy(state, host, silo, &reachable, every_copy_reached).await;
     // What came down, from the inbox or for the full copy, is on the copy it
     // came from, and no longer counts as waiting to back up there.
     if pulled > 0 || inbox.imported > 0 {
@@ -753,6 +752,7 @@ async fn fetch_missing_for_full_copy(
     host: &dyn Host,
     silo: &SiloEntry,
     stores: &[(Uuid, &dyn ObjectStore)],
+    every_copy: bool,
 ) -> usize {
     if !silentsilo_vault::keep_full_copy(&silo.path) {
         return 0;
@@ -796,7 +796,7 @@ async fn fetch_missing_for_full_copy(
         // bytes are damaged, held every later blob back on every pass
         // afterwards: a device asked to keep a full copy never became one
         // and never said why.
-        match sync::fetch_blob_from_targets(stores, &silo.path, blob_id).await {
+        match sync::fetch_blob_from_targets(stores, &silo.path, blob_id, every_copy).await {
             Ok(_) => fetched += 1,
             Err(e) => host.warn("sync", &format!("blob {blob_id} did not come down: {e}")),
         }
