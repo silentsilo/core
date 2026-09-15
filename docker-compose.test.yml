@@ -5,7 +5,7 @@ services:
   minio:
     image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
     command: server /data
-    ports: ["9000:9000"]
+    ports: ["127.0.0.1:9000:9000"]
     environment:
       MINIO_ROOT_USER: silentsilo
       MINIO_ROOT_PASSWORD: silentsilo123
@@ -17,14 +17,14 @@ services:
 
   webdav:
     image: bytemark/webdav
-    ports: ["8088:80"]
+    ports: ["127.0.0.1:8088:80"]
     environment:
       USERNAME: silentsilo
       PASSWORD: silentsilo123
 
   sftp:
     image: atmoz/sftp:alpine
-    ports: ["2222:22"]
+    ports: ["127.0.0.1:2222:22"]
     # OpenSSH 9.8 and later penalise a source that connects without logging
     # in, which is what reading a host key does, so the suites lock
     # themselves out a few tests in.
