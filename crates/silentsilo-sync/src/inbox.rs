@@ -275,10 +275,14 @@ async fn load_senders(
         };
         // Revocation removes the device key's envelope, so its absence is
         // the one signal every client, whatever its version, already gives.
+        // The envelope is plain JSON a sender holding the storage
+        // credentials could put back, so the sealed revocation marker a
+        // newer client leaves is checked as well.
         let envelope = format!("{KEYS_PREFIX}{}.env", record.credential_id);
         let removed = record.credential_id.is_empty()
             || record.credential_id.contains('/')
-            || client.head(&envelope).await?.is_none();
+            || client.head(&envelope).await?.is_none()
+            || crate::key_sync::is_key_revoked(client, kek, &record.credential_id).await?;
         let refusal = removed.then(|| {
             format!(
                 "sent by {}, whose key was removed from the silo",
@@ -579,6 +583,17 @@ pub async fn stage_item(client: &dyn ObjectStore, item: &ReadyItem) -> Result<()
         None => return Err(SyncError::Storage(format!("{source} is not there"))),
     }
     let dest = format!("{BLOBS_PREFIX}{}.sslo", item.blob_id);
+    // Content already under that id is never replaced: the id is the
+    // sender's word, and another file's content may live there.
+    match client.head(&dest).await? {
+        Some(size) if size >= 0 && size as u64 == item.blob_size => return Ok(()),
+        Some(_) => {
+            return Err(SyncError::Storage(format!(
+                "{dest} already holds other content"
+            )));
+        }
+        None => {}
+    }
     client.copy(&source, &dest).await?;
     Ok(())
 }

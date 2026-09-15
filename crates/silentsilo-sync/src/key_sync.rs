@@ -154,10 +154,25 @@ fn merge(
     // An organisation's key is retired only with its proof, which a device
     // following someone else's revocation does not hold; the write guard
     // would refuse it, so it is left for that device's own action.
-    for key in local.keys.iter_mut() {
-        if !key.revoked && !key.managed() && marked.contains(&key.credential_id) {
-            key.revoked = true;
-            outcome.revoked.push(key.credential_id.clone());
+    let follows = |key: &StoredFidoCredential| {
+        !key.revoked && !key.managed() && marked.contains(&key.credential_id)
+    };
+    // Markers are sealed under the content key, which never rotates: anyone
+    // who once held it can write one for every key. Followed blindly, that
+    // removes every way into the silo on every device. A set of markers
+    // that would leave no key at all is not followed; the device that
+    // removed its last key did so knowingly and needs no other device's help.
+    let would_remain = local
+        .keys
+        .iter()
+        .filter(|key| !key.revoked && !follows(key))
+        .count();
+    if would_remain > 0 {
+        for key in local.keys.iter_mut() {
+            if follows(key) {
+                key.revoked = true;
+                outcome.revoked.push(key.credential_id.clone());
+            }
         }
     }
 
@@ -229,6 +244,22 @@ mod tests {
         assert_eq!(outcome.revoked, vec!["aa11".to_string()]);
         assert!(local.keys[0].revoked);
         assert!(!local.keys[1].revoked, "the organisation key is left alone");
+    }
+
+    #[test]
+    fn markers_for_every_key_left_are_not_followed() {
+        let mut local = StoredFidoKeys {
+            keys: vec![key("aa11"), key("bb22")],
+        };
+        let marked = HashSet::from(["aa11".to_string(), "bb22".to_string()]);
+        let outcome = merge(&mut local, Vec::new(), &marked);
+        assert!(outcome.revoked.is_empty());
+        assert!(local.keys.iter().all(|k| !k.revoked));
+
+        // One of two is still followed.
+        let only = HashSet::from(["aa11".to_string()]);
+        let outcome = merge(&mut local, Vec::new(), &only);
+        assert_eq!(outcome.revoked, vec!["aa11".to_string()]);
     }
 
     #[test]

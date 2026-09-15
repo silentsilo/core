@@ -113,6 +113,18 @@ release notes should say.
 - An old snapshot copied under a higher name made every device ask for a
   rebuild on every pass. A snapshot counts only when its contents agree
   with its name.
+- A blob header's chunk size is not authenticated, and a reader allocated
+  whatever it named, up to 4 GiB per chunk. Any size but the one every
+  writer uses is refused.
+- Revocation markers are sealed under the content key, which never
+  rotates, so anyone who once held it could write one for every key and
+  remove every way into the silo on every device. Markers that would leave
+  no key are not followed.
+- A phone whose key was removed could keep sending to the inbox by putting
+  its plain key envelope back in storage. The sealed revocation marker is
+  checked too.
+- Staging an inbox item replaced content of another size already stored
+  under the same id. It is refused.
 
 ## [1.3.0] - The shared application crate
 

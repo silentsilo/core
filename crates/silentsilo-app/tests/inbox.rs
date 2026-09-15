@@ -435,3 +435,26 @@ async fn an_item_naming_content_another_file_holds_is_refused_and_copies_nothing
             .unwrap()
     );
 }
+
+#[tokio::test]
+async fn a_phone_whose_key_was_revoked_is_refused_even_with_its_envelope_put_back() {
+    let storage = tempfile::tempdir().unwrap();
+    let host = Targets(vec![folder_target(&storage)]);
+    let store = FolderStore::new(storage.path().to_path_buf());
+    let device = Device::new(&host).await;
+    let phone = phone(&store, &device, "aa11").await;
+    // The removal left its sealed marker; the phone, holding the storage
+    // credentials, put the plain envelope back.
+    let mut revoked = silentsilo_vault::load_fido_keys(&device.silo.path).unwrap();
+    revoked.keys.iter_mut().for_each(|k| k.revoked = true);
+    silentsilo_sync::reconcile_key_envelopes(&store, &device.kek(), &mut revoked, 0)
+        .await
+        .unwrap();
+    assert!(store.head("keys/aa11.env").await.unwrap().is_some());
+
+    let item_id = send_photo(&store, &phone, b"a photo").await;
+    let report = device.pass(&host).await;
+    assert_eq!(report.inbox_imported, 0);
+    assert_eq!(report.inbox_refused.len(), 1, "{report:?}");
+    assert!(store.head(&envelope(item_id)).await.unwrap().is_some());
+}

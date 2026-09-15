@@ -68,6 +68,14 @@ impl BlobHeader {
             )));
         }
         let chunk_size = u32::from_be_bytes([buf[6], buf[7], buf[8], buf[9]]);
+        // Every writer of this version uses the one size. The field is not
+        // authenticated, and reading chunks of whatever it says let storage
+        // make a reader allocate 4 GiB per chunk.
+        if chunk_size as usize != CHUNK_SIZE {
+            return Err(CryptoError::InvalidHeader(format!(
+                "unsupported chunk size {chunk_size}"
+            )));
+        }
         let file_id = Uuid::from_bytes(buf[10..26].try_into().unwrap());
         let blob_id = Uuid::from_bytes(buf[26..42].try_into().unwrap());
         let mut content_hash = [0u8; 32];
@@ -368,6 +376,19 @@ fn read_up_to<R: Read>(source: &mut R, buf: &mut [u8]) -> Result<usize, CryptoEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_header_naming_another_chunk_size_is_refused_before_anything_is_read() {
+        let header = BlobHeader {
+            version: SSLO_VERSION,
+            chunk_size: u32::MAX,
+            file_id: Uuid::new_v4(),
+            blob_id: Uuid::new_v4(),
+            content_hash: [0; 32],
+            nonce_prefix: [0; NONCE_PREFIX_SIZE],
+        };
+        assert!(BlobHeader::from_bytes(&header.to_bytes()).is_err());
+    }
     use crate::dek::generate_content_key;
     use tempfile::tempdir;
 
