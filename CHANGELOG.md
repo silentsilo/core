@@ -125,6 +125,12 @@ release notes should say.
   checked too.
 - Staging an inbox item replaced content of another size already stored
   under the same id. It is refused.
+- A device that had not heard of a new recovery code pushed its old
+  envelope back over it, so the new code stopped working and the old one
+  worked again. A newer envelope in storage is kept, and adopted locally.
+- The content key envelope was rewritten on every pass, and a device left
+  out of a key rotation could write its old one over the new. It is
+  written only where there is none.
 
 ## [1.3.0] - The shared application crate
 

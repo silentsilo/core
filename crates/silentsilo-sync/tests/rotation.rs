@@ -239,3 +239,35 @@ async fn a_device_the_key_moved_on_from_is_told_before_it_pushes() {
         "a rotated-away key still read as current"
     );
 }
+
+#[tokio::test]
+async fn a_pass_leaves_a_current_content_key_alone_and_never_writes_over_a_rotated_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = silentsilo_store::FolderStore::new(dir.path().to_path_buf());
+    let kek = generate_content_kek();
+    let current = generate_dek();
+    let first = seal(kek.as_bytes(), &current).unwrap();
+    assert!(
+        silentsilo_sync::publish_content_kek_checked(&store, &current, &first)
+            .await
+            .unwrap()
+    );
+    // A second wrap of the same key has other bytes: not a reason to write.
+    let again = seal(kek.as_bytes(), &current).unwrap();
+    assert!(
+        !silentsilo_sync::publish_content_kek_checked(&store, &current, &again)
+            .await
+            .unwrap()
+    );
+    assert_eq!(store.get(CONTENT_KEK_KEY).await.unwrap(), first);
+
+    // A device left out of a rotation does not put its envelope back.
+    let stale = generate_dek();
+    let old = seal(kek.as_bytes(), &stale).unwrap();
+    assert!(
+        silentsilo_sync::publish_content_kek_checked(&store, &stale, &old)
+            .await
+            .is_err()
+    );
+    assert_eq!(store.get(CONTENT_KEK_KEY).await.unwrap(), first);
+}

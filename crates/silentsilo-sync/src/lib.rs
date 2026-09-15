@@ -1472,6 +1472,30 @@ pub async fn publish_content_kek(
     Ok(true)
 }
 
+/// Publishes the KEK envelope from a sync pass: written only where there is
+/// none. One already there that opens under `dek` is current, whatever its
+/// bytes (each wrap takes a fresh nonce, so comparing bytes rewrote it on
+/// every pass). One that does not open means the key was rotated since this
+/// pass checked, or the object is damaged; either way this device's copy is
+/// not the one to put there.
+pub async fn publish_content_kek_checked(
+    client: &dyn ObjectStore,
+    dek: &MasterDek,
+    envelope: &[u8],
+) -> Result<bool, SyncError> {
+    if client.head(CONTENT_KEK_KEY).await?.is_some() {
+        let held = client.get(CONTENT_KEK_KEY).await?;
+        if unseal(&held, dek).is_ok() {
+            return Ok(false);
+        }
+        return Err(SyncError::Vault(
+            "the silo's content key here does not open with this device's key".into(),
+        ));
+    }
+    client.put(CONTENT_KEK_KEY, envelope.to_vec()).await?;
+    Ok(true)
+}
+
 /// The KEK envelope as stored, for a device joining the silo.
 ///
 /// `None` when the silo has none, which a joining device must treat as a
@@ -1740,21 +1764,41 @@ pub async fn push_recovery_envelope(
 /// it. Called on every pass so a target added after the code was generated
 /// still receives it. Compared by content, so a regenerated envelope
 /// replaces the old one instead of being skipped.
+///
+/// A newer envelope already there is left alone. Every device republishes
+/// its own copy on every pass, and one that had not yet heard of a new code
+/// put the old one back: the code the user had just written down stopped
+/// working, and the one they threw away worked again.
 pub async fn ensure_recovery_envelope(
     client: &dyn ObjectStore,
     envelope: &RecoveryEnvelope,
 ) -> Result<bool, SyncError> {
     let bytes = serde_json::to_vec(envelope).map_err(|e| SyncError::Vault(e.to_string()))?;
     if client.head(RECOVERY_KEY).await?.is_some()
-        && client
-            .get(RECOVERY_KEY)
-            .await
-            .is_ok_and(|held| held == bytes)
+        && let Ok(held) = client.get(RECOVERY_KEY).await
     {
-        return Ok(false);
+        if held == bytes {
+            return Ok(false);
+        }
+        if serde_json::from_slice::<RecoveryEnvelope>(&held)
+            .is_ok_and(|stored| stored.created_at > envelope.created_at)
+        {
+            return Ok(false);
+        }
     }
     client.put(RECOVERY_KEY, bytes).await?;
     Ok(true)
+}
+
+/// The envelope this target holds, when it is newer than `local`: a code
+/// made on another device, which this one should keep instead of its own.
+pub async fn newer_recovery_envelope(
+    client: &dyn ObjectStore,
+    local: &RecoveryEnvelope,
+) -> Result<Option<RecoveryEnvelope>, SyncError> {
+    Ok(fetch_recovery_envelope(client)
+        .await?
+        .filter(|stored| stored.created_at > local.created_at))
 }
 
 /// `None` when no recovery code has been set up for this vault.
@@ -1980,7 +2024,11 @@ pub async fn push_everything_to_reporting(
     }
 
     attempt!(ensure_manifest(target.store, silo.vault_id));
-    attempt!(publish_content_kek(target.store, silo.kek_envelope));
+    attempt!(publish_content_kek_checked(
+        target.store,
+        silo.dek,
+        silo.kek_envelope
+    ));
     if let Some(recovery) = silo.recovery {
         attempt!(ensure_recovery_envelope(target.store, recovery));
     }
