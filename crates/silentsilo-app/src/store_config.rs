@@ -70,6 +70,18 @@ pub enum SftpAuthInput {
     },
 }
 
+/// `scheme://host[:port]` of a URL, lowercased, to tell servers apart.
+fn origin(url: &str) -> String {
+    let url = url.trim();
+    let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    format!(
+        "{}://{}",
+        scheme.to_ascii_lowercase(),
+        host.to_ascii_lowercase()
+    )
+}
+
 /// The stored value if the field was left blank, trimmed to nothing if not.
 fn or_stored(given: Option<String>, stored: Option<String>) -> Option<String> {
     given
@@ -90,10 +102,17 @@ impl StoreConfigInput {
                 secret_access_key,
                 path_style,
             } => {
-                // Only an S3 config can supply a remembered secret. Switching
-                // from a folder must not silently inherit one.
+                // Only an S3 config can supply a remembered secret, and only
+                // for the same endpoint and access key: a secret filled in for
+                // an endpoint someone typed instead would be sent there.
                 let stored = match existing {
-                    Some(StoreConfig::S3(c)) => Some(c.secret_access_key),
+                    Some(StoreConfig::S3(c))
+                        if c.endpoint.trim_end_matches('/')
+                            == endpoint.trim().trim_end_matches('/')
+                            && c.access_key_id == access_key_id.trim() =>
+                    {
+                        Some(c.secret_access_key)
+                    }
                     _ => None,
                 };
                 let secret = secret_access_key
@@ -126,8 +145,13 @@ impl StoreConfigInput {
                 username,
                 password,
             } => {
+                // The same server and user only, for the same reason as S3.
                 let stored = match existing {
-                    Some(StoreConfig::WebDav(c)) => Some(c.password),
+                    Some(StoreConfig::WebDav(c))
+                        if origin(&c.url) == origin(&url) && c.username == username.trim() =>
+                    {
+                        Some(c.password)
+                    }
                     _ => None,
                 };
                 let password = password
@@ -150,8 +174,16 @@ impl StoreConfigInput {
                 auth,
                 host_fingerprint,
             } => {
+                // The same server and account only: another directory on it
+                // keeps the password, another host does not get it.
                 let stored = match existing {
-                    Some(StoreConfig::Sftp(c)) => Some(c),
+                    Some(StoreConfig::Sftp(c))
+                        if c.host == host.trim()
+                            && c.port == port
+                            && c.username == username.trim() =>
+                    {
+                        Some(c)
+                    }
                     _ => None,
                 };
 
@@ -415,5 +447,58 @@ mod deserialisation_tests {
         let input: StoreConfigInput = serde_json::from_value(json).unwrap();
 
         assert!(input.into_config(Some(stored)).is_err());
+    }
+
+    #[test]
+    fn a_stored_secret_is_never_sent_to_a_server_typed_in_its_place() {
+        let sftp = StoreConfig::Sftp(silentsilo_store::SftpConfig {
+            host: "nas.example.com".into(),
+            port: 22,
+            username: "alex".into(),
+            auth: SftpAuth::Password {
+                password: "hunter2".into(),
+            },
+            path: "backups/silo".into(),
+            host_fingerprint: Some("SHA256:abc".into()),
+        });
+        let elsewhere: StoreConfigInput = serde_json::from_value(serde_json::json!({
+            "kind": "sftp", "host": "evil.example.net", "port": 22, "username": "alex",
+            "path": "backups/silo", "auth": { "method": "password", "password": null },
+            "hostFingerprint": "SHA256:def"
+        }))
+        .unwrap();
+        assert!(elsewhere.into_config(Some(sftp)).is_err());
+
+        let dav = StoreConfig::WebDav(silentsilo_store::WebDavConfig {
+            url: "https://cloud.example.com/dav/silo".into(),
+            username: "alex".into(),
+            password: "app-pass".into(),
+        });
+        let same_server: StoreConfigInput = serde_json::from_value(serde_json::json!({
+            "kind": "web-dav", "url": "https://CLOUD.example.com/dav/other", "username": "alex", "password": null
+        }))
+        .unwrap();
+        assert!(same_server.into_config(Some(dav.clone())).is_ok());
+        let other_server: StoreConfigInput = serde_json::from_value(serde_json::json!({
+            "kind": "web-dav", "url": "https://cloud.example.com.evil.net/dav/silo", "username": "alex", "password": null
+        }))
+        .unwrap();
+        assert!(other_server.into_config(Some(dav)).is_err());
+
+        let s3 = StoreConfig::S3(silentsilo_core::S3Config {
+            endpoint: "https://s3.example.com".into(),
+            region: "auto".into(),
+            bucket: "vault".into(),
+            prefix: String::new(),
+            access_key_id: "key".into(),
+            secret_access_key: "secret".into(),
+            path_style: false,
+        });
+        let other_endpoint: StoreConfigInput = serde_json::from_value(serde_json::json!({
+            "kind": "s3", "endpoint": "https://s3.evil.net", "region": "auto", "bucket": "vault",
+            "prefix": "", "accessKeyId": "key", "secretAccessKey": null, "pathStyle": false
+        }))
+        .unwrap();
+        assert!(other_endpoint.into_config(Some(s3)).is_err());
     }
 }

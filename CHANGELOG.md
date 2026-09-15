@@ -55,6 +55,11 @@ release notes should say.
 
 ### Fixed
 
+- Editing storage settings with a secret left blank kept the stored secret
+  whatever server the settings now named, so a mistyped or hostile host
+  would have received it. The stored secret is kept only for the same
+  S3 endpoint and access key, WebDAV server and user, or SFTP host, port and
+  user.
 - Content no configured target holds is remembered locally when a download
   finds it on none of them (`list_absent_blob_ids`), asked about again by
   each pass that reached every copy, and skipped by the full-copy fetch.
