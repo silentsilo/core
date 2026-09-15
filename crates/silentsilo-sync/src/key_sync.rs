@@ -63,6 +63,49 @@ pub async fn is_key_revoked(
         .is_some_and(|m| m.credential_id == credential_id))
 }
 
+/// When storage says the marker for `credential_id` was written, if it
+/// holds one that opens with `kek`.
+pub async fn revoked_at(
+    client: &dyn ObjectStore,
+    kek: &ContentKek,
+    credential_id: &str,
+) -> Result<Option<i64>, SyncError> {
+    let key = marker_key(credential_id);
+    if client.head(&key).await?.is_none() {
+        return Ok(None);
+    }
+    let bytes = client.get(&key).await?;
+    Ok(unseal_with_key(&bytes, kek.as_bytes())
+        .ok()
+        .and_then(|plain| serde_json::from_slice::<RevocationMarker>(&plain).ok())
+        .filter(|m| m.credential_id == credential_id)
+        .map(|m| m.revoked_at))
+}
+
+/// The id the recovery code's marker goes under. Not hex, so no key can
+/// ever have it, and the key reconciliation already ignores it.
+pub const RECOVERY_MARKER_ID: &str = "recovery";
+
+/// Records that the recovery code was turned off at `at`: every envelope
+/// made at or before then is dead, whichever device still holds one. The
+/// same sealed marker a key's removal leaves, which every earlier client
+/// already skips.
+pub async fn mark_recovery_disabled(
+    client: &dyn ObjectStore,
+    kek: &ContentKek,
+    at: i64,
+) -> Result<(), SyncError> {
+    let marker = RevocationMarker {
+        version: MARKER_VERSION,
+        credential_id: RECOVERY_MARKER_ID.into(),
+        revoked_at: at,
+    };
+    let json = serde_json::to_vec(&marker).map_err(|e| SyncError::Vault(e.to_string()))?;
+    let sealed = seal_with_key(&json, kek.as_bytes())?;
+    client.put(&marker_key(RECOVERY_MARKER_ID), sealed).await?;
+    Ok(())
+}
+
 /// What one reconciliation changed.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct KeyReconcile {

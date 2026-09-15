@@ -208,6 +208,14 @@ So the rule for anything reading these:
   an organisation's key is not tombstoned on another device's say-so, since
   retiring one needs its proof. 1.0.0 skips the markers, so a 1.0.0 client
   neither sees keys enrolled after it joined nor honours a marker.
+- **Turning the recovery code off leaves a marker too** (core 1.4.0), the
+  same sealed JSON under `keys/revoked/recovery.sealed`, with
+  `credential_id` `"recovery"` and `revoked_at` the time it was turned off.
+  No key id can be `recovery`, since key ids are hex. Each pass drops a
+  local or stored envelope created at or before it, so a device that still
+  held the code does not publish it again; a code generated later is dated
+  after the marker. Clients before 1.4.0 read it as a marker for a key they
+  do not have and ignore it, so they can still put the old envelope back.
 - **Unlocking goes over the keys of a kind this build knows.** That is
   `StoredFidoKeys::usable`, and it is what the authenticator allow-list, the
   "do you have a spare key" nudge and the last-key removal guard are all

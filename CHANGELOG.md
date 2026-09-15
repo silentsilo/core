@@ -193,6 +193,11 @@ release notes should say.
 - A rebuild after falling below a snapshot horizon dropped the changes this
   device had not pushed yet. They are written again on top of the rebuilt
   silo.
+- A recovery code turned off on one device came back from any device that
+  still held its envelope, on that device's next pass. Turning it off now
+  leaves a sealed marker under `keys/revoked/recovery.sealed`, and each pass
+  drops an envelope made at or before it, locally and in storage
+  (`settle_recovery_envelope`, `mark_recovery_disabled`, `revoked_at`).
 
 ## [1.3.0] - The shared application crate
 

@@ -11,7 +11,7 @@
 //! ciphertext, exactly as it does for blob content.
 
 use silentsilo_core::CoreError;
-use silentsilo_crypto::{MasterDek, seal, unseal};
+use silentsilo_crypto::{ContentKek, MasterDek, seal, unseal};
 use silentsilo_store::{ObjectStore, StoreError};
 use silentsilo_vfs::{
     CompactionPolicy, OpRecord, ReplayReport, Snapshot, capture_at, choose_horizon,
@@ -31,7 +31,8 @@ pub mod inbox;
 mod key_sync;
 pub use error::SyncError;
 pub use key_sync::{
-    KeyReconcile, REVOKED_PREFIX, is_key_revoked, plausible_credential_id, reconcile_key_envelopes,
+    KeyReconcile, RECOVERY_MARKER_ID, REVOKED_PREFIX, is_key_revoked, mark_recovery_disabled,
+    plausible_credential_id, reconcile_key_envelopes, revoked_at,
 };
 
 /// Where operation objects live inside the vault prefix.
@@ -1823,6 +1824,63 @@ pub async fn newer_recovery_envelope(
     Ok(fetch_recovery_envelope(client)
         .await?
         .filter(|stored| stored.created_at > local.created_at))
+}
+
+/// Brings this device's recovery envelope in line with storage before a push,
+/// and returns the one to publish.
+///
+/// A code turned off on another device stays off: an envelope made at or
+/// before the marker is dropped here and removed from every copy that
+/// allows it, so a device that had not heard does not put it back. A code
+/// made on another device since is kept here instead of this device's older
+/// one. `targets` pairs each store with whether it allows deletes.
+pub async fn settle_recovery_envelope(
+    targets: &[(&dyn ObjectStore, bool)],
+    kek: &ContentKek,
+    vault_root: &std::path::Path,
+) -> Option<RecoveryEnvelope> {
+    let mut recovery = silentsilo_vault::load_recovery_envelope(vault_root).ok();
+
+    let mut disabled_at: Option<i64> = None;
+    for (store, _) in targets {
+        if let Ok(Some(at)) = revoked_at(*store, kek, RECOVERY_MARKER_ID).await {
+            disabled_at = Some(disabled_at.map_or(at, |d| d.max(at)));
+        }
+    }
+    if let Some(off) = disabled_at {
+        if recovery.as_ref().is_some_and(|r| r.created_at <= off) {
+            silentsilo_vault::clear_recovery_envelope(vault_root);
+            recovery = None;
+        }
+        for (store, allows_delete) in targets {
+            if *allows_delete
+                && let Ok(Some(held)) = fetch_recovery_envelope(*store).await
+                && held.created_at <= off
+            {
+                let _ = revoke_recovery_envelope(*store).await;
+            }
+        }
+    }
+
+    if let Some(local) = recovery.as_ref() {
+        let mut newest: Option<RecoveryEnvelope> = None;
+        for (store, _) in targets {
+            if let Ok(Some(found)) = newer_recovery_envelope(*store, local).await
+                && newest
+                    .as_ref()
+                    .is_none_or(|n| found.created_at > n.created_at)
+                && disabled_at.is_none_or(|off| found.created_at > off)
+            {
+                newest = Some(found);
+            }
+        }
+        if let Some(newer) = newest
+            && silentsilo_vault::save_recovery_envelope(vault_root, &newer).is_ok()
+        {
+            recovery = Some(newer);
+        }
+    }
+    recovery
 }
 
 /// `None` when no recovery code has been set up for this vault.

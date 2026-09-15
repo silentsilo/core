@@ -63,7 +63,9 @@ still remove some keys, or register a sender. Moving these under a key that
 rotates is a format change and is not done in v1.
 
 Replacing or disabling the recovery code deletes or replaces its envelope in
-storage but does not rotate the DEK either. Whoever kept the old
+storage but does not rotate the DEK either. Disabling also leaves a marker
+sealed under the KEK, so a 1.4.0 device that still holds the envelope drops
+it instead of publishing it again; an older client does not read the marker. Whoever kept the old
 `recovery.env` (bucket versioning keeps it too) and has the old code can
 still unwrap the current DEK. Rotate the key after replacing a code that may
 have been exposed.

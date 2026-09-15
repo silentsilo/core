@@ -404,3 +404,60 @@ async fn a_device_that_missed_a_new_recovery_code_does_not_put_the_old_one_back(
         new.salt
     );
 }
+
+#[tokio::test]
+async fn a_recovery_code_turned_off_stays_off_on_a_device_that_had_not_heard() {
+    let storage = tempfile::tempdir().unwrap();
+    let target = || folder_target(storage.path().to_path_buf(), TargetRole::Working);
+    let a = Device::new(Uuid::new_v4(), None);
+    let b = Device::new(a.vault_id(), Some(a.keys()));
+    *a.host.targets.lock().unwrap() = vec![target()];
+    *b.host.targets.lock().unwrap() = vec![target()];
+    let dek = a.keys().0;
+    let kek = a.state.sessions.lock().unwrap()[&a.silo.id].kek.clone();
+    let store = silentsilo_store::FolderStore::new(storage.path().to_path_buf());
+
+    let (_, mut old) = silentsilo_vault::create_recovery_envelope(&dek).unwrap();
+    old.created_at = 100;
+    silentsilo_vault::save_recovery_envelope(&a.silo.path, &old).unwrap();
+    silentsilo_vault::save_recovery_envelope(&b.silo.path, &old).unwrap();
+    a.pass().await;
+    b.pass().await;
+
+    // A turns it off, as the desktop command does; B still holds the code.
+    silentsilo_sync::mark_recovery_disabled(&store, &kek, 150)
+        .await
+        .unwrap();
+    silentsilo_sync::revoke_recovery_envelope(&store)
+        .await
+        .unwrap();
+    silentsilo_vault::clear_recovery_envelope(&a.silo.path);
+    b.pass().await;
+    a.pass().await;
+
+    assert!(
+        silentsilo_sync::fetch_recovery_envelope(&store)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(silentsilo_vault::load_recovery_envelope(&b.silo.path).is_err());
+
+    // A code made after that is the silo's code again, everywhere.
+    let (_, mut new) = silentsilo_vault::create_recovery_envelope(&dek).unwrap();
+    new.created_at = 200;
+    silentsilo_vault::save_recovery_envelope(&b.silo.path, &new).unwrap();
+    b.pass().await;
+    a.pass().await;
+    let held = silentsilo_sync::fetch_recovery_envelope(&store)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(held.salt, new.salt);
+    assert_eq!(
+        silentsilo_vault::load_recovery_envelope(&b.silo.path)
+            .unwrap()
+            .salt,
+        new.salt
+    );
+}
