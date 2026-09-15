@@ -11,6 +11,13 @@ release notes should say.
 
 ## [Unreleased]
 
+## [1.4.0] - The mobile client, and devices that agree
+
+No persisted format version changed, so the 1.0.0 fixtures still describe
+the current era. `SCHEMA_VERSION` is 2, which only rebuilds each device's
+derived tables from its own log on the first open. The recovery-off marker
+reuses the revocation marker's bytes. Desktop and mobile pin this tag.
+
 ### Added
 
 - `Vfs::move_file` and `move_folder`, built from records every version
