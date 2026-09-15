@@ -122,6 +122,13 @@ pub struct UnreadableOp {
 pub struct MissingOps {
     pub records: Vec<OpRecord>,
     pub unreadable: Vec<UnreadableOp>,
+    /// Records that opened but sit under another record's name: a genuine
+    /// record copied by storage to replay it later in the order. Skipped.
+    pub misplaced: Vec<String>,
+    /// The highest Lamport value any record in the listing carries, read
+    /// from the names. After a complete fetch, this device holds every
+    /// record storage had up to here.
+    pub listed_through: u64,
 }
 
 /// Downloads every record the bucket holds that `known` does not name.
@@ -154,9 +161,13 @@ pub async fn fetch_missing_ops_reporting(
     above_horizon: u64,
     progress: &mut (dyn FnMut(usize, usize) + Send),
 ) -> Result<MissingOps, SyncError> {
-    let listing: Vec<_> = client
-        .list(OPS_PREFIX)
-        .await?
+    let listed = client.list(OPS_PREFIX).await?;
+    let listed_through = listed
+        .iter()
+        .filter_map(|entry| lamport_from_key(&entry.key))
+        .max()
+        .unwrap_or(0);
+    let listing: Vec<_> = listed
         .into_iter()
         .filter(|entry| match lamport_from_key(&entry.key) {
             Some(lamport) => lamport > above_horizon,
@@ -172,7 +183,10 @@ pub async fn fetch_missing_ops_reporting(
         .collect();
 
     let total = listing.len();
-    let mut out = MissingOps::default();
+    let mut out = MissingOps {
+        listed_through,
+        ..MissingOps::default()
+    };
     progress(0, total);
 
     for (done, entry) in listing.into_iter().enumerate() {
@@ -198,6 +212,11 @@ pub async fn fetch_missing_ops_reporting(
             let sealed = client.get(&entry.key).await?;
             match unseal(&sealed, dek) {
                 Ok(plain) => match OpRecord::from_bytes(&plain) {
+                    // The name is what the order and the horizon filter were
+                    // read from. A record under another's name is a copy
+                    // storage made, to replay an old change above a snapshot
+                    // or later than it happened: never applied.
+                    Ok(record) if op_key(&record) != entry.key => out.misplaced.push(entry.key),
                     Ok(record) => out.records.push(record),
                     Err(e) => unreadable(entry.key, e.to_string()),
                 },
@@ -259,12 +278,15 @@ pub fn usable_prefix(
 }
 
 /// The most an operation record may weigh before this refuses to read it.
-/// A megabyte is far above anything the app writes, and the ceiling stops a
-/// hostile provider from answering a listing with an object sized to
-/// exhaust memory. Checked against the listing, so an oversized object is
-/// never downloaded. Blobs get no ceiling: their size is whatever the user
-/// stored.
-const MAX_OP_BYTES: i64 = 1024 * 1024;
+/// The ceiling stops a hostile provider from answering a listing with an
+/// object sized to exhaust memory. Checked against the listing, so an
+/// oversized object is never downloaded. Blobs get no ceiling: their size is
+/// whatever the user stored.
+///
+/// Writers keep records under 1 MiB, the ceiling every earlier reader
+/// applies; reading up to 4 MiB lets this build read a purge record an older
+/// build wrote whole.
+const MAX_OP_BYTES: i64 = 4 * 1024 * 1024;
 
 /// One full pass: push what is local-only, pull what is new, replay it.
 ///
@@ -1288,17 +1310,44 @@ pub async fn latest_snapshot(
     client: &dyn ObjectStore,
     dek: &MasterDek,
 ) -> Result<Option<Snapshot>, SyncError> {
-    let horizon = snapshot_horizon(client).await?;
-    if horizon == 0 {
-        return Ok(None);
-    }
     // No size ceiling here, unlike an operation record. A snapshot's honest
     // size is the size of the vault's index, so there is no bound to pick
     // that is not either useless or a limit on how large a silo may be. The
     // same reasoning as blobs, and the same fix when it matters: read it as
     // a stream rather than whole.
-    let sealed = client.get(&snapshot_key(horizon)).await?;
-    Ok(Some(Snapshot::from_bytes(&unseal(&sealed, dek)?)?))
+    //
+    // Newest first, and only one whose own horizon matches its name. A
+    // genuine old snapshot copied under a higher name would otherwise hold
+    // every device in "rebuild" for good, and each rebuild lose what it had
+    // not pushed. One that will not open is still an error: skipping it for
+    // an older one would rebuild without records already pruned.
+    let mut horizons: Vec<u64> = client
+        .list(SNAPSHOTS_PREFIX)
+        .await?
+        .iter()
+        .filter_map(|entry| horizon_from_key(&entry.key))
+        .collect();
+    horizons.sort_unstable_by(|a, b| b.cmp(a));
+    for horizon in horizons {
+        let sealed = client.get(&snapshot_key(horizon)).await?;
+        let snapshot = Snapshot::from_bytes(&unseal(&sealed, dek)?)?;
+        if snapshot.horizon == horizon {
+            return Ok(Some(snapshot));
+        }
+    }
+    Ok(None)
+}
+
+/// The horizon of the newest snapshot whose contents agree with its name, or
+/// 0. Downloads snapshots, so it is asked only when the listing alone
+/// ([`snapshot_horizon`]) says this device has fallen behind.
+pub async fn verified_snapshot_horizon(
+    client: &dyn ObjectStore,
+    dek: &MasterDek,
+) -> Result<u64, SyncError> {
+    Ok(latest_snapshot(client, dek)
+        .await?
+        .map_or(0, |snapshot| snapshot.horizon))
 }
 
 /// Deletes the operation objects a snapshot has made redundant. Only ever

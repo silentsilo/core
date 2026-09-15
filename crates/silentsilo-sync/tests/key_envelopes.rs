@@ -184,7 +184,7 @@ async fn an_operation_object_sized_to_exhaust_memory_is_refused() {
     client
         .put(
             "ops/00000000000000000001-aa-bb.op",
-            vec![0u8; 2 * 1024 * 1024],
+            vec![0u8; 5 * 1024 * 1024],
         )
         .await
         .unwrap();

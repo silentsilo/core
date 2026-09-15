@@ -1063,3 +1063,64 @@ async fn a_snapshot_that_does_not_read_back_prunes_nothing() {
         "records were traded for an unreadable snapshot"
     );
 }
+
+#[tokio::test]
+async fn an_old_snapshot_copied_under_a_higher_name_is_not_believed() {
+    let (_dir, store) = store();
+    let dek = generate_dek();
+    let snapshot = snapshot_at(Uuid::new_v4(), 5);
+    put_snapshot(&store, &dek, &snapshot).await.unwrap();
+    let bytes = store
+        .get("snapshots/00000000000000000005.snap")
+        .await
+        .unwrap();
+    store
+        .put("snapshots/00000000000000099999.snap", bytes)
+        .await
+        .unwrap();
+
+    // The listing alone says 99999; the snapshots themselves say 5.
+    assert_eq!(snapshot_horizon(&store).await.unwrap(), 99999);
+    assert_eq!(
+        silentsilo_sync::verified_snapshot_horizon(&store, &dek)
+            .await
+            .unwrap(),
+        5
+    );
+    assert_eq!(
+        latest_snapshot(&store, &dek).await.unwrap().unwrap(),
+        snapshot
+    );
+}
+
+#[tokio::test]
+async fn a_record_copied_under_another_name_is_skipped_not_replayed() {
+    let (_dir, store) = store();
+    let dek = generate_dek();
+    let genuine = record(3, Uuid::new_v4());
+    push_ops(&store, &dek, std::slice::from_ref(&genuine))
+        .await
+        .unwrap();
+    let key = format!("ops/{}.op", genuine.object_key());
+    let bytes = store.get(&key).await.unwrap();
+    // Storage replays an old change later in the order, past a horizon.
+    let moved = format!(
+        "ops/00000000000000000500-{}-{}.op",
+        genuine.device_id,
+        Uuid::new_v4()
+    );
+    store.put(&moved, bytes).await.unwrap();
+
+    let got = silentsilo_sync::fetch_missing_ops(&store, &dek, &Default::default(), 10)
+        .await
+        .unwrap();
+    assert!(got.records.is_empty());
+    assert_eq!(got.misplaced, vec![moved]);
+    assert_eq!(got.listed_through, 500);
+
+    let got = silentsilo_sync::fetch_missing_ops(&store, &dek, &Default::default(), 0)
+        .await
+        .unwrap();
+    assert_eq!(got.records.len(), 1);
+    assert_eq!(got.records[0].op_id, genuine.op_id);
+}

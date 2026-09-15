@@ -856,6 +856,42 @@ pub fn sweep_due(
     Ok(now - last >= interval_seconds)
 }
 
+const RECEIVED_THROUGH: &str = "received_through";
+
+/// The highest Lamport value storage listed at a fetch that read everything
+/// from every copy. Records up to it that storage held then are all here.
+/// `None` on a vault that has not had such a pass yet.
+///
+/// What says whether this device fell below a snapshot horizon. The highest
+/// record in the local log does not: it counts this device's own records,
+/// and a device that wrote thousands offline would look current while
+/// missing everything the others folded into a snapshot meanwhile.
+pub fn received_through(conn: &Connection) -> CoreResult<Option<u64>> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT value FROM vault_meta WHERE key = ?1",
+            [RECEIVED_THROUGH],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(db)?;
+    Ok(raw.and_then(|s| s.parse().ok()))
+}
+
+/// Raises [`received_through`]; never lowers it.
+pub fn record_received_through(conn: &Connection, lamport: u64) -> CoreResult<()> {
+    if received_through(conn)?.is_some_and(|current| lamport <= current) {
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT INTO vault_meta(key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![RECEIVED_THROUGH, lamport.to_string()],
+    )
+    .map_err(db)?;
+    Ok(())
+}
+
 pub fn record_sweep(conn: &Connection, target: Uuid, now: i64) -> CoreResult<()> {
     conn.execute(
         "INSERT INTO vault_meta(key, value) VALUES (?1, ?2)

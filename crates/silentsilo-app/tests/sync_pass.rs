@@ -281,3 +281,89 @@ async fn one_target_failing_does_not_mark_the_other_as_behind() {
         "a record one target lacks is not delivered everywhere yet"
     );
 }
+
+#[tokio::test]
+async fn a_pass_that_could_not_read_every_record_neither_sweeps_nor_compacts() {
+    // A record nobody can read holds back everything after it, so this
+    // device's picture of what is referenced is short. Content others
+    // added would look orphaned to the sweep.
+    let storage = tempfile::tempdir().unwrap();
+    let device = Device::new(Uuid::new_v4(), None);
+    let target = folder_target(storage.path().to_path_buf(), TargetRole::Working);
+    let target_id = target.config.target_id();
+    *device.host.targets.lock().unwrap() = vec![target];
+    device.make_folder("Documents");
+
+    let orphan = Uuid::new_v4();
+    std::fs::create_dir_all(storage.path().join("blobs")).unwrap();
+    std::fs::write(storage.path().join(format!("blobs/{orphan}.sslo")), b"x").unwrap();
+    std::fs::create_dir_all(storage.path().join("ops")).unwrap();
+    let junk = storage.path().join(format!(
+        "ops/00000000000000000001-{}-{}.op",
+        Uuid::new_v4(),
+        Uuid::new_v4()
+    ));
+    std::fs::write(&junk, b"not a record").unwrap();
+
+    let candidates = |device: &Device| {
+        silentsilo_vfs::snapshot::gc_candidates(
+            &device.state.sessions.lock().unwrap()[&device.silo.id].conn,
+            target_id,
+        )
+        .unwrap()
+    };
+
+    let report = device.pass().await;
+    assert_eq!(report.unreadable.len(), 1, "{report:?}");
+    assert!(candidates(&device).is_empty());
+
+    std::fs::remove_file(&junk).unwrap();
+    let report = device.pass().await;
+    assert!(report.unreadable.is_empty(), "{report:?}");
+    assert!(candidates(&device).contains(&orphan));
+}
+
+#[tokio::test]
+async fn a_device_that_wrote_a_lot_offline_still_sees_it_fell_behind_a_snapshot() {
+    // B last synced early. A moved on and compacted. B then wrote more
+    // records offline than A has, so its own highest record is above A's
+    // horizon, yet it never received what A folded into the snapshot.
+    let storage = tempfile::tempdir().unwrap();
+    let target = || folder_target(storage.path().to_path_buf(), TargetRole::Working);
+    let a = Device::new(Uuid::new_v4(), None);
+    let b = Device::new(a.vault_id(), Some(a.keys()));
+    *a.host.targets.lock().unwrap() = vec![target()];
+    *b.host.targets.lock().unwrap() = vec![target()];
+
+    a.make_folder("Shared");
+    a.pass().await;
+    assert!(!b.pass().await.needs_rebuild);
+
+    for i in 0..5 {
+        a.make_folder(&format!("A{i}"));
+    }
+    a.pass().await;
+    let dek = a.keys().0;
+    let snapshot = {
+        let sessions = a.state.sessions.lock().unwrap();
+        let session = &sessions[&a.silo.id];
+        let policy = silentsilo_vfs::CompactionPolicy {
+            retain_seconds: 0,
+            keep_recent: 1,
+            min_records: 0,
+        };
+        silentsilo_sync::plan_compaction(&session.conn, session.vault_id, &policy, i64::MAX / 4)
+            .unwrap()
+            .expect("a horizon")
+    };
+    let store = silentsilo_store::FolderStore::new(storage.path().to_path_buf());
+    silentsilo_sync::publish_compaction(&store, &dek, &snapshot, true)
+        .await
+        .unwrap();
+
+    for i in 0..3 * snapshot.horizon {
+        b.make_folder(&format!("B{i}"));
+    }
+    let report = b.pass().await;
+    assert!(report.needs_rebuild, "{report:?}");
+}

@@ -354,7 +354,31 @@ pub async fn run_sync_pass(
     let horizon = sync::lowest_snapshot_horizon(&stores)
         .await
         .map_err(|e| e.to_string())?;
-    if horizon > 0 && applied_through <= horizon {
+    // What this device received, not the highest record it holds: its own
+    // records count in the latter. Before a complete fetch has recorded a
+    // watermark, the old bound.
+    let received = {
+        let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
+        sessions
+            .get(&silo.id)
+            .and_then(|s| silentsilo_vfs::snapshot::received_through(&s.conn).ok())
+            .flatten()
+    };
+    let known_through = received.unwrap_or(applied_through);
+    let mut behind = false;
+    if horizon > local_horizon && known_through <= horizon {
+        // The listing's word for the horizon is only a name. Checked against
+        // the snapshots themselves before a rebuild is asked for: a copy
+        // under a higher name would ask for one on every pass.
+        let mut verified: Option<u64> = None;
+        for target in &targets {
+            if let Ok(found) = sync::verified_snapshot_horizon(&*target.store, &dek).await {
+                verified = Some(verified.map_or(found, |v| v.min(found)));
+            }
+        }
+        behind = verified.is_some_and(|v| v > local_horizon && known_through <= v);
+    }
+    if behind {
         return Ok(announce(
             host,
             silo,
@@ -519,6 +543,9 @@ pub async fn run_sync_pass(
     // independent, which is what makes reading the same record twice free.
     let mut incoming = Vec::new();
     let mut unreadable: Vec<sync::UnreadableOp> = Vec::new();
+    let mut fetch_failed = false;
+    let mut misplaced: Vec<String> = Vec::new();
+    let mut listed_through = 0u64;
     for target in &targets {
         match sync::fetch_missing_ops_reporting(
             &*target.store,
@@ -536,8 +563,11 @@ pub async fn run_sync_pass(
             Ok(mut got) => {
                 incoming.append(&mut got.records);
                 unreadable.append(&mut got.unreadable);
+                misplaced.append(&mut got.misplaced);
+                listed_through = listed_through.max(got.listed_through);
             }
             Err(e) => {
+                fetch_failed = true;
                 if let Some(status) = statuses.iter_mut().find(|s| s.id == target.id.to_string())
                     && status.failed.is_none()
                 {
@@ -548,9 +578,20 @@ pub async fn run_sync_pass(
     }
     // An object unreadable on one copy but fetched intact from another is
     // not a hole in the log.
+    for key in &misplaced {
+        host.warn(
+            "sync",
+            &format!("{key} holds a record under another name; skipped"),
+        );
+    }
     let fetched_ids: std::collections::HashSet<Uuid> = incoming.iter().map(|r| r.op_id).collect();
     unreadable.retain(|u| u.op_id.is_none_or(|id| !fetched_ids.contains(&id)));
     let (incoming, held_back) = sync::usable_prefix(incoming, &unreadable);
+    // Everything every copy holds was read and nothing is held back.
+    let view_complete = !fetch_failed
+        && unreadable.is_empty()
+        && held_back == 0
+        && targets.len() == every_target.len();
     let fetched = incoming.len();
     for u in &unreadable {
         host.warn("sync", &format!("{} could not be read: {}", u.key, u.error));
@@ -562,6 +603,10 @@ pub async fn run_sync_pass(
             .get(&silo.id)
             .ok_or_else(|| "Vault locked mid-sync".to_string())?;
         let report = replay(&session.conn, incoming).map_err(|e| e.to_string())?;
+        if view_complete {
+            silentsilo_vfs::snapshot::record_received_through(&session.conn, listed_through)
+                .map_err(|e| e.to_string())?;
+        }
 
         // Written down per target, after the write and never before: a
         // record noted as delivered without having arrived is one this
@@ -642,18 +687,31 @@ pub async fn run_sync_pass(
         let _ = silentsilo_vault::settle_blob_delivery(&root, &every_target);
     }
 
+    // Both steps below act on what this device believes the silo holds:
+    // compaction drops records under its snapshot, and the sweep deletes
+    // content nothing references. With a record held back, unreadable, or
+    // on a copy that could not be read, that belief is short. Files others
+    // added would look unreferenced and have their content deleted, and the
+    // records missing here would be pruned from storage. Neither runs then.
+
     // Compaction publishes to each target before pruning it, which
     // `publish_compaction` guarantees for the target it is given. A target
     // that fails keeps its whole log, which is safe: it simply has more
     // history than it needs.
-    let compacted = run_compaction(state, silo, &targets, &dek, vault_id).await?;
+    let compacted = if view_complete {
+        run_compaction(state, silo, &targets, &dek, vault_id).await?
+    } else {
+        0
+    };
 
     // The sweep exists to delete, so an append-only target is skipped
     // outright rather than swept and refused. Content that nothing
     // references staying there for ever is what that role means, and the
     // Copies panel says so instead of the sweep pretending to run.
-    for target in targets.iter().filter(|t| t.role.allows_delete()) {
-        run_blob_sweep(state, silo, &*target.store, target.id).await?;
+    if view_complete {
+        for target in targets.iter().filter(|t| t.role.allows_delete()) {
+            run_blob_sweep(state, silo, &*target.store, target.id).await?;
+        }
     }
 
     let report = SyncReport {

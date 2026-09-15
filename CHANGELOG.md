@@ -96,6 +96,23 @@ release notes should say.
 - A WebDAV folder whose name has a space or a letter such as "ș" listed
   nothing, so sync and key reconciliation saw an empty store. WebDAV also
   gives up on a server that stops answering.
+- Emptying a trash of more than about 27,000 items wrote one record over
+  the 1 MiB every reader refuses, which held back everything after it on
+  every other device. A large purge is split into records that each stand
+  on their own, and this build reads records up to 4 MiB.
+- The blob sweep and compaction ran on a pass that had held records back,
+  met an unreadable one, or could not read a copy. Content others added
+  could look unreferenced and be deleted. Neither runs on such a pass.
+- A device that wrote many records offline could miss that it had fallen
+  below a snapshot horizon, because its own records raised the bound it
+  was checked on. The check uses what storage listed at the last complete
+  fetch.
+- A record copied by storage under another record's name was replayed at
+  the copy's place in the order, which could bring back an old password
+  or a purged file. It is skipped.
+- An old snapshot copied under a higher name made every device ask for a
+  rebuild on every pass. A snapshot counts only when its contents agree
+  with its name.
 
 ## [1.3.0] - The shared application crate
 

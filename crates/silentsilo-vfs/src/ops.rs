@@ -39,6 +39,12 @@ fn normalized_input(name: &str) -> CoreResult<String> {
     Ok(name)
 }
 
+/// The most ids one `Purge` record carries; see `Vfs::emit_purge`.
+#[cfg(not(test))]
+const PURGE_IDS_PER_RECORD: usize = 10_000;
+#[cfg(test)]
+const PURGE_IDS_PER_RECORD: usize = 40;
+
 pub struct Vfs<'a> {
     session: &'a VaultSession,
 }
@@ -1581,15 +1587,71 @@ impl<'a> Vfs<'a> {
             return Ok((0, Vec::new()));
         }
 
-        crate::oplog::emit(
-            self.conn(),
-            crate::oplog::VaultOp::Purge {
-                folder_ids,
-                file_ids,
-            },
-        )?;
+        self.emit_purge(folder_ids, file_ids)?;
         bump_revision(self.conn()).map_err(|e| CoreError::Database(e.to_string()))?;
         Ok((removed, self.orphaned_by_purge(blob_ids)?))
+    }
+
+    /// Records a purge, in as many records as it takes to keep each one
+    /// readable. Every reader refuses a record over 1 MiB sealed, about
+    /// 27,000 ids, so emptying a trash of 30,000 photos in one record left
+    /// it unreadable on every other device, and everything after it held
+    /// back.
+    ///
+    /// Files go first, then folders deepest first. Each record then stands
+    /// on its own for a reader that deletes exactly the rows it names, as
+    /// 1.0.0 does: no folder goes while something still points at it.
+    fn emit_purge(&self, folder_ids: Vec<Uuid>, file_ids: Vec<Uuid>) -> CoreResult<()> {
+        if folder_ids.len() + file_ids.len() <= PURGE_IDS_PER_RECORD {
+            crate::oplog::emit(
+                self.conn(),
+                crate::oplog::VaultOp::Purge {
+                    folder_ids,
+                    file_ids,
+                },
+            )?;
+            return Ok(());
+        }
+        let mut folders = Vec::with_capacity(folder_ids.len());
+        for id in folder_ids {
+            let depth = self
+                .conn()
+                .query_row(
+                    "SELECT path FROM folders WHERE id = ?1",
+                    [id.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|e| CoreError::Database(e.to_string()))?
+                .map_or(0, |path| path.matches('/').count());
+            folders.push((depth, id));
+        }
+        folders.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+
+        let tx = self
+            .conn()
+            .unchecked_transaction()
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        for chunk in file_ids.chunks(PURGE_IDS_PER_RECORD) {
+            crate::oplog::emit(
+                self.conn(),
+                crate::oplog::VaultOp::Purge {
+                    folder_ids: Vec::new(),
+                    file_ids: chunk.to_vec(),
+                },
+            )?;
+        }
+        let folder_ids: Vec<Uuid> = folders.into_iter().map(|(_, id)| id).collect();
+        for chunk in folder_ids.chunks(PURGE_IDS_PER_RECORD) {
+            crate::oplog::emit(
+                self.conn(),
+                crate::oplog::VaultOp::Purge {
+                    folder_ids: chunk.to_vec(),
+                    file_ids: Vec::new(),
+                },
+            )?;
+        }
+        tx.commit().map_err(|e| CoreError::Database(e.to_string()))
     }
 
     /// Of the blobs a purge released, the ones nothing points at any more.
@@ -1698,13 +1760,7 @@ impl<'a> Vfs<'a> {
             return Ok((0, Vec::new()));
         }
 
-        crate::oplog::emit(
-            self.conn(),
-            crate::oplog::VaultOp::Purge {
-                folder_ids,
-                file_ids,
-            },
-        )?;
+        self.emit_purge(folder_ids, file_ids)?;
         bump_revision(self.conn()).map_err(|e| CoreError::Database(e.to_string()))?;
         Ok((removed, self.orphaned_by_purge(blob_ids)?))
     }
@@ -1760,6 +1816,72 @@ pub fn guess_mime(path: &Path) -> Option<String> {
 mod tests {
     use super::*;
     use silentsilo_vault::VaultSession;
+
+    #[test]
+    fn a_large_purge_is_split_into_records_each_standing_on_its_own() {
+        let (_dir, session) = new_session();
+        let vfs = Vfs::new(&session);
+        let root = vfs.root_folder_id().unwrap();
+        let top = vfs.create_folder(root, "Photos").unwrap();
+        let mut parent = top.id;
+        for depth in 0..PURGE_IDS_PER_RECORD + 3 {
+            parent = vfs.create_folder(parent, &format!("d{depth}")).unwrap().id;
+        }
+        for i in 0..2 * PURGE_IDS_PER_RECORD + 5 {
+            vfs.add_file(
+                parent,
+                &format!("{i}.jpg"),
+                Uuid::new_v4(),
+                1,
+                "h",
+                None,
+                "",
+            )
+            .unwrap();
+        }
+        vfs.trash_folder(top.id).unwrap();
+        let before: i64 = session
+            .conn
+            .query_row("SELECT COUNT(*) FROM oplog", [], |r| r.get(0))
+            .unwrap();
+
+        vfs.empty_trash().unwrap();
+        assert!(vfs.list_trash().unwrap().is_empty());
+
+        // Replayed one at a time in order, deleting only the rows each
+        // names, every record leaves nothing pointing at a missing folder.
+        let records: Vec<String> = {
+            let mut stmt = session
+                .conn
+                .prepare("SELECT payload FROM oplog ORDER BY lamport, device_id, op_id")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        let purges: Vec<crate::oplog::OpRecord> = records[before as usize..]
+            .iter()
+            .map(|text| crate::oplog::OpRecord::from_bytes(text.as_bytes()).unwrap())
+            .collect();
+        assert!(purges.len() > 2, "{}", purges.len());
+        let mut seen_folder = false;
+        for record in &purges {
+            let crate::oplog::OpBody::Known(crate::oplog::VaultOp::Purge {
+                folder_ids,
+                file_ids,
+            }) = &record.op
+            else {
+                panic!("not a purge")
+            };
+            assert!(folder_ids.len() + file_ids.len() <= PURGE_IDS_PER_RECORD);
+            assert!(
+                !(seen_folder && !file_ids.is_empty()),
+                "files after folders"
+            );
+            seen_folder |= !folder_ids.is_empty();
+        }
+    }
     use tempfile::tempdir;
 
     fn new_session() -> (tempfile::TempDir, VaultSession) {
