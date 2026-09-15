@@ -143,6 +143,11 @@ pub async fn reconcile_key_envelopes(
     Ok(outcome)
 }
 
+/// Hex, non-empty and of a sane length: what every key kind writes.
+pub fn plausible_credential_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 2048 && id.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// The decision, apart from storage.
 fn merge(
     local: &mut StoredFidoKeys,
@@ -183,6 +188,12 @@ fn merge(
             .iter()
             .any(|k| k.credential_id == key.credential_id);
         if known || key.revoked || marked.contains(&key.credential_id) {
+            continue;
+        }
+        // Every kind writes its credential id as hex. Anything else would
+        // go into object names (`keys/<id>.env`), where a `..` or a `/` from
+        // an envelope nobody authenticated could reach outside `keys/`.
+        if !plausible_credential_id(&key.credential_id) {
             continue;
         }
         // An envelope is not authenticated. A policy arriving on a silo
@@ -244,6 +255,19 @@ mod tests {
         assert_eq!(outcome.revoked, vec!["aa11".to_string()]);
         assert!(local.keys[0].revoked);
         assert!(!local.keys[1].revoked, "the organisation key is left alone");
+    }
+
+    #[test]
+    fn an_envelope_whose_id_is_not_hex_is_not_taken_in() {
+        let mut local = StoredFidoKeys {
+            keys: vec![key("aa11")],
+        };
+        let outcome = merge(
+            &mut local,
+            vec![key("../../ops/x"), key("bb/22"), key("cc33")],
+            &HashSet::new(),
+        );
+        assert_eq!(outcome.added, vec!["cc33".to_string()]);
     }
 
     #[test]

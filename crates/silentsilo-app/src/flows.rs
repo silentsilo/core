@@ -154,7 +154,7 @@ pub async fn recovery_join_provision(
         join.vault_id,
         device_secret,
         join.dek.clone(),
-        kek,
+        kek.clone(),
     )
     .map_err(|e| e.to_string())?;
     Vfs::new(&session)
@@ -166,9 +166,25 @@ pub async fn recovery_join_provision(
     // under one of them, closing the weaker door `provision_with_dek` opened
     // (the folder plus this device's secret). Only when an envelope exists:
     // a silo with no enrolled key still needs that door to open at all.
-    if let Ok(keys) = sync::fetch_key_envelopes(store).await
-        && !keys.is_empty()
-    {
+    // Envelopes are not authenticated: only well-formed ones, and none a
+    // sealed revocation marker names, so a removed key put back by storage
+    // does not become a key of this device.
+    let mut keys = sync::fetch_key_envelopes(store).await.unwrap_or_default();
+    let mut usable = Vec::with_capacity(keys.len());
+    for key in keys.drain(..) {
+        if key.revoked || !sync::plausible_credential_id(&key.credential_id) {
+            continue;
+        }
+        if sync::is_key_revoked(store, &kek, &key.credential_id)
+            .await
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        usable.push(key);
+    }
+    let keys = usable;
+    if !keys.is_empty() {
         if let Some(envelope) = keys
             .iter()
             .find(|key| !key.wrapped_dek.is_empty())

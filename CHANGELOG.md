@@ -131,6 +131,12 @@ release notes should say.
 - The content key envelope was rewritten on every pass, and a device left
   out of a key rotation could write its old one over the new. It is
   written only where there is none.
+- Key envelopes from storage are not authenticated. One whose credential
+  id is not hex is no longer taken in (the id becomes an object name), and
+  a recovery-code join no longer takes in a key a revocation marker names.
+- The recovery envelope's key derivation could ask for 1 GiB and 64 passes,
+  enough to get a phone's app killed during a join. The ceiling is 256 MiB
+  and 10 passes, four times what any build writes.
 
 ## [1.3.0] - The shared application crate
 

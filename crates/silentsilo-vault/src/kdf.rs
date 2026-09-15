@@ -47,11 +47,12 @@ impl KdfParams {
     /// The most work an envelope is allowed to ask for. The parameters are
     /// chosen by whoever wrote the file, and `recovery.env` comes from
     /// storage the threat model does not trust: `m_cost` is in KiB, so a
-    /// hostile `u32::MAX` asks Argon2 for four terabytes. A gigabyte is
-    /// sixteen times the heaviest thing this app writes.
-    const MAX_M_COST: u32 = 1024 * 1024;
-    const MAX_T_COST: u32 = 64;
-    const MAX_P_COST: u32 = 16;
+    /// hostile `u32::MAX` asks Argon2 for four terabytes. 256 MiB is four
+    /// times the heaviest thing this app writes and still fits a phone; a
+    /// gigabyte and 64 passes, the old ceiling, got a phone's app killed.
+    const MAX_M_COST: u32 = 256 * 1024;
+    const MAX_T_COST: u32 = 10;
+    const MAX_P_COST: u32 = 4;
 
     /// Derives a 32-byte wrap key, refusing an algorithm this build does not
     /// implement rather than silently substituting the one it does.
