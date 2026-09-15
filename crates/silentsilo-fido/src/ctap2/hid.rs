@@ -111,7 +111,13 @@ impl<R: Reports> Hid<R> {
         let mut nonce = [0u8; 8];
         rand::rng().fill_bytes(&mut nonce);
         self.write_message(BROADCAST, CMD_INIT, &nonce)?;
+        // One deadline for the whole setup: each read has its own, and a
+        // device answering every INIT with the wrong nonce kept this going.
+        let deadline = Instant::now() + COMMAND_LIMIT;
         loop {
+            if Instant::now() > deadline {
+                return Err(CtapError::Timeout);
+            }
             let (cmd, data) = self.read_message(BROADCAST)?;
             if cmd == CMD_INIT && data.len() >= 17 && data[..8] == nonce {
                 let cid: [u8; 4] = data[8..12].try_into().expect("four bytes");

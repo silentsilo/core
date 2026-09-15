@@ -407,8 +407,11 @@ pub async fn run_sync_pass(
                     },
                 ));
             }
-            // Current, or nothing published yet to compare against.
-            Ok(_) => break,
+            Ok(Some(true)) => break,
+            // Nothing there to compare against: a new silo, or a copy caught
+            // between the removal and the rename of an SFTP overwrite. The
+            // next copy is asked rather than taking that as an answer.
+            Ok(None) => continue,
             // Unreachable: ask the next copy rather than deciding blind.
             Err(_) => continue,
         }

@@ -788,6 +788,10 @@ fn extract_public_key_der(auth_data: &[u8]) -> Result<Vec<u8>, FidoError> {
             "authData missing attested credential data".into(),
         ));
     }
+    // rpIdHash, flags and counter (37), then the AAGUID and the length.
+    if auth_data.len() < 55 {
+        return Err(FidoError::EnrollmentFailed("authData too short".into()));
+    }
     let cred_id_len = u16::from_be_bytes([auth_data[53], auth_data[54]]) as usize;
     let cose_start = 55 + cred_id_len;
     if auth_data.len() <= cose_start {

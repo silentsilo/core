@@ -11,13 +11,23 @@ use reqwest::{Client, Method, StatusCode};
 
 use crate::{ObjectStore, StoreError, StoredObject};
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct WebDavConfig {
     /// The collection the silo lives in, e.g.
     /// `https://cloud.example.com/remote.php/dav/files/alex/silentsilo`.
     pub url: String,
     pub username: String,
     pub password: String,
+}
+
+/// Never prints the password.
+impl std::fmt::Debug for WebDavConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebDavConfig")
+            .field("url", &self.url)
+            .field("username", &self.username)
+            .finish_non_exhaustive()
+    }
 }
 
 pub struct WebDavStore {
@@ -507,6 +517,24 @@ fn normalise_href(href: &str, base_path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_output_names_the_server_and_never_the_secrets() {
+        let dav = crate::StoreConfig::WebDav(WebDavConfig {
+            url: "https://dav.example.com".into(),
+            username: "alex".into(),
+            password: "hunter2".into(),
+        });
+        let sftp = crate::sftp::SftpAuth::Key {
+            private_key: "-----BEGIN KEY-----".into(),
+            passphrase: Some("open sesame".into()),
+        };
+        let printed = format!("{dav:?} {sftp:?}");
+        assert!(printed.contains("dav.example.com"), "{printed}");
+        for secret in ["hunter2", "BEGIN KEY", "open sesame"] {
+            assert!(!printed.contains(secret), "{printed}");
+        }
+    }
 
     #[test]
     fn a_collection_with_a_space_or_diacritics_still_lists_keys() {

@@ -80,6 +80,14 @@ impl S3Client {
             .endpoint_url(config.endpoint.trim().trim_end_matches('/'))
             .credentials_provider(credentials)
             .force_path_style(config.path_style)
+            // A server that stops answering must not hold a sync pass
+            // forever. Per read, so a large upload is not cut off.
+            .timeout_config(
+                aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+                    .connect_timeout(std::time::Duration::from_secs(30))
+                    .read_timeout(std::time::Duration::from_secs(120))
+                    .build(),
+            )
             .request_checksum_calculation(
                 aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
             )

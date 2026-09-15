@@ -144,6 +144,18 @@ release notes should say.
   path (a folder really named `_trash`, or two entries with the same title
   and attachment). The second is kept beside it, and Windows device names
   such as `CON` are written with a leading underscore.
+- An SFTP overwrite removed the old object before renaming the new one in,
+  so a crash between the two lost it, and a device checking the content key
+  in that moment took "nothing here" as an answer. The old object is set
+  aside until the new one is in place, and the key check asks the next
+  copy instead.
+- S3 and SFTP give up on a server that stops answering: connecting and
+  each read are bounded, and so is the SSH handshake.
+- Store settings printed with `{:?}` showed the S3 secret, the WebDAV
+  password and the SFTP password or key. They are left out.
+- A USB security key answering every channel request with the wrong nonce
+  kept the setup going for good, and a short authenticator answer could
+  crash Windows enrolment. Both are bounded.
 
 ## [1.3.0] - The shared application crate
 

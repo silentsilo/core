@@ -109,7 +109,7 @@ pub struct VaultMeta {
 /// optional: with no config stored the app is purely local. `path_style`
 /// and the free-form `region` exist because non-AWS endpoints disagree on
 /// both.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct S3Config {
     pub endpoint: String,
     pub region: String,
@@ -119,6 +119,20 @@ pub struct S3Config {
     pub access_key_id: String,
     pub secret_access_key: String,
     pub path_style: bool,
+}
+
+/// Never prints the secret key.
+impl std::fmt::Debug for S3Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Config")
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field("bucket", &self.bucket)
+            .field("prefix", &self.prefix)
+            .field("access_key_id", &self.access_key_id)
+            .field("path_style", &self.path_style)
+            .finish_non_exhaustive()
+    }
 }
 
 impl S3Config {

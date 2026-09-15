@@ -16,7 +16,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{ObjectStore, StoreError, StoredObject};
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "method", rename_all = "kebab-case")]
 pub enum SftpAuth {
     Password {
@@ -31,6 +31,19 @@ pub enum SftpAuth {
         private_key: String,
         passphrase: Option<String>,
     },
+}
+
+/// Never prints the password or the key: one `{:?}` in a log would.
+impl std::fmt::Debug for SftpAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Password { .. } => f.write_str("Password { .. }"),
+            Self::Key { passphrase, .. } => f
+                .debug_struct("Key")
+                .field("passphrase", &passphrase.as_ref().map(|_| ".."))
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -121,9 +134,23 @@ where
     let mut wait = std::time::Duration::from_millis(150);
     let mut last;
     loop {
-        match client::connect(Arc::new(client::Config::default()), (host, port), handler()).await {
-            Ok(handle) => return Ok(handle),
-            Err(e) => last = e,
+        // Bounded: a server that accepts the connection and then says
+        // nothing would otherwise hold the pass for good.
+        let attempt = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            client::connect(Arc::new(client::Config::default()), (host, port), handler()),
+        )
+        .await;
+        match attempt {
+            Ok(Ok(handle)) => return Ok(handle),
+            Ok(Err(e)) => last = e,
+            Err(_) => {
+                last = russh::Error::IO(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "the server did not complete the handshake",
+                ))
+                .into()
+            }
         }
         if wait > std::time::Duration::from_millis(600) {
             return Err(last);
@@ -351,16 +378,39 @@ fn temp_beside(final_path: &str) -> String {
 /// existing target, and re-writing a key is legitimate for the manifest and
 /// the key envelopes; another writer can put the target back between the
 /// removal and the rename, so that is tried again.
+///
+/// The old object is renamed aside rather than removed first, and removed
+/// only once the new one is in place. The key is still briefly absent
+/// between the two renames, but a crash there leaves the old object beside
+/// it instead of losing it.
 async fn replace(
     sftp: &russh_sftp::client::SftpSession,
     temp_path: String,
     final_path: String,
     key: &str,
 ) -> Result<(), StoreError> {
+    // Most writes are of a key not there yet: one rename and done.
+    if sftp
+        .rename(temp_path.clone(), final_path.clone())
+        .await
+        .is_ok()
+    {
+        return Ok(());
+    }
     let mut attempt = 0;
     loop {
-        let _ = sftp.remove_file(final_path.clone()).await;
-        match sftp.rename(temp_path.clone(), final_path.clone()).await {
+        let aside = format!("{final_path}.{}.old", uuid::Uuid::new_v4().simple());
+        let moved_aside = sftp.rename(final_path.clone(), aside.clone()).await.is_ok();
+        let renamed = sftp.rename(temp_path.clone(), final_path.clone()).await;
+        if moved_aside {
+            if renamed.is_ok() {
+                let _ = sftp.remove_file(aside).await;
+            } else {
+                // Put back what was there rather than leave the key empty.
+                let _ = sftp.rename(aside, final_path.clone()).await;
+            }
+        }
+        match renamed {
             Ok(()) => return Ok(()),
             Err(_) if attempt < 2 => attempt += 1,
             Err(e) => {
@@ -563,9 +613,10 @@ impl ObjectStore for SftpStore {
 
                     if entry.metadata().is_dir() {
                         queue.push(key);
-                    } else if !name.ends_with(".part") {
-                        // A rename that never completed. Reporting it as an
-                        // object would hand the caller a truncated file.
+                    } else if !name.ends_with(".part") && !name.ends_with(".old") {
+                        // A rename that never completed, or an overwritten
+                        // object set aside. Reporting either as an object
+                        // would hand the caller a file under a wrong name.
                         out.push(StoredObject {
                             key,
                             size: entry.metadata().size.unwrap_or(0) as i64,
