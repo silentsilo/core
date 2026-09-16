@@ -11,6 +11,20 @@ release notes should say.
 
 ## [Unreleased]
 
+### Added
+
+- `wipe_work_dirs_except` and `AppState::sweep_scratch`: remove the decrypted
+  scratch of every silo that is not open, including what a crash, a kill or a
+  power cut left for a silo that may never be opened again. Clients call them
+  at start and after each lock.
+
+### Fixed
+
+- The first unlock after an update rebuilt the derived tables one commit per
+  record: 32 seconds on a 50,000-record log. The rebuild now runs in one
+  savepoint (about 9 seconds), and an interrupted rebuild leaves the previous
+  tables to start over from.
+
 ## [1.4.0] - The mobile client, and devices that agree
 
 No persisted format version changed, so the 1.0.0 fixtures still describe

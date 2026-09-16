@@ -29,20 +29,36 @@ pub fn init_schema(conn: &Connection, vault_id: Uuid) -> CoreResult<()> {
 
     let stored = stored_schema_version(conn)?;
     let stale = stored.is_some_and(|v| v != SCHEMA_VERSION);
-    if stale {
-        drop_derived(conn).map_err(db)?;
+    if !stale {
+        init_derived(conn, vault_id).map_err(db)?;
+        return record_schema_version(conn);
     }
 
-    init_derived(conn, vault_id).map_err(db)?;
-
-    if stale {
+    // One savepoint around the whole rebuild: applied one commit per record
+    // it took half a minute on a 50k-record log, and a rebuild interrupted
+    // halfway now leaves the old tables and version to start over from.
+    conn.execute_batch("SAVEPOINT schema_rebuild;")
+        .map_err(db)?;
+    let rebuilt = (|| {
+        drop_derived(conn).map_err(db)?;
+        init_derived(conn, vault_id).map_err(db)?;
         // Errors here are database failures, not format problems: the log was
         // readable enough to get this far. Surfaced rather than swallowed,
         // because a half-rebuilt index must not be presented as the vault.
         crate::oplog::rebuild_derived(conn)?;
         bump_revision(conn).map_err(db)?;
+        record_schema_version(conn)
+    })();
+    match rebuilt {
+        Ok(()) => conn.execute_batch("RELEASE schema_rebuild;").map_err(db),
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK TO schema_rebuild; RELEASE schema_rebuild;");
+            Err(e)
+        }
     }
+}
 
+fn record_schema_version(conn: &Connection) -> CoreResult<()> {
     conn.execute(
         "INSERT INTO vault_meta(key, value) VALUES (?1, ?2)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",

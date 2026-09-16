@@ -204,6 +204,37 @@ pub fn wipe_work_dir(silo_root: &Path) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Removes the scratch directory of every silo not in `open`, including
+/// ones a crash, a kill or a power cut left behind for a silo that may never
+/// be opened again. Called with nothing open when the app starts, and with
+/// the silos still open after each lock. Returns how many directories
+/// survived, which means another application still holds a file in them.
+pub fn wipe_work_dirs_except(open: &[&Path]) -> usize {
+    wipe_open_dirs_in(&work_base().join("open"), open)
+}
+
+fn wipe_open_dirs_in(base: &Path, open: &[&Path]) -> usize {
+    let keep: Vec<std::ffi::OsString> = open
+        .iter()
+        .filter_map(|root| work_dir_for(root).file_name().map(|n| n.to_os_string()))
+        .collect();
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return 0;
+    };
+    let mut left = 0;
+    for entry in entries.flatten() {
+        if keep.contains(&entry.file_name()) {
+            continue;
+        }
+        let path = entry.path();
+        clear_readonly(&path);
+        if std::fs::remove_dir_all(&path).is_err() && path.exists() {
+            left += 1;
+        }
+    }
+    left
+}
+
 fn clear_readonly(path: &Path) {
     if path.is_dir() {
         if let Ok(entries) = std::fs::read_dir(path) {
@@ -390,6 +421,38 @@ mod tests {
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "got {mode:o}");
+    }
+
+    #[test]
+    fn a_sweep_removes_every_scratch_directory_but_the_open_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let open_root = tmp.path().join("open-silo");
+        let crashed_root = tmp.path().join("crashed-silo");
+        let base = work_dir_for(&open_root).parent().unwrap().to_path_buf();
+        let kept = base.join(work_dir_for(&open_root).file_name().unwrap());
+        let stale = base.join(work_dir_for(&crashed_root).file_name().unwrap());
+        let sandbox = tmp.path().join("open");
+        for dir in [&kept, &stale] {
+            let dir = sandbox.join(dir.file_name().unwrap());
+            std::fs::create_dir_all(dir.join("open")).unwrap();
+            let file = dir.join("open").join("opened.txt");
+            std::fs::write(&file, b"plaintext").unwrap();
+            seal_readonly(&file);
+            std::fs::write(dir.join("vault.db"), b"plaintext").unwrap();
+        }
+
+        let left = wipe_open_dirs_in(&sandbox, &[&open_root]);
+
+        assert_eq!(left, 0);
+        assert!(
+            sandbox
+                .join(kept.file_name().unwrap())
+                .join("vault.db")
+                .exists()
+        );
+        assert!(!sandbox.join(stale.file_name().unwrap()).exists());
+        assert_eq!(wipe_open_dirs_in(&sandbox, &[]), 0);
+        assert_eq!(std::fs::read_dir(&sandbox).unwrap().count(), 0);
     }
 
     #[test]

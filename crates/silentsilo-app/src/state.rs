@@ -154,6 +154,24 @@ impl AppState {
         Ok(())
     }
 
+    /// Removes the decrypted scratch of every silo that is not open, including
+    /// what a crash or kill left behind. The client calls it at start and after
+    /// each lock; not from `close_session`, so that tests sharing a work base
+    /// do not sweep each other. Returns how many directories survived.
+    pub fn sweep_scratch(&self) -> usize {
+        let roots: Vec<PathBuf> = self
+            .sessions
+            .lock()
+            .map(|s| {
+                s.values()
+                    .map(|session| session.paths.root.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let open: Vec<&Path> = roots.iter().map(|r| r.as_path()).collect();
+        silentsilo_vault::wipe_work_dirs_except(&open)
+    }
+
     pub fn open_silo_ids(&self) -> Vec<Uuid> {
         self.sessions
             .lock()
