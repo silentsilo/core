@@ -695,8 +695,12 @@ fn open_ciphered(path: &Path, key: &[u8; 32]) -> Result<Connection, VaultError> 
     let conn = Connection::open(path)?;
     conn.pragma_update(None, "key", key_literal(key).as_str())?;
     // Sorts and temporary tables in memory, never in a plain temp file.
+    // A 64 MiB page cache: every page read from disk is decrypted and
+    // checked, and at SQLite's 2 MiB default a 10,000-record history took
+    // 20 times longer to write.
     conn.execute_batch(
         "PRAGMA temp_store=MEMORY;
+         PRAGMA cache_size=-65536;
          PRAGMA journal_mode=WAL;
          PRAGMA synchronous=NORMAL;
          PRAGMA busy_timeout=5000;

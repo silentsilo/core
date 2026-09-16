@@ -36,7 +36,8 @@ release notes should say.
   OpenSSL) and named `vault.sqlcipher`. Its random page key sits beside it
   as `vault.key`, sealed under the DEK, so a crash, a kill or a power cut
   leaves nothing readable and the next unlock still adopts the changes.
-  Unlock and snapshots move the decrypted index through memory only.
+  Unlock and snapshots move the decrypted index through memory only. The
+  connection keeps a 64 MiB page cache, since every page read is decrypted.
   `vault.db.enc` is unchanged: still a whole plain SQLite image in the same
   envelope, so every release reads it.
 - A plaintext `vault.db` left by a crash of an earlier release is adopted
