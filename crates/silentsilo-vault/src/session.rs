@@ -384,12 +384,17 @@ impl VaultSession {
 
     /// Seals the snapshot, then records its fingerprint in the working copy.
     /// After the image was taken, so the copy holds the snapshot or more.
+    /// Skipped when nothing wrote since the snapshot on disk was taken.
     fn write_snapshot(&self) -> Result<Fingerprint, VaultError> {
+        if let Some(sealed) = unchanged_snapshot(&self.paths, &self.conn) {
+            return Ok(sealed);
+        }
         let _ = self.flush_wal();
         let image = export_image(&self.conn)?;
         let sealed = encrypt_vault_bytes(&image, &self.paths.db_enc_path(), &self.dek)?;
         std::fs::copy(self.paths.db_enc_path(), self.paths.db_enc_backup_path())?;
         record_fingerprint(&self.conn, STATE_SNAPSHOT, &sealed)?;
+        mark_unchanged(&self.conn);
         Ok(sealed)
     }
 
@@ -466,17 +471,21 @@ fn open_database(paths: &VaultPaths, dek: &MasterDek) -> Result<Connection, Vaul
         },
     };
 
-    match write_working_copy(paths, &image, &source, dek) {
-        Ok(conn) => Ok(conn),
+    let conn = match write_working_copy(paths, &image, &source, dek) {
+        Ok(conn) => conn,
         Err(err) => {
             if paths.db_enc_backup_path().is_file() {
                 let image = read_enc_backup(paths, dek)?;
-                write_working_copy(paths, &image, &paths.db_enc_backup_path(), dek)
+                write_working_copy(paths, &image, &paths.db_enc_backup_path(), dek)?
             } else {
-                Err(err)
+                return Err(err);
             }
         }
-    }
+    };
+    // Exactly the sealed file it came from. A lock checks that the file on
+    // disk is still that one.
+    mark_unchanged(&conn);
+    Ok(conn)
 }
 
 /// Whether a working copy left behind really belongs to the silo now at
@@ -549,6 +558,7 @@ fn reuse_working_copy(paths: &VaultPaths, dek: &MasterDek) -> Option<Connection>
             [STATE_LOCKED],
         )
         .ok()?;
+        mark_unchanged(&conn);
         return Some(conn);
     }
 
@@ -592,8 +602,10 @@ fn refresh_snapshot(paths: &VaultPaths, dek: &MasterDek, image: &[u8], conn: Opt
         // A snapshot staged by an interrupted rotation is superseded: the
         // working copy postdates it.
         let _ = std::fs::remove_file(paths.db_enc_staged_path());
-        if let Some(conn) = conn {
-            let _ = record_fingerprint(conn, STATE_SNAPSHOT, &sealed);
+        if let Some(conn) = conn
+            && record_fingerprint(conn, STATE_SNAPSHOT, &sealed).is_ok()
+        {
+            mark_unchanged(conn);
         }
     }
 }
@@ -818,6 +830,62 @@ fn record_fingerprint(conn: &Connection, key: &str, fp: &Fingerprint) -> Result<
         rusqlite::params![key, &fp[..]],
     )?;
     Ok(())
+}
+
+/// What a write to the copy moves: the schema cookie, the header's user
+/// version and this connection's count of changed rows. The count covers
+/// every INSERT, UPDATE and DELETE, committed or not, and the cookie covers
+/// DDL, which the count misses.
+fn change_mark(conn: &Connection) -> Option<(i64, i64, i64)> {
+    let schema = conn
+        .query_row("PRAGMA main.schema_version", [], |r| r.get(0))
+        .ok()?;
+    let user = conn
+        .query_row("PRAGMA main.user_version", [], |r| r.get(0))
+        .ok()?;
+    Some((schema, user, i64::try_from(conn.total_changes()).ok()?))
+}
+
+/// Notes that the copy holds exactly the snapshot whose fingerprint it
+/// recorded. In a TEMP table: it lives and dies with this connection, whose
+/// change count it compares, and no image or file ever holds it.
+fn mark_unchanged(conn: &Connection) {
+    let marked = (|| -> rusqlite::Result<()> {
+        conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS snapshot_mark
+                 (id INTEGER PRIMARY KEY, schema INTEGER, user INTEGER, changes INTEGER);
+             INSERT OR IGNORE INTO temp.snapshot_mark VALUES (1, 0, 0, -1);",
+        )?;
+        let (schema, user, changes) = change_mark(conn).ok_or(rusqlite::Error::InvalidQuery)?;
+        // This one-row UPDATE adds exactly one to the count it stores.
+        conn.execute(
+            "UPDATE temp.snapshot_mark SET schema = ?1, user = ?2, changes = ?3 WHERE id = 1",
+            rusqlite::params![schema, user, changes + 1],
+        )?;
+        Ok(())
+    })();
+    if marked.is_err() {
+        let _ = conn.execute_batch("DROP TABLE IF EXISTS temp.snapshot_mark;");
+    }
+}
+
+/// The fingerprint of the snapshot on disk, when nothing wrote to the copy
+/// since it was taken and both it and its shadow copy are still that one.
+fn unchanged_snapshot(paths: &VaultPaths, conn: &Connection) -> Option<Fingerprint> {
+    let marked: (i64, i64, i64) = conn
+        .query_row(
+            "SELECT schema, user, changes FROM temp.snapshot_mark WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .ok()?;
+    if change_mark(conn)? != marked {
+        return None;
+    }
+    let recorded = read_fingerprint(conn, STATE_SNAPSHOT)?;
+    (file_fingerprint(&paths.db_enc_path()) == Some(recorded)
+        && file_fingerprint(&paths.db_enc_backup_path()) == Some(recorded))
+    .then_some(recorded)
 }
 
 fn read_fingerprint(conn: &Connection, key: &str) -> Option<Fingerprint> {
@@ -1701,6 +1769,148 @@ mod tests {
         let reopened = VaultSession::open_with_device_secret(root, "secret").unwrap();
         assert_eq!(marker(&reopened.conn), "kept");
         assert_eq!(page_key_bytes(&paths), key);
+    }
+
+    /// A snapshot written again differs in every byte: the nonce is random.
+    fn snapshot_bytes(paths: &VaultPaths) -> Vec<u8> {
+        std::fs::read(paths.db_enc_path()).unwrap()
+    }
+
+    /// A lock with nothing changed since the snapshot on disk leaves it as
+    /// it is: after a lock, a fresh export, a crash adoption and a flush.
+    /// The copy is still reused as locked afterwards.
+    #[test]
+    fn a_lock_with_nothing_changed_keeps_the_snapshot() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let session = silo_with_marker(&root, "secret", "kept");
+        let paths = lock(session);
+        let snapshot = snapshot_bytes(&paths);
+        let key = page_key_bytes(&paths);
+
+        // Reused as locked.
+        let session = VaultSession::open_with_device_secret(root.clone(), "secret").unwrap();
+        lock(session);
+        assert_eq!(snapshot_bytes(&paths), snapshot);
+        let session = VaultSession::open_with_device_secret(root.clone(), "secret").unwrap();
+        assert_eq!(
+            page_key_bytes(&paths),
+            key,
+            "the lock left the copy unmarked"
+        );
+        assert_eq!(read_fingerprint(&session.conn, STATE_LOCKED), None);
+        lock(session);
+        assert_eq!(snapshot_bytes(&paths), snapshot);
+
+        // Exported afresh.
+        crate::workdir::wipe_work_dir(&root);
+        let session = VaultSession::open_with_device_secret(root.clone(), "secret").unwrap();
+        lock(session);
+        assert_eq!(snapshot_bytes(&paths), snapshot);
+
+        // A flush, then nothing.
+        let session = VaultSession::open_with_device_secret(root.clone(), "secret").unwrap();
+        set_marker(&session, "flushed");
+        session.backup_locally().unwrap();
+        let flushed = snapshot_bytes(&paths);
+        assert_ne!(flushed, snapshot);
+        session.backup_locally().unwrap();
+        assert_eq!(snapshot_bytes(&paths), flushed);
+        lock(session);
+        assert_eq!(snapshot_bytes(&paths), flushed);
+
+        // A crash, adopted on the next unlock, which refreshes the snapshot.
+        let session = VaultSession::open_with_device_secret(root.clone(), "secret").unwrap();
+        set_marker(&session, "crashed");
+        drop(session);
+        let session = VaultSession::open_with_device_secret(root.clone(), "secret").unwrap();
+        let adopted = snapshot_bytes(&paths);
+        assert_ne!(adopted, flushed);
+        lock(session);
+        assert_eq!(snapshot_bytes(&paths), adopted);
+        crate::workdir::wipe_work_dir(&root);
+        let session = VaultSession::open_with_device_secret(root, "secret").unwrap();
+        assert_eq!(marker(&session.conn), "crashed");
+    }
+
+    /// Any write reaches the snapshot: a row, a change rolled back, a table
+    /// with no rows, a dropped table, the header's user version. So does a
+    /// snapshot or shadow copy changed on disk, and a working copy adopted
+    /// from a crash or exported afresh that was changed.
+    #[test]
+    fn a_lock_after_any_change_writes_the_snapshot() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let session = silo_with_marker(&root, "secret", "one");
+        let dek = session.dek.clone();
+        let paths = lock(session);
+
+        let from_disk = |root: &Path| {
+            crate::workdir::wipe_work_dir(root);
+            VaultSession::open_with_dek(root.to_path_buf(), dek.clone()).unwrap()
+        };
+        let writes: [&dyn Fn(&VaultSession); 6] = [
+            &|s| set_marker(s, "two"),
+            &|s| {
+                s.conn
+                    .execute_batch("BEGIN; UPDATE vault_meta SET value = 'x'; ROLLBACK;")
+                    .unwrap()
+            },
+            &|s| s.conn.execute_batch("CREATE TABLE empty_one (x);").unwrap(),
+            &|s| s.conn.execute_batch("DROP TABLE empty_one;").unwrap(),
+            &|s| s.conn.execute_batch("PRAGMA user_version = 7;").unwrap(),
+            &|s| set_marker(s, "same"),
+        ];
+        for (i, write) in writes.iter().enumerate() {
+            let before = snapshot_bytes(&paths);
+            let session = VaultSession::open_with_dek(root.clone(), dek.clone()).unwrap();
+            write(&session);
+            lock(session);
+            assert_ne!(snapshot_bytes(&paths), before, "write {i} was not saved");
+        }
+        let session = from_disk(&root);
+        assert_eq!(marker(&session.conn), "same");
+        let empty: i64 = session
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'empty_one'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(empty, 0);
+        lock(session);
+
+        // The snapshot on disk put back to an older one, then the shadow.
+        let session = VaultSession::open_with_dek(root.clone(), dek.clone()).unwrap();
+        set_marker(&session, "newer");
+        session.backup_locally().unwrap();
+        let newer = snapshot_bytes(&paths);
+        let older = std::fs::read(paths.db_enc_backup_path()).unwrap();
+        std::fs::write(paths.db_enc_path(), b"elsewhere").unwrap();
+        lock(session);
+        assert_ne!(snapshot_bytes(&paths), b"elsewhere");
+        let session = VaultSession::open_with_dek(root.clone(), dek.clone()).unwrap();
+        std::fs::write(paths.db_enc_backup_path(), &older).unwrap();
+        lock(session);
+        assert_ne!(std::fs::read(paths.db_enc_backup_path()).unwrap(), older);
+        assert_ne!(snapshot_bytes(&paths), newer);
+        assert_eq!(marker(&from_disk(&root).conn), "newer");
+
+        // Changed after a fresh export, and after a crash adoption.
+        let session = from_disk(&root);
+        set_marker(&session, "after export");
+        lock(session);
+        assert_eq!(marker(&from_disk(&root).conn), "after export");
+        let session = VaultSession::open_with_dek(root.clone(), dek.clone()).unwrap();
+        drop(session);
+        let session = VaultSession::open_with_dek(root.clone(), dek.clone()).unwrap();
+        set_marker(&session, "after adoption");
+        drop(session);
+        let session = VaultSession::open_with_dek(root.clone(), dek.clone()).unwrap();
+        set_marker(&session, "after the second adoption");
+        lock(session);
+        assert_eq!(marker(&from_disk(&root).conn), "after the second adoption");
     }
 
     /// A snapshot replaced by anything but this copy: an older generation put

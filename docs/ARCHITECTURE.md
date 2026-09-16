@@ -409,6 +409,11 @@ Read this before "fixing" any of it.
   just read every table through SQLCipher's page HMACs. A copy without it
   never locked, so it is checked and the snapshot catches up, as after a
   crash. The table is dropped from every image, so no release sees it.
+  A lock with nothing written since the snapshot keeps it rather than
+  sealing it again. "Nothing written" is `total_changes()` plus the schema
+  cookie, noted in a TEMP table of the same connection when the snapshot is
+  written, exported or adopted. Never a timestamp or the revision, which
+  sync writes do not bump; the note dies with the connection it counts.
 - **Recovery codes map O→0, I/L→1, U→V on input.** Crockford's alphabet
   excludes those on output precisely because handwriting confuses them;
   strict parsing would reject correct codes.

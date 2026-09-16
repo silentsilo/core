@@ -57,6 +57,13 @@ release notes should say.
   `wipe_plaintext_working_copy` now removes only plaintext (opened files, a
   legacy `vault.db`), and `wipe_work_dir` still removes everything.
   `encrypt_vault_bytes` returns the fingerprint.
+- A lock or a flush with nothing written to the working copy since the
+  snapshot on disk was taken keeps that snapshot instead of sealing it
+  again: after an unlock with no change, a lock takes about 35 ms instead
+  of 220 ms on a 12 MB index. "Nothing written" is this connection's count
+  of changed rows plus the schema cookie, noted in a TEMP table when the
+  snapshot is written, exported or adopted, and both `vault.db.enc` and its
+  shadow copy must still match the recorded fingerprint.
 - Building now needs Perl for OpenSSL (Strawberry Perl on Windows).
 
 ### Fixed
