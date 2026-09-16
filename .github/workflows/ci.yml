@@ -181,7 +181,7 @@ jobs:
       - run: cargo check -p silentsilo-fido --features hardware --locked
 
   # File modes are a Unix-only concern. Scoped to the `workdir` module on
-  # purpose: it is the one that decides what the plaintext working copy and
+  # purpose: it is the one that decides what the ciphered working copy and
   # every opened file are readable by. The symlink test needs a runner that
   # can create symbolic links without developer mode, which Windows cannot.
   permissions-linux:
