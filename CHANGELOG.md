@@ -30,6 +30,24 @@ release notes should say.
   (`snapshot::gc_first_seen`, a new `blob_gc_seen` table beside the
   candidates). Emptying the trash frees space in storage a month later.
 
+### Changed
+
+- The working copy of an open silo is ciphered with SQLCipher 4 (vendored
+  OpenSSL) and named `vault.sqlcipher`. Its random page key sits beside it
+  as `vault.key`, sealed under the DEK, so a crash, a kill or a power cut
+  leaves nothing readable and the next unlock still adopts the changes.
+  Unlock and snapshots move the decrypted index through memory only.
+  `vault.db.enc` is unchanged: still a whole plain SQLite image in the same
+  envelope, so every release reads it.
+- A plaintext `vault.db` left by a crash of an earlier release is adopted
+  once, snapshotted and replaced by a ciphered copy. An earlier release
+  after a downgrade never sees the ciphered copy and opens the snapshot.
+- `VaultPaths::db_path` names the ciphered copy; `db_key_path`,
+  `db_key_staged_path` and `legacy_db_path` are new.
+- `stage_local_backup` also seals the page key under the new DEK
+  (`vault.key.next`), so a crash after a rotation commits keeps the changes.
+- Building now needs Perl for OpenSSL (Strawberry Perl on Windows).
+
 ### Fixed
 
 - A file moved on a device that had not yet received an edit or a purge of
@@ -48,6 +66,10 @@ release notes should say.
   content can be missing from storage for up to a day at a time, and it is
   lost only where no device on this build holds it.
 
+- A lock straight after a key rotation snapshotted under the session's old
+  DEK, over the snapshot the rotation had just written under the new one,
+  and the silo then failed to open locally. `backup_locally` now refuses
+  when the content KEK on disk no longer opens under the session's DEK.
 - The first unlock after an update rebuilt the derived tables one commit per
   record: 32 seconds on a 50,000-record log. The rebuild now runs in one
   savepoint (about 9 seconds), and an interrupted rebuild leaves the previous

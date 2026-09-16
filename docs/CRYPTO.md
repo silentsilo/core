@@ -15,17 +15,21 @@ above suggests.
 
 | Asset | Location | At rest |
 |-------|----------|---------|
-| File names, folder tree | `vault.db` (plaintext working copy, only while unlocked) + `vault.db.enc` | AES-256-GCM |
+| File names, folder tree | `vault.db.enc` in the silo, plus the working copy `vault.sqlcipher` on the machine while unlocked or after a crash | AES-256-GCM; the working copy SQLCipher 4, per page |
 | File content | `.sslo` blobs under the vault directory | AES-256-GCM, chunked |
 | Master DEK | `master.dek.enc`, `keys/fido.json`, `keys/recovery.json` | Wrapped separately under each key that can produce it |
 | Security-key secret | Hardware token (any FIDO2 key with hmac-secret) | Never leaves the device |
 
 An attacker with the vault directory but no enrolled security key has
-ciphertext only. While the vault is unlocked, the plaintext `vault.db` working
-copy exists on disk and is deleted on lock or exit. It lives outside the vault
-directory, under the machine's local application data, and so does the
-fallback file holding the device secret when the OS keyring will not take it.
-Neither travels with the folder.
+ciphertext only. While the vault is unlocked, a working copy of the index
+exists on disk and is deleted on lock or exit. It is ciphered page by page
+under a random key that is itself sealed under the DEK, so a crash, a kill or
+a power cut that leaves it behind leaves nothing readable without the DEK. It
+lives outside the vault directory, under the machine's local application
+data, and so does the fallback file holding the device secret when the OS
+keyring will not take it. Neither travels with the folder. Files the user
+opens are decrypted there too, in the clear, until the lock or the next start
+removes them.
 
 Two limits of that sentence, stated here rather than left to be discovered:
 
@@ -500,23 +504,35 @@ remove content that is about to be referenced.
 
 ## Local metadata (`vault.db`)
 
-`vault.db` holds folder/file names, blob references and the password store, in an ordinary (unencrypted) SQLite file. It's a **working copy only**: present on disk while a session is open, deleted on lock or app exit.
+`vault.db` holds folder/file names, blob references and the password store, in a SQLite database.
 
-At rest, the vault's state lives in `vault.db.enc`: the whole `vault.db` file in one sealed envelope under the Master DEK, single shot, no chunking. Written through a temporary file and a rename, so a crash mid-write cannot leave a half-encrypted snapshot where the vault used to be. Unlocking decrypts `vault.db.enc` into the working copy; locking re-encrypts the working copy and deletes the plaintext.
+At rest, the vault's state lives in `vault.db.enc`: a whole plain SQLite file image in one sealed envelope under the Master DEK, single shot, no chunking. Written through a temporary file and a rename, so a crash mid-write cannot leave a half-encrypted snapshot where the vault used to be. A local shadow copy, `vault.db.enc.bak`, is refreshed alongside it and used if the primary is missing or fails to decrypt (wrong key, truncated write, tampering).
 
-A local shadow copy, `vault.db.enc.bak`, is refreshed alongside the primary snapshot and used to recover if the primary is missing or fails to decrypt (wrong key, truncated write, tampering). Only `vault.db.enc` is ever written as a backup, never the plaintext working copy.
+While a silo is open the database lives in a **working copy** on the machine, outside the silo folder, ciphered by SQLCipher 4 with its default settings (AES-256-CBC per page, HMAC-SHA512 per page, the WAL ciphered the same way). Since core 1.5.0 the decrypted image never touches the disk:
 
-This was originally intended to be SQLCipher (page-level encryption baked into SQLite itself), but `bundled-sqlcipher`/`bundled-sqlcipher-vendored-openssl` need a working C/OpenSSL build toolchain that isn't reliably available out of the box on Windows. The AES-256-GCM approach reuses the same dependency-free primitive as blob encryption and builds identically on every platform.
+| File, in the work directory | What it is |
+|---|---|
+| `vault.sqlcipher` (+ `-wal`, `-shm`) | The working copy, under a raw 256-bit page key, random per working copy |
+| `vault.key` | The page key, sealed under the DEK with the same envelope as `vault.db.enc` |
+| `vault.key.next` | The page key sealed under a rotation's new DEK, written with `vault.db.enc.next` |
+
+- **Unlock** decrypts `vault.db.enc` into memory, loads it into an in-memory database and exports it into a new ciphered working copy (`sqlcipher_export`).
+- **A snapshot** (lock, flush, rotation) exports the working copy into an attached in-memory plain database, serializes it and seals those bytes. The result is the same plain image as before, so every release reads it.
+- **After a crash** the next unlock opens `vault.key` (or `vault.key.next`) with the DEK and adopts the working copy with every change since the last snapshot. A wrong DEK opens neither, and leaves the files alone.
+- **A plaintext `vault.db`** left by a crash of a release before 1.5.0 is adopted once the way those releases did, snapshotted, and replaced by a ciphered copy.
+- **Downgrading** to a release before 1.5.0 is safe: those releases look only for `vault.db`, never see the ciphered copy, and open the snapshot. They lose only what a crashed newer session had not yet snapshotted. The ciphered copy is deliberately not called `vault.db`: an older release would decrypt the snapshot over a file of that name while a ciphered WAL still sits beside it, and nothing should depend on SQLite discarding that WAL.
+
+The page key and the SQLCipher pages add no persisted format: the files are local, transient and rebuilt from `vault.db.enc` whenever they do not open. Temporary tables and sorts are kept in memory (`temp_store=MEMORY`), so SQLite writes no plain temporary files either. What stays out of reach is process memory: the decrypted image, the in-memory databases and the page cache are plaintext while the silo is open, and SQLite frees its buffers without wiping them.
 
 ### The password store
 
 Logins live as rows in `vault.db` rather than as a file in the tree. Each entry, including its TOTP secret, is one row.
 
-Unlike the rest of the index, an entry is **sealed individually** with the content KEK (AES-256-GCM, random nonce, base64 in the column) rather than relying only on the encryption of the database as a whole. The KEK and not the DEK, so a key rotation never has to re-seal every entry. The reason is the working copy: while a silo is unlocked, `vault.db` exists as plaintext on the local disk. That is a reasonable place for file names and not one for credentials, so anything reading that file, a backup agent sweeping the working directory or a crash leaving it behind, finds ciphertext. Entries are plaintext only in process memory, and only while the panel holds them.
+Unlike the rest of the index, an entry is **sealed individually** with the content KEK (AES-256-GCM, random nonce, base64 in the column) rather than relying only on the encryption of the database as a whole. The KEK and not the DEK, so a key rotation never has to re-seal every entry. The reason was the working copy: until core 1.5.0 it was a plaintext file on the local disk while a silo was unlocked, a reasonable place for file names and not one for credentials. The working copy is ciphered now, and per-entry sealing stays: an entry is still ciphertext in the in-memory database, in the snapshot image and in every record, and plaintext only in process memory while the panel holds it.
 
 | Where | Password entries |
 |-------|------------------|
-| `vault.db` working copy (unlocked) | Sealed under the content KEK |
+| Working copy (unlocked) | Sealed under the content KEK, inside SQLCipher pages |
 | `vault.db.enc` at rest | Sealed, inside the encrypted database |
 | Operation records in storage | Sealed, then sealed again by sync |
 | Process memory, panel open | Plaintext |
@@ -532,7 +548,8 @@ Code running as the user, while a silo is unlocked, can read this process's memo
 | Measure | What it stops |
 |---------|---------------|
 | Locking on workstation lock, disconnect and suspend | The common case: the user locks the screen and leaves, while the idle timer still has minutes to run |
-| Per-entry sealing of passwords | Reading credentials out of the plaintext `vault.db` working copy without touching the process |
+| Per-entry sealing of passwords | Reading credentials out of the database, in memory or in any copy of it, without also holding the KEK |
+| SQLCipher working copy, key sealed under the DEK | Reading names or structure out of a working copy a crash, a kill or a power cut left behind |
 | Clipboard opt-out (`CanIncludeInClipboardHistory`, `ExcludeClipboardContentFromMonitorProcessing`) plus a 45-second clear | Copied passwords being retained by Clipboard History, which persists to disk, and by Cloud Clipboard, which syncs them off the machine |
 | `ProcessExtensionPointDisablePolicy` | AppInit_DLLs, `SetWindowsHookEx` and other injection paths the system performs on an attacker's behalf, needing no exploit |
 
@@ -618,8 +635,11 @@ Everything that can open the vault is wiped when it goes out of scope:
   `master.dek.enc` on its own.
 - The device secret itself, in `LocalVaultAuth`.
 - The buffer `unwrap_dek_bytes` unseals the DEK into on its way to `MasterDek`,
-  and the decrypted index `decrypt_vault_file` holds while writing the working
-  copy. That second one is the whole tree of names.
+  the decrypted index `decrypt_vault_bytes` returns and the image a snapshot
+  serializes. Those two are the whole tree of names. The working copy's page
+  key and the hex literal built from it are wiped too. The copies SQLite and
+  SQLCipher keep (the in-memory database, the page cache, the SQL text a key
+  pragma is sent as) are not.
 
 A test asserts each of those types still carries `ZeroizeOnDrop`, because what
 happens in practice is a derive disappearing during a refactor, not someone
@@ -665,6 +685,7 @@ machine](#malware-on-the-users-machine).
 | Format versions and rules | `FORMATS.md` |
 | DEK wrap | `crates/silentsilo-vault/src/dek_store.rs` |
 | vault.db at-rest encryption | `crates/silentsilo-vault/src/vault_file_crypto.rs` |
+| Working copy (SQLCipher), page key | `crates/silentsilo-vault/src/session.rs` |
 | Argon2 KDF | `crates/silentsilo-vault/src/kdf.rs` |
 | FIDO hmac-secret (Windows) | `crates/silentsilo-fido/src/backend/win.rs` |
 | FIDO hmac-secret (Linux/macOS) | `crates/silentsilo-fido/src/backend/ctap.rs` |

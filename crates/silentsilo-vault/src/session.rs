@@ -1,16 +1,27 @@
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use rusqlite::Connection;
-use silentsilo_crypto::{ContentKek, MasterDek, generate_content_kek, generate_dek};
+use rusqlite::{Connection, MAIN_DB};
+use silentsilo_crypto::{ContentKek, MasterDek, generate_content_kek, generate_dek, seal, unseal};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::dek_store::{load_dek, save_dek};
 use crate::error::VaultError;
 use crate::kdf::derive_vault_key;
 use crate::kek_store::{load_kek, save_kek};
-use crate::vault_file_crypto::{decrypt_vault_file, encrypt_vault_file};
+use crate::vault_file_crypto::{decrypt_vault_bytes, encrypt_vault_bytes};
 
-const VAULT_DB: &str = "vault.db";
+/// Not `vault.db`, so a release before 1.5.0 never touches it after a
+/// downgrade: it would try to open it, then decrypt the snapshot over it
+/// with a ciphered WAL still beside it.
+const VAULT_DB: &str = "vault.sqlcipher";
+/// Where releases before 1.5.0 kept a plaintext working copy.
+const LEGACY_VAULT_DB: &str = "vault.db";
+/// The working copy's page key, sealed under the DEK.
+const VAULT_KEY: &str = "vault.key";
+/// The same key sealed under a rotation's new DEK.
+const VAULT_KEY_NEXT: &str = "vault.key.next";
 const VAULT_DB_ENC: &str = "vault.db.enc";
 const VAULT_DB_ENC_BAK: &str = "vault.db.enc.bak";
 /// The snapshot re-encrypted under a rotation's new key, written before the
@@ -19,6 +30,8 @@ const VAULT_DB_ENC_BAK: &str = "vault.db.enc.bak";
 const VAULT_DB_ENC_NEXT: &str = "vault.db.enc.next";
 const VAULT_SALT: &str = "vault.salt";
 const BLOBS_DIR: &str = "blobs";
+/// How every plain SQLite file starts. A SQLCipher file starts with its salt.
+const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
 
 #[derive(Debug, Clone)]
 pub struct VaultPaths {
@@ -37,9 +50,10 @@ impl VaultPaths {
             .unwrap_or_else(|| self.root.clone())
     }
 
-    /// Where anything decrypted goes while the silo is open.
+    /// Where the working copy and anything decrypted go while the silo is
+    /// open.
     ///
-    /// Machine-local, never inside the silo folder — see `workdir` for why
+    /// Machine-local, never inside the silo folder: see `workdir` for why
     /// that distinction is the difference between "keep your silo wherever
     /// you like" being an offer and being a trap.
     pub fn work_dir(&self) -> PathBuf {
@@ -47,16 +61,35 @@ impl VaultPaths {
     }
 
     /// Creates the scratch directory, since nothing else will: SQLite does
-    /// not make parent directories, and neither does the snapshot decrypt.
+    /// not make parent directories.
     pub fn ensure_work_dir(&self) -> Result<(), VaultError> {
         crate::workdir::create_private_dir(&self.work_dir())?;
         Ok(())
     }
 
-    /// Plaintext working copy — only present while a session is open, and
-    /// only ever on this machine.
+    /// The working copy, ciphered page by page with SQLCipher. Only present
+    /// while a session is open or after a crash, and only on this machine.
     pub fn db_path(&self) -> PathBuf {
         self.work_dir().join(VAULT_DB)
+    }
+
+    /// The working copy's page key, sealed under the DEK like
+    /// `vault.db.enc`. Kept so the next unlock can adopt what a crash left.
+    pub fn db_key_path(&self) -> PathBuf {
+        self.work_dir().join(VAULT_KEY)
+    }
+
+    /// The page key sealed under a rotation's new DEK, written with
+    /// [`Self::db_enc_staged_path`], so a crash after the commit still
+    /// adopts the working copy.
+    pub fn db_key_staged_path(&self) -> PathBuf {
+        self.work_dir().join(VAULT_KEY_NEXT)
+    }
+
+    /// The plaintext working copy of releases before 1.5.0, which a crash
+    /// may have left. Adopted once on unlock, then removed.
+    pub fn legacy_db_path(&self) -> PathBuf {
+        self.work_dir().join(LEGACY_VAULT_DB)
     }
 
     /// Decrypted copies of files the user opened. Wiped with everything else
@@ -101,8 +134,8 @@ impl VaultPaths {
 
     /// Whether a silo has already been provisioned at this path.
     ///
-    /// Asks only about the encrypted snapshot: the plaintext copy lives
-    /// elsewhere now, so its presence says something about this machine's
+    /// Asks only about the encrypted snapshot: the working copy lives
+    /// elsewhere, so its presence says something about this machine's
     /// session rather than about the folder.
     pub fn exists(&self) -> bool {
         self.db_enc_path().is_file()
@@ -120,7 +153,7 @@ pub struct VaultSession {
 }
 
 impl VaultSession {
-    /// First-time setup after POST /devices/register — binds local state to server vault_id.
+    /// First-time setup after POST /devices/register: binds local state to server vault_id.
     pub fn provision(
         root: PathBuf,
         server_vault_id: Uuid,
@@ -149,12 +182,7 @@ impl VaultSession {
         // does not have.
         crate::workdir::wipe_machine_state(&root);
 
-        paths.ensure_work_dir()?;
-        let conn = Connection::open(paths.db_path())?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA foreign_keys=ON;",
-        )?;
+        let conn = create_working_copy(&paths, &dek)?;
 
         let session = Self {
             paths,
@@ -163,8 +191,8 @@ impl VaultSession {
             dek,
             kek,
         };
-        // Persist an encrypted snapshot immediately so a crash right after
-        // provisioning doesn't leave nothing but a plaintext file on disk.
+        // Persist an encrypted snapshot immediately, so the silo exists as
+        // far as `VaultPaths::exists` is concerned.
         session.backup_locally()?;
 
         Ok(session)
@@ -204,12 +232,7 @@ impl VaultSession {
         // before still points at that silo's working copy.
         crate::workdir::wipe_machine_state(&root);
 
-        paths.ensure_work_dir()?;
-        let conn = Connection::open(paths.db_path())?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA foreign_keys=ON;",
-        )?;
+        let conn = create_working_copy(&paths, &dek)?;
 
         let session = Self {
             paths,
@@ -240,7 +263,6 @@ impl VaultSession {
         let dek = load_dek(&paths.root, &vault_key.wrap_key)?;
 
         let conn = open_database(&paths, &dek)?;
-        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
 
         let vault_id = read_vault_id(&conn).ok_or(VaultError::NotFound)?;
         let kek = load_kek(&paths.root, &dek)?;
@@ -274,7 +296,6 @@ impl VaultSession {
         let dek = crate::dek_store::unwrap_dek_hex(wrapped_dek_hex, fido_wrap_key)?;
 
         let conn = open_database(&paths, &dek)?;
-        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
 
         let vault_id = read_vault_id(&conn).ok_or(VaultError::NotFound)?;
         let kek = load_kek(&paths.root, &dek)?;
@@ -292,7 +313,7 @@ impl VaultSession {
     ///
     /// The recovery path uses this: the code produces the DEK directly, with
     /// no credential and no on-disk envelope involved. Everything below the
-    /// key is identical either way — the DEK is what decrypts the database,
+    /// key is identical either way: the DEK is what decrypts the database,
     /// and where it came from stops mattering once it is in hand.
     pub fn open_with_dek(root: PathBuf, dek: MasterDek) -> Result<Self, VaultError> {
         let paths = VaultPaths::new(root);
@@ -300,7 +321,6 @@ impl VaultSession {
             return Err(VaultError::NotFound);
         }
         let conn = open_database(&paths, &dek)?;
-        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
         let vault_id = read_vault_id(&conn).ok_or(VaultError::NotFound)?;
         let kek = load_kek(&paths.root, &dek)?;
         Ok(Self {
@@ -322,39 +342,55 @@ impl VaultSession {
     /// Rewrites the encrypted copy of the database under a different key,
     /// for rotation: without it the silo opens once more and then never
     /// again, because the shadow backup stays under the old key and the
-    /// plaintext working copy is wiped at lock. Written to one side and
-    /// moved into place by the caller, next to the key changeover.
+    /// working copy is wiped at lock. Written to one side and moved into
+    /// place by the caller, next to the key changeover.
+    ///
+    /// Also seals the working copy's page key under the new key, so a crash
+    /// after the changeover still adopts the working copy.
     pub fn stage_local_backup(&self, dek: &MasterDek, to: &Path) -> Result<(), VaultError> {
         let _ = self.flush_wal();
-        encrypt_vault_file(&self.paths.db_path(), to, dek)
+        if let Some(key) = read_page_key(&self.paths.db_key_path(), &self.dek) {
+            save_page_key(&self.paths.db_key_staged_path(), &key, dek)?;
+        }
+        let image = export_image(&self.conn)?;
+        encrypt_vault_bytes(&image, to, dek)
     }
 
+    /// Seals the current state into `vault.db.enc` and its shadow copy.
+    /// Fails inside an open transaction: the export attaches a database.
     pub fn backup_locally(&self) -> Result<(), VaultError> {
-        let _ = self.flush_wal();
-        encrypt_vault_file(&self.paths.db_path(), &self.paths.db_enc_path(), &self.dek)?;
-        if self.paths.db_enc_path().exists() {
-            std::fs::copy(self.paths.db_enc_path(), self.paths.db_enc_backup_path())?;
+        // A rotation committed since this session opened: the snapshot on
+        // disk is under the new key, and sealing over it under this one
+        // would leave the silo opening under nothing.
+        if let Ok(sealed) = std::fs::read(crate::kek_store::kek_path(&self.paths.root))
+            && crate::kek_store::unwrap_kek_bytes(&sealed, &self.dek).is_err()
+        {
+            return Err(VaultError::Crypto(
+                "the silo's key changed since this session opened".into(),
+            ));
         }
+        let _ = self.flush_wal();
+        let image = export_image(&self.conn)?;
+        encrypt_vault_bytes(&image, &self.paths.db_enc_path(), &self.dek)?;
+        std::fs::copy(self.paths.db_enc_path(), self.paths.db_enc_backup_path())?;
         Ok(())
     }
 
-    /// Encrypt current state to disk and remove the plaintext working copy
-    /// (and its WAL/SHM sidecars) so only ciphertext remains once locked.
-    /// The `Connection` must be dropped by the caller before/after this, since
-    /// Windows won't let an open file be deleted.
+    /// Writes the snapshot before lock. The caller drops the `Connection`
+    /// and then wipes the working copy: Windows won't delete an open file.
     pub fn seal_for_lock(&self) -> Result<(), VaultError> {
         self.backup_locally()?;
         Ok(())
     }
 }
 
-/// Remove the plaintext working copy and SQLite sidecar files. Call only
-/// after the `Connection` that owned them has been dropped.
-/// Removes everything decrypted that this machine wrote for the silo.
+/// Removes everything this machine wrote for the silo while it was open.
+/// Call only after the `Connection` that owned the working copy is dropped.
 ///
 /// One call rather than a list of filenames: the scratch directory holds the
-/// working database, its journals and any file the user opened, and a wipe
-/// that knew about only some of those is how plaintext survives a lock.
+/// working database, its journals, its sealed key and any file the user
+/// opened, and a wipe that knew about only some of those is how something
+/// survives a lock.
 pub fn wipe_plaintext_working_copy(paths: &VaultPaths) {
     crate::workdir::wipe_work_dir(&paths.root);
 }
@@ -372,42 +408,51 @@ fn verify_integrity(conn: &Connection) -> Result<(), VaultError> {
     }
 }
 
-/// Open the working copy a crash left behind, or decrypt the encrypted
-/// snapshot into a fresh one, falling back to the encrypted shadow backup
-/// if the primary is missing, tampered, or under a different key. Then open
-/// and verify SQLite-level integrity, falling back again if that fails too.
+/// Adopts the working copy a crash left behind, or builds a fresh one from
+/// the encrypted snapshot, falling back to the staged snapshot of an
+/// interrupted rotation and then to the shadow backup if the primary is
+/// missing, tampered, or under a different key.
+///
+/// Nothing decrypted is written to disk on the way: the snapshot is opened
+/// in memory and exported straight into a ciphered working copy.
 fn open_database(paths: &VaultPaths, dek: &MasterDek) -> Result<Connection, VaultError> {
     paths.ensure_work_dir()?;
-    let enc_path = paths.db_enc_path();
-    let plain_path = paths.db_path();
 
     // A working copy on disk means the last session never locked, since
     // locking wipes it. It holds everything written since the last
     // snapshot, so a sound one is used as it stands: decrypting the
     // snapshot over it silently discarded the crashed session's changes.
-    if plain_path.is_file()
-        && let Ok(conn) = open_and_verify(&plain_path)
-        && let Some(id) = read_vault_id(&conn)
-        && working_copy_belongs_here(paths, id)
+    //
+    // A plaintext copy is always the newer of the two: this build removes
+    // it before writing a ciphered one, and an older release ignores the
+    // ciphered one.
+    if is_plain_sqlite(&paths.legacy_db_path())
+        && let Some(conn) = adopt_plaintext_working_copy(paths, dek)
     {
-        adopt_surviving_working_copy(paths, dek, &conn);
+        return Ok(conn);
+    }
+    if !paths.legacy_db_path().exists()
+        && paths.db_path().is_file()
+        && let Some(conn) = adopt_surviving_working_copy(paths, dek)
+    {
         return Ok(conn);
     }
 
-    if enc_path.is_file() {
-        if decrypt_vault_file(&enc_path, &plain_path, dek).is_err() {
-            adopt_staged_snapshot(paths, dek).or_else(|_| restore_from_enc_backup(paths, dek))?;
-        }
-    } else if !plain_path.is_file() {
+    let enc_path = paths.db_enc_path();
+    if !enc_path.is_file() {
         return Err(VaultError::NotFound);
     }
+    let image = match decrypt_vault_bytes(&enc_path, dek) {
+        Ok(image) => image,
+        Err(_) => adopt_staged_snapshot(paths, dek).or_else(|_| read_enc_backup(paths, dek))?,
+    };
 
-    match open_and_verify(&plain_path) {
+    match write_working_copy(paths, &image, dek) {
         Ok(conn) => Ok(conn),
         Err(err) => {
             if paths.db_enc_backup_path().is_file() {
-                restore_from_enc_backup(paths, dek)?;
-                open_and_verify(&plain_path)
+                let image = read_enc_backup(paths, dek)?;
+                write_working_copy(paths, &image, dek)
             } else {
                 Err(err)
             }
@@ -419,7 +464,7 @@ fn open_database(paths: &VaultPaths, dek: &MasterDek) -> Result<Connection, Vaul
 /// this path.
 ///
 /// The scratch directory is keyed by path, so a folder that once held
-/// another silo can hand this one its predecessor's plaintext. Adopting
+/// another silo can hand this one its predecessor's working copy. Adopting
 /// that would re-encrypt the wrong tree over this silo's snapshot before
 /// the caller ever gets to compare vault ids. The marker in the folder is
 /// the silo's own claim about which vault it is; a folder without one
@@ -431,15 +476,52 @@ fn working_copy_belongs_here(paths: &VaultPaths, working_copy_vault: Uuid) -> bo
     }
 }
 
-/// Refreshes the encrypted snapshot from a working copy that survived a
-/// crash, so the durable artifact catches up with what the disk already
-/// holds. Best-effort: if the write fails, the working copy is still the
+/// Opens the ciphered working copy a crash left, if its sealed key opens
+/// under this DEK and it is sound, and refreshes the encrypted snapshot
+/// from it so the durable artifact catches up with what the disk holds.
+/// The refresh is best-effort: if it fails, the working copy is still the
 /// session, and the next lock writes the snapshot again.
-fn adopt_surviving_working_copy(paths: &VaultPaths, dek: &MasterDek, conn: &Connection) {
-    // Fold the crashed session's WAL into the main file first, or the
-    // snapshot would miss everything still sitting in it.
+fn adopt_surviving_working_copy(paths: &VaultPaths, dek: &MasterDek) -> Option<Connection> {
+    let key = load_page_key(paths, dek)?;
+    let conn = open_ciphered(&paths.db_path(), &key).ok()?;
+    verify_integrity(&conn).ok()?;
+    let id = read_vault_id(&conn)?;
+    if !working_copy_belongs_here(paths, id) {
+        return None;
+    }
+    // Fold the crashed session's WAL into the main file first, so it does
+    // not grow across sessions.
     let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
-    if encrypt_vault_file(&paths.db_path(), &paths.db_enc_path(), dek).is_ok() {
+    if let Ok(image) = export_image(&conn) {
+        refresh_snapshot(paths, dek, &image);
+    }
+    Some(conn)
+}
+
+/// The plaintext working copy an earlier release left after a crash.
+///
+/// Adopted once, as those releases did, then replaced by a ciphered copy:
+/// the plaintext files are removed before this returns. `None` leaves the
+/// caller to build from the snapshot, which removes them too.
+fn adopt_plaintext_working_copy(paths: &VaultPaths, dek: &MasterDek) -> Option<Connection> {
+    let image = {
+        let conn = Connection::open(paths.legacy_db_path()).ok()?;
+        conn.execute_batch("PRAGMA busy_timeout=5000;").ok()?;
+        verify_integrity(&conn).ok()?;
+        let id = read_vault_id(&conn)?;
+        if !working_copy_belongs_here(paths, id) {
+            return None;
+        }
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        Zeroizing::new(conn.serialize(MAIN_DB).ok()?.to_vec())
+    };
+    refresh_snapshot(paths, dek, &image);
+    write_working_copy(paths, &image, dek).ok()
+}
+
+/// Seals a working copy's image as the snapshot and its shadow copy.
+fn refresh_snapshot(paths: &VaultPaths, dek: &MasterDek, image: &[u8]) {
+    if encrypt_vault_bytes(image, &paths.db_enc_path(), dek).is_ok() {
         let _ = std::fs::copy(paths.db_enc_path(), paths.db_enc_backup_path());
         // A snapshot staged by an interrupted rotation is superseded: the
         // working copy postdates it.
@@ -460,41 +542,181 @@ fn adopt_surviving_working_copy(paths: &VaultPaths, dek: &MasterDek, conn: &Conn
 /// The staged file is promoted rather than merely read: leaving it in place
 /// would mean doing this on every unlock, and the shadow copy would stay
 /// under a key nothing holds.
-fn adopt_staged_snapshot(paths: &VaultPaths, dek: &MasterDek) -> Result<(), VaultError> {
+fn adopt_staged_snapshot(
+    paths: &VaultPaths,
+    dek: &MasterDek,
+) -> Result<Zeroizing<Vec<u8>>, VaultError> {
     let staged = paths.db_enc_staged_path();
     if !staged.is_file() {
         return Err(VaultError::NotFound);
     }
-    decrypt_vault_file(&staged, &paths.db_path(), dek)?;
+    let image = decrypt_vault_bytes(&staged, dek)?;
     silentsilo_core::rename_with_retry(&staged, &paths.db_enc_path())?;
     std::fs::copy(paths.db_enc_path(), paths.db_enc_backup_path())?;
-    Ok(())
+    Ok(image)
 }
 
-fn restore_from_enc_backup(paths: &VaultPaths, dek: &MasterDek) -> Result<(), VaultError> {
+fn read_enc_backup(paths: &VaultPaths, dek: &MasterDek) -> Result<Zeroizing<Vec<u8>>, VaultError> {
     let backup = paths.db_enc_backup_path();
     if !backup.is_file() {
         return Err(VaultError::Corrupted("no local backup available".into()));
     }
-    decrypt_vault_file(&backup, &paths.db_path(), dek)
+    decrypt_vault_bytes(&backup, dek)
         .map_err(|_| VaultError::Corrupted("shadow backup failed to decrypt".into()))
 }
 
-fn open_and_verify(plain_path: &Path) -> Result<Connection, VaultError> {
-    let conn = open_database_raw(plain_path)?;
+/// Whether `path` is a plain SQLite file rather than a ciphered one.
+fn is_plain_sqlite(path: &Path) -> bool {
+    let mut header = [0u8; 16];
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut header))
+        .is_ok()
+        && &header == SQLITE_HEADER
+}
+
+/// A working copy page key. Random per working copy, never the DEK.
+type PageKey = Zeroizing<[u8; 32]>;
+
+/// The key as SQLCipher takes a raw key: used as is, no passphrase KDF.
+fn key_literal(key: &[u8; 32]) -> Zeroizing<String> {
+    use std::fmt::Write;
+    let mut literal = Zeroizing::new(String::with_capacity(67));
+    literal.push_str("x'");
+    for byte in key {
+        let _ = write!(literal, "{byte:02X}");
+    }
+    literal.push('\'');
+    literal
+}
+
+fn save_page_key(path: &Path, key: &[u8; 32], dek: &MasterDek) -> Result<(), VaultError> {
+    let sealed = seal(key, dek).map_err(|e| VaultError::Crypto(e.to_string()))?;
+    crate::workdir::write_private(path, &sealed)?;
+    Ok(())
+}
+
+fn read_page_key(path: &Path, dek: &MasterDek) -> Option<PageKey> {
+    let data = std::fs::read(path).ok()?;
+    let plain = Zeroizing::new(unseal(&data, dek).ok()?);
+    if plain.len() != 32 {
+        return None;
+    }
+    let mut key = Zeroizing::new([0u8; 32]);
+    key.copy_from_slice(&plain);
+    Some(key)
+}
+
+/// The page key a surviving working copy was written under, if this DEK
+/// opens it. After a committed rotation only the staged one does, and it is
+/// moved into place so the next unlock finds it there.
+fn load_page_key(paths: &VaultPaths, dek: &MasterDek) -> Option<PageKey> {
+    if let Some(key) = read_page_key(&paths.db_key_path(), dek) {
+        return Some(key);
+    }
+    let key = read_page_key(&paths.db_key_staged_path(), dek)?;
+    let _ = silentsilo_core::rename_with_retry(&paths.db_key_staged_path(), &paths.db_key_path());
+    Some(key)
+}
+
+/// Removes the working copy, its journals and its sealed keys.
+fn remove_working_copy(paths: &VaultPaths) -> Result<(), VaultError> {
+    let mut files = vec![paths.db_key_path(), paths.db_key_staged_path()];
+    for db in [paths.db_path(), paths.legacy_db_path()] {
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let mut name = db.as_os_str().to_os_string();
+            name.push(suffix);
+            files.push(PathBuf::from(name));
+        }
+    }
+    for file in files {
+        match std::fs::remove_file(&file) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// An empty ciphered working copy under a new page key.
+fn create_working_copy(paths: &VaultPaths, dek: &MasterDek) -> Result<Connection, VaultError> {
+    paths.ensure_work_dir()?;
+    remove_working_copy(paths)?;
+    let key: PageKey = Zeroizing::new(rand::random());
+    save_page_key(&paths.db_key_path(), &key, dek)?;
+    open_ciphered(&paths.db_path(), &key)
+}
+
+/// A ciphered working copy holding `image`, a plain SQLite file image,
+/// under a new page key. The image is exported from memory, so its
+/// plaintext never touches the disk.
+fn write_working_copy(
+    paths: &VaultPaths,
+    image: &[u8],
+    dek: &MasterDek,
+) -> Result<Connection, VaultError> {
+    paths.ensure_work_dir()?;
+    remove_working_copy(paths)?;
+    let key: PageKey = Zeroizing::new(rand::random());
+    save_page_key(&paths.db_key_path(), &key, dek)?;
+
+    let path = paths.db_path();
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| VaultError::Corrupted("working copy path is not UTF-8".into()))?;
+    {
+        let mut mem = Connection::open_in_memory()?;
+        // A file image in WAL mode says so in bytes 18 and 19, and an
+        // in-memory database cannot open a WAL. Legacy mode reads the same.
+        let mut header = Zeroizing::new([0u8; 100]);
+        let head = image.len().min(100);
+        header[..head].copy_from_slice(&image[..head]);
+        if head == 100 && header[18] == 2 && header[19] == 2 {
+            header[18] = 1;
+            header[19] = 1;
+        }
+        let reader = (&header[..head]).chain(&image[head..]);
+        mem.deserialize_read_exact(MAIN_DB, reader, image.len(), false)?;
+        mem.execute(
+            "ATTACH DATABASE ?1 AS enc KEY ?2",
+            rusqlite::params![path_str, key_literal(&key).as_str()],
+        )?;
+        mem.query_row("SELECT sqlcipher_export('enc')", [], |_| Ok(()))?;
+        mem.execute_batch("DETACH DATABASE enc;")?;
+    }
+
+    let conn = open_ciphered(&path, &key)?;
     verify_integrity(&conn)?;
     Ok(conn)
 }
 
-fn open_database_raw(path: &Path) -> Result<Connection, VaultError> {
+/// Opens a ciphered database. The key goes first: nothing may read the file
+/// before it is set.
+fn open_ciphered(path: &Path, key: &[u8; 32]) -> Result<Connection, VaultError> {
     let conn = Connection::open(path)?;
+    conn.pragma_update(None, "key", key_literal(key).as_str())?;
+    // Sorts and temporary tables in memory, never in a plain temp file.
     conn.execute_batch(
-        "PRAGMA journal_mode=WAL;
+        "PRAGMA temp_store=MEMORY;
+         PRAGMA journal_mode=WAL;
          PRAGMA synchronous=NORMAL;
          PRAGMA busy_timeout=5000;
          PRAGMA foreign_keys=ON;",
     )?;
     Ok(conn)
+}
+
+/// The database behind `conn` as a plain SQLite file image, in memory only:
+/// the shape `vault.db.enc` has always sealed, so every release reads it.
+fn export_image(conn: &Connection) -> Result<Zeroizing<Vec<u8>>, VaultError> {
+    conn.execute_batch("ATTACH DATABASE ':memory:' AS plain KEY '';")?;
+    let image = conn
+        .query_row("SELECT sqlcipher_export('plain')", [], |_| Ok(()))
+        .and_then(|()| conn.serialize(c"plain"))
+        .map(|data| Zeroizing::new(data.to_vec()));
+    let detached = conn.execute_batch("DETACH DATABASE plain;");
+    let image = image?;
+    detached?;
+    Ok(image)
 }
 
 fn read_vault_id(conn: &Connection) -> Option<Uuid> {
@@ -642,7 +864,7 @@ mod tests {
         // rather than adopting a leftover working copy.
         wipe_plaintext_working_copy(&paths);
 
-        // Open successfully — vault.db.enc decrypts into the working copy.
+        // Opens: vault.db.enc decrypts into the working copy.
         let session2 = VaultSession::open_with_device_secret(root.clone(), secret).unwrap();
         assert_eq!(session2.vault_id, vault_id);
         drop(session2);
@@ -719,16 +941,27 @@ mod tests {
     #[test]
     fn a_working_copy_left_by_another_silo_is_not_adopted_over_this_one() {
         // The scratch directory is keyed by path, so a folder that once held
-        // another silo can hand this one its predecessor's plaintext.
+        // another silo can hand this one its predecessor's working copy.
         // Adopting it would re-encrypt the wrong tree over this silo's
         // snapshot before any caller compares vault ids.
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
         let secret = "test_device_secret_123";
+        // One DEK for both, so the stranger's page key opens and only the
+        // marker tells the two apart.
+        let dek = generate_dek();
+        let kek = generate_content_kek();
 
         // A stranger's working copy, sitting where this path's scratch is.
         let stranger = Uuid::new_v4();
-        let stranger_session = VaultSession::provision(root.clone(), stranger, secret).unwrap();
+        let stranger_session = VaultSession::provision_with_dek(
+            root.clone(),
+            stranger,
+            secret,
+            dek.clone(),
+            kek.clone(),
+        )
+        .unwrap();
         stranger_session
             .conn
             .execute_batch(&format!(
@@ -742,13 +975,15 @@ mod tests {
 
         // This silo takes the folder over, keeping the stranger's scratch in
         // place: what a moved or copied silo folder produces.
-        let plaintext = VaultPaths::new(root.clone()).db_path();
-        let kept = std::fs::read(&plaintext).unwrap();
+        let paths = VaultPaths::new(root.clone());
+        let kept = std::fs::read(paths.db_path()).unwrap();
+        let kept_key = std::fs::read(paths.db_key_path()).unwrap();
         for name in ["vault.db.enc", "vault.db.enc.bak", "silo.json"] {
             let _ = std::fs::remove_file(root.join(name));
         }
         let ours = Uuid::new_v4();
-        let session = VaultSession::provision(root.clone(), ours, secret).unwrap();
+        let session =
+            VaultSession::provision_with_dek(root.clone(), ours, secret, dek, kek).unwrap();
         session
             .conn
             .execute_batch(&format!(
@@ -758,12 +993,17 @@ mod tests {
             ))
             .unwrap();
         session.backup_locally().unwrap();
-        let paths = session.paths.clone();
         drop(session);
         crate::registry::write_marker(&root, ours).unwrap();
         let snapshot_before = std::fs::read(paths.db_enc_path()).unwrap();
-        // The stranger's plaintext is put back, as a crash would leave it.
-        std::fs::write(&plaintext, kept).unwrap();
+        // The stranger's copy is put back, as a crash would leave it.
+        remove_working_copy(&paths).unwrap();
+        std::fs::write(paths.db_path(), kept).unwrap();
+        std::fs::write(paths.db_key_path(), kept_key).unwrap();
+        assert!(
+            read_page_key(&paths.db_key_path(), &load_dek_for(&root, secret)).is_some(),
+            "the stranger's copy must open, or the marker is never consulted"
+        );
 
         let reopened = VaultSession::open_with_device_secret(root, secret).unwrap();
 
@@ -773,6 +1013,15 @@ mod tests {
             snapshot_before,
             "this silo's snapshot was overwritten from another silo's copy"
         );
+    }
+
+    fn load_dek_for(root: &Path, secret: &str) -> MasterDek {
+        let salt: [u8; 16] = std::fs::read(root.join(VAULT_SALT))
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let key = derive_vault_key(secret, &salt).unwrap();
+        load_dek(root, &key.wrap_key).unwrap()
     }
 
     #[test]
@@ -960,7 +1209,7 @@ mod tests {
     fn nothing_decrypted_is_written_into_the_silo_folder() {
         // The guarantee that makes "keep your silo wherever you like" safe.
         // If this fails, a silo in a synced folder uploads its index in the
-        // clear — the one outcome the whole design exists to prevent.
+        // clear, the one outcome the whole design exists to prevent.
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
         let session =
@@ -1010,5 +1259,254 @@ mod tests {
             !plaintext.exists(),
             "the working copy must not outlive the session"
         );
+    }
+
+    /// Every file in the working directory, as bytes.
+    fn work_files(paths: &VaultPaths) -> Vec<(PathBuf, Vec<u8>)> {
+        std::fs::read_dir(paths.work_dir())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().is_file())
+            .map(|e| (e.path(), std::fs::read(e.path()).unwrap()))
+            .collect()
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    fn marker(conn: &Connection) -> String {
+        conn.query_row(
+            "SELECT value FROM vault_meta WHERE key = 'marker'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn silo_with_marker(root: &Path, secret: &str, marker: &str) -> VaultSession {
+        let session = VaultSession::provision(root.to_path_buf(), Uuid::new_v4(), secret).unwrap();
+        let id = session.vault_id;
+        session
+            .conn
+            .execute_batch(&format!(
+                "CREATE TABLE vault_meta (key TEXT PRIMARY KEY, value TEXT);
+                 INSERT INTO vault_meta VALUES ('vault_id', '{id}');
+                 INSERT INTO vault_meta VALUES ('marker', '{marker}');"
+            ))
+            .unwrap();
+        session
+    }
+
+    /// The reason for SQLCipher: a crash, a kill or a power cut leaves the
+    /// working copy and its WAL on disk, and neither may be readable.
+    #[test]
+    fn the_working_copy_and_its_wal_hold_no_plaintext() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let name = "Quarterly-Salaries-Marker.xlsx";
+        let session = silo_with_marker(&root, "secret", "early");
+        session.backup_locally().unwrap();
+        // Written after the checkpoint, so it sits in the WAL.
+        session
+            .conn
+            .execute("INSERT INTO vault_meta VALUES ('file', ?1)", [name])
+            .unwrap();
+        let paths = session.paths.clone();
+
+        let files = work_files(&paths);
+        assert!(
+            files
+                .iter()
+                .any(|(p, b)| p.ends_with("vault.sqlcipher-wal") && !b.is_empty()),
+            "the test needs a WAL holding the write"
+        );
+        for (path, bytes) in &files {
+            let shown = path.display();
+            assert!(!contains(bytes, name.as_bytes()), "{shown} holds the name");
+            assert!(!contains(bytes, b"vault_meta"), "{shown} holds the schema");
+            assert!(!bytes.starts_with(SQLITE_HEADER), "{shown} is plain SQLite");
+        }
+
+        // The snapshot still carries it, sealed.
+        session.backup_locally().unwrap();
+        drop(session);
+        for (path, bytes) in work_files(&paths) {
+            let shown = path.display();
+            assert!(!contains(&bytes, name.as_bytes()), "{shown} holds the name");
+        }
+        wipe_plaintext_working_copy(&paths);
+        let reopened = VaultSession::open_with_device_secret(root, "secret").unwrap();
+        let back: String = reopened
+            .conn
+            .query_row("SELECT value FROM vault_meta WHERE key = 'file'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(back, name);
+    }
+
+    /// A leftover opens only through the DEK. A wrong key must neither read
+    /// it nor destroy it, or a failed unlock would cost the crashed
+    /// session's changes.
+    #[test]
+    fn a_leftover_working_copy_needs_the_dek() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let session = silo_with_marker(&root, "secret", "early");
+        session.backup_locally().unwrap();
+        session
+            .conn
+            .execute(
+                "UPDATE vault_meta SET value = 'late' WHERE key = 'marker'",
+                [],
+            )
+            .unwrap();
+        let (paths, dek) = (session.paths.clone(), session.dek.clone());
+        drop(session);
+
+        let plain = Connection::open(paths.db_path()).unwrap();
+        assert!(
+            plain
+                .query_row("SELECT COUNT(*) FROM sqlite_master", [], |r| r
+                    .get::<_, i64>(0))
+                .is_err(),
+            "opened without a key"
+        );
+        drop(plain);
+        assert!(open_ciphered(&paths.db_path(), &[7u8; 32]).is_err());
+        assert!(VaultSession::open_with_dek(root.clone(), generate_dek()).is_err());
+        assert!(read_page_key(&paths.db_key_path(), &generate_dek()).is_none());
+
+        let reopened = VaultSession::open_with_dek(root, dek).unwrap();
+        assert_eq!(marker(&reopened.conn), "late");
+    }
+
+    /// A release before SQLCipher left its working copy in the clear after
+    /// a crash. It is adopted once, then replaced by a ciphered copy.
+    #[test]
+    fn a_plaintext_leftover_from_an_earlier_release_is_adopted_then_ciphered() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let session = silo_with_marker(&root, "secret", "early");
+        session.backup_locally().unwrap();
+        let (paths, vault_id) = (session.paths.clone(), session.vault_id);
+        drop(session);
+        remove_working_copy(&paths).unwrap();
+
+        // What 1.4.0 leaves: a plain database with the change in its WAL.
+        let legacy = paths.legacy_db_path();
+        let wal = PathBuf::from(format!("{}-wal", legacy.display()));
+        let old = Connection::open(&legacy).unwrap();
+        old.execute_batch(&format!(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE vault_meta (key TEXT PRIMARY KEY, value TEXT);
+             INSERT INTO vault_meta VALUES ('vault_id', '{vault_id}');
+             INSERT INTO vault_meta VALUES ('marker', 'written by 1.4.0');"
+        ))
+        .unwrap();
+        // Copied while open: closing would checkpoint and delete the WAL.
+        let db_bytes = std::fs::read(&legacy).unwrap();
+        let wal_bytes = std::fs::read(&wal).unwrap();
+        drop(old);
+        assert!(contains(&wal_bytes, b"written by 1.4.0"));
+        std::fs::write(&legacy, db_bytes).unwrap();
+        std::fs::write(&wal, wal_bytes).unwrap();
+        assert!(is_plain_sqlite(&legacy));
+
+        let reopened = VaultSession::open_with_device_secret(root.clone(), "secret").unwrap();
+        assert_eq!(marker(&reopened.conn), "written by 1.4.0");
+        for (path, bytes) in work_files(&paths) {
+            let shown = path.display();
+            assert!(!contains(&bytes, b"written by 1.4.0"), "{shown} is plain");
+        }
+        assert!(
+            !legacy.exists() && !wal.exists(),
+            "the plaintext files stayed"
+        );
+        assert!(paths.db_path().is_file());
+
+        // The snapshot caught up, so a clean lock keeps it.
+        drop(reopened);
+        wipe_plaintext_working_copy(&paths);
+        let again = VaultSession::open_with_device_secret(root, "secret").unwrap();
+        assert_eq!(marker(&again.conn), "written by 1.4.0");
+    }
+
+    /// A crash after a rotation committed: the page key was sealed under the
+    /// old DEK, and only the new one opens the silo now.
+    #[test]
+    fn a_crash_after_a_rotation_keeps_the_changes() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let session = silo_with_marker(&root, "secret", "before");
+        session.backup_locally().unwrap();
+        let paths = session.paths.clone();
+
+        // The rotation as the desktop commits it.
+        let new_dek = generate_dek();
+        crate::rotation::stage_rotation(&root, &new_dek, &session.kek, &session.dek).unwrap();
+        session
+            .stage_local_backup(&new_dek, &paths.db_enc_staged_path())
+            .unwrap();
+        crate::rotation::commit_rotation(&root).unwrap();
+        silentsilo_core::rename_with_retry(&paths.db_enc_staged_path(), &paths.db_enc_path())
+            .unwrap();
+        std::fs::copy(paths.db_enc_path(), paths.db_enc_backup_path()).unwrap();
+
+        // Written after the commit, then the crash.
+        session
+            .conn
+            .execute(
+                "UPDATE vault_meta SET value = 'after' WHERE key = 'marker'",
+                [],
+            )
+            .unwrap();
+        let old_dek = session.dek.clone();
+        drop(session);
+
+        assert!(VaultSession::open_with_dek(root.clone(), old_dek).is_err());
+        let reopened = VaultSession::open_with_dek(root.clone(), new_dek.clone()).unwrap();
+        assert_eq!(marker(&reopened.conn), "after");
+        assert!(
+            !paths.db_key_staged_path().exists(),
+            "the staged key is promoted"
+        );
+
+        // A second crash finds the key in place.
+        drop(reopened);
+        let again = VaultSession::open_with_dek(root, new_dek).unwrap();
+        assert_eq!(marker(&again.conn), "after");
+    }
+
+    /// The desktop locks every silo right after a rotation commits, and the
+    /// lock snapshots with the session's DEK, which is the old one. Sealing
+    /// under it would put `vault.db.enc` and its shadow copy under a key
+    /// nothing opens any more.
+    #[test]
+    fn a_session_whose_key_was_rotated_away_does_not_overwrite_the_snapshot() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let session = silo_with_marker(&root, "secret", "kept");
+        session.backup_locally().unwrap();
+        let paths = session.paths.clone();
+
+        let new_dek = generate_dek();
+        crate::rotation::stage_rotation(&root, &new_dek, &session.kek, &session.dek).unwrap();
+        session
+            .stage_local_backup(&new_dek, &paths.db_enc_staged_path())
+            .unwrap();
+        crate::rotation::commit_rotation(&root).unwrap();
+        silentsilo_core::rename_with_retry(&paths.db_enc_staged_path(), &paths.db_enc_path())
+            .unwrap();
+        std::fs::copy(paths.db_enc_path(), paths.db_enc_backup_path()).unwrap();
+
+        // The lock.
+        assert!(session.backup_locally().is_err());
+        drop(session);
+        wipe_plaintext_working_copy(&paths);
+
+        let reopened = VaultSession::open_with_dek(root, new_dek).unwrap();
+        assert_eq!(marker(&reopened.conn), "kept");
     }
 }

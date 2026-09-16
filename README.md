@@ -21,7 +21,7 @@ from this repository. Mobile clients will do the same.
 |-------|------|
 | `silentsilo-core` | Shared types and errors |
 | `silentsilo-crypto` | AES-GCM streaming, envelope encryption, blob format |
-| `silentsilo-vault` | Silo provisioning, keys on disk, `vault.db` encrypted at rest |
+| `silentsilo-vault` | Silo provisioning, keys on disk, the index sealed at rest and ciphered while open |
 | `silentsilo-vfs` | Operation log, folder and file tree, name resolution, snapshots |
 | `silentsilo-sync` | Bucket layout and the transport half of a sync pass |
 | `silentsilo-store` | Backup storage: bucket, folder, WebDAV or SFTP |
@@ -90,6 +90,18 @@ nested directory can hit the 260-character path limit. If `git clone` reports
 ```bash
 git config --global core.longpaths true
 ```
+
+SQLCipher builds a vendored OpenSSL, which needs Perl. Git Bash's own Perl
+does not work: install Strawberry Perl, and from Git Bash point at it with
+`PERL=/c/Strawberry/perl/bin/perl.exe`. OpenSSL's configure also fails when a
+path under the target directory passes 260 characters, so keep the checkout,
+or `CARGO_TARGET_DIR`, short. The first build takes several minutes longer.
+
+Cross-building for Android from Windows needs a Unix-style Perl with its
+full module set (MSYS2's `/c/msys64/usr/bin/perl.exe`, not Git's), `make` on
+the path, and the NDK's `clang.exe` as `CC_aarch64_linux_android` with
+`CFLAGS_aarch64_linux_android=--target=aarch64-linux-android31`: OpenSSL's
+build runs under `sh`, which loses the backslash in the `.cmd` wrapper's path.
 
 ## Docs
 

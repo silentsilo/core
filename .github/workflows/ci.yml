@@ -28,9 +28,12 @@ jobs:
   #
   # `--locked` everywhere: a lockfile that drifts silently is how a release
   # picks up dependency versions nobody chose.
+  #
+  # 45 minutes: the OpenSSL that SQLCipher vendors takes several to build
+  # cold, with the runner's Strawberry Perl.
   test:
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
@@ -141,13 +144,16 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: mobile-${{ matrix.target }}
-      # The runner image ships an NDK; SQLite and aws-lc compile with it.
+      # The runner image ships an NDK; SQLCipher, OpenSSL and aws-lc compile
+      # with it. OpenSSL's build also runs ranlib, which the NDK has only as
+      # llvm-ranlib.
       - name: Android NDK compilers
         if: matrix.target == 'aarch64-linux-android'
         run: |
           bin="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
           echo "CC_aarch64_linux_android=$bin/aarch64-linux-android31-clang" >> "$GITHUB_ENV"
           echo "AR_aarch64_linux_android=$bin/llvm-ar" >> "$GITHUB_ENV"
+          echo "RANLIB_aarch64_linux_android=$bin/llvm-ranlib" >> "$GITHUB_ENV"
           echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$bin/aarch64-linux-android31-clang" >> "$GITHUB_ENV"
       - run: cargo check --locked --target ${{ matrix.target }} -p silentsilo-core -p silentsilo-crypto -p silentsilo-store -p silentsilo-vault -p silentsilo-vfs -p silentsilo-sync -p silentsilo-app
       - run: cargo check --locked --target ${{ matrix.target }} -p silentsilo-fido --no-default-features --features enclave,ctap2

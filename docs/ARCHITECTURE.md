@@ -151,10 +151,14 @@ property:
   may register a `LocalProtector` (Android: a Keystore key), and without one
   they are plaintext, private to the user or app.
 - **The machine workdir** (keyed by silo path, outside the folder): the
-  plaintext working copy `vault.db` with its WAL, decrypted files the user
-  opened (`open/`), and `cache.db` (blob bookkeeping). Wiped on lock;
-  adopted on unlock after a crash. Nothing here may ever land in the silo
-  folder, or a silo in Dropbox uploads its index in the clear.
+  working copy `vault.sqlcipher` with its WAL, ciphered by SQLCipher under a
+  random page key, that key sealed under the DEK as `vault.key` (and
+  `vault.key.next` mid-rotation), and decrypted files the user opened
+  (`open/`). Wiped on lock; adopted on unlock after a crash, which needs the
+  DEK. Unlock and snapshots move the decrypted index through memory only
+  (CRYPTO.md, "Local metadata"). Beside it, kept across locks, the cache
+  directory: `cache.db` (blob bookkeeping) and `protected.db`. Nothing here
+  may ever land in the silo folder.
 - **The bucket** (per target): `vault.json` (the only plaintext object, one
   random UUID), `ops/`, `blobs/`, `snapshots/`, `keys/*.env`,
   `keys/content.kek`, `recovery.env`. Layout and versions are FORMATS.md's
@@ -380,6 +384,13 @@ Read this before "fixing" any of it.
 - **`MAX_OP_BYTES` rejects from the listing**, before download: storage is
   untrusted and an object sized to exhaust memory must never be fetched.
   Same posture as the Argon2 parameter ceiling on `recovery.env`.
+- **The working copy is not called `vault.db`, and its key sits beside
+  it.** An older release after a downgrade decrypts the snapshot over
+  anything named `vault.db`, with the ciphered WAL still beside it; under
+  its own name the copy is never touched. The page key is sealed under the DEK on
+  disk rather than held in memory because a key that dies with the process
+  takes a crashed session's changes with it. `stage_local_backup` seals it
+  under the new DEK too, so a crash after a rotation commits still adopts.
 - **Recovery codes map O→0, I/L→1, U→V on input.** Crockford's alphabet
   excludes those on output precisely because handwriting confuses them;
   strict parsing would reject correct codes.

@@ -128,6 +128,14 @@ holds a copy.
 | Cache settings | `cache_settings.json` | **No version.** Plain JSON | One number, the local cache ceiling. Unreadable reads as the default, so there is nothing a version could save |
 | Protected folders | `protected.json` | `SILO_FILE_VERSION` | Which folders on this computer the silo copies from. Absolute local paths, so they describe what someone keeps and where; kept beside the ledger of what has already been imported, and out of a folder that travels |
 
+Not formats, and deliberately so: the working copy of an open silo
+(`vault.sqlcipher`, ciphered by SQLCipher 4) and its page key (`vault.key`,
+`vault.key.next`, sealed under the DEK in the envelope above). They are
+transient and machine-local, and anything that does not open is rebuilt from
+`vault.db.enc`. What `vault.db.enc` seals is still a whole plain SQLite file
+image. A release before core 1.5.0 looks only for a plaintext `vault.db`,
+which this build adopts once and removes; see CRYPTO.md, "Local metadata".
+
 ### `vault.db.enc.next`
 
 Rotation writes the index under the new key beside the old one, commits the

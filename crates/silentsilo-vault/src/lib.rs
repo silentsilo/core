@@ -1,7 +1,6 @@
-//! Local vault provisioning and unlock. `vault.db` is encrypted at rest with
-//! AES-256-GCM under the vault's Master DEK (see `vault_file_crypto`) rather
-//! than SQLCipher, which needs a C/OpenSSL toolchain that isn't reliably
-//! available out of the box on Windows.
+//! Local vault provisioning and unlock. The index is sealed at rest as
+//! `vault.db.enc` under the vault's Master DEK (see `vault_file_crypto`),
+//! and ciphered by SQLCipher while it is open (see `session`).
 
 /// Whether `seal_under_code_for_fixtures` is compiled into this build.
 /// Cargo unifies features across a `--workspace` build, so the app asserts

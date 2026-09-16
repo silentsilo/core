@@ -2,3 +2,9 @@
 # %LOCALAPPDATA%\SilentSilo\work. Read by debug builds only; see workdir.rs.
 [env]
 SILENTSILO_TEST_WORK_BASE = { value = "target/test-work", relative = true }
+
+# OpenSSL (vendored for SQLCipher) is built without its PDB, and MSVC's
+# LNK4099 about it reaches rustc as a `linker_messages` warning on every
+# link. Nothing is missing from the binary, so the one message is ignored.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "link-arg=/ignore:4099"]
