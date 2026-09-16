@@ -27,5 +27,7 @@ silentsilo-vault-v1_0_0 = { package = "silentsilo-vault", git = "https://github.
 silentsilo-sync-v1_0_0 = { package = "silentsilo-sync", git = "https://github.com/silentsilo/core", tag = "v1.0.0" }
 silentsilo-store-v1_0_0 = { package = "silentsilo-store", git = "https://github.com/silentsilo/core", tag = "v1.0.0" }
 silentsilo-crypto-v1_0_0 = { package = "silentsilo-crypto", git = "https://github.com/silentsilo/core", tag = "v1.0.0" }
+silentsilo-vfs-v1_0_0 = { package = "silentsilo-vfs", git = "https://github.com/silentsilo/core", tag = "v1.0.0" }
+silentsilo-app = { workspace = true }
 hex = "0.4"
 blake3 = { workspace = true }
