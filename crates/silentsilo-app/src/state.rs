@@ -13,9 +13,9 @@ use crate::Host;
 
 /// The most silos that may be unlocked at the same time.
 ///
-/// Each open silo means a decrypted working database on disk and a set of
-/// keys in memory, so the number of them is the size of what a compromised
-/// process gets while the user is unlocked. Switching between silos all day
+/// Each open silo means a decrypted index and a set of keys in memory, so
+/// the number of them is the size of what a compromised process gets while
+/// the user is unlocked. Switching between silos all day
 /// would otherwise leave every one of them open, which is not something a
 /// person would choose deliberately.
 pub const MAX_OPEN_SILOS: usize = 3;
@@ -154,10 +154,11 @@ impl AppState {
         Ok(())
     }
 
-    /// Removes the decrypted scratch of every silo that is not open, including
-    /// what a crash or kill left behind. The client calls it at start and after
-    /// each lock; not from `close_session`, so that tests sharing a work base
-    /// do not sweep each other. Returns how many directories survived.
+    /// Removes the plaintext scratch of every silo that is not open, including
+    /// what a crash or kill left behind, and keeps their ciphered working
+    /// copies. The client calls it at start and after each lock; not from
+    /// `close_session`, so that tests sharing a work base do not sweep each
+    /// other. Returns how many directories still hold plaintext.
     pub fn sweep_scratch(&self) -> usize {
         let roots: Vec<PathBuf> = self
             .sessions
@@ -296,19 +297,17 @@ fn stalest(ids: impl Iterator<Item = Uuid>, touched: &HashMap<Uuid, Instant>) ->
     ids.min_by_key(|id| touched.get(id).copied())
 }
 
-/// Snapshots a session and clears the plaintext it was working through.
+/// Snapshots a session and clears the plaintext it was working through. The
+/// ciphered working copy stays, so the next unlock reuses it.
 ///
-/// The session is dropped before the working copy is removed: Windows will
-/// not delete a file that still has an open handle, so the order here is the
-/// difference between locking a silo and leaving its decrypted database on
-/// disk.
+/// The session is dropped before anything is removed: Windows will not
+/// delete a file that still has an open handle.
 fn close_one(host: &dyn Host, session: VaultSession) {
-    if let Err(e) = session.backup_locally() {
+    if let Err(e) = session.seal_for_lock() {
         host.warn("lock", &format!("local snapshot failed: {e}"));
     }
     let paths = session.paths.clone();
     drop(session);
-    wipe_open_scratch(&paths.root);
     silentsilo_vault::wipe_plaintext_working_copy(&paths);
 }
 

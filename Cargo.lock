@@ -4213,6 +4213,7 @@ version = "1.4.0"
 dependencies = [
  "aes-gcm 0.10.3",
  "argon2 0.5.3",
+ "blake3",
  "hex",
  "keyring",
  "rand 0.9.5",

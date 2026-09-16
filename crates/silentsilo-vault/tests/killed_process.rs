@@ -1,7 +1,7 @@
-//! A real kill, not a dropped session: a child process unlocks, writes and
-//! is killed with its database open, as a crash or a power cut would leave
-//! it. What it leaves must hold nothing readable, and the next unlock must
-//! still have the change.
+//! A real kill, not a dropped session: after a lock, a child process
+//! unlocks the kept working copy, writes and is killed with its database
+//! open, as a crash or a power cut would leave it. What it leaves must hold
+//! nothing readable, and the next unlock must still have the change.
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -70,10 +70,11 @@ fn a_killed_session_leaves_nothing_readable_and_loses_nothing() {
              CREATE TABLE names (name TEXT);"
         ))
         .unwrap();
-    session.backup_locally().unwrap();
+    session.seal_for_lock().unwrap();
     let paths = VaultPaths::new(root.clone());
     drop(session);
     wipe_plaintext_working_copy(&paths);
+    let locked_key = std::fs::read(paths.db_key_path()).unwrap();
 
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args([
@@ -109,8 +110,13 @@ fn a_killed_session_leaves_nothing_readable_and_loses_nothing() {
         );
     }
 
+    assert_eq!(
+        std::fs::read(paths.db_key_path()).unwrap(),
+        locked_key,
+        "the child did not reuse the kept copy"
+    );
     let reopened = VaultSession::open_with_device_secret(root, SECRET).unwrap();
     assert_eq!(names(&reopened), vec![NAME.to_string()]);
     drop(reopened);
-    wipe_plaintext_working_copy(&paths);
+    silentsilo_vault::wipe_work_dir(&paths.root);
 }

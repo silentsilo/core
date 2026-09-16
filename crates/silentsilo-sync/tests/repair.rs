@@ -41,7 +41,7 @@ async fn a_device_rebuilds_in_place_from_its_storage() {
     // machine-local bookkeeping. What the repair command deletes and wipes.
     let paths = session.paths.clone();
     drop(session);
-    silentsilo_vault::wipe_plaintext_working_copy(&paths);
+    silentsilo_vault::wipe_work_dir(&paths.root);
     std::fs::remove_file(paths.db_enc_path()).unwrap();
     let _ = std::fs::remove_file(paths.db_enc_backup_path());
 

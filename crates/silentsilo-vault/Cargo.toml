@@ -12,6 +12,7 @@ fixture-support = []
 [dependencies]
 argon2 = { workspace = true }
 aes-gcm = { workspace = true }
+blake3 = { workspace = true }
 rand = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }

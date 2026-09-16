@@ -46,8 +46,8 @@ fn credential(id: &str, wrapped: &str) -> StoredFidoCredential {
 
 #[test]
 fn the_encrypted_index_saves_while_a_scanner_holds_the_old_one() {
-    // The file unlock reads. Losing this write leaves the session's work in
-    // the plaintext copy alone, which the next lock deletes.
+    // The file unlock reads when there is no working copy. Losing this write
+    // leaves the session's work in a copy alone.
     let (_dir, session) = silo();
     session
         .conn
@@ -62,7 +62,7 @@ fn the_encrypted_index_saves_while_a_scanner_holds_the_old_one() {
 
     let paths = session.paths.clone();
     drop(session);
-    silentsilo_vault::wipe_plaintext_working_copy(&paths);
+    silentsilo_vault::wipe_work_dir(&paths.root);
 
     let reopened =
         VaultSession::open_with_device_secret(paths.root.clone(), "hostile-secret").unwrap();

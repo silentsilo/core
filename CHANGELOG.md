@@ -16,7 +16,9 @@ release notes should say.
 - `wipe_work_dirs_except` and `AppState::sweep_scratch`: remove the decrypted
   scratch of every silo that is not open, including what a crash, a kill or a
   power cut left for a silo that may never be opened again. Clients call them
-  at start and after each lock.
+  at start and after each lock. They keep a ciphered working copy that has
+  its sealed key.
+- `wipe_plaintext`, `KEPT_ACROSS_LOCKS`.
 - The storage sweep puts back content a file still points at that a copy no
   longer holds, from this device's cache or from another copy
   (`restore_missing_blobs`, `SyncReport::blobs_restored`). It uses the
@@ -47,6 +49,14 @@ release notes should say.
   `db_key_staged_path` and `legacy_db_path` are new.
 - `stage_local_backup` also seals the page key under the new DEK
   (`vault.key.next`), so a crash after a rotation commits keeps the changes.
+- A lock keeps the ciphered working copy and its sealed key, and the next
+  unlock reuses it while it still stands for `vault.db.enc`, checked by a
+  BLAKE3 fingerprint the copy records at every snapshot write. A 12 MB index
+  unlocks in about 50 ms instead of 800 ms. A snapshot written by anything
+  else gets a fresh export. `seal_for_lock` marks the copy and folds its WAL;
+  `wipe_plaintext_working_copy` now removes only plaintext (opened files, a
+  legacy `vault.db`), and `wipe_work_dir` still removes everything.
+  `encrypt_vault_bytes` returns the fingerprint.
 - Building now needs Perl for OpenSSL (Strawberry Perl on Windows).
 
 ### Fixed

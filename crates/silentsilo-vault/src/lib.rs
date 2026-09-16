@@ -67,8 +67,9 @@ pub use s3_store::{BackupTarget, TargetRole, load_targets, save_targets};
 pub use s3_store::{clear_s3_config, load_s3_config, save_s3_config};
 pub use session::{VaultPaths, VaultSession, wipe_plaintext_working_copy};
 pub use workdir::{
-    create_private_dir, detect_sync_provider, seal_readonly, set_work_base, wipe_cache_dir,
-    wipe_machine_state, wipe_work_dir, wipe_work_dirs_except, work_dir_for,
+    KEPT_ACROSS_LOCKS, create_private_dir, detect_sync_provider, seal_readonly, set_work_base,
+    wipe_cache_dir, wipe_machine_state, wipe_plaintext, wipe_work_dir, wipe_work_dirs_except,
+    work_dir_for,
 };
 
 #[cfg(test)]

@@ -1,8 +1,9 @@
-//! Where a silo's plaintext lives while it is open. Not in the silo
+//! Where a silo's working copy and opened files live. Not in the silo
 //! folder, which the user may have put on a NAS, an external drive or a
 //! OneDrive-redirected Documents. Anything decrypted lives here on the
-//! local machine and is wiped when the silo locks; what stays in the silo
-//! folder is ciphertext, a public salt and wrapped keys.
+//! local machine and is wiped when the silo locks; the ciphered working copy
+//! and its sealed key stay, so the next unlock reuses them. What stays in
+//! the silo folder is ciphertext, a public salt and wrapped keys.
 
 use std::path::{Path, PathBuf};
 
@@ -63,9 +64,9 @@ pub fn work_base() -> PathBuf {
 /// The scratch directory for the silo stored at `silo_root`.
 ///
 /// Derived from the path rather than from the silo's id, so it can be
-/// answered without opening anything — `VaultPaths::exists()` needs it
+/// answered without opening anything: `VaultPaths::exists()` needs it
 /// before there is a session to ask. Moving a silo folder simply earns it a
-/// new scratch directory; nothing durable lives here.
+/// new scratch directory; nothing here is more than `vault.db.enc` rebuilds.
 pub fn work_dir_for(silo_root: &Path) -> PathBuf {
     let key = silo_root.to_string_lossy().to_lowercase();
     work_base()
@@ -157,7 +158,7 @@ pub fn seal_readonly(path: &Path) {
 ///
 /// Separate from the scratch directory precisely so that wiping plaintext
 /// does not also throw away the record of which blobs are already in the
-/// bucket — that record is expensive to rebuild and harmless to keep.
+/// bucket. That record is expensive to rebuild and harmless to keep.
 pub fn cache_dir_for(silo_root: &Path) -> PathBuf {
     let key = silo_root.to_string_lossy().to_lowercase();
     work_base()
@@ -187,7 +188,19 @@ pub fn wipe_machine_state(silo_root: &Path) {
     wipe_cache_dir(silo_root);
 }
 
-/// Removes a silo's scratch directory and everything in it.
+/// The files a lock leaves in a silo's scratch directory: the working copy
+/// SQLCipher ciphers, its WAL and shared memory, and its page key sealed
+/// under the DEK. Nothing else there survives a lock or a sweep.
+pub const KEPT_ACROSS_LOCKS: [&str; 5] = [
+    "vault.sqlcipher",
+    "vault.sqlcipher-wal",
+    "vault.sqlcipher-shm",
+    "vault.key",
+    "vault.key.next",
+];
+
+/// Removes a silo's scratch directory and everything in it, the ciphered
+/// working copy included. For a silo that is gone or provisioned over.
 pub fn wipe_work_dir(silo_root: &Path) {
     let dir = work_dir_for(silo_root);
     if !dir.exists() {
@@ -196,19 +209,49 @@ pub fn wipe_work_dir(silo_root: &Path) {
     // Files opened from the silo are written read-only so an editor cannot
     // save into a copy that is about to vanish; Windows will not delete a
     // read-only file, so the bit has to come off first.
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            clear_readonly(&entry.path());
-        }
-    }
+    clear_readonly(&dir);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Removes the scratch directory of every silo not in `open`, including
-/// ones a crash, a kill or a power cut left behind for a silo that may never
-/// be opened again. Called with nothing open when the app starts, and with
-/// the silos still open after each lock. Returns how many directories
-/// survived, which means another application still holds a file in them.
+/// Removes everything readable from a silo's scratch directory: opened
+/// files, a plaintext `vault.db` an earlier release left, anything not in
+/// [`KEPT_ACROSS_LOCKS`]. Returns whether something could not be removed,
+/// which means another application still holds it open.
+pub fn wipe_plaintext(silo_root: &Path) -> bool {
+    wipe_plaintext_in(&work_dir_for(silo_root))
+}
+
+fn wipe_plaintext_in(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    let mut left = false;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if KEPT_ACROSS_LOCKS.iter().any(|kept| name == *kept) {
+            continue;
+        }
+        let path = entry.path();
+        clear_readonly(&path);
+        let removed = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        if removed.is_err() && path.exists() {
+            left = true;
+        }
+    }
+    left
+}
+
+/// Clears the scratch of every silo not in `open`, including what a crash,
+/// a kill or a power cut left behind. Plaintext goes; a ciphered working
+/// copy stays for the next unlock, and a directory without a sealed page key
+/// holds nothing that copy could open with, so it goes whole. Called with
+/// nothing open when the app starts, and with the silos still open after
+/// each lock. Returns how many directories still hold plaintext, which
+/// means another application holds a file in them.
 pub fn wipe_work_dirs_except(open: &[&Path]) -> usize {
     wipe_open_dirs_in(&work_base().join("open"), open)
 }
@@ -227,6 +270,15 @@ fn wipe_open_dirs_in(base: &Path, open: &[&Path]) -> usize {
             continue;
         }
         let path = entry.path();
+        let has_key = ["vault.key", "vault.key.next"]
+            .iter()
+            .any(|key| path.join(key).is_file());
+        if has_key {
+            if wipe_plaintext_in(&path) {
+                left += 1;
+            }
+            continue;
+        }
         clear_readonly(&path);
         if std::fs::remove_dir_all(&path).is_err() && path.exists() {
             left += 1;
@@ -393,8 +445,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_scratch_directory_is_not_readable_by_other_users() {
-        // It holds the working copy of vault.db, which is the whole tree of
-        // names in plaintext.
+        // It holds files the user opened, in plaintext.
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("work").join("nested");
@@ -424,41 +475,51 @@ mod tests {
     }
 
     #[test]
-    fn a_sweep_removes_every_scratch_directory_but_the_open_ones() {
+    fn a_sweep_keeps_ciphered_copies_and_removes_plaintext() {
         let tmp = tempfile::tempdir().unwrap();
-        let open_root = tmp.path().join("open-silo");
-        let crashed_root = tmp.path().join("crashed-silo");
-        let base = work_dir_for(&open_root).parent().unwrap().to_path_buf();
-        let kept = base.join(work_dir_for(&open_root).file_name().unwrap());
-        let stale = base.join(work_dir_for(&crashed_root).file_name().unwrap());
         let sandbox = tmp.path().join("open");
-        for dir in [&kept, &stale] {
-            let dir = sandbox.join(dir.file_name().unwrap());
+        let dir_of = |name: &str| {
+            let root = tmp.path().join(name);
+            sandbox.join(work_dir_for(&root).file_name().unwrap())
+        };
+        let (open, locked, crashed) = (dir_of("open"), dir_of("locked"), dir_of("crashed"));
+        for dir in [&open, &locked, &crashed] {
             std::fs::create_dir_all(dir.join("open")).unwrap();
             let file = dir.join("open").join("opened.txt");
             std::fs::write(&file, b"plaintext").unwrap();
             seal_readonly(&file);
             std::fs::write(dir.join("vault.db"), b"plaintext").unwrap();
+            std::fs::write(dir.join("vault.sqlcipher"), b"ciphered").unwrap();
         }
+        // Only the locked one has a sealed page key.
+        std::fs::write(locked.join("vault.key"), b"sealed").unwrap();
 
-        let left = wipe_open_dirs_in(&sandbox, &[&open_root]);
+        let left = wipe_open_dirs_in(&sandbox, &[&tmp.path().join("open")]);
 
         assert_eq!(left, 0);
-        assert!(
-            sandbox
-                .join(kept.file_name().unwrap())
-                .join("vault.db")
-                .exists()
-        );
-        assert!(!sandbox.join(stale.file_name().unwrap()).exists());
+        assert!(open.join("vault.db").exists(), "an open silo is left alone");
+        assert!(open.join("open").join("opened.txt").exists());
+        assert!(locked.join("vault.sqlcipher").is_file());
+        assert!(locked.join("vault.key").is_file());
+        assert!(!locked.join("vault.db").exists(), "plaintext survived");
+        assert!(!locked.join("open").exists(), "an opened file survived");
+        assert!(!crashed.exists(), "a copy with no key opens under nothing");
+
         assert_eq!(wipe_open_dirs_in(&sandbox, &[]), 0);
-        assert_eq!(std::fs::read_dir(&sandbox).unwrap().count(), 0);
+        assert!(!open.join("vault.db").exists());
+        let mut names: Vec<_> = std::fs::read_dir(&locked)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["vault.key", "vault.sqlcipher"]);
     }
 
     #[test]
     fn wiping_removes_read_only_files() {
         // An opened file is written read-only on purpose, and Windows
-        // refuses to delete those — so plaintext would survive the lock.
+        // refuses to delete those, so plaintext would survive the lock.
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("silo");
         let work = work_dir_for(&root);

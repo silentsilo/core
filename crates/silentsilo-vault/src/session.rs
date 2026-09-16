@@ -32,6 +32,14 @@ const VAULT_SALT: &str = "vault.salt";
 const BLOBS_DIR: &str = "blobs";
 /// How every plain SQLite file starts. A SQLCipher file starts with its salt.
 const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
+/// The working copy's own bookkeeping. Left out of every snapshot image.
+const STATE_TABLE: &str = "working_copy_state";
+/// Fingerprint of the last `vault.db.enc` this copy wrote or was built from.
+const STATE_SNAPSHOT: &str = "snapshot";
+/// Fingerprint of the `vault.db.enc.next` a rotation staged from this copy.
+const STATE_STAGED: &str = "staged";
+/// Fingerprint of the snapshot a lock wrote, cleared by the next unlock.
+const STATE_LOCKED: &str = "locked";
 
 #[derive(Debug, Clone)]
 pub struct VaultPaths {
@@ -67,14 +75,15 @@ impl VaultPaths {
         Ok(())
     }
 
-    /// The working copy, ciphered page by page with SQLCipher. Only present
-    /// while a session is open or after a crash, and only on this machine.
+    /// The working copy, ciphered page by page with SQLCipher. Kept across
+    /// locks until the snapshot changes or the silo is removed, and only on
+    /// this machine.
     pub fn db_path(&self) -> PathBuf {
         self.work_dir().join(VAULT_DB)
     }
 
     /// The working copy's page key, sealed under the DEK like
-    /// `vault.db.enc`. Kept so the next unlock can adopt what a crash left.
+    /// `vault.db.enc`. Kept so the next unlock can reuse the copy.
     pub fn db_key_path(&self) -> PathBuf {
         self.work_dir().join(VAULT_KEY)
     }
@@ -92,8 +101,7 @@ impl VaultPaths {
         self.work_dir().join(LEGACY_VAULT_DB)
     }
 
-    /// Decrypted copies of files the user opened. Wiped with everything else
-    /// in the scratch directory when the silo locks.
+    /// Decrypted copies of files the user opened. Wiped when the silo locks.
     pub fn open_scratch_dir(&self) -> PathBuf {
         self.work_dir().join("open")
     }
@@ -113,8 +121,8 @@ impl VaultPaths {
     /// Rotation commits the keys and then moves this into place. Those are
     /// two filesystem operations, and a machine that dies between them wakes
     /// up with a new key and a snapshot under the old one, which nothing can
-    /// read: the working copy is wiped at lock and the shadow backup is
-    /// under the old key too. This file is the way back, which is why unlock
+    /// read without a working copy, and the shadow backup is under the old
+    /// key too. This file is the way back, which is why unlock
     /// knows about it.
     pub fn db_enc_staged_path(&self) -> PathBuf {
         self.root.join(VAULT_DB_ENC_NEXT)
@@ -341,19 +349,21 @@ impl VaultSession {
 
     /// Rewrites the encrypted copy of the database under a different key,
     /// for rotation: without it the silo opens once more and then never
-    /// again, because the shadow backup stays under the old key and the
-    /// working copy is wiped at lock. Written to one side and moved into
-    /// place by the caller, next to the key changeover.
+    /// again once the working copy is gone, because the shadow backup stays
+    /// under the old key. Written to one side and moved into place by the
+    /// caller, next to the key changeover.
     ///
-    /// Also seals the working copy's page key under the new key, so a crash
-    /// after the changeover still adopts the working copy.
+    /// Also seals the working copy's page key under the new key and records
+    /// the staged snapshot's fingerprint, so after the changeover the next
+    /// unlock still reuses the working copy.
     pub fn stage_local_backup(&self, dek: &MasterDek, to: &Path) -> Result<(), VaultError> {
         let _ = self.flush_wal();
         if let Some(key) = read_page_key(&self.paths.db_key_path(), &self.dek) {
             save_page_key(&self.paths.db_key_staged_path(), &key, dek)?;
         }
         let image = export_image(&self.conn)?;
-        encrypt_vault_bytes(&image, to, dek)
+        let sealed = encrypt_vault_bytes(&image, to, dek)?;
+        record_fingerprint(&self.conn, STATE_STAGED, &sealed)
     }
 
     /// Seals the current state into `vault.db.enc` and its shadow copy.
@@ -369,30 +379,42 @@ impl VaultSession {
                 "the silo's key changed since this session opened".into(),
             ));
         }
-        let _ = self.flush_wal();
-        let image = export_image(&self.conn)?;
-        encrypt_vault_bytes(&image, &self.paths.db_enc_path(), &self.dek)?;
-        std::fs::copy(self.paths.db_enc_path(), self.paths.db_enc_backup_path())?;
-        Ok(())
+        self.write_snapshot().map(|_| ())
     }
 
-    /// Writes the snapshot before lock. The caller drops the `Connection`
-    /// and then wipes the working copy: Windows won't delete an open file.
+    /// Seals the snapshot, then records its fingerprint in the working copy.
+    /// After the image was taken, so the copy holds the snapshot or more.
+    fn write_snapshot(&self) -> Result<Fingerprint, VaultError> {
+        let _ = self.flush_wal();
+        let image = export_image(&self.conn)?;
+        let sealed = encrypt_vault_bytes(&image, &self.paths.db_enc_path(), &self.dek)?;
+        std::fs::copy(self.paths.db_enc_path(), self.paths.db_enc_backup_path())?;
+        record_fingerprint(&self.conn, STATE_SNAPSHOT, &sealed)?;
+        Ok(sealed)
+    }
+
+    /// Writes the snapshot before lock and marks the working copy as exactly
+    /// that snapshot, folded into one file, so the next unlock reuses it as
+    /// it stands. The caller drops the `Connection` and then calls
+    /// [`wipe_plaintext_working_copy`]. On an error the copy stays unmarked,
+    /// and the next unlock treats it as a session that never locked.
     pub fn seal_for_lock(&self) -> Result<(), VaultError> {
-        self.backup_locally()?;
-        Ok(())
+        let sealed = self.write_snapshot()?;
+        record_fingerprint(&self.conn, STATE_LOCKED, &sealed)?;
+        self.flush_wal()
     }
 }
 
-/// Removes everything this machine wrote for the silo while it was open.
-/// Call only after the `Connection` that owned the working copy is dropped.
+/// Removes everything readable this machine wrote for the silo while it was
+/// open: opened files and a plaintext copy an earlier release left. The
+/// ciphered working copy and its sealed key stay for the next unlock. Call
+/// only after the `Connection` is dropped.
 ///
-/// One call rather than a list of filenames: the scratch directory holds the
-/// working database, its journals, its sealed key and any file the user
-/// opened, and a wipe that knew about only some of those is how something
-/// survives a lock.
+/// An allowlist rather than a list of what to delete: anything in the
+/// scratch directory other than the ciphered copy goes, so a file some later
+/// feature writes there cannot survive a lock by being forgotten.
 pub fn wipe_plaintext_working_copy(paths: &VaultPaths) {
-    crate::workdir::wipe_work_dir(&paths.root);
+    crate::workdir::wipe_plaintext(&paths.root);
 }
 
 fn verify_integrity(conn: &Connection) -> Result<(), VaultError> {
@@ -408,7 +430,7 @@ fn verify_integrity(conn: &Connection) -> Result<(), VaultError> {
     }
 }
 
-/// Adopts the working copy a crash left behind, or builds a fresh one from
+/// Reuses the working copy a lock or a crash left, or builds a fresh one from
 /// the encrypted snapshot, falling back to the staged snapshot of an
 /// interrupted rotation and then to the shadow backup if the primary is
 /// missing, tampered, or under a different key.
@@ -418,14 +440,8 @@ fn verify_integrity(conn: &Connection) -> Result<(), VaultError> {
 fn open_database(paths: &VaultPaths, dek: &MasterDek) -> Result<Connection, VaultError> {
     paths.ensure_work_dir()?;
 
-    // A working copy on disk means the last session never locked, since
-    // locking wipes it. It holds everything written since the last
-    // snapshot, so a sound one is used as it stands: decrypting the
-    // snapshot over it silently discarded the crashed session's changes.
-    //
-    // A plaintext copy is always the newer of the two: this build removes
-    // it before writing a ciphered one, and an older release ignores the
-    // ciphered one.
+    // A plaintext copy is always the newest: this build removes it before
+    // writing a ciphered one, and an older release ignores the ciphered one.
     if is_plain_sqlite(&paths.legacy_db_path())
         && let Some(conn) = adopt_plaintext_working_copy(paths, dek)
     {
@@ -433,7 +449,7 @@ fn open_database(paths: &VaultPaths, dek: &MasterDek) -> Result<Connection, Vaul
     }
     if !paths.legacy_db_path().exists()
         && paths.db_path().is_file()
-        && let Some(conn) = adopt_surviving_working_copy(paths, dek)
+        && let Some(conn) = reuse_working_copy(paths, dek)
     {
         return Ok(conn);
     }
@@ -442,17 +458,20 @@ fn open_database(paths: &VaultPaths, dek: &MasterDek) -> Result<Connection, Vaul
     if !enc_path.is_file() {
         return Err(VaultError::NotFound);
     }
-    let image = match decrypt_vault_bytes(&enc_path, dek) {
-        Ok(image) => image,
-        Err(_) => adopt_staged_snapshot(paths, dek).or_else(|_| read_enc_backup(paths, dek))?,
+    let (image, source) = match decrypt_vault_bytes(&enc_path, dek) {
+        Ok(image) => (image, enc_path),
+        Err(_) => match adopt_staged_snapshot(paths, dek) {
+            Ok(image) => (image, enc_path),
+            Err(_) => (read_enc_backup(paths, dek)?, paths.db_enc_backup_path()),
+        },
     };
 
-    match write_working_copy(paths, &image, dek) {
+    match write_working_copy(paths, &image, &source, dek) {
         Ok(conn) => Ok(conn),
         Err(err) => {
             if paths.db_enc_backup_path().is_file() {
                 let image = read_enc_backup(paths, dek)?;
-                write_working_copy(paths, &image, dek)
+                write_working_copy(paths, &image, &paths.db_enc_backup_path(), dek)
             } else {
                 Err(err)
             }
@@ -476,24 +495,69 @@ fn working_copy_belongs_here(paths: &VaultPaths, working_copy_vault: Uuid) -> bo
     }
 }
 
-/// Opens the ciphered working copy a crash left, if its sealed key opens
-/// under this DEK and it is sound, and refreshes the encrypted snapshot
-/// from it so the durable artifact catches up with what the disk holds.
-/// The refresh is best-effort: if it fails, the working copy is still the
-/// session, and the next lock writes the snapshot again.
-fn adopt_surviving_working_copy(paths: &VaultPaths, dek: &MasterDek) -> Option<Connection> {
+/// Opens the ciphered working copy left on disk, if it still stands for the
+/// snapshot beside it.
+///
+/// It does when a fingerprint it recorded is the fingerprint of
+/// `vault.db.enc` as it is now: this copy wrote that snapshot, or was built
+/// from it, and has only moved forward since. Anything that replaced the
+/// snapshot (a rotation finished elsewhere, a repair, a restored backup, a
+/// session of another release, a different folder at this path) changes
+/// the fingerprint, and the copy is dropped for a fresh export. So is a copy
+/// whose page key this DEK does not open, one another silo left, and one
+/// that does not open.
+///
+/// A copy a lock marked is exactly the snapshot and is used as it stands.
+/// One not marked is a session that never locked: it may hold changes the
+/// snapshot lacks, so it is checked and the snapshot catches up from it.
+fn reuse_working_copy(paths: &VaultPaths, dek: &MasterDek) -> Option<Connection> {
+    // A DEK a rotation retired must not write a snapshot over the new one.
+    if let Ok(sealed) = std::fs::read(crate::kek_store::kek_path(&paths.root))
+        && crate::kek_store::unwrap_kek_bytes(&sealed, dek).is_err()
+    {
+        return None;
+    }
     let key = load_page_key(paths, dek)?;
     let conn = open_ciphered(&paths.db_path(), &key).ok()?;
-    verify_integrity(&conn).ok()?;
+    // The first read: a wrong key or a damaged page fails here.
     let id = read_vault_id(&conn)?;
     if !working_copy_belongs_here(paths, id) {
         return None;
     }
+    let recorded = [
+        read_fingerprint(&conn, STATE_SNAPSHOT),
+        read_fingerprint(&conn, STATE_STAGED),
+    ];
+    let stands_for = |fp: Option<Fingerprint>| fp.is_some() && recorded.contains(&fp);
+    let current = file_fingerprint(&paths.db_enc_path());
+    if !stands_for(current) {
+        // A snapshot that no longer opens was damaged rather than replaced,
+        // and the shadow copy is what it was.
+        if !stands_for(file_fingerprint(&paths.db_enc_backup_path()))
+            || decrypt_vault_bytes(&paths.db_enc_path(), dek).is_ok()
+        {
+            return None;
+        }
+    }
+
+    if current.is_some() && read_fingerprint(&conn, STATE_LOCKED) == current {
+        // Cleared first, so a crash in this session is not taken for a lock.
+        // No quick_check: nothing wrote the file since the lock exported
+        // every table from it, and SQLCipher checks each page's HMAC on read.
+        conn.execute(
+            &format!("DELETE FROM {STATE_TABLE} WHERE key = ?1"),
+            [STATE_LOCKED],
+        )
+        .ok()?;
+        return Some(conn);
+    }
+
+    verify_integrity(&conn).ok()?;
     // Fold the crashed session's WAL into the main file first, so it does
     // not grow across sessions.
     let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
     if let Ok(image) = export_image(&conn) {
-        refresh_snapshot(paths, dek, &image);
+        refresh_snapshot(paths, dek, &image, Some(&conn));
     }
     Some(conn)
 }
@@ -515,17 +579,22 @@ fn adopt_plaintext_working_copy(paths: &VaultPaths, dek: &MasterDek) -> Option<C
         let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
         Zeroizing::new(conn.serialize(MAIN_DB).ok()?.to_vec())
     };
-    refresh_snapshot(paths, dek, &image);
-    write_working_copy(paths, &image, dek).ok()
+    refresh_snapshot(paths, dek, &image, None);
+    // The plaintext copy holds at least the snapshot, refreshed or not.
+    write_working_copy(paths, &image, &paths.db_enc_path(), dek).ok()
 }
 
-/// Seals a working copy's image as the snapshot and its shadow copy.
-fn refresh_snapshot(paths: &VaultPaths, dek: &MasterDek, image: &[u8]) {
-    if encrypt_vault_bytes(image, &paths.db_enc_path(), dek).is_ok() {
+/// Seals a working copy's image as the snapshot and its shadow copy, and
+/// records the fingerprint in `conn`, the copy the image came from.
+fn refresh_snapshot(paths: &VaultPaths, dek: &MasterDek, image: &[u8], conn: Option<&Connection>) {
+    if let Ok(sealed) = encrypt_vault_bytes(image, &paths.db_enc_path(), dek) {
         let _ = std::fs::copy(paths.db_enc_path(), paths.db_enc_backup_path());
         // A snapshot staged by an interrupted rotation is superseded: the
         // working copy postdates it.
         let _ = std::fs::remove_file(paths.db_enc_staged_path());
+        if let Some(conn) = conn {
+            let _ = record_fingerprint(conn, STATE_SNAPSHOT, &sealed);
+        }
     }
 }
 
@@ -647,11 +716,13 @@ fn create_working_copy(paths: &VaultPaths, dek: &MasterDek) -> Result<Connection
 }
 
 /// A ciphered working copy holding `image`, a plain SQLite file image,
-/// under a new page key. The image is exported from memory, so its
+/// under a new page key, recording the fingerprint of `source`, the sealed
+/// file the image came from. The image is exported from memory, so its
 /// plaintext never touches the disk.
 fn write_working_copy(
     paths: &VaultPaths,
     image: &[u8],
+    source: &Path,
     dek: &MasterDek,
 ) -> Result<Connection, VaultError> {
     paths.ensure_work_dir()?;
@@ -686,6 +757,9 @@ fn write_working_copy(
 
     let conn = open_ciphered(&path, &key)?;
     verify_integrity(&conn)?;
+    if let Some(fp) = file_fingerprint(source) {
+        record_fingerprint(&conn, STATE_SNAPSHOT, &fp)?;
+    }
     Ok(conn)
 }
 
@@ -715,12 +789,45 @@ fn export_image(conn: &Connection) -> Result<Zeroizing<Vec<u8>>, VaultError> {
     conn.execute_batch("ATTACH DATABASE ':memory:' AS plain KEY '';")?;
     let image = conn
         .query_row("SELECT sqlcipher_export('plain')", [], |_| Ok(()))
+        .and_then(|()| conn.execute_batch(&format!("DROP TABLE IF EXISTS plain.{STATE_TABLE};")))
         .and_then(|()| conn.serialize(c"plain"))
         .map(|data| Zeroizing::new(data.to_vec()));
     let detached = conn.execute_batch("DETACH DATABASE plain;");
     let image = image?;
     detached?;
     Ok(image)
+}
+
+/// BLAKE3 of a sealed snapshot's bytes. It names one snapshot: the
+/// envelope's nonce is random, so no other write produces the same bytes.
+type Fingerprint = [u8; 32];
+
+fn file_fingerprint(path: &Path) -> Option<Fingerprint> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = blake3::Hasher::new();
+    std::io::copy(&mut file, &mut hasher).ok()?;
+    Some(*hasher.finalize().as_bytes())
+}
+
+fn record_fingerprint(conn: &Connection, key: &str, fp: &Fingerprint) -> Result<(), VaultError> {
+    conn.execute_batch(&format!(
+        "CREATE TABLE IF NOT EXISTS {STATE_TABLE} (key TEXT PRIMARY KEY, value BLOB NOT NULL);"
+    ))?;
+    conn.execute(
+        &format!("INSERT OR REPLACE INTO {STATE_TABLE} (key, value) VALUES (?1, ?2)"),
+        rusqlite::params![key, &fp[..]],
+    )?;
+    Ok(())
+}
+
+fn read_fingerprint(conn: &Connection, key: &str) -> Option<Fingerprint> {
+    conn.query_row(
+        &format!("SELECT value FROM {STATE_TABLE} WHERE key = ?1"),
+        [key],
+        |row| row.get::<_, Vec<u8>>(0),
+    )
+    .ok()
+    .and_then(|v| v.try_into().ok())
 }
 
 fn read_vault_id(conn: &Connection) -> Option<Uuid> {
@@ -862,17 +969,15 @@ mod tests {
 
         assert!(session.paths.db_enc_backup_path().exists());
 
-        let paths = session.paths.clone();
         drop(session);
-        // A clean lock, so the reopen genuinely exercises the snapshot path
-        // rather than adopting a leftover working copy.
-        wipe_plaintext_working_copy(&paths);
+        // No copy kept, so the reopen genuinely exercises the snapshot path.
+        crate::workdir::wipe_work_dir(&root);
 
         // Opens: vault.db.enc decrypts into the working copy.
         let session2 = VaultSession::open_with_device_secret(root.clone(), secret).unwrap();
         assert_eq!(session2.vault_id, vault_id);
         drop(session2);
-        wipe_plaintext_working_copy(&paths);
+        crate::workdir::wipe_work_dir(&root);
 
         // Corrupt the encrypted-at-rest snapshot.
         std::fs::write(root.join(VAULT_DB_ENC), b"corrupted ciphertext junk").unwrap();
@@ -925,11 +1030,10 @@ mod tests {
             .unwrap();
         assert_eq!(marker, "late", "the crashed session's changes were lost");
 
-        // Adoption also refreshed the snapshot, so even a clean lock right
+        // Adoption also refreshed the snapshot, so even losing the copy right
         // now would carry the late change forward.
-        let paths = reopened.paths.clone();
         drop(reopened);
-        wipe_plaintext_working_copy(&paths);
+        crate::workdir::wipe_work_dir(&root);
         let from_snapshot = VaultSession::open_with_device_secret(root, secret).unwrap();
         let marker: String = from_snapshot
             .conn
@@ -1246,25 +1350,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn locking_removes_the_plaintext_copy() {
-        let dir = tempdir().unwrap();
-        let root = dir.path().to_path_buf();
-        let session =
-            VaultSession::provision(root.clone(), Uuid::new_v4(), "a-device-secret").unwrap();
-        let plaintext = session.paths.db_path();
-        assert!(plaintext.is_file());
-
-        let paths = session.paths.clone();
-        drop(session);
-        wipe_plaintext_working_copy(&paths);
-
-        assert!(
-            !plaintext.exists(),
-            "the working copy must not outlive the session"
-        );
-    }
-
     /// Every file in the working directory, as bytes.
     fn work_files(paths: &VaultPaths) -> Vec<(PathBuf, Vec<u8>)> {
         std::fs::read_dir(paths.work_dir())
@@ -1430,9 +1515,9 @@ mod tests {
         );
         assert!(paths.db_path().is_file());
 
-        // The snapshot caught up, so a clean lock keeps it.
+        // The snapshot caught up, so it holds the change without the copy.
         drop(reopened);
-        wipe_plaintext_working_copy(&paths);
+        crate::workdir::wipe_work_dir(&root);
         let again = VaultSession::open_with_device_secret(root, "secret").unwrap();
         assert_eq!(marker(&again.conn), "written by 1.4.0");
     }
@@ -1469,7 +1554,13 @@ mod tests {
         let old_dek = session.dek.clone();
         drop(session);
 
+        let snapshot = std::fs::read(paths.db_enc_path()).unwrap();
         assert!(VaultSession::open_with_dek(root.clone(), old_dek).is_err());
+        assert_eq!(
+            std::fs::read(paths.db_enc_path()).unwrap(),
+            snapshot,
+            "a retired key wrote the snapshot"
+        );
         let reopened = VaultSession::open_with_dek(root.clone(), new_dek.clone()).unwrap();
         assert_eq!(marker(&reopened.conn), "after");
         assert!(
@@ -1512,5 +1603,266 @@ mod tests {
 
         let reopened = VaultSession::open_with_dek(root, new_dek).unwrap();
         assert_eq!(marker(&reopened.conn), "kept");
+    }
+
+    /// Snapshots, drops the connection and clears plaintext, as a lock does.
+    fn lock(session: VaultSession) -> VaultPaths {
+        session.seal_for_lock().unwrap();
+        let paths = session.paths.clone();
+        drop(session);
+        wipe_plaintext_working_copy(&paths);
+        paths
+    }
+
+    fn set_marker(session: &VaultSession, value: &str) {
+        session
+            .conn
+            .execute(
+                "UPDATE vault_meta SET value = ?1 WHERE key = 'marker'",
+                [value],
+            )
+            .unwrap();
+    }
+
+    /// A snapshot image an in-memory database opens: not marked as WAL.
+    fn plain_image(image: &[u8]) -> Vec<u8> {
+        let mut image = image.to_vec();
+        if image.len() >= 100 && image[18] == 2 {
+            image[18] = 1;
+            image[19] = 1;
+        }
+        image
+    }
+
+    /// The sealed page key changes whenever a working copy is exported fresh.
+    fn page_key_bytes(paths: &VaultPaths) -> Vec<u8> {
+        std::fs::read(paths.db_key_path()).unwrap()
+    }
+
+    /// After a lock only ciphertext is left: the copy in one file, its sealed
+    /// key, nothing opened, nothing plain.
+    #[test]
+    fn a_lock_leaves_only_the_ciphered_copy_and_its_key() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let name = "Locked-Silo-Marker-Payroll.xlsx";
+        let session = silo_with_marker(&root, "secret", "early");
+        session
+            .conn
+            .execute("INSERT INTO vault_meta VALUES ('file', ?1)", [name])
+            .unwrap();
+        let opened = session.paths.open_scratch_dir();
+        std::fs::create_dir_all(&opened).unwrap();
+        std::fs::write(opened.join(name), name).unwrap();
+        crate::workdir::seal_readonly(&opened.join(name));
+        std::fs::write(session.paths.legacy_db_path(), name).unwrap();
+
+        let paths = lock(session);
+
+        let mut names: Vec<String> = std::fs::read_dir(paths.work_dir())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["vault.key", "vault.sqlcipher"]);
+        for (path, bytes) in work_files(&paths) {
+            let shown = path.display();
+            assert!(!contains(&bytes, name.as_bytes()), "{shown} holds the name");
+            assert!(!contains(&bytes, b"vault_meta"), "{shown} holds the schema");
+            assert!(!bytes.starts_with(SQLITE_HEADER), "{shown} is plain SQLite");
+        }
+    }
+
+    /// The point of keeping the copy: an unlock after a lock opens it as it
+    /// stands, with no export and no new snapshot.
+    #[test]
+    fn an_unlock_after_a_lock_reuses_the_copy() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let session = silo_with_marker(&root, "secret", "kept");
+        let paths = lock(session);
+        let key = page_key_bytes(&paths);
+        let snapshot = std::fs::read(paths.db_enc_path()).unwrap();
+
+        let mut snapshot = snapshot;
+        for round in 0..3 {
+            let session = VaultSession::open_with_device_secret(root.clone(), "secret").unwrap();
+            assert_eq!(marker(&session.conn), "kept");
+            assert_eq!(page_key_bytes(&paths), key, "round {round} exported afresh");
+            assert_eq!(std::fs::read(paths.db_enc_path()).unwrap(), snapshot);
+            lock(session);
+            assert!(!paths.work_dir().join("vault.sqlcipher-wal").exists());
+            // Each lock writes a new snapshot, which the copy then stands for.
+            snapshot = std::fs::read(paths.db_enc_path()).unwrap();
+        }
+        // The copy was never replaced, and neither was its key.
+        assert_eq!(page_key_bytes(&paths), key);
+        let reopened = VaultSession::open_with_device_secret(root, "secret").unwrap();
+        assert_eq!(marker(&reopened.conn), "kept");
+        assert_eq!(page_key_bytes(&paths), key);
+    }
+
+    /// A snapshot replaced by anything but this copy: an older generation put
+    /// back, the same state sealed again (a repair, another release), a
+    /// rotation. The unlock shows the snapshot, never the stale copy.
+    #[test]
+    fn a_snapshot_replaced_elsewhere_is_exported_afresh() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let session = silo_with_marker(&root, "secret", "one");
+        let dek = session.dek.clone();
+        let paths = lock(session);
+        let first = std::fs::read(paths.db_enc_path()).unwrap();
+
+        let session = VaultSession::open_with_dek(root.clone(), dek.clone()).unwrap();
+        set_marker(&session, "two");
+        lock(session);
+
+        // An older snapshot put back, over the shadow copy too.
+        std::fs::write(paths.db_enc_path(), &first).unwrap();
+        std::fs::write(paths.db_enc_backup_path(), &first).unwrap();
+        let key = page_key_bytes(&paths);
+        let session = VaultSession::open_with_dek(root.clone(), dek.clone()).unwrap();
+        assert_eq!(marker(&session.conn), "one", "the stale copy was reused");
+        assert_ne!(page_key_bytes(&paths), key);
+        lock(session);
+
+        // The same state sealed again, as a repair or another release does.
+        let image = decrypt_vault_bytes(&paths.db_enc_path(), &dek).unwrap();
+        encrypt_vault_bytes(&image, &paths.db_enc_path(), &dek).unwrap();
+        let key = page_key_bytes(&paths);
+        let session = VaultSession::open_with_dek(root.clone(), dek.clone()).unwrap();
+        assert_eq!(marker(&session.conn), "one");
+        assert_ne!(
+            page_key_bytes(&paths),
+            key,
+            "a resealed snapshot was not noticed"
+        );
+        set_marker(&session, "three");
+        lock(session);
+
+        // A rotation finished without this copy: the snapshot under the new
+        // key holds something else.
+        let new_dek = generate_dek();
+        let kek = crate::kek_store::load_kek(&root, &dek).unwrap();
+        crate::rotation::stage_rotation(&root, &new_dek, &kek, &dek).unwrap();
+        crate::rotation::commit_rotation(&root).unwrap();
+        let rotated = {
+            let mut mem = Connection::open_in_memory().unwrap();
+            let image = plain_image(&decrypt_vault_bytes(&paths.db_enc_path(), &dek).unwrap());
+            mem.deserialize_read_exact(MAIN_DB, &image[..], image.len(), false)
+                .unwrap();
+            mem.execute(
+                "UPDATE vault_meta SET value = 'rotated' WHERE key = 'marker'",
+                [],
+            )
+            .unwrap();
+            Zeroizing::new(mem.serialize(MAIN_DB).unwrap().to_vec())
+        };
+        encrypt_vault_bytes(&rotated, &paths.db_enc_path(), &new_dek).unwrap();
+        std::fs::copy(paths.db_enc_path(), paths.db_enc_backup_path()).unwrap();
+        let session = VaultSession::open_with_dek(root, new_dek).unwrap();
+        assert_eq!(marker(&session.conn), "rotated");
+    }
+
+    /// A damaged snapshot is not a replaced one: the copy still stands for
+    /// the shadow copy and keeps its changes. A shadow copy of another
+    /// generation does not count.
+    #[test]
+    fn a_damaged_snapshot_keeps_the_copy_only_if_the_shadow_matches() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let session = silo_with_marker(&root, "secret", "one");
+        let dek = session.dek.clone();
+        let paths = lock(session);
+        let older_shadow = std::fs::read(paths.db_enc_backup_path()).unwrap();
+
+        let session = VaultSession::open_with_dek(root.clone(), dek.clone()).unwrap();
+        set_marker(&session, "two");
+        session.backup_locally().unwrap();
+        set_marker(&session, "unsaved");
+        drop(session);
+        std::fs::write(paths.db_enc_path(), b"damaged").unwrap();
+        let reopened = VaultSession::open_with_dek(root.clone(), dek.clone()).unwrap();
+        assert_eq!(marker(&reopened.conn), "unsaved");
+        drop(reopened);
+
+        std::fs::write(paths.db_enc_path(), b"damaged").unwrap();
+        std::fs::write(paths.db_enc_backup_path(), older_shadow).unwrap();
+        let reopened = VaultSession::open_with_dek(root, dek).unwrap();
+        assert_eq!(marker(&reopened.conn), "one");
+    }
+
+    /// A session opened from a kept copy that then crashes still keeps its
+    /// changes: the unlock cleared the lock's mark.
+    #[test]
+    fn a_crash_after_reusing_the_copy_keeps_the_changes() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let session = silo_with_marker(&root, "secret", "locked");
+        let paths = lock(session);
+
+        let session = VaultSession::open_with_device_secret(root.clone(), "secret").unwrap();
+        set_marker(&session, "after the unlock");
+        drop(session);
+
+        let reopened = VaultSession::open_with_device_secret(root.clone(), "secret").unwrap();
+        assert_eq!(marker(&reopened.conn), "after the unlock");
+        drop(reopened);
+        // Adoption refreshed the snapshot.
+        crate::workdir::wipe_work_dir(&paths.root);
+        let from_snapshot = VaultSession::open_with_device_secret(root, "secret").unwrap();
+        assert_eq!(marker(&from_snapshot.conn), "after the unlock");
+    }
+
+    /// A kept copy opens only through the DEK, and a failed unlock leaves it
+    /// as it was.
+    #[test]
+    fn a_kept_copy_needs_the_dek() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let session = silo_with_marker(&root, "secret", "kept");
+        let dek = session.dek.clone();
+        let paths = lock(session);
+        let copy = std::fs::read(paths.db_path()).unwrap();
+        let key = page_key_bytes(&paths);
+
+        assert!(VaultSession::open_with_dek(root.clone(), generate_dek()).is_err());
+        assert!(VaultSession::open_with_device_secret(root.clone(), "wrong").is_err());
+        assert!(read_page_key(&paths.db_key_path(), &generate_dek()).is_none());
+        assert_eq!(std::fs::read(paths.db_path()).unwrap(), copy);
+        assert_eq!(page_key_bytes(&paths), key);
+
+        let reopened = VaultSession::open_with_dek(root, dek).unwrap();
+        assert_eq!(marker(&reopened.conn), "kept");
+        assert_eq!(page_key_bytes(&paths), key);
+    }
+
+    /// The copy's bookkeeping never reaches a snapshot, which every release
+    /// reads.
+    #[test]
+    fn the_snapshot_image_carries_no_working_copy_state() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let session = silo_with_marker(&root, "secret", "one");
+        let dek = session.dek.clone();
+        let paths = lock(session);
+        let session = VaultSession::open_with_dek(root, dek.clone()).unwrap();
+        assert!(read_fingerprint(&session.conn, STATE_SNAPSHOT).is_some());
+        lock(session);
+
+        let image = plain_image(&decrypt_vault_bytes(&paths.db_enc_path(), &dek).unwrap());
+        let mut mem = Connection::open_in_memory().unwrap();
+        mem.deserialize_read_exact(MAIN_DB, &image[..], image.len(), false)
+            .unwrap();
+        let tables: i64 = mem
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = ?1",
+                [STATE_TABLE],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 0);
     }
 }

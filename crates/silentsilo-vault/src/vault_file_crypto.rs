@@ -18,11 +18,13 @@ use crate::error::VaultError;
 /// The envelope comes from `silentsilo_crypto::seal`, so this file carries
 /// the same magic and version byte as an operation record: one format to
 /// version, one place to change the algorithm.
+///
+/// Returns the BLAKE3 of the sealed bytes, which names this snapshot.
 pub fn encrypt_vault_bytes(
     plaintext: &[u8],
     enc_path: &Path,
     dek: &MasterDek,
-) -> Result<(), VaultError> {
+) -> Result<[u8; 32], VaultError> {
     let out = seal(plaintext, dek).map_err(|e| VaultError::Crypto(e.to_string()))?;
 
     // Written to a sibling and renamed, synced first: this file is what
@@ -30,7 +32,7 @@ pub fn encrypt_vault_bytes(
     // power cut as an empty snapshot. A scanner holding the old snapshot
     // open cannot fail the save; see `silentsilo_core::durable`.
     silentsilo_core::write_replacing(enc_path, &out, |at| std::fs::File::create(at))?;
-    Ok(())
+    Ok(*blake3::hash(&out).as_bytes())
 }
 
 /// Opens `enc_path` (written by [`encrypt_vault_bytes`]) into memory.

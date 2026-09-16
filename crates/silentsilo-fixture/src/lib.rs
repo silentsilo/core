@@ -16,8 +16,7 @@ use std::path::{Path, PathBuf};
 use silentsilo_core::CoreError;
 use silentsilo_store::{ObjectStore, StoreConfig};
 use silentsilo_vault::{
-    VaultPaths, VaultSession, load_recovery_envelope, save_recovery_envelope, unwrap_with_code,
-    wipe_plaintext_working_copy,
+    VaultSession, load_recovery_envelope, save_recovery_envelope, unwrap_with_code,
 };
 use silentsilo_vfs::{Vfs, all_ops, pending_ops, replay};
 use uuid::Uuid;
@@ -194,8 +193,8 @@ pub async fn digest_from_store(root: &Path, code: &str) -> Result<Vec<String>, S
 ///
 /// The store never enters the picture, which is the point. `digest_from_store`
 /// answers for the machine that is gone; this answers for the one that just
-/// updated, which is every existing user. Pass a copy: unlocking writes the
-/// plaintext working copy for this path.
+/// updated, which is every existing user. Pass a copy: unlocking writes a
+/// working copy for this path.
 pub fn digest_from_silo(silo: &Path, code: &str) -> Result<Vec<String>, String> {
     let envelope = load_recovery_envelope(silo).map_err(|e| e.to_string())?;
     let dek = unwrap_with_code(&envelope, code).map_err(|e| e.to_string())?;
@@ -203,10 +202,10 @@ pub fn digest_from_silo(silo: &Path, code: &str) -> Result<Vec<String>, String> 
         VaultSession::open_with_dek(silo.to_path_buf(), dek).map_err(|e| e.to_string())?;
     let lines = digest(&session.conn).map_err(|e| e.to_string())?;
     let root = session.paths.root.clone();
-    // The connection holds the plaintext copy open; Windows will not delete
-    // an open file.
+    // The connection holds the working copy open; Windows will not delete
+    // an open file. All of it goes: the copy is a throwaway.
     drop(session);
-    wipe_plaintext_working_copy(&VaultPaths::new(root));
+    silentsilo_vault::wipe_work_dir(&root);
     Ok(lines)
 }
 

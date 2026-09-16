@@ -15,17 +15,17 @@ above suggests.
 
 | Asset | Location | At rest |
 |-------|----------|---------|
-| File names, folder tree | `vault.db.enc` in the silo, plus the working copy `vault.sqlcipher` on the machine while unlocked or after a crash | AES-256-GCM; the working copy SQLCipher 4, per page |
+| File names, folder tree | `vault.db.enc` in the silo, plus the working copy `vault.sqlcipher` on the machine, kept across locks | AES-256-GCM; the working copy SQLCipher 4, per page |
 | File content | `.sslo` blobs under the vault directory | AES-256-GCM, chunked |
 | Master DEK | `master.dek.enc`, `keys/fido.json`, `keys/recovery.json` | Wrapped separately under each key that can produce it |
 | Security-key secret | Hardware token (any FIDO2 key with hmac-secret) | Never leaves the device |
 
 An attacker with the vault directory but no enrolled security key has
-ciphertext only. While the vault is unlocked, a working copy of the index
-exists on disk and is deleted on lock or exit. It is ciphered page by page
-under a random key that is itself sealed under the DEK, so a crash, a kill or
-a power cut that leaves it behind leaves nothing readable without the DEK. It
-lives outside the vault directory, under the machine's local application
+ciphertext only. A working copy of the index stays on disk across locks,
+so the next unlock reuses it instead of exporting a new one. It is ciphered
+page by page under a random key that is itself sealed under the DEK, so a
+lock, a crash, a kill or a power cut leaves nothing readable without the DEK.
+It lives outside the vault directory, under the machine's local application
 data, and so does the fallback file holding the device secret when the OS
 keyring will not take it. Neither travels with the folder. Files the user
 opens are decrypted there too, in the clear, until the lock or the next start
@@ -516,13 +516,14 @@ While a silo is open the database lives in a **working copy** on the machine, ou
 | `vault.key` | The page key, sealed under the DEK with the same envelope as `vault.db.enc` |
 | `vault.key.next` | The page key sealed under a rotation's new DEK, written with `vault.db.enc.next` |
 
-- **Unlock** decrypts `vault.db.enc` into memory, loads it into an in-memory database and exports it into a new ciphered working copy (`sqlcipher_export`).
-- **A snapshot** (lock, flush, rotation) exports the working copy into an attached in-memory plain database, serializes it and seals those bytes. The result is the same plain image as before, so every release reads it.
-- **After a crash** the next unlock opens `vault.key` (or `vault.key.next`) with the DEK and adopts the working copy with every change since the last snapshot. A wrong DEK opens neither, and leaves the files alone.
+- **A snapshot** (lock, flush, rotation) exports the working copy into an attached in-memory plain database, serializes it and seals those bytes. The result is the same plain image as before, so every release reads it. The copy then records the BLAKE3 of the sealed bytes in its own table, `working_copy_state`, which is dropped from the image first.
+- **A lock** writes the snapshot, marks the copy as exactly that snapshot, folds the WAL into the file and removes everything else in the work directory: opened files, a plaintext copy of an older release, anything not on the list of ciphered files. `vault.sqlcipher` and `vault.key` stay.
+- **Unlock** opens `vault.key` (or `vault.key.next`) with the DEK and reuses the copy when a fingerprint it recorded matches `vault.db.enc` on disk. A marked copy is used as it stands. An unmarked one never locked (a crash, a kill): it gets `PRAGMA quick_check` and the snapshot is rewritten from it, so the changes since the last snapshot are kept. With no copy, or one that does not match, does not open or belongs to another silo, unlock decrypts `vault.db.enc` into memory, loads it into an in-memory database and exports it into a new ciphered copy (`sqlcipher_export`) under a new page key. A wrong DEK opens nothing and leaves the files alone.
+- **A marked copy skips `quick_check`.** Nothing wrote it since the lock exported every table from it, and SQLCipher verifies each page's HMAC-SHA512 when it reads the page, so a changed or damaged page fails on first use rather than being read.
 - **A plaintext `vault.db`** left by a crash of a release before 1.5.0 is adopted once the way those releases did, snapshotted, and replaced by a ciphered copy.
 - **Downgrading** to a release before 1.5.0 is safe: those releases look only for `vault.db`, never see the ciphered copy, and open the snapshot. They lose only what a crashed newer session had not yet snapshotted. The ciphered copy is deliberately not called `vault.db`: an older release would decrypt the snapshot over a file of that name while a ciphered WAL still sits beside it, and nothing should depend on SQLite discarding that WAL.
 
-The page key and the SQLCipher pages add no persisted format: the files are local, transient and rebuilt from `vault.db.enc` whenever they do not open. Temporary tables and sorts are kept in memory (`temp_store=MEMORY`), so SQLite writes no plain temporary files either. What stays out of reach is process memory: the decrypted image, the in-memory databases and the page cache are plaintext while the silo is open, and SQLite frees its buffers without wiping them.
+The page key and the SQLCipher pages add no persisted format: the files are local, and rebuilt from `vault.db.enc` whenever they do not open or no longer match it. A kept copy gives someone with the disk what `vault.db.enc` gives them: pages under a random key that only the DEK unseals. With the DEK they read the same index, newer at most by what a crashed session wrote. The copy is deleted with the silo, not at lock. Temporary tables and sorts are kept in memory (`temp_store=MEMORY`), so SQLite writes no plain temporary files either. What stays out of reach is process memory: the decrypted image, the in-memory databases and the page cache are plaintext while the silo is open, and SQLite frees its buffers without wiping them.
 
 ### The password store
 
@@ -549,7 +550,7 @@ Code running as the user, while a silo is unlocked, can read this process's memo
 |---------|---------------|
 | Locking on workstation lock, disconnect and suspend | The common case: the user locks the screen and leaves, while the idle timer still has minutes to run |
 | Per-entry sealing of passwords | Reading credentials out of the database, in memory or in any copy of it, without also holding the KEK |
-| SQLCipher working copy, key sealed under the DEK | Reading names or structure out of a working copy a crash, a kill or a power cut left behind |
+| SQLCipher working copy, key sealed under the DEK | Reading names or structure out of the working copy a lock keeps, or one a crash, a kill or a power cut left behind |
 | Clipboard opt-out (`CanIncludeInClipboardHistory`, `ExcludeClipboardContentFromMonitorProcessing`) plus a 45-second clear | Copied passwords being retained by Clipboard History, which persists to disk, and by Cloud Clipboard, which syncs them off the machine |
 | `ProcessExtensionPointDisablePolicy` | AppInit_DLLs, `SetWindowsHookEx` and other injection paths the system performs on an attacker's behalf, needing no exploit |
 

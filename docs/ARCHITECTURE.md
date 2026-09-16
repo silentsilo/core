@@ -154,9 +154,12 @@ property:
   working copy `vault.sqlcipher` with its WAL, ciphered by SQLCipher under a
   random page key, that key sealed under the DEK as `vault.key` (and
   `vault.key.next` mid-rotation), and decrypted files the user opened
-  (`open/`). Wiped on lock; adopted on unlock after a crash, which needs the
-  DEK. Unlock and snapshots move the decrypted index through memory only
-  (CRYPTO.md, "Local metadata"). Beside it, kept across locks, the cache
+  (`open/`). A lock and the sweeps remove the plaintext and keep the ciphered
+  copy and its key (`workdir::KEPT_ACROSS_LOCKS`); the next unlock reuses the
+  copy while it still stands for `vault.db.enc`, and exports a fresh one
+  otherwise. Only removing the silo deletes the copy. Unlock and snapshots
+  move the decrypted index through memory only (CRYPTO.md, "Local
+  metadata"). Beside it, kept across locks, the cache
   directory: `cache.db` (blob bookkeeping) and `protected.db`. Nothing here
   may ever land in the silo folder.
 - **The bucket** (per target): `vault.json` (the only plaintext object, one
@@ -389,8 +392,23 @@ Read this before "fixing" any of it.
   anything named `vault.db`, with the ciphered WAL still beside it; under
   its own name the copy is never touched. The page key is sealed under the DEK on
   disk rather than held in memory because a key that dies with the process
-  takes a crashed session's changes with it. `stage_local_backup` seals it
+  takes the copy with it: a crashed session's changes, and the next unlock's
+  reuse. `stage_local_backup` seals it
   under the new DEK too, so a crash after a rotation commits still adopts.
+- **The working copy outlives the lock.** Exporting a 12 MB index into a
+  fresh SQLCipher copy took 600 ms of every unlock. Reuse is decided by
+  fingerprint, not by timestamps: each snapshot write records the BLAKE3 of
+  the sealed `vault.db.enc` in the copy (`working_copy_state`), after the
+  image was taken, so a recorded fingerprint always means "this copy holds
+  that snapshot or more". An unlock reuses the copy only when the file on
+  disk matches one (a rotation's staged `.next` included), or when the
+  snapshot is damaged and the shadow copy matches. Anything else that wrote
+  the snapshot (a rotation elsewhere, a repair, a restored file, another
+  release) gets a fresh export. A lock also records `locked`; a copy that has
+  it is used as is, with no `quick_check` (130 ms on 12 MB), because the lock
+  just read every table through SQLCipher's page HMACs. A copy without it
+  never locked, so it is checked and the snapshot catches up, as after a
+  crash. The table is dropped from every image, so no release sees it.
 - **Recovery codes map O→0, I/L→1, U→V on input.** Crockford's alphabet
   excludes those on output precisely because handwriting confuses them;
   strict parsing would reject correct codes.

@@ -1,5 +1,6 @@
 //! The working copy on this machine: what an installed 1.0.0 makes of what
-//! this build leaves, and what an unlock and a snapshot cost.
+//! this build leaves after a crash or a lock, and what an unlock and a
+//! snapshot cost.
 //!
 //! The benchmark is ignored by default: `cargo test -p silentsilo-fixture
 //! --release --test working_copy -- --ignored --nocapture`, sized by
@@ -11,6 +12,7 @@ use std::time::Instant;
 use silentsilo_vault::{VaultSession, wipe_plaintext_working_copy};
 use silentsilo_vault_v1_0_0 as vault_v1;
 use silentsilo_vfs::Vfs;
+use silentsilo_vfs_v1_0_0 as vfs_v1;
 use uuid::Uuid;
 
 fn add(vfs: &Vfs, name: &str) {
@@ -64,7 +66,7 @@ fn crashed_silo(dir: &Path, name_in_old_work_dir: &str) -> PathBuf {
             .is_file()
     );
     drop(session);
-    wipe_plaintext_working_copy(&paths);
+    silentsilo_vault::wipe_work_dir(&root);
     root
 }
 
@@ -83,6 +85,66 @@ fn after_a_crash_1_0_0_opens_the_silo_from_the_snapshot() {
     vault_v1::wipe_plaintext_working_copy(&paths);
 
     assert_eq!(names, vec!["snapshotted.pdf".to_string()]);
+}
+
+/// Downgrading after a lock: 1.0.0 opens the snapshot beside the kept copy,
+/// and the copy it never saw does not hide what 1.0.0 wrote from this build
+/// afterwards.
+#[test]
+fn after_a_lock_1_0_0_and_this_build_take_turns() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("silo");
+    let session = VaultSession::provision(root.clone(), Uuid::new_v4(), "secret").unwrap();
+    let vfs = Vfs::new(&session);
+    vfs.ensure_initialized().unwrap();
+    add(&vfs, "written by this build.pdf");
+    let paths = session.paths.clone();
+    session.seal_for_lock().unwrap();
+    drop(session);
+    wipe_plaintext_working_copy(&paths);
+    assert!(paths.db_path().is_file() && paths.db_key_path().is_file());
+
+    // On a real machine both builds share one work base: put the kept copy
+    // where 1.0.0 looks.
+    let old_work = vault_v1::work_dir_for(&root);
+    std::fs::create_dir_all(&old_work).unwrap();
+    for name in silentsilo_vault::KEPT_ACROSS_LOCKS {
+        let from = paths.work_dir().join(name);
+        if from.is_file() {
+            std::fs::copy(from, old_work.join(name)).unwrap();
+        }
+    }
+
+    let old = vault_v1::VaultSession::open_with_device_secret(root.clone(), "secret").unwrap();
+    assert_eq!(live_names(&old.conn), ["written by this build.pdf"]);
+    let old_vfs = vfs_v1::Vfs::new(&old);
+    let top = old_vfs.root_folder_id().unwrap();
+    old_vfs
+        .add_file(
+            top,
+            "written by 1.0.0.pdf",
+            Uuid::new_v4(),
+            1,
+            "hash",
+            None,
+            "key",
+        )
+        .unwrap();
+    old.seal_for_lock().unwrap();
+    let old_paths = old.paths.clone();
+    drop(old);
+    vault_v1::wipe_plaintext_working_copy(&old_paths);
+
+    let key = std::fs::read(paths.db_key_path()).unwrap();
+    let back = VaultSession::open_with_device_secret(root.clone(), "secret").unwrap();
+    assert_eq!(
+        live_names(&back.conn),
+        ["written by 1.0.0.pdf", "written by this build.pdf"],
+        "the kept copy hid what 1.0.0 wrote"
+    );
+    assert_ne!(std::fs::read(paths.db_key_path()).unwrap(), key);
+    drop(back);
+    silentsilo_vault::wipe_work_dir(&root);
 }
 
 #[test]
@@ -136,21 +198,29 @@ fn unlock_and_snapshot_benchmark() {
         .len();
     let paths = session.paths.clone();
     drop(session);
-    wipe_plaintext_working_copy(&paths);
+    silentsilo_vault::wipe_work_dir(&root);
 
     let started = Instant::now();
     let reopened = VaultSession::open_with_dek(root.clone(), dek.clone()).unwrap();
     let unlock = started.elapsed();
+    reopened.seal_for_lock().unwrap();
     drop(reopened);
+    wipe_plaintext_working_copy(&paths);
+
+    // After a lock: the kept copy is reused as it stands.
+    let started = Instant::now();
+    let reused = VaultSession::open_with_dek(root.clone(), dek.clone()).unwrap();
+    let reuse = started.elapsed();
+    drop(reused);
 
     // A crash: the working copy is left, the next unlock adopts it.
     let started = Instant::now();
-    let adopted = VaultSession::open_with_dek(root, dek).unwrap();
+    let adopted = VaultSession::open_with_dek(root.clone(), dek).unwrap();
     let adopt = started.elapsed();
     drop(adopted);
-    wipe_plaintext_working_copy(&paths);
+    silentsilo_vault::wipe_work_dir(&root);
 
     println!(
-        "{records} records, snapshot {snapshot_size} bytes: snapshot {snapshot:?}, unlock {unlock:?}, unlock adopting a crashed copy {adopt:?}"
+        "{records} records, snapshot {snapshot_size} bytes: snapshot {snapshot:?}, unlock with no copy {unlock:?}, unlock after a lock {reuse:?}, unlock adopting a crashed copy {adopt:?}"
     );
 }
