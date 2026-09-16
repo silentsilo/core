@@ -1592,7 +1592,7 @@ fn rescue_entry(
     Ok(())
 }
 
-fn was_purged(conn: &Connection, id: Uuid) -> CoreResult<bool> {
+pub(crate) fn was_purged(conn: &Connection, id: Uuid) -> CoreResult<bool> {
     conn.query_row(
         "SELECT 1 FROM purged_ids WHERE id = ?1",
         [id.to_string()],
@@ -1767,6 +1767,251 @@ fn rename_existing_entry(
 /// allows and normalises rather than rejects.
 fn prefix_chars(prefix: &str) -> i64 {
     prefix.chars().count() as i64 + 1
+}
+
+// ── Names a 1.0.0 device can apply ──────────────────────────────────
+//
+// 1.0.0 ranks a claim group `name`, `name (2)`, `name (3)` with no gaps, and
+// stops replaying for good at a record whose name its ranking gives to an
+// entry already called that. This build skips a suffix another entry asked
+// for outright. While no group in a folder needs a suffix some other group
+// asked for, both rankings agree. A record written here keeps it so: where
+// they would differ it asks for the name shown, and asking for a suffix some
+// group ranks onto moves that group's holders out first. Claims made at once
+// on two devices can still meet on 1.0.0; nothing written alone can.
+
+/// What to record for one claim: the name to ask for, and the renames to
+/// record first.
+pub(crate) struct ClaimPlan {
+    pub name: String,
+    pub pins: Vec<(Uuid, String)>,
+}
+
+/// `group_names` over a set of existing keys rather than the table.
+fn names_skipping(members: &[String], keys: &std::collections::HashSet<String>) -> Vec<String> {
+    let mut names = Vec::with_capacity(members.len());
+    let Some(first) = members.first() else {
+        return names;
+    };
+    names.push(first.clone());
+    let (stem, ext) = split_extension(first);
+    let mut suffix = 2usize;
+    for member in &members[1..] {
+        let (own_stem, own_ext) = split_extension(member);
+        loop {
+            let probe = crate::names::fold(&format!("{stem} ({suffix}){ext}"));
+            suffix += 1;
+            if !keys.contains(&probe) {
+                names.push(format!("{own_stem} ({}){own_ext}", suffix - 1));
+                break;
+            }
+        }
+    }
+    names
+}
+
+/// How to record `entry` (None for a new one) asking for `desired` in
+/// `scope_id`: the name to ask for, and the renames to record before it.
+/// Joining a group whose next suffix another group holds asks for the name
+/// shown here, which the entry then keeps. Asking outright for a suffix an
+/// existing group ranks onto renames the entries from that rank on, last
+/// first, each to a free suffix above its own.
+pub(crate) fn plan_claim_for_1_0_0(
+    conn: &Connection,
+    entry: Option<Uuid>,
+    scope_id: Uuid,
+    is_folder: bool,
+    desired: &str,
+) -> CoreResult<ClaimPlan> {
+    let db = |e: rusqlite::Error| CoreError::Database(e.to_string());
+    let desired = crate::names::sanitize(desired);
+    let entry = entry.map(|id| id.to_string());
+    let mut groups: std::collections::HashMap<String, Vec<(Uuid, String)>> =
+        std::collections::HashMap::new();
+    let mut stmt = conn
+        .prepare(
+            "SELECT entry_id, key, desired FROM name_claims
+              WHERE scope_id = ?1 AND is_folder = ?2
+              ORDER BY lamport, device_id, op_id",
+        )
+        .map_err(db)?;
+    let rows = stmt
+        .query_map(params![scope_id.to_string(), is_folder as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(db)?;
+    for row in rows {
+        let (id, key, wanted) = row.map_err(db)?;
+        if entry.as_deref() == Some(id.as_str()) {
+            continue;
+        }
+        groups
+            .entry(key)
+            .or_default()
+            .push((parse_uuid(&id)?, wanted));
+    }
+    let mut keys: std::collections::HashSet<String> = groups.keys().cloned().collect();
+    let key = crate::names::fold(&desired);
+
+    // Joining a group. Where 1.0.0 would rank the entry onto a suffix this
+    // build skips, the name shown is asked for outright. Otherwise the plain
+    // name: a suffix asked for outright meets any claim another device joins
+    // the group with meanwhile, which ranks onto the same suffix on 1.0.0.
+    if let Some(members) = groups.get(&key) {
+        let mut wanted: Vec<String> = members.iter().map(|(_, d)| d.clone()).collect();
+        wanted.push(desired.clone());
+        let shown = names_skipping(&wanted, &keys).pop().unwrap_or_default();
+        let (stem, ext) = split_extension(&desired);
+        let ranked = format!("{stem} ({}){ext}", members.len() + 1);
+        return Ok(ClaimPlan {
+            name: if shown == ranked { desired } else { shown },
+            pins: Vec::new(),
+        });
+    }
+
+    let mut pins = Vec::new();
+    let Some(base) = suffix_base(&key) else {
+        return Ok(ClaimPlan {
+            name: desired,
+            pins,
+        });
+    };
+    let Some(members) = groups.get(&base) else {
+        return Ok(ClaimPlan {
+            name: desired,
+            pins,
+        });
+    };
+    let (stem, ext) = split_extension(&members[0].1);
+    let probe = |suffix: usize| crate::names::fold(&format!("{stem} ({suffix}){ext}"));
+    let Some(taken) = (1..members.len()).find(|&rank| probe(rank + 1) == key) else {
+        return Ok(ClaimPlan {
+            name: desired,
+            pins,
+        });
+    };
+    // Counted with `entry` still in the group, which it is until its own
+    // record. Pinned last first, each gets a suffix above the one it has, so
+    // no rename is to the name 1.0.0 already shows (1.0.0 ignores those). An
+    // entry sliding onto the wanted suffix would be one, so it is pinned too.
+    keys.insert(key.clone());
+    let mut suffix = taken + 1;
+    for claim in claim_group(conn, scope_id, is_folder, &base)?
+        .into_iter()
+        .skip(taken)
+    {
+        loop {
+            suffix += 1;
+            if !keys.contains(&probe(suffix)) {
+                break;
+            }
+        }
+        let (own_stem, own_ext) = split_extension(&claim.desired);
+        pins.push((claim.entry_id, format!("{own_stem} ({suffix}){own_ext}")));
+    }
+    pins.reverse();
+    Ok(ClaimPlan {
+        name: desired,
+        pins,
+    })
+}
+
+/// Every conflict copy any version can have made of `file_ids`, copies of
+/// copies included, that is not among them. A purge here takes a file's
+/// copies with it; 1.0.0 deletes only the ids a purge names, and a copy it
+/// kept in a purged folder stops it for good. A copy's id derives from the
+/// edit it preserves, so naming one for each edit covers both versions.
+pub(crate) fn conflict_copy_ids(conn: &Connection, file_ids: &[Uuid]) -> CoreResult<Vec<Uuid>> {
+    let db = |e: rusqlite::Error| CoreError::Database(e.to_string());
+    let mut seen: std::collections::HashSet<Uuid> = file_ids.iter().copied().collect();
+    let mut queue: Vec<Uuid> = file_ids.to_vec();
+    let mut out = Vec::new();
+    let mut edits = conn
+        .prepare("SELECT op_id FROM content_versions WHERE file_id = ?1")
+        .map_err(db)?;
+    let mut kept = conn
+        .prepare("SELECT copy_id FROM conflict_copies WHERE file_id = ?1")
+        .map_err(db)?;
+    while let Some(file) = queue.pop() {
+        let mut found: Vec<Uuid> = Vec::new();
+        for op in edits
+            .query_map([file.to_string()], |row| row.get::<_, String>(0))
+            .map_err(db)?
+        {
+            if let Ok(op) = Uuid::parse_str(&op.map_err(db)?) {
+                found.push(Uuid::new_v5(&op, b"silentsilo-conflict-copy"));
+            }
+        }
+        for copy in kept
+            .query_map([file.to_string()], |row| row.get::<_, String>(0))
+            .map_err(db)?
+        {
+            found.push(parse_uuid(&copy.map_err(db)?)?);
+        }
+        for copy in found {
+            if seen.insert(copy) {
+                out.push(copy);
+                queue.push(copy);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The renames that bring 1.0.0's stored names back in line after a purge:
+/// 1.0.0 frees the claims without ranking what is left again, so the
+/// entries after a purged one keep their old suffix there until something
+/// claims in that group. Renaming a group's last entry to the name it asked
+/// for ranks it again, and changes nothing here. Read before the purge.
+pub(crate) fn touches_after_purge(
+    conn: &Connection,
+    folder_ids: &[Uuid],
+    file_ids: &[Uuid],
+) -> CoreResult<Vec<(Uuid, bool, String)>> {
+    let db = |e: rusqlite::Error| CoreError::Database(e.to_string());
+    let purged: std::collections::HashSet<Uuid> =
+        folder_ids.iter().chain(file_ids).copied().collect();
+    let mut seen: Vec<ClaimGroupKey> = Vec::new();
+    let mut out = Vec::new();
+    for id in folder_ids.iter().chain(file_ids) {
+        let Some(group) = current_group(conn, *id)? else {
+            continue;
+        };
+        if seen.contains(&group) || purged.contains(&group.scope_id) {
+            continue;
+        }
+        seen.push(group.clone());
+        let members = claim_group(conn, group.scope_id, group.is_folder, &group.key)?;
+        let Some(first) = members.iter().position(|c| purged.contains(&c.entry_id)) else {
+            continue;
+        };
+        let Some((last, claim)) = members
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, c)| !purged.contains(&c.entry_id))
+        else {
+            continue;
+        };
+        let table = if group.is_folder { "folders" } else { "files" };
+        let has_row = conn
+            .query_row(
+                &format!("SELECT 1 FROM {table} WHERE id = ?1"),
+                [claim.entry_id.to_string()],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(db)?
+            .is_some();
+        if last > first && has_row {
+            out.push((claim.entry_id, group.is_folder, claim.desired.clone()));
+        }
+    }
+    Ok(out)
 }
 
 /// Frees a name for later claimants. Called on permanent deletion only —

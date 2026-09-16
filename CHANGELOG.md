@@ -24,6 +24,28 @@ release notes should say.
   record: 32 seconds on a 50,000-record log. The rebuild now runs in one
   savepoint (about 9 seconds), and an interrupted rebuild leaves the previous
   tables to start over from.
+- A device on this build no longer writes, from what it holds, records that
+  stop a 1.0.0 device for good. A 1.0.0 device stopped replaying at a record
+  it could not apply and received nothing after it until it updated. The
+  causes, all changes 1.0.0 itself refuses:
+  - names. 1.0.0 ranks a name group `a.txt`, `a (2).txt`, `a (3).txt` with
+    no gaps, and this build skips a suffix another entry asked for outright.
+    Where the two would differ, a record joining the group asks for the name
+    shown (the entry keeps that suffix later). Asking outright for a suffix
+    some group ranks onto renames the entries holding it first. After a
+    purge, the last entry of each group it left gaps in is renamed to the
+    name it already asked for, because 1.0.0 does not rank the rest again.
+  - emptying the trash while a trashed folder still holds something
+    restored. What is live in a trashed folder is moved to the top of the
+    silo first, deepest first.
+  - a purge now names the conflict copies of the files it removes. This
+    build removed them without naming them, and 1.0.0 kept them, in folders
+    it then could not delete.
+
+  Two devices changing the same folder at once can still write records that
+  1.0.0 refuses together, as two 1.0.0 devices can.
+- `Vfs::ensure_folder_path` failed with "not found" when the folder id it
+  derives had been purged; it now takes a fresh id, as for a trashed row.
 
 ## [1.4.0] - The mobile client, and devices that agree
 

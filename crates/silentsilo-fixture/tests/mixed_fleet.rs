@@ -11,8 +11,12 @@
 //!
 //! - no pass fails, holds records back or finds an unreadable object, on
 //!   either version. The one exception is a 1.0.0 replay stopping at a
-//!   record 1.0.0 refuses the same way when the change is made on it
-//!   (`refused_by_1_0_0.rs`): that is printed with who wrote the record;
+//!   record 1.0.0 refuses the same way when the change is made on it, which
+//!   is printed with who wrote it. A record this build wrote may only be
+//!   refused because of what its author could not know: a change another
+//!   device made meanwhile, or a folder 1.0.0 derives differently from the
+//!   same records. Replayed into a fresh 1.0.0 database with only what its
+//!   author held, it must apply (`refused_by_1_0_0.rs`);
 //! - the devices on this build agree exactly;
 //! - nothing added is gone from them unless it was deleted for good;
 //! - every file any device shows opens, with the bytes that were added,
@@ -27,8 +31,9 @@
 //! Every pass sweeps storage for unreferenced content, where the apps sweep
 //! once a day: the window a sweep could delete something in is the point.
 //!
-//! `SILENTSILO_MIXED_SEED` replays one seed, `SILENTSILO_MIXED_TRACE` prints
-//! what each device does as it goes.
+//! `SILENTSILO_MIXED_SEED` replays one seed, `SILENTSILO_MIXED_SEEDS=1..100`
+//! runs a range, `SILENTSILO_MIXED_TRACE` prints what each device does as it
+//! goes.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -713,6 +718,19 @@ fn picture(device: &Device) -> (BTreeSet<String>, BTreeSet<String>, BTreeSet<Str
 
 // ── What was done, for judging what may be gone ─────────────────────
 
+/// Why a 1.0.0 device refused a record this build wrote.
+enum Verdict {
+    /// Refused given only what its author held: a defect here.
+    Ours(String),
+    /// Applied given what its author held; another device's change it had
+    /// not seen made the difference.
+    Concurrent,
+    /// 1.0.0 derives the folder differently from what its author held.
+    Diverged(String),
+    /// What the author held is not known, or 1.0.0 stops earlier.
+    Unknown,
+}
+
 #[derive(Default)]
 struct Ledger {
     /// Content added, by hash, with its bytes.
@@ -732,8 +750,17 @@ struct Ledger {
     /// this build.
     updated_from: HashMap<Uuid, u64>,
     /// Records a 1.0.0 device could not apply, by author and position, with
-    /// whether this build wrote them.
-    refused: std::collections::BTreeMap<(Uuid, u64), (bool, String, String)>,
+    /// who wrote them.
+    refused: std::collections::BTreeMap<(Uuid, u64), (&'static str, String, String)>,
+    /// The silo, for a 1.0.0 database built from scratch.
+    vault_id: Uuid,
+    /// Every record a device on this build held, by id.
+    records: HashMap<Uuid, Vec<u8>>,
+    /// What a device on this build held when it wrote each record, by
+    /// author and position.
+    knew: HashMap<(Uuid, u64), std::sync::Arc<HashSet<Uuid>>>,
+    /// Where each device's chain stood after its last change.
+    tips: HashMap<Uuid, u64>,
 }
 
 impl Ledger {
@@ -754,7 +781,134 @@ impl Ledger {
         }
     }
 
-    /// Checks a pass, keeping what a 1.0.0 device refused.
+    /// Notes what a device on this build held after it changed something,
+    /// as what it knew when writing each record it just wrote.
+    fn learn(&mut self, device: &Device) {
+        if device.is_old() {
+            return;
+        }
+        let (me, tip) = device.with_conn(|conn| {
+            let me = silentsilo_vfs::device_id(conn).unwrap();
+            (me, silentsilo_vfs::chain_tip(conn, me).unwrap().0)
+        });
+        let from = self.tips.insert(me, tip).unwrap_or(0);
+        if from == tip {
+            return;
+        }
+        let records = device.with_conn(|conn| silentsilo_vfs::all_ops(conn).unwrap());
+        let mut ids = HashSet::new();
+        for record in records {
+            ids.insert(record.op_id);
+            self.records
+                .entry(record.op_id)
+                .or_insert_with(|| record.to_bytes().unwrap());
+        }
+        let ids = std::sync::Arc::new(ids);
+        for seq in from..tip {
+            self.knew.insert((me, seq), ids.clone());
+        }
+    }
+
+    /// Replays what `author` held when it wrote its record `seq` into a fresh
+    /// 1.0.0 database and one on this build, then applies that record on
+    /// 1.0.0.
+    fn judge(&self, author: Uuid, seq: u64) -> Verdict {
+        use silentsilo_vfs::{OpBody, VaultOp};
+        let Some(knew) = self.knew.get(&(author, seq)) else {
+            return Verdict::Unknown;
+        };
+        let mut records: Vec<silentsilo_vfs::OpRecord> = knew
+            .iter()
+            .filter_map(|id| self.records.get(id))
+            .map(|bytes| silentsilo_vfs::OpRecord::from_bytes(bytes).unwrap())
+            .filter(|r| r.device_id != author || r.seq <= seq)
+            .collect();
+        records.sort_by_key(|r| r.sort_key());
+        let Some(refused) = records.pop() else {
+            return Verdict::Unknown;
+        };
+        let db = || {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+            conn
+        };
+        let (old, new) = (db(), db());
+        vfs_v1::init_schema(&old, self.vault_id).unwrap();
+        silentsilo_vfs::init_schema(&new, self.vault_id).unwrap();
+        silentsilo_vfs::replay(&new, records.clone()).unwrap();
+        for record in &records {
+            let record = vfs_v1::OpRecord::from_bytes(&record.to_bytes().unwrap()).unwrap();
+            if vfs_v1::apply_op(&old, &record).is_err() {
+                // An earlier record of this build: judged from what its own
+                // author held.
+                let ours = self
+                    .updated_from
+                    .get(&record.device_id)
+                    .is_some_and(|from| record.seq >= *from);
+                return if ours {
+                    self.judge(record.device_id, record.seq)
+                } else {
+                    Verdict::Unknown
+                };
+            }
+        }
+        // The folders the record names or claims in, as the author saw them.
+        let parent = |sql: &str, id: Uuid| -> Vec<String> {
+            new.query_row(sql, [id.to_string()], |r| r.get::<_, Option<String>>(0))
+                .ok()
+                .flatten()
+                .into_iter()
+                .collect()
+        };
+        let scopes: Vec<String> = match &refused.op {
+            OpBody::Known(VaultOp::AddFile { folder_id, .. }) => vec![folder_id.to_string()],
+            OpBody::Known(VaultOp::CreateFolder { parent_id, .. }) => vec![parent_id.to_string()],
+            OpBody::Known(VaultOp::RenameFile { id, .. }) => {
+                parent("SELECT folder_id FROM files WHERE id = ?1", *id)
+            }
+            OpBody::Known(VaultOp::RenameFolder { id, .. }) => {
+                parent("SELECT parent_id FROM folders WHERE id = ?1", *id)
+            }
+            OpBody::Known(VaultOp::Purge { folder_ids, .. }) => {
+                folder_ids.iter().map(Uuid::to_string).collect()
+            }
+            _ => Vec::new(),
+        };
+        let rows = |conn: &Connection| -> BTreeSet<String> {
+            let mut out = BTreeSet::new();
+            for scope in &scopes {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT 'folder ' || id || ' ' || name FROM folders WHERE parent_id = ?1
+                         UNION ALL SELECT 'file ' || id || ' ' || name FROM files WHERE folder_id = ?1",
+                    )
+                    .unwrap();
+                out.extend(
+                    stmt.query_map([scope], |r| r.get::<_, String>(0))
+                        .unwrap()
+                        .map(Result::unwrap),
+                );
+            }
+            out
+        };
+        let (on_old, here) = (rows(&old), rows(&new));
+        if on_old != here {
+            return Verdict::Diverged(format!(
+                "only on 1.0.0 {:?}, only here {:?}",
+                on_old.difference(&here).collect::<Vec<_>>(),
+                here.difference(&on_old).collect::<Vec<_>>()
+            ));
+        }
+        let refused = vfs_v1::OpRecord::from_bytes(&refused.to_bytes().unwrap()).unwrap();
+        match vfs_v1::apply_op(&old, &refused) {
+            Err(e) => Verdict::Ours(format!("{e}: {:?}", refused.op)),
+            Ok(_) => Verdict::Concurrent,
+        }
+    }
+
+    /// Checks a pass, keeping what a 1.0.0 device refused. A record this
+    /// build wrote that 1.0.0 refuses given only what its author held fails
+    /// the run.
     fn check(&mut self, pass: Pass, context: &str) {
         assert!(
             pass.unreadable.is_empty()
@@ -768,9 +922,31 @@ impl Ledger {
                 .updated_from
                 .get(&refusal.author)
                 .is_some_and(|from| refusal.seq >= *from);
+            // Two devices writing at once can each write what 1.0.0 applies
+            // alone and refuses together, whichever version wrote them, and
+            // 1.0.0 derives some trees differently from the same records.
+            // What this build wrote from a tree 1.0.0 derives alike must
+            // apply there.
+            let author = match by_this_build.then(|| self.judge(refusal.author, refusal.seq)) {
+                None => "1.0.0",
+                Some(Verdict::Ours(own)) => {
+                    panic!(
+                        "{context}: 1.0.0 refuses a record this build wrote from what it held: {own}
+  on the 1.0.0 device: {refusal:?}"
+                    )
+                }
+                Some(Verdict::Concurrent) => "this build, beside a change it had not seen,",
+                Some(Verdict::Diverged(how)) => {
+                    self.note(format!(
+                        "  1.0.0 derives the author's tree differently: {how}"
+                    ));
+                    "this build, into a tree 1.0.0 derives differently,"
+                }
+                Some(Verdict::Unknown) => "this build, after a record 1.0.0 refuses,",
+            };
             self.refused
                 .entry((refusal.author, refusal.seq))
-                .or_insert((by_this_build, refusal.error, refusal.op));
+                .or_insert((author, refusal.error, refusal.op));
         }
     }
 
@@ -1005,7 +1181,7 @@ struct OldDivergence {
     /// Content this build keeps that the 1.0.0 device does not show.
     content_missing: usize,
     /// Records 1.0.0 could not apply: (written by this build, error, op).
-    refused: Vec<(bool, String, String)>,
+    refused: Vec<(&'static str, String, String)>,
 }
 
 async fn run(seed: u64, before: usize, after: usize) -> OldDivergence {
@@ -1019,7 +1195,10 @@ async fn run(seed: u64, before: usize, after: usize) -> OldDivergence {
     for _ in 0..2 {
         devices.push(Device::old(vault_id, Some(keys), storage.path()));
     }
-    let mut ledger = Ledger::default();
+    let mut ledger = Ledger {
+        vault_id,
+        ..Ledger::default()
+    };
     settle(&devices, seed, &mut ledger).await;
     for (i, d) in devices.iter().enumerate() {
         let id = d.with_conn(|conn| vfs_v1::device_id(conn).unwrap());
@@ -1041,8 +1220,14 @@ async fn run(seed: u64, before: usize, after: usize) -> OldDivergence {
     }
     ledger.note("devices 1 and 2 updated".into());
 
+    for d in &devices {
+        ledger.learn(d);
+    }
     for step in before..before + after {
         act(&devices, &mut rng, &mut ledger, step).await;
+        for d in &devices {
+            ledger.learn(d);
+        }
     }
     settle(&devices, seed, &mut ledger).await;
 
@@ -1132,8 +1317,14 @@ async fn run(seed: u64, before: usize, after: usize) -> OldDivergence {
 }
 
 fn seeds(default: std::ops::Range<u64>) -> Vec<u64> {
-    match std::env::var("SILENTSILO_MIXED_SEED") {
-        Ok(seed) => vec![seed.parse().expect("a number")],
+    if let Ok(seed) = std::env::var("SILENTSILO_MIXED_SEED") {
+        return vec![seed.parse().expect("a number")];
+    }
+    match std::env::var("SILENTSILO_MIXED_SEEDS") {
+        Ok(range) => {
+            let (from, to) = range.split_once("..").expect("a range like 1..100");
+            (from.parse().expect("a number")..to.parse().expect("a number")).collect()
+        }
         Err(_) => default.collect(),
     }
 }
@@ -1147,12 +1338,7 @@ async fn a_1_0_0_device_beside_updated_ones_loses_nothing_and_breaks_nothing() {
             "seed {seed}: the 1.0.0 device differs in {} rows and lacks {} contents this build keeps",
             old.rows, old.content_missing
         );
-        for (by_this_build, error, op) in &old.refused {
-            let author = if *by_this_build {
-                "this build"
-            } else {
-                "1.0.0"
-            };
+        for (author, error, op) in &old.refused {
             println!("seed {seed}: 1.0.0 refused a record {author} wrote: {error}\n  {op}");
         }
     }

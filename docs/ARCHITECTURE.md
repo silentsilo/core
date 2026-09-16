@@ -326,6 +326,22 @@ Read this before "fixing" any of it.
 - **A large purge is several records.** Readers refuse records over their
   size ceiling, so a purge is split files first, then folders deepest first,
   and each record stands on its own for a 1.0.0 reader.
+- **This build writes nothing a 1.0.0 device refuses from what it holds.**
+  A 1.0.0 replay stops for good at a record it cannot apply, so the `Vfs`
+  authors around 1.0.0's rules with records every version applies
+  (`oplog::plan_claim_for_1_0_0`, `touches_after_purge`,
+  `conflict_copy_ids`). 1.0.0 ranks name groups with no gaps; while no group
+  needs a suffix another group asked for, both rankings agree, so a record
+  joining a group asks for the name shown where they would not, and asking
+  for a taken suffix renames its holders first. Emptying the trash moves
+  live entries out of trashed folders before the purge, a purge names the
+  conflict copies it takes along, and the last entry of each group a purge
+  left gaps in is renamed to the name it already asked for, because 1.0.0
+  does not rank a group again on purge. The extra renames look redundant
+  here and are not. Changes made at once on two devices can still meet on
+  1.0.0. `silentsilo-fixture/tests/refused_by_1_0_0.rs` replays random
+  histories into a 1.0.0 database; `mixed_fleet.rs` fails when 1.0.0
+  refuses a record this build wrote given only what its author held.
 - **Seeding size-skips only `blobs/`.** Everything else is rewritten in
   place at identical length by rotation, so "same key, same size" would
   skip the one write that matters.

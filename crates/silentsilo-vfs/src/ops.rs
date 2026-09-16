@@ -67,6 +67,49 @@ impl<'a> Vfs<'a> {
         &self.session.conn
     }
 
+    /// A transaction, unless the caller already holds one.
+    fn begin(&self) -> CoreResult<Option<rusqlite::Transaction<'_>>> {
+        if !self.conn().is_autocommit() {
+            return Ok(None);
+        }
+        self.conn()
+            .unchecked_transaction()
+            .map(Some)
+            .map_err(|e| CoreError::Database(e.to_string()))
+    }
+
+    fn commit(tx: Option<rusqlite::Transaction<'_>>) -> CoreResult<()> {
+        match tx {
+            Some(tx) => tx.commit().map_err(|e| CoreError::Database(e.to_string())),
+            None => Ok(()),
+        }
+    }
+
+    /// The name to record for a claim, after recording the renames a 1.0.0
+    /// device needs first. See `oplog::plan_claim_for_1_0_0`. The caller
+    /// holds a transaction.
+    fn claim_for_1_0_0(
+        &self,
+        entry: Option<Uuid>,
+        scope_id: Uuid,
+        is_folder: bool,
+        name: &str,
+    ) -> CoreResult<String> {
+        let plan =
+            crate::oplog::plan_claim_for_1_0_0(self.conn(), entry, scope_id, is_folder, name)?;
+        for (id, name) in plan.pins {
+            crate::oplog::emit(
+                self.conn(),
+                if is_folder {
+                    crate::oplog::VaultOp::RenameFolder { id, name }
+                } else {
+                    crate::oplog::VaultOp::RenameFile { id, name }
+                },
+            )?;
+        }
+        Ok(plan.name)
+    }
+
     pub fn ensure_initialized(&self) -> CoreResult<()> {
         init_schema(self.conn(), self.session.vault_id)
     }
@@ -201,15 +244,18 @@ impl<'a> Vfs<'a> {
         }
         drop(stmt);
 
-        let (_record, _outcome) = crate::oplog::emit(
+        let tx = self.begin()?;
+        let name = self.claim_for_1_0_0(None, parent_id, true, name)?;
+        crate::oplog::emit(
             self.conn(),
             crate::oplog::VaultOp::CreateFolder {
                 id,
                 parent_id,
-                name: name.to_string(),
+                name,
             },
         )?;
         bump_revision(self.conn()).map_err(|e| CoreError::Database(e.to_string()))?;
+        Self::commit(tx)?;
         self.get_folder(id)
     }
 
@@ -371,6 +417,7 @@ impl<'a> Vfs<'a> {
             .optional()
             .map_err(|e| CoreError::Database(e.to_string()))?;
 
+        let tx = self.begin()?;
         let op = match &existing_id {
             Some((raw, previous_blob)) => {
                 let id = Uuid::parse_str(raw).map_err(|e| CoreError::Database(e.to_string()))?;
@@ -390,7 +437,7 @@ impl<'a> Vfs<'a> {
             None => crate::oplog::VaultOp::AddFile {
                 id: Uuid::now_v7(),
                 folder_id,
-                name: name.to_string(),
+                name: self.claim_for_1_0_0(None, folder_id, false, name)?,
                 blob_id,
                 size_bytes,
                 content_hash: content_hash.to_string(),
@@ -407,6 +454,7 @@ impl<'a> Vfs<'a> {
 
         crate::oplog::emit(self.conn(), op)?;
         bump_revision(self.conn()).map_err(|e| CoreError::Database(e.to_string()))?;
+        Self::commit(tx)?;
         self.get_file(id)
     }
 
@@ -466,9 +514,11 @@ impl<'a> Vfs<'a> {
         for segment in segments {
             let name = crate::names::sanitize(segment);
             let derived = Uuid::new_v5(&folder.id, crate::names::fold(&name).as_bytes());
-            // A row with that id already, trashed most likely: a record
-            // for it would be dropped as a duplicate, so a fresh id.
-            let id = if self.folder_row_exists(derived)? {
+            // A row with that id already, trashed most likely, or one purged:
+            // a record for it would be dropped, so a fresh id.
+            let id = if self.folder_row_exists(derived)?
+                || crate::oplog::was_purged(self.conn(), derived)?
+            {
                 Uuid::now_v7()
             } else {
                 derived
@@ -513,12 +563,14 @@ impl<'a> Vfs<'a> {
             return Ok(None);
         }
         let _folder = self.get_folder(folder_id)?;
+        let tx = self.begin()?;
+        let name = self.claim_for_1_0_0(None, folder_id, false, &crate::names::sanitize(name))?;
         crate::oplog::emit(
             self.conn(),
             crate::oplog::VaultOp::AddFile {
                 id,
                 folder_id,
-                name: crate::names::sanitize(name),
+                name,
                 blob_id,
                 size_bytes,
                 content_hash: content_hash.to_string(),
@@ -527,6 +579,7 @@ impl<'a> Vfs<'a> {
             },
         )?;
         bump_revision(self.conn()).map_err(|e| CoreError::Database(e.to_string()))?;
+        Self::commit(tx)?;
         self.get_file(id).map(Some)
     }
 
@@ -1125,14 +1178,19 @@ impl<'a> Vfs<'a> {
             return Ok(file);
         }
 
+        let tx = self.begin()?;
+        let name = self.claim_for_1_0_0(Some(file_id), file.folder_id, false, new_name)?;
+        // Already shown under that name: 1.0.0 would ignore the record.
+        if name == file.name {
+            Self::commit(tx)?;
+            return Ok(file);
+        }
         crate::oplog::emit(
             self.conn(),
-            crate::oplog::VaultOp::RenameFile {
-                id: file_id,
-                name: new_name.to_string(),
-            },
+            crate::oplog::VaultOp::RenameFile { id: file_id, name },
         )?;
         bump_revision(self.conn()).map_err(|e| CoreError::Database(e.to_string()))?;
+        Self::commit(tx)?;
         self.get_file(file_id)
     }
 
@@ -1146,15 +1204,25 @@ impl<'a> Vfs<'a> {
         if folder.name == *new_name {
             return Ok(folder);
         }
+        let Some(parent_id) = folder.parent_id else {
+            return Err(CoreError::InvalidPath("cannot rename root".into()));
+        };
 
+        let tx = self.begin()?;
+        let name = self.claim_for_1_0_0(Some(folder_id), parent_id, true, new_name)?;
+        if name == folder.name {
+            Self::commit(tx)?;
+            return Ok(folder);
+        }
         crate::oplog::emit(
             self.conn(),
             crate::oplog::VaultOp::RenameFolder {
                 id: folder_id,
-                name: new_name.to_string(),
+                name,
             },
         )?;
         bump_revision(self.conn()).map_err(|e| CoreError::Database(e.to_string()))?;
+        Self::commit(tx)?;
         self.get_folder(folder_id)
     }
 
@@ -1180,14 +1248,10 @@ impl<'a> Vfs<'a> {
             return Ok(file);
         }
         let _destination = self.get_folder(folder_id)?;
-        let tx = self
-            .conn()
-            .unchecked_transaction()
-            .map_err(|e| CoreError::Database(e.to_string()))?;
+        let tx = self.begin()?;
         let new_id = self.copy_file_row(file_id, folder_id)?;
         self.trash_file(file_id)?;
-        tx.commit()
-            .map_err(|e| CoreError::Database(e.to_string()))?;
+        Self::commit(tx)?;
         self.get_file(new_id)
     }
 
@@ -1213,7 +1277,7 @@ impl<'a> Vfs<'a> {
                 "a folder cannot move into itself".into(),
             ));
         }
-        let tx = self.conn().unchecked_transaction().map_err(db)?;
+        let tx = self.begin()?;
 
         // The live tree, parents before children.
         let subtree = crate::like::subtree(&folder.path);
@@ -1251,6 +1315,7 @@ impl<'a> Vfs<'a> {
                 parent
             };
             let new_id = Uuid::now_v7();
+            let name = self.claim_for_1_0_0(None, new_parent, true, &name)?;
             crate::oplog::emit(
                 self.conn(),
                 crate::oplog::VaultOp::CreateFolder {
@@ -1292,7 +1357,7 @@ impl<'a> Vfs<'a> {
 
         self.trash_folder(folder_id)?;
         bump_revision(self.conn()).map_err(|e| CoreError::Database(e.to_string()))?;
-        tx.commit().map_err(db)?;
+        Self::commit(tx)?;
         self.get_folder(mapped[&folder_id])
     }
 
@@ -1326,6 +1391,7 @@ impl<'a> Vfs<'a> {
             .map_err(|_| CoreError::NotFound(file_id.to_string()))?;
         let blob_key = self.blob_key(file_id)?;
         let new_id = Uuid::now_v7();
+        let name = self.claim_for_1_0_0(None, folder_id, false, &name)?;
         crate::oplog::emit(
             self.conn(),
             crate::oplog::VaultOp::AddFile {
@@ -1575,6 +1641,8 @@ impl<'a> Vfs<'a> {
     /// so the caller can also delete the corresponding blob objects (local
     /// cache and/or cloud) — this function only ever touches `vault.db`.
     pub fn empty_trash(&self) -> CoreResult<(u64, Vec<Uuid>)> {
+        let tx = self.begin()?;
+        self.move_out_of_trashed_folders()?;
         // The operation carries the exact ids being removed rather than
         // meaning "empty whatever is in the trash". Each device's trash may
         // differ at the moment this runs, and a self-referential operation
@@ -1584,12 +1652,59 @@ impl<'a> Vfs<'a> {
         let removed = (file_ids.len() + folder_ids.len()) as u64;
 
         if removed == 0 {
+            Self::commit(tx)?;
             return Ok((0, Vec::new()));
         }
 
         self.emit_purge(folder_ids, file_ids)?;
         bump_revision(self.conn()).map_err(|e| CoreError::Database(e.to_string()))?;
+        Self::commit(tx)?;
         Ok((removed, self.orphaned_by_purge(blob_ids)?))
+    }
+
+    /// Moves what is live inside a trashed folder to the top of the silo,
+    /// deepest first, before the trash is emptied. A purge of a folder that
+    /// still holds a row stops a 1.0.0 device for good; moves are records
+    /// every version applies, and the old rows go to the trash with the
+    /// folder.
+    fn move_out_of_trashed_folders(&self) -> CoreResult<()> {
+        let db = |e: rusqlite::Error| CoreError::Database(e.to_string());
+        let stranded: Vec<(String, bool, i64)> = self
+            .conn()
+            .prepare(
+                "SELECT c.id, 1, length(c.path) FROM folders c
+                   JOIN folders p ON p.id = c.parent_id
+                  WHERE c.deleted_at IS NULL AND p.deleted_at IS NOT NULL
+                 UNION ALL
+                 SELECT f.id, 0, length(d.path) + 1 FROM files f
+                   JOIN folders d ON d.id = f.folder_id
+                  WHERE f.deleted_at IS NULL AND d.deleted_at IS NOT NULL",
+            )
+            .map_err(db)?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .map_err(db)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db)?;
+        if stranded.is_empty() {
+            return Ok(());
+        }
+        let mut stranded = stranded;
+        stranded.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+        let root = self.root_folder_id()?;
+        for (id, is_folder, _) in stranded {
+            let id = parse_id(&id)?;
+            // Gone to the trash with a folder moved before it.
+            let moved = if is_folder {
+                self.move_folder(id, root).map(|_| ())
+            } else {
+                self.move_file(id, root).map(|_| ())
+            };
+            match moved {
+                Err(CoreError::NotFound(_)) => {}
+                other => other?,
+            }
+        }
+        Ok(())
     }
 
     /// Records a purge, in as many records as it takes to keep each one
@@ -1601,7 +1716,29 @@ impl<'a> Vfs<'a> {
     /// Files go first, then folders deepest first. Each record then stands
     /// on its own for a reader that deletes exactly the rows it names, as
     /// 1.0.0 does: no folder goes while something still points at it.
-    fn emit_purge(&self, folder_ids: Vec<Uuid>, file_ids: Vec<Uuid>) -> CoreResult<()> {
+    ///
+    /// Then the renames 1.0.0 needs to rank what the purge left behind
+    /// (`oplog::touches_after_purge`).
+    fn emit_purge(&self, folder_ids: Vec<Uuid>, mut file_ids: Vec<Uuid>) -> CoreResult<()> {
+        let tx = self.begin()?;
+        // Named, not implied: 1.0.0 keeps what a purge does not name.
+        file_ids.extend(crate::oplog::conflict_copy_ids(self.conn(), &file_ids)?);
+        let touches = crate::oplog::touches_after_purge(self.conn(), &folder_ids, &file_ids)?;
+        self.emit_purge_records(folder_ids, file_ids)?;
+        for (id, is_folder, name) in touches {
+            crate::oplog::emit(
+                self.conn(),
+                if is_folder {
+                    crate::oplog::VaultOp::RenameFolder { id, name }
+                } else {
+                    crate::oplog::VaultOp::RenameFile { id, name }
+                },
+            )?;
+        }
+        Self::commit(tx)
+    }
+
+    fn emit_purge_records(&self, folder_ids: Vec<Uuid>, file_ids: Vec<Uuid>) -> CoreResult<()> {
         if folder_ids.len() + file_ids.len() <= PURGE_IDS_PER_RECORD {
             crate::oplog::emit(
                 self.conn(),
@@ -1628,10 +1765,6 @@ impl<'a> Vfs<'a> {
         }
         folders.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
 
-        let tx = self
-            .conn()
-            .unchecked_transaction()
-            .map_err(|e| CoreError::Database(e.to_string()))?;
         for chunk in file_ids.chunks(PURGE_IDS_PER_RECORD) {
             crate::oplog::emit(
                 self.conn(),
@@ -1651,7 +1784,7 @@ impl<'a> Vfs<'a> {
                 },
             )?;
         }
-        tx.commit().map_err(|e| CoreError::Database(e.to_string()))
+        Ok(())
     }
 
     /// Of the blobs a purge released, the ones nothing points at any more.
