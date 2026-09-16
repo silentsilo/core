@@ -15,7 +15,7 @@ fn db(e: rusqlite::Error) -> CoreError {
 /// **Adding a `VaultOp` variant counts as a change and must bump this**:
 /// the rebuild it triggers is what applies records an earlier build stored
 /// but could not act on. See `oplog::rebuild_derived`.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 

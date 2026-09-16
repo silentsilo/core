@@ -340,13 +340,41 @@ Read this before "fixing" any of it.
   trash state from every trash and restore record (`trash_events`), a
   file's content and conflict copies from every edit (`content_versions`),
   password edits and renames guarded by total order (`password_order`, the
-  claim's own order), purged ids remembered (`purged_ids`).
+  claim's own order), purged ids remembered (`purged_ids`), and each purge
+  with its place in the order (`purges`).
   `tests/arrival_order.rs` applies records one at a time in random causal
   orders; `silentsilo-app/tests/fleet.rs` runs three devices on one storage.
 - **A purge never deletes what its author did not name.** Entries another
   device put in a purged folder meanwhile move to the top of the silo, as do
   entries a later record creates there (`purged_ids`). A rebuild writes this
   device's unpushed records again on top (`sync::apply_rebuild`).
+- **A purge keeps the edits its author could not have seen.** An edit to a
+  purged file made on a device that had not received the purge becomes a
+  file of its own at the top of the silo, named as a conflict copy of the
+  purged file and holding exactly that content; the purged file stays gone
+  (`settle_kept_edits`). What the author had seen: a purge this build writes
+  names, for each file, the conflict copy id of every content record it held
+  and a marker saying the list is complete (`purge_groups`, `purge_marker`),
+  one file's group never split across records. An edit it lists, or one a
+  listed edit was written on top of, was seen. A copy it does not list came
+  from an edit it never had, so every edit to that copy is unseen. A purge
+  without the marker, from an earlier build, is read by the order: its
+  author's clock was past every record it had received, so an edit from
+  another device at the purge's Lamport value or above was unseen, and one
+  below counts as seen. The purging device's own later edits count as seen.
+  Every unseen edit is kept, not only the newest, and one purge that missed
+  it is enough: the newest edit and the set of purges both change with
+  arrival, and a kept file that went away again would take later work on it
+  along. A conflict copy counts as purged with its file (`copy_origins`).
+  The purge leaves the file's `content_versions` in place and records what
+  it named in `purges`; the kept file's id derives from the file id and the
+  edit's op id (`kept_edit_id`), and its name follows the purged file's last
+  name (`purged_names`), so every arrival order and a rebuild give the same
+  file. Like `purged_ids`, none of this is in a snapshot: an edit arriving
+  after the purge was compacted goes with the file. A 1.0.0 device ignores
+  the markers and drops the edit; the kept file references the content, so
+  the sweep here keeps it and `restore_missing_blobs` puts back what a 1.0.0
+  sweep deleted.
 - **A large purge is several records.** Readers refuse records over their
   size ceiling, so a purge is split files first, then folders deepest first,
   and each record stands on its own for a 1.0.0 reader.
@@ -354,7 +382,7 @@ Read this before "fixing" any of it.
   A 1.0.0 replay stops for good at a record it cannot apply, so the `Vfs`
   authors around 1.0.0's rules with records every version applies
   (`oplog::plan_claim_for_1_0_0`, `touches_after_purge`,
-  `conflict_copy_ids`). 1.0.0 ranks name groups with no gaps; while no group
+  `purge_groups`). 1.0.0 ranks name groups with no gaps; while no group
   needs a suffix another group asked for, both rankings agree, so a record
   joining a group asks for the name shown where they would not, and asking
   for a taken suffix renames its holders first. Emptying the trash moves

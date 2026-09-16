@@ -1719,12 +1719,13 @@ impl<'a> Vfs<'a> {
     ///
     /// Then the renames 1.0.0 needs to rank what the purge left behind
     /// (`oplog::touches_after_purge`).
-    fn emit_purge(&self, folder_ids: Vec<Uuid>, mut file_ids: Vec<Uuid>) -> CoreResult<()> {
+    fn emit_purge(&self, folder_ids: Vec<Uuid>, file_ids: Vec<Uuid>) -> CoreResult<()> {
         let tx = self.begin()?;
-        // Named, not implied: 1.0.0 keeps what a purge does not name.
-        file_ids.extend(crate::oplog::conflict_copy_ids(self.conn(), &file_ids)?);
+        // Copies named, not implied: 1.0.0 keeps what a purge does not name.
+        let groups = crate::oplog::purge_groups(self.conn(), &file_ids)?;
+        let file_ids: Vec<Uuid> = groups.iter().flatten().copied().collect();
         let touches = crate::oplog::touches_after_purge(self.conn(), &folder_ids, &file_ids)?;
-        self.emit_purge_records(folder_ids, file_ids)?;
+        self.emit_purge_records(folder_ids, groups)?;
         for (id, is_folder, name) in touches {
             crate::oplog::emit(
                 self.conn(),
@@ -1738,7 +1739,8 @@ impl<'a> Vfs<'a> {
         Self::commit(tx)
     }
 
-    fn emit_purge_records(&self, folder_ids: Vec<Uuid>, file_ids: Vec<Uuid>) -> CoreResult<()> {
+    fn emit_purge_records(&self, folder_ids: Vec<Uuid>, groups: Vec<Vec<Uuid>>) -> CoreResult<()> {
+        let file_ids: Vec<Uuid> = groups.iter().flatten().copied().collect();
         if folder_ids.len() + file_ids.len() <= PURGE_IDS_PER_RECORD {
             crate::oplog::emit(
                 self.conn(),
@@ -1765,12 +1767,32 @@ impl<'a> Vfs<'a> {
         }
         folders.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
 
-        for chunk in file_ids.chunks(PURGE_IDS_PER_RECORD) {
+        // A file's group stays in one record, or its markers would claim a
+        // list the record does not hold. One too large for a record goes
+        // without them.
+        let mut chunks: Vec<Vec<Uuid>> = vec![Vec::new()];
+        for group in groups {
+            let group = if group.len() > PURGE_IDS_PER_RECORD {
+                let files = group.len() / 2;
+                group[..files].to_vec()
+            } else {
+                group
+            };
+            for id in group.chunks(PURGE_IDS_PER_RECORD) {
+                let last = chunks.last_mut().unwrap();
+                if last.len() + id.len() > PURGE_IDS_PER_RECORD {
+                    chunks.push(id.to_vec());
+                } else {
+                    last.extend_from_slice(id);
+                }
+            }
+        }
+        for chunk in chunks.into_iter().filter(|c| !c.is_empty()) {
             crate::oplog::emit(
                 self.conn(),
                 crate::oplog::VaultOp::Purge {
                     folder_ids: Vec::new(),
-                    file_ids: chunk.to_vec(),
+                    file_ids: chunk,
                 },
             )?;
         }

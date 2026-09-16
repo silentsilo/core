@@ -442,13 +442,17 @@ So a file edited three times and then deleted leaves two earlier versions
 behind. Someone who replaces a document to remove something from it, then
 deletes the file, has not removed what they thought they had.
 
+An edit another device made to the file before it received the purge is not
+removed either. It comes back as a new file at the top of the silo, because
+the device that purged never had it.
+
 The password store behaves the same way for a different reason: replacing a
 password writes a new operation record, and the previous value stays in the
 log. Records are never pruned today.
 
 | Action | Removed | Left behind |
 |--------|---------|-------------|
-| Purge a file | Its current blob | Blobs superseded by earlier content replacements |
+| Purge a file | Its current blob | Blobs superseded by earlier content replacements; an edit another device made before it received the purge, kept as a new file |
 | Change a password | Nothing | The previous value, in the operation log |
 | Revoke a security key | Its envelope | The DEK it wrapped, unchanged |
 | Disable the recovery code | Its envelope, locally and in storage | The DEK it wrapped, unchanged |

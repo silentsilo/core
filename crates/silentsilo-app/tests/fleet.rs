@@ -5,14 +5,16 @@
 //! - every device shows the same tree, the same trash and the same passwords;
 //! - no folder holds two entries whose names differ only in case;
 //! - every file on every device opens, with the bytes that were added;
-//! - nothing added is gone unless someone moved it to the trash, or trashed
-//!   or moved a folder it was in, and the trash was emptied after that;
+//! - nothing added is gone unless a device emptied a trash that held it, or
+//!   a later add over the same name replaced it. An edit the emptying device
+//!   had not received is kept, so its loss fails the run;
 //! - no pass failed, held records back or found an unreadable object.
 //!
 //! Against folder storage always, and against MinIO, WebDAV and SFTP when
 //! `scripts/test-local.ps1` (or CI) provides them. A failure prints its seed;
 //! `SILENTSILO_FLEET_SEED` replays that one run, device ids included: they
 //! break Lamport ties, so random ones made a seed fail on some runs only.
+//! `SILENTSILO_FLEET_SEED=1..300` runs a range instead.
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -231,8 +233,6 @@ struct Ledger {
     added: HashMap<String, Vec<u8>>,
     /// Step at which each hash first became something the trash could take.
     trashable_since: HashMap<String, usize>,
-    /// Steps at which some device emptied its trash.
-    emptied: Vec<usize>,
     /// Every folder each hash was put under, with that folder's ancestors
     /// on the device that put it there.
     lived_under: HashMap<String, HashSet<Uuid>>,
@@ -243,21 +243,10 @@ struct Ledger {
     /// Content a later add over the same name replaced in place: gone by
     /// design, not through the trash.
     replaced: HashSet<String>,
-    /// Content that sat in the trash of a device when that device emptied
-    /// it: the one way content may be gone for good.
+    /// Content a device removed by emptying its trash, conflict copies taken
+    /// along included: the one way content may be gone for good. Only what
+    /// that device held counts; an edit it had not received must survive.
     purged: HashSet<String>,
-    /// Files in the trash of a device when it emptied it. Another device
-    /// that had not received that yet can still write new content to one,
-    /// which goes with the purge: a file can enter a trash by landing in a
-    /// folder trashed elsewhere, so this is not known when it is trashed.
-    purged_files: HashSet<Uuid>,
-    /// Which file each content went into.
-    hash_file: HashMap<String, Uuid>,
-    /// First step at which a device sent each file to the trash, directly,
-    /// by trashing or moving a folder it was in, or by moving the file. An
-    /// edit another device makes to such a file lands on the trashed row,
-    /// and goes when that trash is emptied: by design, and known.
-    file_trashed_at: HashMap<Uuid, usize>,
 }
 
 impl Ledger {
@@ -272,22 +261,10 @@ impl Ledger {
             .extend(chain);
     }
 
-    /// Gone is allowed once the trash could hold it and was emptied after.
+    /// Gone is allowed for content replaced in place, or removed by a
+    /// device that held it when it emptied its trash.
     fn may_be_gone(&self, hash: &str) -> bool {
-        if self.replaced.contains(hash) || self.purged.contains(hash) {
-            return true;
-        }
-        if self
-            .hash_file
-            .get(hash)
-            .is_some_and(|file| self.purged_files.contains(file))
-        {
-            return true;
-        }
-        self.hash_file
-            .get(hash)
-            .and_then(|file| self.file_trashed_at.get(file))
-            .is_some_and(|since| self.emptied.iter().any(|at| at > since))
+        self.replaced.contains(hash) || self.purged.contains(hash)
     }
 }
 
@@ -310,31 +287,6 @@ fn chain(device: &Device, folder_id: Uuid) -> Vec<Uuid> {
 }
 
 /// Hashes of the files under a folder (itself included) on one device.
-/// Ids of the files under a folder (itself included) on one device.
-fn files_under(device: &Device, folder_id: Uuid) -> Vec<Uuid> {
-    device.with(|_vfs, conn| {
-        let Ok(path) = conn.query_row(
-            "SELECT path FROM folders WHERE id = ?1",
-            [folder_id.to_string()],
-            |r| r.get::<_, String>(0),
-        ) else {
-            return Vec::new();
-        };
-        let below = format!("{}/*", path.trim_end_matches('/'));
-        conn.prepare(
-            "SELECT f.id FROM files f JOIN folders d ON d.id = f.folder_id
-              WHERE d.id = ?1 OR d.path GLOB ?2",
-        )
-        .unwrap()
-        .query_map(rusqlite::params![folder_id.to_string(), below], |r| {
-            r.get::<_, String>(0)
-        })
-        .unwrap()
-        .map(|id| Uuid::parse_str(&id.unwrap()).unwrap())
-        .collect()
-    })
-}
-
 fn hashes_under(device: &Device, folder_id: Uuid) -> Vec<String> {
     device.with(|_vfs, conn| {
         let Ok(path) = conn.query_row(
@@ -451,7 +403,6 @@ async fn act(devices: &[Device], rng: &mut Rng, ledger: &mut Ledger, step: usize
                 None,
             ) && let Some(hash) = file.content_hash
             {
-                ledger.hash_file.insert(hash.clone(), file.id);
                 ledger.lives_under(&hash, chain(d, folder));
                 ledger.trace.push(format!(
                     "  added {hash} as {} id {} in {folder}",
@@ -475,7 +426,6 @@ async fn act(devices: &[Device], rng: &mut Rng, ledger: &mut Ledger, step: usize
                 rng.pick(&files_with(d, false)).cloned(),
                 rng.pick(&folders).copied(),
             ) {
-                ledger.file_trashed_at.entry(id).or_insert(step);
                 if let Some(hash) = hash {
                     ledger.lives_under(&hash, chain(d, to));
                     ledger.trashable(hash, step);
@@ -491,9 +441,6 @@ async fn act(devices: &[Device], rng: &mut Rng, ledger: &mut Ledger, step: usize
             if let (Some(id), Some(to)) = (rng.pick(&folders).copied(), rng.pick(&folders).copied())
             {
                 ledger.folder_trashed.entry(id).or_insert(step);
-                for file in files_under(d, id) {
-                    ledger.file_trashed_at.entry(file).or_insert(step);
-                }
                 let to_chain = chain(d, to);
                 for hash in hashes_under(d, id) {
                     ledger.lives_under(&hash, to_chain.clone());
@@ -507,7 +454,6 @@ async fn act(devices: &[Device], rng: &mut Rng, ledger: &mut Ledger, step: usize
         }
         14 => {
             if let Some((id, hash)) = rng.pick(&files_with(d, false)).cloned() {
-                ledger.file_trashed_at.entry(id).or_insert(step);
                 if let Some(hash) = hash {
                     ledger.trashable(hash, step);
                 }
@@ -518,9 +464,6 @@ async fn act(devices: &[Device], rng: &mut Rng, ledger: &mut Ledger, step: usize
         15 => {
             if let Some(id) = rng.pick(&live_folders(d)).copied() {
                 ledger.folder_trashed.entry(id).or_insert(step);
-                for file in files_under(d, id) {
-                    ledger.file_trashed_at.entry(file).or_insert(step);
-                }
                 for hash in hashes_under(d, id) {
                     ledger.trashable(hash, step);
                 }
@@ -536,25 +479,18 @@ async fn act(devices: &[Device], rng: &mut Rng, ledger: &mut Ledger, step: usize
         }
         17 => {
             if rng.below(3) == 0 {
-                ledger.emptied.push(step);
-                // Whatever that device shows in the trash, directly or inside
-                // a trashed folder, is what emptying it removes.
-                let in_trash: Vec<(String, Option<String>)> = d.with(|_vfs, conn| {
-                    conn.prepare(
-                        "SELECT f.id, f.content_hash FROM files f JOIN folders d ON d.id = f.folder_id
-                          WHERE f.deleted_at IS NOT NULL OR d.deleted_at IS NOT NULL",
-                    )
-                    .unwrap()
-                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-                    .unwrap()
-                    .map(Result::unwrap)
-                    .collect()
-                });
-                for (id, hash) in in_trash {
-                    ledger.purged_files.insert(Uuid::parse_str(&id).unwrap());
-                    ledger.purged.extend(hash);
-                }
+                // What the device holds before and after: the difference is
+                // what emptying the trash removed, all of it seen here.
+                let held = || -> HashSet<String> {
+                    files_with(d, false)
+                        .into_iter()
+                        .chain(files_with(d, true))
+                        .filter_map(|(_, hash)| hash)
+                        .collect()
+                };
+                let before = held();
                 let orphaned = d.with(|vfs, _| vfs.empty_trash().map(|(_, blobs)| blobs));
+                ledger.purged.extend(before.difference(&held()).cloned());
                 ledger.trace.push(format!("  emptied trash: {orphaned:?}"));
                 // As the apps do: the local copies go, storage keeps its own
                 // until the sweep.
@@ -714,8 +650,8 @@ async fn run(seed: u64, steps: usize, targets: impl Fn() -> Vec<BackupTarget>) {
         }
     }
 
-    // Nothing added is gone unless the trash was emptied after it could
-    // have gone there.
+    // Nothing added is gone unless it was replaced in place, or a device
+    // holding it emptied the trash it was in.
     let present: HashSet<String> = files_with(&devices[0], false)
         .into_iter()
         .chain(files_with(&devices[0], true))
@@ -729,9 +665,47 @@ async fn run(seed: u64, steps: usize, targets: impl Fn() -> Vec<BackupTarget>) {
         .collect();
     assert!(
         lost.is_empty(),
-        "seed {seed}: content lost: {lost:?}\n{}",
-        ledger.trace.join("\n")
+        "seed {seed}: content lost: {lost:?}\n{}\n{}",
+        ledger.trace.join("\n"),
+        lost.keys()
+            .map(|hash| history(&devices, hash))
+            .collect::<Vec<_>>()
+            .join("\n")
     );
+}
+
+/// The records that concern the file some content went into, for a loss to
+/// be read.
+fn history(devices: &[Device], hash: &str) -> String {
+    let ids: Vec<String> = devices
+        .iter()
+        .map(|d| d.with(|_vfs, conn| silentsilo_vfs::device_id(conn).unwrap().to_string()))
+        .collect();
+    devices[0].with(|_vfs, conn| {
+        let payloads: Vec<(i64, String, String)> = conn
+            .prepare("SELECT lamport, device_id, payload FROM oplog ORDER BY lamport, device_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let Some(file) = payloads
+            .iter()
+            .find(|(_, _, p)| p.contains(hash))
+            .and_then(|(_, _, p)| serde_json::from_str::<serde_json::Value>(p).ok())
+            .and_then(|v| v["id"].as_str().map(str::to_string))
+        else {
+            return format!("{hash}: no record");
+        };
+        let mut out = vec![format!("{hash} in file {file}:")];
+        for (lamport, device, payload) in &payloads {
+            if payload.contains(&file) {
+                let who = ids.iter().position(|id| id == device);
+                out.push(format!("  L{lamport} device {who:?}: {payload}"));
+            }
+        }
+        out.join("\n")
+    })
 }
 
 fn folder_target(dir: &std::path::Path) -> BackupTarget {
@@ -746,6 +720,10 @@ fn folder_target(dir: &std::path::Path) -> BackupTarget {
 
 fn seeds(default: std::ops::Range<u64>) -> Vec<u64> {
     match std::env::var("SILENTSILO_FLEET_SEED") {
+        Ok(range) if range.contains("..") => {
+            let (from, to) = range.split_once("..").unwrap();
+            (from.parse().expect("a number")..to.parse().expect("a number")).collect()
+        }
         Ok(seed) => vec![seed.parse().expect("a number")],
         Err(_) => default.collect(),
     }

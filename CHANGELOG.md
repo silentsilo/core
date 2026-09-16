@@ -27,6 +27,13 @@ release notes should say.
 
 ### Changed
 
+- An edit made on one device while another emptied the trash is kept as a
+  copy at the top of the silo, instead of going with the file. Only edits
+  the emptying device had not received count. A purge now also names a
+  marker per file saying it lists every edit its device held; for a purge
+  from an earlier release, an edit counts as not received when another
+  device wrote it at or after the purge's place in the order. The index
+  rebuilds once on the first unlock (`SCHEMA_VERSION` 3).
 - The sweep deletes content only once it has been unreferenced for 30 days
   by this device's clock, on top of the two sightings
   (`snapshot::gc_first_seen`, a new `blob_gc_seen` table beside the

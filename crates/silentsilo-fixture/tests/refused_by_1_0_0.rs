@@ -575,3 +575,99 @@ fn a_1_0_0_device_applies_every_record_this_build_writes() {
         );
     }
 }
+
+#[test]
+fn what_is_done_with_a_kept_edit_applies_on_1_0_0() {
+    // B emptied a trash holding a.txt while A, not having that, edited it.
+    // This build keeps A's edit as a file of its own and 1.0.0 drops it, so
+    // what this build then writes about that file names an id 1.0.0 never
+    // had.
+    let (old, new) = side_by_side();
+    let root = silentsilo_vfs::root_folder_id_for(new.vault_id);
+    let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+    let file = Uuid::from_u128(0x100);
+    let record = |n: u128, lamport, device, seq, op| {
+        silentsilo_vfs::OpRecord::authored(
+            Uuid::from_u128(0x300 + n),
+            lamport,
+            device,
+            1_700_000_000,
+            seq,
+            None,
+            op,
+        )
+    };
+    let records = vec![
+        record(
+            0,
+            1,
+            b,
+            0,
+            silentsilo_vfs::VaultOp::AddFile {
+                id: file,
+                folder_id: root,
+                name: "a.txt".into(),
+                blob_id: Uuid::from_u128(0x200),
+                size_bytes: 1,
+                content_hash: "h".into(),
+                mime_type: None,
+                blob_key: "k".into(),
+            },
+        ),
+        record(1, 2, b, 1, silentsilo_vfs::VaultOp::TrashFile { id: file }),
+        record(
+            2,
+            3,
+            b,
+            2,
+            silentsilo_vfs::VaultOp::Purge {
+                folder_ids: Vec::new(),
+                file_ids: vec![file],
+            },
+        ),
+        record(
+            3,
+            3,
+            a,
+            0,
+            silentsilo_vfs::VaultOp::ReplaceFileContent {
+                id: file,
+                blob_id: Uuid::from_u128(0x201),
+                size_bytes: 2,
+                content_hash: "h2".into(),
+                mime_type: None,
+                blob_key: "k2".into(),
+                replaces: Some(Uuid::from_u128(0x200)),
+            },
+        ),
+    ];
+    silentsilo_vfs::replay(&new.conn, records.clone()).unwrap();
+    vfs_v1::replay(&old.conn, as_1_0_0(records)).unwrap();
+
+    let vfs = Vfs::new(&new);
+    let top = vfs.list_folder(root).unwrap();
+    let [silentsilo_core::VaultEntry::File(kept)] = top.as_slice() else {
+        panic!("one kept file: {top:?}")
+    };
+    assert_eq!(kept.name, "a (conflicted copy 2023-11-14).txt");
+
+    // Named over, renamed, another file given its old name, moved, and the
+    // trash emptied: each record applies on 1.0.0, and the trees meet again.
+    vfs.add_file(root, &kept.name, Uuid::new_v4(), 3, "h3", None, "k3")
+        .unwrap();
+    vfs.rename_file(kept.id, "b.txt").unwrap();
+    vfs.add_file(
+        root,
+        "a (conflicted copy 2023-11-14).txt",
+        Uuid::new_v4(),
+        1,
+        "h",
+        None,
+        "k",
+    )
+    .unwrap();
+    let folder = vfs.create_folder(root, "F").unwrap();
+    vfs.move_file(kept.id, folder.id).unwrap();
+    vfs.empty_trash().unwrap();
+    applies_on_1_0_0(&old, &new);
+}

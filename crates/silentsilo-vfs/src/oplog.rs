@@ -492,6 +492,48 @@ pub fn init_oplog_derived(conn: &Connection) -> rusqlite::Result<()> {
             id TEXT PRIMARY KEY
         );
 
+        -- Every id each purge record named or took along, and where that
+        -- record sits in the order: what decides which edits to a purged
+        -- file its author could not have seen (`settle_kept_edits`).
+        CREATE TABLE IF NOT EXISTS purges (
+            id        TEXT NOT NULL,
+            op_id     TEXT NOT NULL,
+            lamport   INTEGER NOT NULL,
+            device_id TEXT NOT NULL,
+            PRIMARY KEY (id, op_id)
+        );
+
+        -- The last name a purged file asked for, from its claim when purged
+        -- or a record naming it that arrives later.
+        CREATE TABLE IF NOT EXISTS purged_names (
+            file_id   TEXT PRIMARY KEY,
+            desired   TEXT NOT NULL,
+            lamport   INTEGER NOT NULL,
+            device_id TEXT NOT NULL,
+            op_id     TEXT NOT NULL
+        );
+
+        -- Files kept from edits a purge's author could not have seen, like
+        -- `conflict_copies`, so their names follow the purged file's.
+        CREATE TABLE IF NOT EXISTS kept_edits (
+            copy_id  TEXT PRIMARY KEY,
+            file_id  TEXT NOT NULL,
+            claim_op TEXT NOT NULL,
+            at       INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_kept_edits_file ON kept_edits(file_id);
+
+        -- The conflict copy each content record would make, and of which
+        -- file, whether or not it was made here: a purge takes a file's
+        -- copies along, including ones this device never had.
+        CREATE TABLE IF NOT EXISTS copy_origins (
+            copy_id TEXT PRIMARY KEY,
+            file_id TEXT NOT NULL,
+            op_id   TEXT NOT NULL,
+            at      INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_copy_origins_file ON copy_origins(file_id);
+
         CREATE TABLE IF NOT EXISTS password_order (
             id        TEXT PRIMARY KEY,
             lamport   INTEGER NOT NULL,
@@ -542,6 +584,10 @@ pub fn drop_oplog_derived(conn: &Connection) -> rusqlite::Result<()> {
         DROP TABLE IF EXISTS trash_events;
         DROP TABLE IF EXISTS conflict_copies;
         DROP TABLE IF EXISTS purged_ids;
+        DROP TABLE IF EXISTS purges;
+        DROP TABLE IF EXISTS purged_names;
+        DROP TABLE IF EXISTS kept_edits;
+        DROP TABLE IF EXISTS copy_origins;
         DROP TABLE IF EXISTS content_versions;
         ",
     )
@@ -798,7 +844,7 @@ fn conflict_copy(
     at: i64,
 ) -> CoreResult<()> {
     let (lamport, device_id, op_id) = losing.written_by;
-    let copy_id = Uuid::new_v5(&op_id, b"silentsilo-conflict-copy");
+    let copy_id = copy_id_of(op_id);
 
     // Already here from an earlier pass, or from replaying the same pair in
     // the other order. Or made before and purged since: a third edit
@@ -943,7 +989,24 @@ fn insert_version(
         ],
     )
     .map_err(|e| CoreError::Database(e.to_string()))?;
+    if let Ok(op) = Uuid::parse_str(op_id) {
+        conn.execute(
+            "INSERT OR IGNORE INTO copy_origins(copy_id, file_id, op_id, at) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                copy_id_of(op).to_string(),
+                file_id.to_string(),
+                op_id,
+                at
+            ],
+        )
+        .map_err(db)?;
+    }
     Ok(())
+}
+
+/// The id of the conflict copy a content record makes.
+fn copy_id_of(op_id: Uuid) -> Uuid {
+    Uuid::new_v5(&op_id, b"silentsilo-conflict-copy")
 }
 
 #[derive(Clone)]
@@ -967,6 +1030,33 @@ impl Version {
     }
 }
 
+fn load_versions(conn: &Connection, file_id: Uuid) -> CoreResult<Vec<Version>> {
+    conn.prepare_cached(
+        "SELECT op_id, lamport, device_id, blob_id, replaces, has_base, size_bytes,
+                content_hash, mime_type, blob_key, at
+           FROM content_versions WHERE file_id = ?1",
+    )
+    .map_err(db)?
+    .query_map([file_id.to_string()], |row| {
+        Ok(Version {
+            op_id: row.get(0)?,
+            lamport: row.get(1)?,
+            device_id: row.get(2)?,
+            blob_id: row.get(3)?,
+            replaces: row.get(4)?,
+            has_base: row.get::<_, i64>(5)? != 0,
+            size_bytes: row.get(6)?,
+            content_hash: row.get(7)?,
+            mime_type: row.get(8)?,
+            blob_key: row.get(9)?,
+            at: row.get(10)?,
+        })
+    })
+    .map_err(db)?
+    .collect::<rusqlite::Result<Vec<_>>>()
+    .map_err(db)
+}
+
 /// Works out which content a file holds and which conflict copies it has,
 /// from every record that wrote its content.
 ///
@@ -981,32 +1071,7 @@ fn settle_content(conn: &Connection, file_id: Uuid) -> CoreResult<()> {
     let Some(current) = read_content_state(conn, file_id)? else {
         return Ok(());
     };
-    let load = |conn: &Connection| -> CoreResult<Vec<Version>> {
-        conn.prepare(
-            "SELECT op_id, lamport, device_id, blob_id, replaces, has_base, size_bytes,
-                    content_hash, mime_type, blob_key, at
-               FROM content_versions WHERE file_id = ?1",
-        )
-        .map_err(db)?
-        .query_map([file_id.to_string()], |row| {
-            Ok(Version {
-                op_id: row.get(0)?,
-                lamport: row.get(1)?,
-                device_id: row.get(2)?,
-                blob_id: row.get(3)?,
-                replaces: row.get(4)?,
-                has_base: row.get::<_, i64>(5)? != 0,
-                size_bytes: row.get(6)?,
-                content_hash: row.get(7)?,
-                mime_type: row.get(8)?,
-                blob_key: row.get(9)?,
-                at: row.get(10)?,
-            })
-        })
-        .map_err(db)?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(db)
-    };
+    let load = |conn: &Connection| load_versions(conn, file_id);
     let mut versions = load(conn)?;
     // A file restored from a snapshot holds content no version names.
     if !versions
@@ -1169,15 +1234,36 @@ fn follow_file_name(conn: &Connection, file_id: Uuid, record_at: i64) -> CoreRes
     else {
         return Ok(());
     };
-    let copies: Vec<(String, String, i64)> = conn
-        .prepare("SELECT copy_id, claim_op, at FROM conflict_copies WHERE file_id = ?1")
-        .map_err(db)?
-        .query_map([file_id.to_string()], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })
-        .map_err(db)?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(db)?;
+    let copies = copies_in(conn, "conflict_copies", file_id)?;
+    follow_copy_names(conn, &desired, copies, record_at)
+}
+
+/// `(copy_id, claim_op, at)` for each copy made of `file_id`. `table` is a
+/// literal from the caller.
+fn copies_in(
+    conn: &Connection,
+    table: &str,
+    file_id: Uuid,
+) -> CoreResult<Vec<(String, String, i64)>> {
+    conn.prepare(&format!(
+        "SELECT copy_id, claim_op, at FROM {table} WHERE file_id = ?1"
+    ))
+    .map_err(db)?
+    .query_map([file_id.to_string()], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+    })
+    .map_err(db)?
+    .collect::<rusqlite::Result<Vec<_>>>()
+    .map_err(db)
+}
+
+/// Names each copy after `desired`, unless the user renamed it since.
+fn follow_copy_names(
+    conn: &Connection,
+    desired: &str,
+    copies: Vec<(String, String, i64)>,
+    record_at: i64,
+) -> CoreResult<()> {
     for (copy_id, claim_op, at) in copies {
         let claim: Option<(String, String, i64, String)> = conn
             .query_row(
@@ -1192,7 +1278,7 @@ fn follow_file_name(conn: &Connection, file_id: Uuid, record_at: i64) -> CoreRes
         let Some((current, folder_id, lamport, device_id)) = claim else {
             continue;
         };
-        let wanted = conflict_name(&desired, at);
+        let wanted = conflict_name(desired, at);
         if current == wanted {
             continue;
         }
@@ -1236,6 +1322,398 @@ fn conflict_name(name: &str, at: i64) -> String {
         }
         _ => format!("{name} (conflicted copy {day})"),
     }
+}
+
+// ── Edits a purge's author could not have seen ─────────────────────
+//
+// A purge names files, not their content. An edit made on a device that had
+// not received the purge went with the file. It is kept instead, as a file
+// of its own at the top of the silo, named as a conflict copy of the purged
+// one and holding exactly that content. The purged file stays gone.
+//
+// What a purge's author had seen: a purge this build writes lists every
+// content record it held for each file, as the ids of the conflict copies
+// those records would make, and says so with a marker (`purge_groups`). An
+// edit it listed, or one a listed edit was written on top of, was seen. A
+// conflict copy it never listed came from an edit it never had, so every
+// edit to that copy is unseen. A purge without the marker, from an earlier
+// build, falls back to the order: its author's clock was past every record
+// it had received, so an edit from another device at the purge's Lamport
+// value or above was unseen, and anything below it counts as seen. The
+// purging device's own later edits count as seen either way.
+//
+// Every unseen edit is kept, not only the newest, and one purge that missed
+// it is enough: which edit is newest and which purges arrived both change
+// with arrival, and a kept file that went away again would take what was
+// done to it along.
+
+fn order_of(record: &OpRecord) -> (i64, String, String) {
+    (
+        record.lamport as i64,
+        record.device_id.to_string(),
+        record.op_id.to_string(),
+    )
+}
+
+fn kept_edit_id(file_id: Uuid, op_id: Uuid) -> Uuid {
+    Uuid::new_v5(&file_id, format!("silentsilo-kept-edit:{op_id}").as_bytes())
+}
+
+/// Says a purge record lists every content record its author held for
+/// `file_id` (`purge_groups`).
+pub(crate) fn purge_marker(file_id: Uuid) -> Uuid {
+    Uuid::new_v5(&file_id, b"silentsilo-purge-lists-content")
+}
+
+/// How a purge tells what its author had seen of a file.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Seen {
+    /// It lists the content records of the file.
+    Listed,
+    /// It lists a file this one is a copy of, and not this copy: its author
+    /// never had the edit the copy came from.
+    Nothing,
+    /// No list: the Lamport order decides.
+    ByOrder,
+}
+
+struct PurgeView {
+    op_id: String,
+    lamport: i64,
+    device_id: String,
+    seen: Seen,
+}
+
+fn purge_names(conn: &Connection, op_id: &str, id: Uuid) -> CoreResult<bool> {
+    conn.prepare_cached("SELECT 1 FROM purges WHERE id = ?1 AND op_id = ?2")
+        .map_err(db)?
+        .exists(params![id.to_string(), op_id])
+        .map_err(db)
+}
+
+/// Every purge that took `id`: those naming it, and for a conflict copy
+/// those that took its file, which takes its copies.
+fn purges_of(conn: &Connection, id: Uuid) -> CoreResult<Vec<PurgeView>> {
+    let mut out: Vec<PurgeView> = Vec::new();
+    let mut at = Some(id);
+    // Copies of copies; the depth only guards against a hostile log.
+    for depth in 0..32 {
+        let Some(current) = at.take() else {
+            break;
+        };
+        let rows: Vec<(String, i64, String)> = conn
+            .prepare_cached("SELECT op_id, lamport, device_id FROM purges WHERE id = ?1")
+            .map_err(db)?
+            .query_map([current.to_string()], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(db)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(db)?;
+        for (op_id, lamport, device_id) in rows {
+            if out.iter().any(|v| v.op_id == op_id) {
+                continue;
+            }
+            let seen = match (depth, purge_names(conn, &op_id, purge_marker(current))?) {
+                (_, false) => Seen::ByOrder,
+                (0, true) => Seen::Listed,
+                (_, true) => Seen::Nothing,
+            };
+            out.push(PurgeView {
+                op_id,
+                lamport,
+                device_id,
+                seen,
+            });
+        }
+        at = conn
+            .query_row(
+                "SELECT file_id FROM copy_origins WHERE copy_id = ?1",
+                [current.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(db)?
+            .map(|raw| parse_uuid(&raw))
+            .transpose()?;
+    }
+    Ok(out)
+}
+
+/// Whether `purge` could have seen `edit`, one of `versions`.
+fn purge_saw(
+    conn: &Connection,
+    purge: &PurgeView,
+    edit: &Version,
+    versions: &[Version],
+) -> CoreResult<bool> {
+    if edit.device_id == purge.device_id && edit.lamport > purge.lamport {
+        return Ok(true);
+    }
+    match purge.seen {
+        Seen::Nothing => Ok(false),
+        Seen::ByOrder => Ok(edit.lamport < purge.lamport || edit.device_id == purge.device_id),
+        Seen::Listed => {
+            let mut listed: Vec<&Version> = Vec::new();
+            for version in versions {
+                if let Ok(op) = Uuid::parse_str(&version.op_id)
+                    && purge_names(conn, &purge.op_id, copy_id_of(op))?
+                {
+                    listed.push(version);
+                }
+            }
+            if listed.iter().any(|v| v.op_id == edit.op_id) {
+                return Ok(true);
+            }
+            if !edit.has_base && listed.iter().any(|v| v.order() > edit.order()) {
+                return Ok(true);
+            }
+            // Written under something listed.
+            let mut under: std::collections::HashSet<&str> = listed
+                .iter()
+                .filter_map(|v| v.replaces.as_deref())
+                .collect();
+            loop {
+                let before = under.len();
+                for version in versions {
+                    if under.contains(version.blob_id.as_str())
+                        && let Some(base) = version.replaces.as_deref()
+                    {
+                        under.insert(base);
+                    }
+                }
+                if under.len() == before {
+                    break;
+                }
+            }
+            Ok(under.contains(edit.blob_id.as_str()))
+        }
+    }
+}
+
+/// Records the name a purged file asked for, when `order` is later than the
+/// one held. True when it changed.
+fn remember_purged_name(
+    conn: &Connection,
+    file_id: Uuid,
+    desired: &str,
+    order: (i64, String, String),
+) -> CoreResult<bool> {
+    let held: Option<(i64, String, String)> = conn
+        .query_row(
+            "SELECT lamport, device_id, op_id FROM purged_names WHERE file_id = ?1",
+            [file_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(db)?;
+    if held.is_some_and(|held| held >= order) {
+        return Ok(false);
+    }
+    conn.execute(
+        "INSERT INTO purged_names(file_id, desired, lamport, device_id, op_id)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(file_id) DO UPDATE SET desired = excluded.desired,
+            lamport = excluded.lamport, device_id = excluded.device_id, op_id = excluded.op_id",
+        params![file_id.to_string(), desired, order.0, order.1, order.2],
+    )
+    .map_err(db)?;
+    Ok(true)
+}
+
+/// What a purged file is called. A conflict copy the user never renamed is
+/// named after its file, which may have been renamed since.
+fn purged_name(conn: &Connection, file_id: Uuid, depth: usize) -> CoreResult<Option<String>> {
+    let own: Option<(String, String)> = conn
+        .query_row(
+            "SELECT desired, op_id FROM purged_names WHERE file_id = ?1",
+            [file_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(db)?;
+    let origin: Option<(String, String, i64)> = conn
+        .query_row(
+            "SELECT file_id, op_id, at FROM copy_origins WHERE copy_id = ?1",
+            [file_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(db)?;
+    if let Some((parent, op, at)) = origin
+        && own.as_ref().is_none_or(|(_, claim)| *claim == op)
+        && depth < 32
+    {
+        let parent = parse_uuid(&parent)?;
+        let live: Option<String> = conn
+            .query_row(
+                "SELECT desired FROM name_claims WHERE entry_id = ?1",
+                [parent.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db)?;
+        let name = match live {
+            Some(name) => Some(name),
+            None => purged_name(conn, parent, depth + 1)?,
+        };
+        if let Some(name) = name {
+            return Ok(Some(conflict_name(&name, at)));
+        }
+    }
+    Ok(own.map(|(desired, _)| desired))
+}
+
+/// Renames what was kept of `file_id` and of its copies after their names.
+fn follow_purged_name(conn: &Connection, file_id: Uuid, record_at: i64) -> CoreResult<()> {
+    let mut queue = vec![file_id];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(id) = queue.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let copies = copies_in(conn, "kept_edits", id)?;
+        if !copies.is_empty()
+            && let Some(name) = purged_name(conn, id, 0)?
+        {
+            follow_copy_names(conn, &name, copies, record_at)?;
+        }
+        let derived: Vec<String> = conn
+            .prepare_cached("SELECT copy_id FROM copy_origins WHERE file_id = ?1")
+            .map_err(db)?
+            .query_map([id.to_string()], |row| row.get(0))
+            .map_err(db)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db)?;
+        for copy in derived {
+            queue.push(parse_uuid(&copy)?);
+        }
+    }
+    Ok(())
+}
+
+/// Makes a file for every edit to purged `file_id` that a purge taking it
+/// could not have seen, where one is missing. True when it made one.
+fn settle_kept_edits(conn: &Connection, file_id: Uuid) -> CoreResult<bool> {
+    if read_content_state(conn, file_id)?.is_some() {
+        return Ok(false);
+    }
+    let purges = purges_of(conn, file_id)?;
+    if purges.is_empty() {
+        return Ok(false);
+    }
+    let versions = load_versions(conn, file_id)?;
+    let mut made = false;
+    for version in &versions {
+        // Records only, and not the one that created the file.
+        let Ok(op_id) = Uuid::parse_str(&version.op_id) else {
+            continue;
+        };
+        if version.has_base && version.replaces.is_none() {
+            continue;
+        }
+        let mut unseen = false;
+        for purge in &purges {
+            if !purge_saw(conn, purge, version, &versions)? {
+                unseen = true;
+                break;
+            }
+        }
+        if unseen {
+            made |= keep_edit(conn, file_id, op_id, version)?;
+        }
+    }
+    Ok(made)
+}
+
+fn keep_edit(conn: &Connection, file_id: Uuid, op_id: Uuid, version: &Version) -> CoreResult<bool> {
+    let copy_id = kept_edit_id(file_id, op_id);
+    // Made already, or made and purged since.
+    let exists: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM files WHERE id = ?1
+             UNION ALL SELECT 1 FROM purged_ids WHERE id = ?1",
+            [copy_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(db)?;
+    if exists.is_some() {
+        return Ok(false);
+    }
+    let (Ok(device_id), Ok(blob_id)) = (
+        Uuid::parse_str(&version.device_id),
+        Uuid::parse_str(&version.blob_id),
+    ) else {
+        return Ok(false);
+    };
+    let root = root_folder(conn)?;
+    let at = version.at;
+    let lamport = version.lamport as u64;
+    let claimant = OpRecord::authored(
+        op_id,
+        lamport,
+        device_id,
+        at,
+        0,
+        None,
+        VaultOp::AddFile {
+            id: copy_id,
+            folder_id: root,
+            name: String::new(),
+            blob_id,
+            size_bytes: version.size_bytes,
+            content_hash: version.content_hash.clone(),
+            mime_type: version.mime_type.clone(),
+            blob_key: version.blob_key.clone(),
+        },
+    );
+    let base = purged_name(conn, file_id, 0)?.unwrap_or_else(|| "file".into());
+    let wanted = conflict_name(&base, at);
+    let final_name = claim_name(conn, copy_id, false, root, &wanted, &claimant)?;
+    conn.execute(
+        "INSERT INTO files(id, folder_id, name, blob_id, size_bytes, mime_type, content_hash,
+                           created_at, updated_at, content_op_id, content_lamport,
+                           content_device_id, blob_key)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            copy_id.to_string(),
+            root.to_string(),
+            final_name,
+            version.blob_id,
+            version.size_bytes,
+            version.mime_type,
+            version.content_hash,
+            at,
+            version.op_id,
+            version.lamport,
+            version.device_id,
+            version.blob_key,
+        ],
+    )
+    .map_err(|e| CoreError::Database(format!("kept edit {copy_id} wanted {final_name:?}: {e}")))?;
+    settle_file_trash(conn, copy_id)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO kept_edits(copy_id, file_id, claim_op, at) VALUES (?1, ?2, ?3, ?4)",
+        params![copy_id.to_string(), file_id.to_string(), version.op_id, at],
+    )
+    .map_err(db)?;
+    // Its own first version, for edits made to it later.
+    insert_version(
+        conn,
+        &format!("{op_id}:kept"),
+        copy_id,
+        (lamport, device_id),
+        blob_id,
+        None,
+        true,
+        version.size_bytes,
+        &version.content_hash,
+        &version.mime_type,
+        &version.blob_key,
+        at,
+    )?;
+    Ok(true)
 }
 
 fn folder_path(conn: &Connection, id: Uuid) -> CoreResult<Option<String>> {
@@ -1920,30 +2398,35 @@ pub(crate) fn plan_claim_for_1_0_0(
     })
 }
 
-/// Every conflict copy any version can have made of `file_ids`, copies of
-/// copies included, that is not among them. A purge here takes a file's
-/// copies with it; 1.0.0 deletes only the ids a purge names, and a copy it
-/// kept in a purged folder stops it for good. A copy's id derives from the
-/// edit it preserves, so naming one for each edit covers both versions.
-pub(crate) fn conflict_copy_ids(conn: &Connection, file_ids: &[Uuid]) -> CoreResult<Vec<Uuid>> {
+/// What a purge of `file_ids` names, one group per file: the file, every
+/// conflict copy any of its content records can have made (copies of copies
+/// included), and a marker for each of those (`purge_marker`).
+///
+/// A purge here takes a file's copies with it; 1.0.0 deletes only the ids a
+/// purge names, and a copy it kept in a purged folder stops it for good. A
+/// copy's id derives from the record it preserves, so the copy ids also list
+/// every content record the purging device held, which is what the marker
+/// says. A copy named in `file_ids` goes in its file's group, so a group
+/// split across records is the only way to separate them.
+pub(crate) fn purge_groups(conn: &Connection, file_ids: &[Uuid]) -> CoreResult<Vec<Vec<Uuid>>> {
     let db = |e: rusqlite::Error| CoreError::Database(e.to_string());
-    let mut seen: std::collections::HashSet<Uuid> = file_ids.iter().copied().collect();
-    let mut queue: Vec<Uuid> = file_ids.to_vec();
-    let mut out = Vec::new();
     let mut edits = conn
-        .prepare("SELECT op_id FROM content_versions WHERE file_id = ?1")
+        .prepare(
+            "SELECT op_id FROM content_versions WHERE file_id = ?1
+             UNION SELECT content_op_id FROM files WHERE id = ?1 AND content_op_id IS NOT NULL",
+        )
         .map_err(db)?;
     let mut kept = conn
         .prepare("SELECT copy_id FROM conflict_copies WHERE file_id = ?1")
         .map_err(db)?;
-    while let Some(file) = queue.pop() {
+    let mut copies_of = |file: Uuid| -> CoreResult<Vec<Uuid>> {
         let mut found: Vec<Uuid> = Vec::new();
         for op in edits
             .query_map([file.to_string()], |row| row.get::<_, String>(0))
             .map_err(db)?
         {
             if let Ok(op) = Uuid::parse_str(&op.map_err(db)?) {
-                found.push(Uuid::new_v5(&op, b"silentsilo-conflict-copy"));
+                found.push(copy_id_of(op));
             }
         }
         for copy in kept
@@ -1952,14 +2435,51 @@ pub(crate) fn conflict_copy_ids(conn: &Connection, file_ids: &[Uuid]) -> CoreRes
         {
             found.push(parse_uuid(&copy.map_err(db)?)?);
         }
-        for copy in found {
-            if seen.insert(copy) {
-                out.push(copy);
-                queue.push(copy);
+        Ok(found)
+    };
+
+    // Everything reachable from each file, in the order found.
+    let mut reach: Vec<Vec<Uuid>> = Vec::with_capacity(file_ids.len());
+    for file in file_ids {
+        let mut seen = std::collections::HashSet::from([*file]);
+        let mut order = vec![*file];
+        let mut queue = vec![*file];
+        while let Some(id) = queue.pop() {
+            for copy in copies_of(id)? {
+                if seen.insert(copy) {
+                    order.push(copy);
+                    queue.push(copy);
+                }
             }
         }
+        reach.push(order);
     }
-    Ok(out)
+    let inside: std::collections::HashSet<Uuid> =
+        reach.iter().flat_map(|r| r[1..].iter().copied()).collect();
+    let mut placed: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+    let mut groups = Vec::new();
+    for (i, file) in file_ids.iter().enumerate() {
+        if inside.contains(file) {
+            continue;
+        }
+        let members: Vec<Uuid> = reach[i]
+            .iter()
+            .copied()
+            .filter(|id| placed.insert(*id))
+            .collect();
+        groups.push(members);
+    }
+    // Only a hostile log makes copies of each other.
+    for file in file_ids {
+        if placed.insert(*file) {
+            groups.push(vec![*file]);
+        }
+    }
+    for group in &mut groups {
+        let markers: Vec<Uuid> = group.iter().map(|id| purge_marker(*id)).collect();
+        group.extend(markers);
+    }
+    Ok(groups)
 }
 
 /// The renames that bring 1.0.0's stored names back in line after a purge:
@@ -2409,7 +2929,17 @@ fn apply_inner(conn: &Connection, record: &OpRecord) -> CoreResult<ApplyOutcome>
             // Two records creating one id only comes from a corrupted or
             // hostile bucket, but failing on it would wedge sync for good;
             // like the folder arm, the file being there means nothing to do.
-            if read_content_state(conn, *id)?.is_some() || was_purged(conn, *id)? {
+            if read_content_state(conn, *id)?.is_some() {
+                return Ok(ApplyOutcome::Obsolete);
+            }
+            if !purges_of(conn, *id)?.is_empty() {
+                // Arriving after its purge: only its name is of use.
+                if remember_purged_name(conn, *id, &sanitize(name), order_of(record))? {
+                    follow_purged_name(conn, *id, at)?;
+                }
+                return Ok(ApplyOutcome::Obsolete);
+            }
+            if was_purged(conn, *id)? {
                 return Ok(ApplyOutcome::Obsolete);
             }
             let final_name = claim_name(conn, *id, false, *folder_id, &sanitize(name), record)?;
@@ -2462,7 +2992,8 @@ fn apply_inner(conn: &Connection, record: &OpRecord) -> CoreResult<ApplyOutcome>
             blob_key,
             replaces,
         } => {
-            if read_content_state(conn, *id)?.is_none() {
+            let here = read_content_state(conn, *id)?.is_some();
+            if !here && purges_of(conn, *id)?.is_empty() {
                 return Ok(ApplyOutcome::Obsolete);
             }
             // Every edit is kept, and what the file holds and which copies
@@ -2481,6 +3012,14 @@ fn apply_inner(conn: &Connection, record: &OpRecord) -> CoreResult<ApplyOutcome>
                 blob_key,
                 at,
             )?;
+            if !here {
+                // Purged: kept as a file of its own if the purge missed it.
+                return Ok(if settle_kept_edits(conn, *id)? {
+                    ApplyOutcome::Applied
+                } else {
+                    ApplyOutcome::Obsolete
+                });
+            }
             settle_content(conn, *id)?;
             Ok(ApplyOutcome::Applied)
         }
@@ -2495,6 +3034,12 @@ fn apply_inner(conn: &Connection, record: &OpRecord) -> CoreResult<ApplyOutcome>
                 .optional()
                 .map_err(db)?;
             let Some((folder_id, _current)) = existing else {
+                // What was kept of a purged file is named after it.
+                if !purges_of(conn, *id)?.is_empty()
+                    && remember_purged_name(conn, *id, &sanitize(name), order_of(record))?
+                {
+                    follow_purged_name(conn, *id, at)?;
+                }
                 return Ok(ApplyOutcome::Obsolete);
             };
             // No shortcut when the name already reads the same: that can be
@@ -2602,6 +3147,42 @@ fn apply_inner(conn: &Connection, record: &OpRecord) -> CoreResult<ApplyOutcome>
                     [id.to_string()],
                 )
                 .map_err(db)?;
+            }
+            // Only what the record names: a copy taken along is reached
+            // through its file (`purges_of`), and is not in the author's list.
+            let VaultOp::Purge {
+                file_ids: named, ..
+            } = op
+            else {
+                unreachable!()
+            };
+            for id in named.iter().chain(folder_ids) {
+                conn.execute(
+                    "INSERT OR IGNORE INTO purges(id, op_id, lamport, device_id)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        id.to_string(),
+                        record.op_id.to_string(),
+                        record.lamport as i64,
+                        record.device_id.to_string()
+                    ],
+                )
+                .map_err(db)?;
+            }
+            // Named before the claims go, for what is kept of an edit.
+            for id in file_ids {
+                let claim: Option<(String, i64, String, String)> = conn
+                    .query_row(
+                        "SELECT desired, lamport, device_id, op_id FROM name_claims
+                          WHERE entry_id = ?1 AND is_folder = 0",
+                        [id.to_string()],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )
+                    .optional()
+                    .map_err(db)?;
+                if let Some((desired, lamport, device, op)) = claim {
+                    remember_purged_name(conn, *id, &desired, (lamport, device, op))?;
+                }
             }
             let mut extra_files: Vec<Uuid> = Vec::new();
             let mut extra_folders: Vec<Uuid> = Vec::new();
@@ -2720,11 +3301,8 @@ fn apply_inner(conn: &Connection, record: &OpRecord) -> CoreResult<ApplyOutcome>
                     [id.to_string()],
                 )
                 .map_err(db)?;
-                conn.execute(
-                    "DELETE FROM content_versions WHERE file_id = ?1",
-                    [id.to_string()],
-                )
-                .map_err(db)?;
+                // `content_versions` stays: an edit the purge did not see
+                // is kept from it (`settle_kept_edits`).
             }
             groups.retain(|g| folder_path(conn, g.scope_id).ok().flatten().is_some());
             settle_groups(conn, &groups, at)?;
@@ -2733,6 +3311,9 @@ fn apply_inner(conn: &Connection, record: &OpRecord) -> CoreResult<ApplyOutcome>
             }
             for id in &top_files {
                 settle_file_trash(conn, *id)?;
+            }
+            for id in file_ids {
+                settle_kept_edits(conn, *id)?;
             }
             Ok(ApplyOutcome::Applied)
         }
@@ -5124,58 +5705,476 @@ pub(crate) mod tests {
         assert_eq!(late.snapshot(), d.snapshot());
     }
 
-    #[test]
-    fn content_written_without_a_purge_goes_with_the_file() {
-        // B empties a trash holding x.txt; A, not having that yet, writes new
-        // content to x.txt later in the total order. The purge names the file,
-        // so the edit goes with it in either arrival order: deliberate, and
-        // what `fleet.rs` allows for (`purged_files`).
-        let (folder, file, edited) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-        let run = |edit_first: bool| {
-            let d = Device::new();
-            let root = d.root();
-            apply_op(d.conn(), &d.make(1, new_folder(folder, root, "Temp"))).unwrap();
-            apply_op(d.conn(), &d.make(2, add_file(file, folder, "x.txt"))).unwrap();
-            apply_op(d.conn(), &d.make(3, VaultOp::TrashFolder { id: folder })).unwrap();
-            let purge = d.make(
-                4,
-                VaultOp::Purge {
-                    folder_ids: vec![folder],
-                    file_ids: vec![file],
-                },
-            );
-            let edit = d.make(
-                5,
-                VaultOp::ReplaceFileContent {
-                    id: file,
-                    blob_id: edited,
-                    size_bytes: 20,
-                    content_hash: "edited".into(),
-                    mime_type: None,
-                    blob_key: String::new(),
-                    replaces: None,
-                },
-            );
-            let order = if edit_first {
-                [&edit, &purge]
-            } else {
-                [&purge, &edit]
-            };
-            for record in order {
-                apply_op(d.conn(), record).unwrap();
+    // ---- edits a purge could not have seen ----
+
+    const DAY_ONE: i64 = 1_700_000_000;
+
+    fn by(device: Uuid, lamport: u64, op: VaultOp) -> OpRecord {
+        OpRecord::authored(Uuid::new_v4(), lamport, device, DAY_ONE, 0, None, op)
+    }
+
+    fn added(id: Uuid, folder_id: Uuid, name: &str, blob: Uuid) -> VaultOp {
+        VaultOp::AddFile {
+            id,
+            folder_id,
+            name: name.into(),
+            blob_id: blob,
+            size_bytes: 10,
+            content_hash: format!("hash-{blob}"),
+            mime_type: None,
+            blob_key: format!("key-{blob}"),
+        }
+    }
+
+    fn edited(id: Uuid, blob: Uuid, replaces: Uuid) -> VaultOp {
+        VaultOp::ReplaceFileContent {
+            id,
+            blob_id: blob,
+            size_bytes: 20,
+            content_hash: format!("hash-{blob}"),
+            mime_type: None,
+            blob_key: format!("key-{blob}"),
+            replaces: Some(replaces),
+        }
+    }
+
+    /// Every row, ids and keys included: kept files are derived, and two
+    /// devices giving one different ids would never agree again.
+    fn tree(conn: &Connection) -> Vec<String> {
+        let mut out: Vec<String> = conn
+            .prepare("SELECT path, id, deleted_at IS NOT NULL FROM folders")
+            .unwrap()
+            .query_map([], |r| {
+                Ok(format!(
+                    "folder {} {} deleted={}",
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, bool>(2)?
+                ))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        out.extend(
+            conn.prepare(
+                "SELECT d.path, f.name, f.id, f.blob_id, f.blob_key, f.deleted_at IS NOT NULL
+                   FROM files f JOIN folders d ON d.id = f.folder_id",
+            )
+            .unwrap()
+            .query_map([], |r| {
+                Ok(format!(
+                    "file {}::{} {} blob={} key={} deleted={}",
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, bool>(5)?
+                ))
+            })
+            .unwrap()
+            .map(Result::unwrap),
+        );
+        out.sort();
+        out
+    }
+
+    fn permutations(n: usize) -> Vec<Vec<usize>> {
+        if n == 0 {
+            return vec![Vec::new()];
+        }
+        let mut out = Vec::new();
+        for rest in permutations(n - 1) {
+            for at in 0..=rest.len() {
+                let mut order = rest.clone();
+                order.insert(at, n - 1);
+                out.push(order);
             }
-            let rows: i64 = d
-                .conn()
-                .query_row(
-                    "SELECT COUNT(*) FROM files WHERE id = ?1 OR blob_id = ?2",
-                    [file.to_string(), edited.to_string()],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert_eq!(rows, 0, "edit first: {edit_first}");
-            d.snapshot()
+        }
+        out
+    }
+
+    /// Applies `prefix` in order, then `rest` in every order, one record at
+    /// a time; then rebuilds the last device from its log. Every result must
+    /// match the sorted replay, which is returned.
+    fn same_in_every_order(vault: Uuid, prefix: &[OpRecord], rest: &[OpRecord]) -> Vec<String> {
+        let reference = bare_device(vault);
+        replay(&reference, prefix.iter().chain(rest).cloned().collect()).unwrap();
+        let expected = tree(&reference);
+        let mut last = None;
+        for order in permutations(rest.len()) {
+            let conn = bare_device(vault);
+            for record in prefix.iter().chain(order.iter().map(|&i| &rest[i])) {
+                apply_op(&conn, record).unwrap();
+            }
+            assert_eq!(tree(&conn), expected, "order {order:?}");
+            last = Some(conn);
+        }
+        let conn = last.unwrap();
+        crate::schema::drop_derived_for_test(&conn).unwrap();
+        crate::schema::init_schema(&conn, vault).unwrap();
+        rebuild_derived(&conn).unwrap();
+        assert_eq!(tree(&conn), expected, "rebuilt");
+        expected
+    }
+
+    /// B puts x.txt in Temp, trashes Temp and empties the trash at Lamport 4.
+    struct Emptied {
+        vault: Uuid,
+        root: Uuid,
+        folder: Uuid,
+        purger: Uuid,
+        file: Uuid,
+        original: Uuid,
+        records: Vec<OpRecord>,
+        purge: OpRecord,
+    }
+
+    fn emptied() -> Emptied {
+        let vault = Uuid::new_v4();
+        let root = crate::schema::root_folder_id_for(vault);
+        let (purger, folder, file, original) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let records = vec![
+            by(purger, 1, new_folder(folder, root, "Temp")),
+            by(purger, 2, added(file, folder, "x.txt", original)),
+            by(purger, 3, VaultOp::TrashFolder { id: folder }),
+        ];
+        let purge = by(
+            purger,
+            4,
+            VaultOp::Purge {
+                folder_ids: vec![folder],
+                file_ids: vec![file],
+            },
+        );
+        Emptied {
+            vault,
+            root,
+            folder,
+            purger,
+            file,
+            original,
+            records,
+            purge,
+        }
+    }
+
+    fn kept_row(file: Uuid, edit: &OpRecord, name: &str, blob: Uuid) -> String {
+        format!(
+            "file /::{name} {} blob={blob} key=key-{blob} deleted=false",
+            kept_edit_id(file, edit.op_id)
+        )
+    }
+
+    #[test]
+    fn an_edit_the_purge_could_not_have_seen_is_kept_at_the_top() {
+        // A, not having B's purge yet, writes new content to x.txt later in
+        // the order. The purged file stays gone; the new content is kept as a
+        // file of its own, in either arrival order and after a rebuild.
+        let s = emptied();
+        let blob = Uuid::new_v4();
+        let edit = by(Uuid::new_v4(), 5, edited(s.file, blob, s.original));
+        let tree = same_in_every_order(s.vault, &s.records, &[s.purge.clone(), edit.clone()]);
+        assert_eq!(
+            tree,
+            vec![
+                kept_row(s.file, &edit, "x (conflicted copy 2023-11-14).txt", blob),
+                format!("folder / {} deleted=false", s.root),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_edit_at_the_purges_own_lamport_value_is_kept() {
+        // The purging device's clock was past everything it had seen, so a
+        // record at the same value from another device was not among it.
+        // Both sides of the device id tie-break.
+        for editor in [Uuid::from_u128(1), Uuid::from_u128(u128::MAX)] {
+            let s = emptied();
+            let blob = Uuid::new_v4();
+            let edit = by(editor, 4, edited(s.file, blob, s.original));
+            let tree = same_in_every_order(s.vault, &s.records, &[s.purge.clone(), edit.clone()]);
+            assert!(
+                tree.contains(&kept_row(
+                    s.file,
+                    &edit,
+                    "x (conflicted copy 2023-11-14).txt",
+                    blob
+                )),
+                "{tree:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_edit_the_purge_may_have_seen_goes_with_the_file() {
+        // The purging device's own later edit came after its purge, and an
+        // edit below the purge's value may have been in the trash it emptied.
+        let s = emptied();
+        let own = by(s.purger, 5, edited(s.file, Uuid::new_v4(), s.original));
+        let tree = same_in_every_order(s.vault, &s.records, &[s.purge.clone(), own]);
+        assert_eq!(tree, vec![format!("folder / {} deleted=false", s.root)]);
+
+        let s = emptied();
+        let earlier = by(
+            Uuid::new_v4(),
+            3,
+            edited(s.file, Uuid::new_v4(), s.original),
+        );
+        let tree = same_in_every_order(s.vault, &s.records, &[earlier, s.purge.clone()]);
+        assert_eq!(tree, vec![format!("folder / {} deleted=false", s.root)]);
+    }
+
+    #[test]
+    fn every_unseen_edit_is_kept() {
+        // A saved twice, C once, none of it seen by the purge. Keeping only
+        // the newest would depend on which had arrived.
+        let s = emptied();
+        let (a, c) = (Uuid::new_v4(), Uuid::new_v4());
+        let (one, two, three) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let first = by(a, 5, edited(s.file, one, s.original));
+        let second = by(a, 6, edited(s.file, two, one));
+        let other = by(c, 5, edited(s.file, three, s.original));
+        let mut prefix = s.records.clone();
+        prefix.push(first.clone());
+        let tree = same_in_every_order(
+            s.vault,
+            &prefix,
+            &[s.purge.clone(), second.clone(), other.clone()],
+        );
+        let kept: Vec<&String> = tree.iter().filter(|r| r.starts_with("file /::")).collect();
+        assert_eq!(kept.len(), 3, "{tree:#?}");
+        for (edit, blob) in [(&first, one), (&second, two), (&other, three)] {
+            let id = kept_edit_id(s.file, edit.op_id).to_string();
+            assert!(
+                kept.iter()
+                    .any(|r| r.contains(&id) && r.contains(&format!("blob={blob} key=key-{blob}"))),
+                "{tree:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_kept_edit_takes_the_name_of_a_rename_made_with_it() {
+        // A edited x.txt and renamed it to y.txt while B emptied the trash.
+        let s = emptied();
+        let a = Uuid::new_v4();
+        let blob = Uuid::new_v4();
+        let edit = by(a, 5, edited(s.file, blob, s.original));
+        let rename = by(
+            a,
+            6,
+            VaultOp::RenameFile {
+                id: s.file,
+                name: "y.txt".into(),
+            },
+        );
+        let tree = same_in_every_order(
+            s.vault,
+            &s.records,
+            &[s.purge.clone(), edit.clone(), rename],
+        );
+        assert_eq!(
+            tree,
+            vec![
+                kept_row(s.file, &edit, "y (conflicted copy 2023-11-14).txt", blob),
+                format!("folder / {} deleted=false", s.root),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_purged_folder_keeps_the_edit_and_what_was_added_to_it() {
+        // Temp/Sub/x.txt is purged with both folders. A meanwhile edited
+        // x.txt and added y.txt to Sub: y.txt moves to the top, and so does
+        // the edit, as a file of its own.
+        let vault = Uuid::new_v4();
+        let root = crate::schema::root_folder_id_for(vault);
+        let (b, a) = (Uuid::new_v4(), Uuid::new_v4());
+        let (temp, sub, file, other) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let (original, blob, other_blob) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let prefix = vec![
+            by(b, 1, new_folder(temp, root, "Temp")),
+            by(b, 2, new_folder(sub, temp, "Sub")),
+            by(b, 3, added(file, sub, "x.txt", original)),
+            by(b, 4, VaultOp::TrashFolder { id: temp }),
+        ];
+        let purge = by(
+            b,
+            5,
+            VaultOp::Purge {
+                folder_ids: vec![sub, temp],
+                file_ids: vec![file],
+            },
+        );
+        let edit = by(a, 5, edited(file, blob, original));
+        let add = by(a, 6, added(other, sub, "y.txt", other_blob));
+        let tree = same_in_every_order(vault, &prefix, &[purge, edit.clone(), add]);
+        assert_eq!(
+            tree,
+            vec![
+                kept_row(file, &edit, "x (conflicted copy 2023-11-14).txt", blob),
+                format!(
+                    "file /::y.txt {other} blob={other_blob} key=key-{other_blob} deleted=false"
+                ),
+                format!("folder / {root} deleted=false"),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unseen_edit_to_a_conflict_copy_is_kept() {
+        // x.txt was edited on A and C at once, so one edit became a conflict
+        // copy. B saw both and emptied the trash, naming the copies as this
+        // build does. A, not having that, then edited the copy.
+        let s = emptied();
+        let (a, c) = (Uuid::new_v4(), Uuid::new_v4());
+        let (from_a, from_c, later) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let edit_a = by(a, 3, edited(s.file, from_a, s.original));
+        let edit_c = by(c, 3, edited(s.file, from_c, s.original));
+        let (loser, loser_blob) = if edit_a.sort_key() < edit_c.sort_key() {
+            (&edit_a, from_a)
+        } else {
+            (&edit_c, from_c)
         };
-        assert_eq!(run(true), run(false));
+        let copy = copy_id_of(loser.op_id);
+        let purge = by(
+            s.purger,
+            4,
+            VaultOp::Purge {
+                folder_ids: vec![s.folder],
+                file_ids: vec![s.file, copy_id_of(edit_a.op_id), copy_id_of(edit_c.op_id)],
+            },
+        );
+        let on_copy = by(a, 5, edited(copy, later, loser_blob));
+        let mut prefix = s.records.clone();
+        prefix.extend([edit_a.clone(), edit_c.clone()]);
+        let tree = same_in_every_order(s.vault, &prefix, &[purge, on_copy.clone()]);
+        assert_eq!(
+            tree,
+            vec![
+                kept_row(
+                    copy,
+                    &on_copy,
+                    "x (conflicted copy 2023-11-14) (conflicted copy 2023-11-14).txt",
+                    later
+                ),
+                format!("folder / {} deleted=false", s.root),
+            ]
+        );
+    }
+
+    /// A purge as this build writes it: the file, a copy id for each content
+    /// record `held`, and the markers.
+    fn listing_purge(s: &Emptied, lamport: u64, held: &[&OpRecord]) -> OpRecord {
+        let mut listed = vec![s.file];
+        listed.extend(held.iter().map(|r| copy_id_of(r.op_id)));
+        let markers: Vec<Uuid> = listed.iter().map(|id| purge_marker(*id)).collect();
+        listed.extend(markers);
+        by(
+            s.purger,
+            lamport,
+            VaultOp::Purge {
+                folder_ids: vec![s.folder],
+                file_ids: listed,
+            },
+        )
+    }
+
+    #[test]
+    fn a_purge_that_lists_what_it_held_keeps_an_earlier_edit_it_never_had() {
+        // A's edit sorts below the purge, but the purge lists what B held,
+        // and the edit is not there.
+        let s = emptied();
+        let blob = Uuid::new_v4();
+        let edit = by(Uuid::new_v4(), 3, edited(s.file, blob, s.original));
+        let purge = listing_purge(&s, 9, &[&s.records[1]]);
+        let tree = same_in_every_order(s.vault, &s.records, &[purge, edit.clone()]);
+        assert_eq!(
+            tree,
+            vec![
+                kept_row(s.file, &edit, "x (conflicted copy 2023-11-14).txt", blob),
+                format!("folder / {} deleted=false", s.root),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_purge_that_lists_an_edit_takes_it_and_what_it_was_written_on() {
+        let s = emptied();
+        let a = Uuid::new_v4();
+        let (one, two) = (Uuid::new_v4(), Uuid::new_v4());
+        let first = by(a, 3, edited(s.file, one, s.original));
+        let second = by(a, 4, edited(s.file, two, one));
+        // B received both edits but its list names only the second: the
+        // first is under it.
+        let purge = listing_purge(&s, 9, &[&s.records[1], &second]);
+        let mut prefix = s.records.clone();
+        prefix.extend([first, second]);
+        let tree = same_in_every_order(s.vault, &prefix, &[purge]);
+        assert_eq!(tree, vec![format!("folder / {} deleted=false", s.root)]);
+    }
+
+    #[test]
+    fn an_edit_to_a_copy_the_purge_never_listed_is_kept() {
+        // B held x.txt and A's edit; C's concurrent edit, and the copy it
+        // made, never reached B. C then edited that copy, below the purge.
+        let s = emptied();
+        let (c, a) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let (from_a, from_c, later) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let edit_a = by(a, 3, edited(s.file, from_a, s.original));
+        let edit_c = by(c, 3, edited(s.file, from_c, s.original));
+        // C sorts first, so C's edit is the copy; C edits it on top.
+        let copy = copy_id_of(edit_c.op_id);
+        let on_copy = by(c, 4, edited(copy, later, from_c));
+        let purge = listing_purge(&s, 9, &[&s.records[1], &edit_a]);
+        let mut prefix = s.records.clone();
+        prefix.extend([edit_a.clone(), edit_c.clone()]);
+        let tree = same_in_every_order(s.vault, &prefix, &[purge, on_copy.clone()]);
+        let kept_c = kept_row(
+            s.file,
+            &edit_c,
+            "x (conflicted copy 2023-11-14).txt",
+            from_c,
+        );
+        assert!(tree.contains(&kept_c), "{tree:#?}");
+        let id = kept_edit_id(copy, on_copy.op_id).to_string();
+        assert!(
+            tree.iter()
+                .any(|r| r.contains(&id) && r.contains(&format!("blob={later}"))),
+            "{tree:#?}"
+        );
+        assert_eq!(tree.len(), 3, "{tree:#?}");
+    }
+
+    #[test]
+    fn a_kept_edit_holds_its_content_for_the_sweep() {
+        let s = emptied();
+        let blob = Uuid::new_v4();
+        let conn = bare_device(s.vault);
+        for record in s.records.iter().chain([&s.purge]) {
+            apply_op(&conn, record).unwrap();
+        }
+        apply_op(
+            &conn,
+            &by(Uuid::new_v4(), 6, edited(s.file, blob, s.original)),
+        )
+        .unwrap();
+        assert!(
+            crate::snapshot::referenced_blobs(&conn)
+                .unwrap()
+                .contains(&blob)
+        );
     }
 
     #[test]
