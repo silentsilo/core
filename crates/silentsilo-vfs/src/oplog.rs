@@ -5125,6 +5125,60 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn content_written_without_a_purge_goes_with_the_file() {
+        // B empties a trash holding x.txt; A, not having that yet, writes new
+        // content to x.txt later in the total order. The purge names the file,
+        // so the edit goes with it in either arrival order: deliberate, and
+        // what `fleet.rs` allows for (`purged_files`).
+        let (folder, file, edited) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let run = |edit_first: bool| {
+            let d = Device::new();
+            let root = d.root();
+            apply_op(d.conn(), &d.make(1, new_folder(folder, root, "Temp"))).unwrap();
+            apply_op(d.conn(), &d.make(2, add_file(file, folder, "x.txt"))).unwrap();
+            apply_op(d.conn(), &d.make(3, VaultOp::TrashFolder { id: folder })).unwrap();
+            let purge = d.make(
+                4,
+                VaultOp::Purge {
+                    folder_ids: vec![folder],
+                    file_ids: vec![file],
+                },
+            );
+            let edit = d.make(
+                5,
+                VaultOp::ReplaceFileContent {
+                    id: file,
+                    blob_id: edited,
+                    size_bytes: 20,
+                    content_hash: "edited".into(),
+                    mime_type: None,
+                    blob_key: String::new(),
+                    replaces: None,
+                },
+            );
+            let order = if edit_first {
+                [&edit, &purge]
+            } else {
+                [&purge, &edit]
+            };
+            for record in order {
+                apply_op(d.conn(), record).unwrap();
+            }
+            let rows: i64 = d
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM files WHERE id = ?1 OR blob_id = ?2",
+                    [file.to_string(), edited.to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(rows, 0, "edit first: {edit_first}");
+            d.snapshot()
+        };
+        assert_eq!(run(true), run(false));
+    }
+
+    #[test]
     fn a_suffixed_name_skips_one_already_asked_for() {
         // A has "report.pdf" and "report (2).pdf"; B adds "report.pdf" too.
         // Its copy must not take "report (2).pdf", in either arrival order.

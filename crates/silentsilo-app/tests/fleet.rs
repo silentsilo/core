@@ -11,7 +11,8 @@
 //!
 //! Against folder storage always, and against MinIO, WebDAV and SFTP when
 //! `scripts/test-local.ps1` (or CI) provides them. A failure prints its seed;
-//! `SILENTSILO_FLEET_SEED` replays that one run.
+//! `SILENTSILO_FLEET_SEED` replays that one run, device ids included: they
+//! break Lamport ties, so random ones made a seed fail on some runs only.
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -96,6 +97,7 @@ impl Device {
         vault_id: Uuid,
         keys: Option<(silentsilo_crypto::MasterDek, silentsilo_crypto::ContentKek)>,
         targets: Vec<BackupTarget>,
+        device_id: Uuid,
     ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("silo");
@@ -119,13 +121,23 @@ impl Device {
             warnings: Mutex::new(Vec::new()),
         };
         state.open_session(&host, silo.id, session).unwrap();
-        Self {
+        let device = Self {
             _dir: dir,
             state,
             silo,
             host,
             swept_on: Cell::new(DAY.get()),
-        }
+        };
+        // Before the first record, so the chain starts under this id.
+        device.with(|vfs, conn| {
+            vfs.ensure_initialized().unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO vault_meta(key, value) VALUES ('oplog_device_id', ?1)",
+                [device_id.to_string()],
+            )
+            .unwrap();
+        });
+        device
     }
 
     fn keys(&self) -> (silentsilo_crypto::MasterDek, silentsilo_crypto::ContentKek) {
@@ -234,6 +246,11 @@ struct Ledger {
     /// Content that sat in the trash of a device when that device emptied
     /// it: the one way content may be gone for good.
     purged: HashSet<String>,
+    /// Files in the trash of a device when it emptied it. Another device
+    /// that had not received that yet can still write new content to one,
+    /// which goes with the purge: a file can enter a trash by landing in a
+    /// folder trashed elsewhere, so this is not known when it is trashed.
+    purged_files: HashSet<Uuid>,
     /// Which file each content went into.
     hash_file: HashMap<String, Uuid>,
     /// First step at which a device sent each file to the trash, directly,
@@ -258,6 +275,13 @@ impl Ledger {
     /// Gone is allowed once the trash could hold it and was emptied after.
     fn may_be_gone(&self, hash: &str) -> bool {
         if self.replaced.contains(hash) || self.purged.contains(hash) {
+            return true;
+        }
+        if self
+            .hash_file
+            .get(hash)
+            .is_some_and(|file| self.purged_files.contains(file))
+        {
             return true;
         }
         self.hash_file
@@ -515,19 +539,21 @@ async fn act(devices: &[Device], rng: &mut Rng, ledger: &mut Ledger, step: usize
                 ledger.emptied.push(step);
                 // Whatever that device shows in the trash, directly or inside
                 // a trashed folder, is what emptying it removes.
-                let in_trash: Vec<String> = d.with(|_vfs, conn| {
+                let in_trash: Vec<(String, Option<String>)> = d.with(|_vfs, conn| {
                     conn.prepare(
-                        "SELECT f.content_hash FROM files f JOIN folders d ON d.id = f.folder_id
-                          WHERE (f.deleted_at IS NOT NULL OR d.deleted_at IS NOT NULL)
-                            AND f.content_hash IS NOT NULL",
+                        "SELECT f.id, f.content_hash FROM files f JOIN folders d ON d.id = f.folder_id
+                          WHERE f.deleted_at IS NOT NULL OR d.deleted_at IS NOT NULL",
                     )
                     .unwrap()
-                    .query_map([], |r| r.get::<_, String>(0))
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
                     .unwrap()
                     .map(Result::unwrap)
                     .collect()
                 });
-                ledger.purged.extend(in_trash);
+                for (id, hash) in in_trash {
+                    ledger.purged_files.insert(Uuid::parse_str(&id).unwrap());
+                    ledger.purged.extend(hash);
+                }
                 let orphaned = d.with(|vfs, _| vfs.empty_trash().map(|(_, blobs)| blobs));
                 ledger.trace.push(format!("  emptied trash: {orphaned:?}"));
                 // As the apps do: the local copies go, storage keeps its own
@@ -613,15 +639,19 @@ async fn settle(devices: &[Device], seed: u64) {
 async fn run(seed: u64, steps: usize, targets: impl Fn() -> Vec<BackupTarget>) {
     let mut rng = Rng::new(seed);
     DAY.set(0);
-    let first = Device::new(Uuid::new_v4(), None, targets());
+    let mut ids = Rng::new(seed ^ 0xDE71CE);
+    let mut device_id = || Uuid::from_u128((ids.next() as u128) << 64 | ids.next() as u128);
+    let first = Device::new(Uuid::new_v4(), None, targets(), device_id());
     let keys = first.keys();
     let vault_id = first.vault_id();
     let mut devices = vec![first];
     for _ in 0..2 {
-        devices.push(Device::new(vault_id, Some(keys.clone()), targets()));
-    }
-    for d in &devices {
-        d.with(|vfs, _| vfs.ensure_initialized()).unwrap();
+        devices.push(Device::new(
+            vault_id,
+            Some(keys.clone()),
+            targets(),
+            device_id(),
+        ));
     }
     // The first device publishes the silo; the others arrive on top of it.
     settle(&devices, seed).await;
