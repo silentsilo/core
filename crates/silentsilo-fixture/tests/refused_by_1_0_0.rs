@@ -253,6 +253,83 @@ fn purge_after_concurrent_edits() {
     applies_on_1_0_0(&old, &new);
 }
 
+#[test]
+fn a_group_a_1_0_0_purge_left_unranked_refuses_every_rename_on_1_0_0_too() {
+    // Records from three devices, the purge from one on 1.0.0, which writes
+    // no rename after it. 1.0.0 then keeps "a (3).txt" and "A (4).txt"
+    // where its ranking says "a (2).txt" and "A (3).txt", and "a (2).txt" is
+    // another file's. Any claim that ranks the group again stops 1.0.0, a
+    // rename made on it included, so no record this build writes for such
+    // an entry can apply there. `mixed_fleet.rs` allows these refusals.
+    let (old, new) = side_by_side();
+    let root = silentsilo_vfs::root_folder_id_for(new.vault_id);
+    let devices = [Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3)];
+    let id = |n: u128| Uuid::from_u128(0x100 + n);
+    let add = |n: u128, name: &str| silentsilo_vfs::VaultOp::AddFile {
+        id: id(n),
+        folder_id: root,
+        name: name.into(),
+        blob_id: Uuid::from_u128(0x200 + n),
+        size_bytes: 1,
+        content_hash: "h".into(),
+        mime_type: None,
+        blob_key: "k".into(),
+    };
+    let ops = [
+        (2, 0, add(0, "notă.md")),
+        (3, 1, add(1, "a (2).txt")),
+        (5, 2, add(2, "A.txt")),
+        (9, 2, add(3, "A.txt")),
+        (
+            11,
+            1,
+            silentsilo_vfs::VaultOp::RenameFile {
+                id: id(0),
+                name: "a.txt".into(),
+            },
+        ),
+        (17, 2, add(4, "A.txt")),
+        (
+            36,
+            1,
+            silentsilo_vfs::VaultOp::Purge {
+                folder_ids: Vec::new(),
+                file_ids: vec![id(3)],
+            },
+        ),
+    ];
+    let mut seqs = [0u64; 3];
+    let records: Vec<silentsilo_vfs::OpRecord> = ops
+        .into_iter()
+        .enumerate()
+        .map(|(n, (lamport, device, op))| {
+            seqs[device] += 1;
+            silentsilo_vfs::OpRecord::authored(
+                Uuid::from_u128(0x300 + n as u128),
+                lamport,
+                devices[device],
+                0,
+                seqs[device] - 1,
+                None,
+                op,
+            )
+        })
+        .collect();
+    silentsilo_vfs::replay(&new.conn, records.clone()).unwrap();
+    for record in as_1_0_0(records) {
+        vfs_v1::apply_op(&old.conn, &record).unwrap();
+    }
+    assert_eq!(tree(&old.conn), tree(&new.conn), "both show the same names");
+
+    let old_vfs = vfs_v1::Vfs::new(&old);
+    for name in ["a.txt", "a (4).txt", "b.txt"] {
+        assert!(
+            old_vfs.rename_file(id(4), name).is_err(),
+            "1.0.0 renamed it to {name}"
+        );
+    }
+}
+
 // ── Guard: anything this build writes, 1.0.0 applies ────────────────
 
 struct Rng(u64);

@@ -1420,6 +1420,8 @@ pub struct SweepOutcome {
     /// them for that to mean anything.
     pub candidates: Vec<Uuid>,
     pub failed: Vec<(Uuid, String)>,
+    /// Every blob the listing held, deleted ones included.
+    pub listed: Vec<Uuid>,
 }
 
 /// Deletes content nothing points at any more, one pass behind: a blob
@@ -1442,6 +1444,7 @@ pub async fn sweep_orphan_blobs(
             // unreadable operation object.
             continue;
         };
+        outcome.listed.push(blob_id);
         if referenced.contains(&blob_id) {
             continue;
         }
@@ -1462,6 +1465,63 @@ pub async fn sweep_orphan_blobs(
     }
 
     Ok(outcome)
+}
+
+/// How many missing blobs one pass puts back per target.
+const RESTORE_PER_PASS: usize = 100;
+
+/// What [`restore_missing_blobs`] put back.
+#[derive(Debug, Default, Clone)]
+pub struct RestoreOutcome {
+    pub restored: Vec<Uuid>,
+    /// Missing, and neither this device nor another copy had the bytes.
+    pub unavailable: Vec<Uuid>,
+    pub failed: Vec<(Uuid, String)>,
+}
+
+/// Puts back content a file still points at that `target` no longer holds,
+/// from this device's cache or from another copy. `missing` comes from a
+/// listing of `target` against what this device references; content this
+/// device does not reference is never sent. An older version's sweep deletes
+/// content it has no row for, and a row can reach a device after the sweep
+/// that saw none.
+pub async fn restore_missing_blobs(
+    target: (Uuid, &dyn ObjectStore),
+    others: &[(Uuid, &dyn ObjectStore)],
+    vault_root: &Path,
+    missing: &[Uuid],
+) -> RestoreOutcome {
+    let mut outcome = RestoreOutcome::default();
+    let (target_id, store) = target;
+    for blob_id in missing.iter().copied().take(RESTORE_PER_PASS) {
+        let path = vault_root.join("blobs").join(format!("{blob_id}.sslo"));
+        if !path.is_file() {
+            let mut found = false;
+            for (other, client) in others {
+                if *other == target_id {
+                    continue;
+                }
+                if fetch_blob(*client, vault_root, blob_id).await.is_ok() {
+                    let _ = record_blob_delivered(vault_root, blob_id, *other);
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                outcome.unavailable.push(blob_id);
+                continue;
+            }
+        }
+        match store.put_from_file(&blob_key(blob_id), &path).await {
+            Ok(()) => {
+                let _ = record_blob_delivered(vault_root, blob_id, target_id);
+                let _ = silentsilo_vault::clear_blob_absent(vault_root, blob_id);
+                outcome.restored.push(blob_id);
+            }
+            Err(e) => outcome.failed.push((blob_id, e.to_string())),
+        }
+    }
+    outcome
 }
 
 fn blob_id_from_key(key: &str) -> Option<Uuid> {

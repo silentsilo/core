@@ -63,12 +63,18 @@ fn state(conn: &Connection) -> Vec<String> {
     out.extend(
         files
             .query_map([], |r| {
+                let (blob, key) = (r.get::<_, String>(2)?, r.get::<_, String>(3)?);
+                // 1.0.0 gave a conflict copy made in one arrival order the
+                // other edit's key. Every row's key must be its own blob's.
+                assert_eq!(
+                    key,
+                    format!("key-{blob}"),
+                    "a file carries another blob's key"
+                );
                 Ok(format!(
-                    "file {}/{} blob={} key={} deleted={:?}",
+                    "file {}/{} blob={blob} key={key} deleted={:?}",
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
                     r.get::<_, Option<i64>>(4)?
                 ))
             })

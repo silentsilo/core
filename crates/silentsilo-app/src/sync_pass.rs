@@ -33,6 +33,10 @@ pub struct SyncReport {
     /// the status line can say why a quiet pass moved gigabytes.
     pub blobs_fetched: usize,
     pub blobs_failed: usize,
+    /// Content a file points at that a copy had lost, put back from this
+    /// device or another copy.
+    #[serde(default)]
+    pub blobs_restored: usize,
     /// Entries another device's changes forced a rename on, so the UI can
     /// tell the user rather than letting a file quietly change name.
     pub renamed: Vec<String>,
@@ -716,9 +720,11 @@ pub async fn run_sync_pass(
     // outright rather than swept and refused. Content that nothing
     // references staying there for ever is what that role means, and the
     // Copies panel says so instead of the sweep pretending to run.
+    let mut blobs_restored = 0;
     if view_complete {
         for target in targets.iter().filter(|t| t.role.allows_delete()) {
-            run_blob_sweep(state, silo, &*target.store, target.id).await?;
+            blobs_restored +=
+                run_blob_sweep(state, silo, (target.id, &*target.store), &reachable).await?;
         }
     }
 
@@ -731,6 +737,7 @@ pub async fn run_sync_pass(
         blobs_uploaded,
         blobs_fetched: pulled,
         blobs_failed,
+        blobs_restored,
         renamed: replayed
             .renamed
             .iter()
@@ -950,15 +957,25 @@ async fn run_compaction(
 /// has been wasted for a day is no worse than storage wasted for a minute.
 const BLOB_SWEEP_INTERVAL_SECS: i64 = 24 * 60 * 60;
 
-/// Deletes superseded content, at most once a day, and only what was
-/// already unreferenced last time. Runs after a successful pass, when the
-/// referenced set is trustworthy. Errors are swallowed: housekeeping.
+/// How long content stays in storage after this device first saw nothing
+/// point at it. A device that has not synced meanwhile can still write a
+/// record naming it: a move made on top of an edit or a purge it had not
+/// received copies the old content's id. The same span as the compaction
+/// margin, past which such a device has to rebuild anyway.
+const BLOB_SWEEP_GRACE_SECS: i64 = 30 * 24 * 60 * 60;
+
+/// Deletes content nothing references, at most once a day, and only what
+/// was unreferenced on an earlier sweep and for the whole grace period. The
+/// same listing puts back content a file points at that the target lost.
+/// Runs after a successful pass, when the referenced set is trustworthy.
+/// Errors are swallowed: housekeeping. Returns how many blobs went back.
 async fn run_blob_sweep(
     state: &AppState,
     silo: &SiloEntry,
-    store: &dyn ObjectStore,
-    target: Uuid,
-) -> Result<(), String> {
+    target: (Uuid, &dyn ObjectStore),
+    reachable: &[(Uuid, &dyn ObjectStore)],
+) -> Result<usize, String> {
+    let (target, store) = target;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -967,7 +984,7 @@ async fn run_blob_sweep(
     let plan = {
         let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
         let Some(session) = sessions.get(&silo.id) else {
-            return Ok(());
+            return Ok(0);
         };
         // Every read here gives up rather than failing the pass: a missing
         // bookkeeping table once turned this `?` into a sync that failed a
@@ -981,21 +998,44 @@ async fn run_blob_sweep(
             ),
             Ok(true)
         ) {
-            return Ok(());
+            return Ok(0);
         }
         // Attachments included: they have no row in `files`, so the bare
         // tree set reads them as orphans and the sweep deletes them.
-        let (Ok(referenced), Ok(candidates)) = (
+        let (Ok(referenced), Ok(first_seen)) = (
             Vfs::new(session).referenced_blobs_with_attachments(),
-            silentsilo_vfs::snapshot::gc_candidates(&session.conn, target),
+            silentsilo_vfs::snapshot::gc_first_seen(&session.conn, target, now),
         ) else {
-            return Ok(());
+            return Ok(0);
         };
-        (referenced, candidates)
+        (referenced, first_seen)
+    };
+    let (referenced, first_seen) = plan;
+    // Only a candidate past its grace may go on this sweep.
+    let due: std::collections::HashSet<Uuid> = first_seen
+        .iter()
+        .filter(|(_, seen)| now - **seen >= BLOB_SWEEP_GRACE_SECS)
+        .map(|(id, _)| *id)
+        .collect();
+
+    let Ok(outcome) = sync::sweep_orphan_blobs(store, &referenced, &due).await else {
+        return Ok(0);
     };
 
-    let Ok(outcome) = sync::sweep_orphan_blobs(store, &plan.0, &plan.1).await else {
-        return Ok(());
+    let listed: std::collections::HashSet<Uuid> = outcome.listed.iter().copied().collect();
+    let mut missing: Vec<Uuid> = referenced.difference(&listed).copied().collect();
+    missing.sort();
+    let restored = if missing.is_empty() {
+        0
+    } else {
+        let others: Vec<(Uuid, &dyn ObjectStore)> = reachable
+            .iter()
+            .filter(|(id, _)| *id != target)
+            .copied()
+            .collect();
+        let put_back =
+            sync::restore_missing_blobs((target, store), &others, &silo.path, &missing).await;
+        put_back.restored.len()
     };
 
     let mut sessions = state.sessions.lock().map_err(|e| e.to_string())?;
@@ -1003,10 +1043,14 @@ async fn run_blob_sweep(
         // Locked while the listing ran. The candidate set is not written, so
         // the next sweep starts these blobs over at first sighting, which is
         // the safe direction.
-        return Ok(());
+        return Ok(restored);
     };
-    let seen = outcome.candidates.into_iter().collect();
-    let _ = silentsilo_vfs::snapshot::set_gc_candidates(&mut session.conn, target, &seen);
+    let seen = outcome
+        .candidates
+        .into_iter()
+        .map(|id| (id, first_seen.get(&id).copied().unwrap_or(now)))
+        .collect();
+    let _ = silentsilo_vfs::snapshot::set_gc_first_seen(&mut session.conn, target, &seen);
     let _ = silentsilo_vfs::snapshot::record_sweep(&session.conn, target, now);
-    Ok(())
+    Ok(restored)
 }

@@ -221,8 +221,9 @@ stateDiagram-v2
     Synced --> Evicted: cache limit (LRU, never full-copy silos, never unsynced)
     Evicted --> LocalOnly: fetch_blob on open/export (from any copy)
     Synced --> Candidate: sweep sees it unreferenced
-    Candidate --> Deleted: still unreferenced on the next daily sweep
+    Candidate --> Deleted: still unreferenced on a later sweep, 30 days on
     Candidate --> Synced: a record referencing it arrives
+    Deleted --> Synced: a row points at it and a device holds it (restored)
 ```
 
 The referenced set is `files.blob_id` (trash included, a restore needs the
@@ -234,6 +235,16 @@ to delete, because the sweep re-asks after the ops have converged, and a
 row written concurrently on another device may still need the bytes. All
 transfers stream through disk (`put_from_file`/`get_to_file`); nothing
 holds a whole blob in memory.
+
+The sweep keeps a candidate for 30 days after this device first saw it
+unreferenced (`snapshot::gc_first_seen`). A move records the file again over
+the content its device holds, and a device that has not synced for days can
+make one on top of an edit or a purge it has not received: without the grace
+the others had already deleted that content. The same listing puts back
+content a row here points at and the target lacks, from the local cache or
+another copy (`sync::restore_missing_blobs`). A 1.0.0 device sweeps after
+two sightings and has no row for some content this build keeps (below), so
+beside one the content goes and comes back until it updates.
 
 ### The inbox
 
@@ -297,8 +308,14 @@ Read this before "fixing" any of it.
   device skips the ones whose derivation it cannot perform. Mobile will add
   to the list rather than change it.
 - **Purge does not delete bucket blobs.** The sweep does, two-pass, after
-  convergence. Deleting at purge time froze "referenced" at what one device
-  knew and destroyed content another device still pointed at.
+  convergence and a 30-day grace. Deleting at purge time froze "referenced"
+  at what one device knew and destroyed content another device still pointed
+  at, and so did the sweep without a grace, for a move made on a device that
+  had not synced.
+- **A pass uploads content it did not create.** The sweep puts back what a
+  row points at and storage lost. It never sends content no row here
+  references, so emptying the trash is not undone by a device that still
+  holds the bytes in its cache.
 - **Compaction and the sweep skip a partial pass.** A record held back, an
   unreadable object or a copy that could not be read means this device's
   idea of what is referenced is short, so neither runs. The same complete
@@ -386,7 +403,7 @@ The checklist, in order:
    invariant it preserves: nothing is marked sent before storage confirms;
    nothing local is dropped unless every copy holds it; nothing in a bucket
    is deleted unless it is covered by a snapshot or unreferenced across two
-   sweeps.
+   sweeps and for 30 days; nothing is put back that no row references.
 4. **Run the whole CI sequence locally, from the workspace root**, in the
    order `.github/workflows/ci.yml` runs it. The cargo commands need `--all`
    from the root or they silently skip crates. Add

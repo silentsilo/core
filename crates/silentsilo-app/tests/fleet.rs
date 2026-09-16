@@ -13,6 +13,7 @@
 //! `scripts/test-local.ps1` (or CI) provides them. A failure prints its seed;
 //! `SILENTSILO_FLEET_SEED` replays that one run.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Mutex;
 
@@ -76,11 +77,18 @@ impl Host for FleetHost {
     }
 }
 
+thread_local! {
+    /// The step the run on this thread is at, read as the day.
+    static DAY: Cell<usize> = const { Cell::new(0) };
+}
+
 struct Device {
     _dir: tempfile::TempDir,
     state: AppState,
     silo: SiloEntry,
     host: FleetHost,
+    /// The day of this device's last pass.
+    swept_on: Cell<usize>,
 }
 
 impl Device {
@@ -116,6 +124,7 @@ impl Device {
             state,
             silo,
             host,
+            swept_on: Cell::new(DAY.get()),
         }
     }
 
@@ -135,7 +144,25 @@ impl Device {
         f(&Vfs::new(session), &session.conn)
     }
 
+    /// A pass that sweeps, where the apps sweep once a day. A step of the
+    /// run stands for a day, so the sweep's grace runs out for content
+    /// unreferenced for that many steps, and a device that has not synced
+    /// for fewer can still point at it.
     async fn pass(&self) -> SyncReport {
+        let today = DAY.get();
+        let days = today.saturating_sub(self.swept_on.replace(today));
+        self.with(|_, conn| {
+            conn.execute(
+                "DELETE FROM vault_meta WHERE key LIKE 'blob_sweep_at:%'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE blob_gc_seen SET first_seen = first_seen - ?1",
+                [days as i64 * 24 * 60 * 60],
+            )
+            .unwrap();
+        });
         run_sync_pass(&self.state, &self.host, &self.silo)
             .await
             .unwrap_or_else(|e| panic!("a pass failed: {e}"))
@@ -341,6 +368,7 @@ fn files_with(device: &Device, trashed: bool) -> Vec<(Uuid, Option<String>)> {
 async fn act(devices: &[Device], rng: &mut Rng, ledger: &mut Ledger, step: usize) {
     let which = rng.below(devices.len());
     let d = &devices[which];
+    DAY.set(step);
     let choice = rng.below(20);
     ledger
         .trace
@@ -584,6 +612,7 @@ async fn settle(devices: &[Device], seed: u64) {
 
 async fn run(seed: u64, steps: usize, targets: impl Fn() -> Vec<BackupTarget>) {
     let mut rng = Rng::new(seed);
+    DAY.set(0);
     let first = Device::new(Uuid::new_v4(), None, targets());
     let keys = first.keys();
     let vault_id = first.vault_id();

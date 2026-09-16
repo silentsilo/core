@@ -795,8 +795,70 @@ pub fn init_gc(conn: &Connection) -> rusqlite::Result<()> {
             blob_id TEXT NOT NULL,
             PRIMARY KEY (target, blob_id)
         );
+        -- When each candidate was first seen unreferenced, by this device's
+        -- clock, for the grace period (`gc_first_seen`).
+        CREATE TABLE IF NOT EXISTS blob_gc_seen (
+            target     TEXT NOT NULL,
+            blob_id    TEXT NOT NULL,
+            first_seen INTEGER NOT NULL,
+            PRIMARY KEY (target, blob_id)
+        );
         ",
     )
+}
+
+/// One target's candidates with when each was first seen unreferenced. A
+/// candidate from before this table existed counts from `now`.
+pub fn gc_first_seen(
+    conn: &Connection,
+    target: Uuid,
+    now: i64,
+) -> CoreResult<std::collections::HashMap<Uuid, i64>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT c.blob_id, s.first_seen FROM blob_gc_candidates c
+               LEFT JOIN blob_gc_seen s ON s.target = c.target AND s.blob_id = c.blob_id
+              WHERE c.target = ?1",
+        )
+        .map_err(db)?;
+    let rows = stmt
+        .query_map([target.to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+        })
+        .map_err(db)?;
+    let mut out = std::collections::HashMap::new();
+    for row in rows {
+        let (id, seen) = row.map_err(db)?;
+        if let Ok(id) = Uuid::parse_str(&id) {
+            out.insert(id, seen.unwrap_or(now));
+        }
+    }
+    Ok(out)
+}
+
+/// [`set_gc_candidates`], keeping when each was first seen.
+pub fn set_gc_first_seen(
+    conn: &mut Connection,
+    target: Uuid,
+    candidates: &std::collections::HashMap<Uuid, i64>,
+) -> CoreResult<()> {
+    let ids = candidates.keys().copied().collect();
+    set_gc_candidates(conn, target, &ids)?;
+    let tx = conn.transaction().map_err(db)?;
+    tx.execute(
+        "DELETE FROM blob_gc_seen WHERE target = ?1",
+        [target.to_string()],
+    )
+    .map_err(db)?;
+    for (id, seen) in candidates {
+        tx.execute(
+            "INSERT OR REPLACE INTO blob_gc_seen(target, blob_id, first_seen) VALUES (?1, ?2, ?3)",
+            params![target.to_string(), id.to_string(), seen],
+        )
+        .map_err(db)?;
+    }
+    tx.commit().map_err(db)?;
+    Ok(())
 }
 
 pub fn gc_candidates(
@@ -839,6 +901,13 @@ pub fn set_gc_candidates(
         )
         .map_err(db)?;
     }
+    // A blob referenced again starts its grace over when it next goes.
+    tx.execute(
+        "DELETE FROM blob_gc_seen WHERE target = ?1 AND blob_id NOT IN
+           (SELECT blob_id FROM blob_gc_candidates WHERE target = ?1)",
+        [target.to_string()],
+    )
+    .map_err(db)?;
     tx.commit().map_err(db)?;
     Ok(())
 }
@@ -1403,5 +1472,20 @@ mod gc_target_tests {
             sweep_due(&conn, fresh, 1_000_100, day).unwrap(),
             "a bucket that has never been swept was told to wait"
         );
+    }
+
+    #[test]
+    fn a_candidate_keeps_its_first_sighting_until_it_is_referenced_again() {
+        let mut conn = bare_device(Uuid::new_v4());
+        let target = Uuid::new_v4();
+        let blob = Uuid::new_v4();
+
+        set_gc_first_seen(&mut conn, target, &[(blob, 100)].into_iter().collect()).unwrap();
+        assert_eq!(gc_first_seen(&conn, target, 500).unwrap()[&blob], 100);
+
+        // Referenced for a while, then unreferenced again: the clock restarts.
+        set_gc_candidates(&mut conn, target, &std::collections::HashSet::new()).unwrap();
+        set_gc_candidates(&mut conn, target, &[blob].into_iter().collect()).unwrap();
+        assert_eq!(gc_first_seen(&conn, target, 900).unwrap()[&blob], 900);
     }
 }

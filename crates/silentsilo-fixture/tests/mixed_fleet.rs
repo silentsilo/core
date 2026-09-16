@@ -18,11 +18,24 @@
 //!   same records. Replayed into a fresh 1.0.0 database with only what its
 //!   author held, it must apply (`refused_by_1_0_0.rs`);
 //! - the devices on this build agree exactly;
-//! - nothing added is gone from them unless it was deleted for good;
-//! - every file any device shows opens, with the bytes that were added,
-//!   unless that content was deleted for good on purpose. A 1.0.0 sweep
-//!   deleting content this build still shows is the failure this exists to
-//!   catch.
+//! - nothing added is gone from them unless a purge named the file it was
+//!   written to, or a later edit replaced it;
+//! - every file a device on this build shows opens, with the bytes that were
+//!   added. Content a 1.0.0 sweep deleted is put back by any device on this
+//!   build that holds it;
+//! - every file the 1.0.0 device shows opens too, unless a purge named it.
+//!
+//! Two losses are allowed, each printed with its reason, because only the
+//! 1.0.0 device could have avoided them:
+//!
+//! - a 1.0.0 sweep deleted content that no device on this build holds. 1.0.0
+//!   sweeps without a grace period and has no row for content this build
+//!   keeps: an entry added to a folder purged meanwhile, or a move another
+//!   device made from a version 1.0.0 had already replaced or purged;
+//! - 1.0.0 cannot decrypt a conflict copy it made. When the losing edit
+//!   arrives after the winning one, 1.0.0 pairs the losing content with the
+//!   winning edit's key. The records hold the right key, and this build
+//!   reads it.
 //!
 //! What the 1.0.0 device shows differently is printed, not failed: 1.0.0
 //! applied some records differently depending on arrival order, which this
@@ -30,6 +43,9 @@
 //!
 //! Every pass sweeps storage for unreferenced content, where the apps sweep
 //! once a day: the window a sweep could delete something in is the point.
+//! A step of the run stands for a day for this build's sweep, which keeps
+//! content for 30 days after it stopped being referenced. 1.0.0 deletes on
+//! its second pass.
 //!
 //! `SILENTSILO_MIXED_SEED` replays one seed, `SILENTSILO_MIXED_SEEDS=1..100`
 //! runs a range, `SILENTSILO_MIXED_TRACE` prints what each device does as it
@@ -38,6 +54,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rusqlite::Connection;
 use silentsilo_app::files::{import_file, read_file};
@@ -50,6 +67,12 @@ use silentsilo_vault_v1_0_0 as vault_v1;
 use silentsilo_vfs::Vfs;
 use silentsilo_vfs_v1_0_0 as vfs_v1;
 use uuid::Uuid;
+
+/// The step the run is at, read as the day by this build's sweep.
+static DAY: AtomicUsize = AtomicUsize::new(0);
+
+/// Blobs a 1.0.0 sweep deleted.
+static SWEPT_BY_1_0_0: Mutex<BTreeSet<Uuid>> = Mutex::new(BTreeSet::new());
 
 // ── A seeded order ──────────────────────────────────────────────────
 
@@ -102,6 +125,8 @@ struct NewDevice {
     state: AppState,
     silo: SiloEntry,
     host: FleetHost,
+    /// The day of this device's last pass.
+    swept_on: AtomicUsize,
 }
 
 /// A device on 1.0.0.
@@ -229,6 +254,7 @@ impl Device {
             host: FleetHost {
                 targets: Vec::new(),
             },
+            swept_on: AtomicUsize::new(DAY.load(Ordering::SeqCst)),
         });
         let Kind::Old(old) = std::mem::replace(&mut self.kind, placeholder) else {
             unreachable!()
@@ -279,10 +305,21 @@ impl Device {
         });
         match &self.kind {
             Kind::New(new) => {
+                let today = DAY.load(Ordering::SeqCst);
+                let days = today.saturating_sub(new.swept_on.swap(today, Ordering::SeqCst));
+                self.with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE blob_gc_seen SET first_seen = first_seen - ?1",
+                        [days as i64 * 24 * 60 * 60],
+                    )
+                    .unwrap()
+                });
                 let report: SyncReport = run_sync_pass(&new.state, &new.host, &new.silo)
                     .await
                     .unwrap_or_else(|e| panic!("a pass on this build failed: {e}"));
                 Pass {
+                    // Not what it put back: 1.0.0 deletes that again two
+                    // passes on, for as long as it has no row for it.
                     moved: report.ops_pushed + report.ops_applied + report.blobs_uploaded,
                     unreadable: report.unreadable,
                     held_back: report.held_back,
@@ -482,13 +519,29 @@ async fn old_pass(device: &OldDevice, root: &Path) -> Result<Pass, OldPassError>
             _ => None,
         }
     };
-    if let Some((referenced, candidates)) = plan
-        && let Ok(swept) = sync_v1::sweep_orphan_blobs(&*store, &referenced, &candidates).await
-    {
-        let mut session = device.session.lock().unwrap();
-        let seen = swept.candidates.into_iter().collect();
-        let _ = vfs_v1::snapshot::set_gc_candidates(&mut session.conn, target_id, &seen);
-        let _ = vfs_v1::snapshot::record_sweep(&session.conn, target_id, now);
+    if let Some((referenced, candidates)) = plan {
+        let storage = match &device.target {
+            store_v1::StoreConfig::Folder { path } => path.clone(),
+            _ => unreachable!("a folder target"),
+        };
+        let at_risk: Vec<Uuid> = candidates
+            .iter()
+            .filter(|id| !referenced.contains(id))
+            .filter(|id| storage.join(format!("blobs/{id}.sslo")).is_file())
+            .copied()
+            .collect();
+        if let Ok(swept) = sync_v1::sweep_orphan_blobs(&*store, &referenced, &candidates).await {
+            // What it could delete and did: noted for the allowance.
+            SWEPT_BY_1_0_0.lock().unwrap().extend(
+                at_risk
+                    .into_iter()
+                    .filter(|id| !storage.join(format!("blobs/{id}.sslo")).is_file()),
+            );
+            let mut session = device.session.lock().unwrap();
+            let seen = swept.candidates.into_iter().collect();
+            let _ = vfs_v1::snapshot::set_gc_candidates(&mut session.conn, target_id, &seen);
+            let _ = vfs_v1::snapshot::record_sweep(&session.conn, target_id, now);
+        }
     }
 
     Ok(Pass {
@@ -727,6 +780,9 @@ enum Verdict {
     Concurrent,
     /// 1.0.0 derives the folder differently from what its author held.
     Diverged(String),
+    /// 1.0.0 cannot rename the entry to any name either: a purge it made
+    /// left a group whose ranking lands on a name another entry asked for.
+    Unrenamable,
     /// What the author held is not known, or 1.0.0 stops earlier.
     Unknown,
 }
@@ -741,11 +797,9 @@ struct Ledger {
     replaced: HashSet<String>,
     /// Content in the trash of a device when that device emptied it.
     purged: HashSet<String>,
-    /// First step at which some device sent each file to the trash, directly
-    /// or with a folder, or moved it.
-    file_trashed_at: HashMap<Uuid, usize>,
-    /// Steps at which some device emptied its trash.
-    emptied: Vec<usize>,
+    /// Content written to a file a purge named, edits its author had not
+    /// seen included: a purge takes the file it names with all its content.
+    named: HashSet<String>,
     /// For each updated device, the first position in its chain written by
     /// this build.
     updated_from: HashMap<Uuid, u64>,
@@ -765,13 +819,36 @@ struct Ledger {
 
 impl Ledger {
     fn may_be_gone(&self, hash: &str) -> bool {
-        if self.replaced.contains(hash) || self.purged.contains(hash) {
-            return true;
+        self.replaced.contains(hash) || self.purged.contains(hash) || self.named.contains(hash)
+    }
+
+    /// Notes the content of every file a purge named, from the records a
+    /// device on this build holds.
+    fn learn_purges(&mut self, device: &Device) {
+        use silentsilo_vfs::{OpBody, VaultOp};
+        let records = device.with_conn(|conn| silentsilo_vfs::all_ops(conn).unwrap());
+        let named: HashSet<Uuid> = records
+            .iter()
+            .filter_map(|r| match &r.op {
+                OpBody::Known(VaultOp::Purge { file_ids, .. }) => Some(file_ids.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        for record in &records {
+            if let OpBody::Known(
+                VaultOp::AddFile {
+                    id, content_hash, ..
+                }
+                | VaultOp::ReplaceFileContent {
+                    id, content_hash, ..
+                },
+            ) = &record.op
+                && named.contains(id)
+            {
+                self.named.insert(content_hash.clone());
+            }
         }
-        self.hash_file
-            .get(hash)
-            .and_then(|file| self.file_trashed_at.get(file))
-            .is_some_and(|since| self.emptied.iter().any(|at| at > since))
     }
 
     /// What happened, printed as it happens under `SILENTSILO_MIXED_TRACE`.
@@ -901,9 +978,46 @@ impl Ledger {
         }
         let refused = vfs_v1::OpRecord::from_bytes(&refused.to_bytes().unwrap()).unwrap();
         match vfs_v1::apply_op(&old, &refused) {
+            Err(_) if self.unrenamable_on_1_0_0(&records, &refused) => Verdict::Unrenamable,
             Err(e) => Verdict::Ours(format!("{e}: {:?}", refused.op)),
             Ok(_) => Verdict::Concurrent,
         }
+    }
+
+    /// Whether 1.0.0's own `Vfs`, holding `records`, refuses renaming the
+    /// entry `refused` renames, to that name and to one nothing has.
+    fn unrenamable_on_1_0_0(
+        &self,
+        records: &[silentsilo_vfs::OpRecord],
+        refused: &vfs_v1::OpRecord,
+    ) -> bool {
+        let (id, name, folder) = match &refused.op {
+            vfs_v1::OpBody::Known(vfs_v1::VaultOp::RenameFile { id, name }) => (*id, name, false),
+            vfs_v1::OpBody::Known(vfs_v1::VaultOp::RenameFolder { id, name }) => (*id, name, true),
+            _ => return false,
+        };
+        [name.as_str(), "unclaimed probe"].iter().all(|to| {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+            let session = vault_v1::VaultSession {
+                paths: vault_v1::VaultPaths::new(PathBuf::from("unused")),
+                conn,
+                vault_id: self.vault_id,
+                dek: crypto_v1::generate_dek(),
+                kek: crypto_v1::generate_content_kek(),
+            };
+            vfs_v1::init_schema(&session.conn, self.vault_id).unwrap();
+            for record in records {
+                let record = vfs_v1::OpRecord::from_bytes(&record.to_bytes().unwrap()).unwrap();
+                vfs_v1::apply_op(&session.conn, &record).unwrap();
+            }
+            let vfs = vfs_v1::Vfs::new(&session);
+            if folder {
+                vfs.rename_folder(id, to).is_err()
+            } else {
+                vfs.rename_file(id, to).is_err()
+            }
+        })
     }
 
     /// Checks a pass, keeping what a 1.0.0 device refused. A record this
@@ -936,6 +1050,7 @@ impl Ledger {
                     )
                 }
                 Some(Verdict::Concurrent) => "this build, beside a change it had not seen,",
+                Some(Verdict::Unrenamable) => "this build, on an entry 1.0.0 cannot rename,",
                 Some(Verdict::Diverged(how)) => {
                     self.note(format!(
                         "  1.0.0 derives the author's tree differently: {how}"
@@ -949,17 +1064,12 @@ impl Ledger {
                 .or_insert((author, refusal.error, refusal.op));
         }
     }
-
-    fn trashing(&mut self, files: Vec<(Uuid, Option<String>)>, step: usize) {
-        for (id, _) in files {
-            self.file_trashed_at.entry(id).or_insert(step);
-        }
-    }
 }
 
 // ── One run ─────────────────────────────────────────────────────────
 
 async fn act(devices: &[Device], rng: &mut Rng, ledger: &mut Ledger, step: usize) {
+    DAY.store(step, Ordering::SeqCst);
     let which = rng.below(devices.len());
     let d = &devices[which];
     let choice = rng.below(20);
@@ -1027,10 +1137,11 @@ async fn act(devices: &[Device], rng: &mut Rng, ledger: &mut Ledger, step: usize
         11 => {
             if let Some((id, _)) = rng.pick(&files_with(d, false)) {
                 let name = rng.pick(FILE_NAMES).unwrap();
-                let _ = on_vfs!(d, |vfs| vfs
+                let r = on_vfs!(d, |vfs| vfs
                     .rename_file(id, name)
                     .map(|_| ())
                     .map_err(|e| e.to_string()));
+                ledger.note(format!("  rename file {id} to {name}: {r:?}"));
             } else if let Some(id) = rng.pick(&live_folders(d)) {
                 let name = rng.pick(FOLDER_NAMES).unwrap();
                 let _ = on_vfs!(d, |vfs| vfs
@@ -1043,10 +1154,9 @@ async fn act(devices: &[Device], rng: &mut Rng, ledger: &mut Ledger, step: usize
         12 => match &d.kind {
             Kind::New(new) => {
                 let folders = live_folders(d);
-                if let (Some((id, hash)), Some(to)) =
+                if let (Some((id, _)), Some(to)) =
                     (rng.pick(&files_with(d, false)), rng.pick(&folders))
                 {
-                    ledger.trashing(vec![(id, hash)], step);
                     let sessions = new.state.sessions.lock().unwrap();
                     let r = Vfs::new(&sessions[&new.silo.id])
                         .move_file(id, to)
@@ -1073,7 +1183,6 @@ async fn act(devices: &[Device], rng: &mut Rng, ledger: &mut Ledger, step: usize
                 return;
             };
             if let Kind::New(new) = &d.kind {
-                ledger.trashing(files_under(d, id), step);
                 let sessions = new.state.sessions.lock().unwrap();
                 let r = Vfs::new(&sessions[&new.silo.id])
                     .move_folder(id, to)
@@ -1082,15 +1191,13 @@ async fn act(devices: &[Device], rng: &mut Rng, ledger: &mut Ledger, step: usize
             }
         }
         14 => {
-            if let Some((id, hash)) = rng.pick(&files_with(d, false)) {
-                ledger.trashing(vec![(id, hash)], step);
+            if let Some((id, _)) = rng.pick(&files_with(d, false)) {
                 let r = on_vfs!(d, |vfs| vfs.trash_file(id).map_err(|e| e.to_string()));
                 ledger.note(format!("  trash file {id}: {r:?}"));
             }
         }
         15 => {
             if let Some(id) = rng.pick(&live_folders(d)) {
-                ledger.trashing(files_under(d, id), step);
                 let r = on_vfs!(d, |vfs| vfs.trash_folder(id).map_err(|e| e.to_string()));
                 ledger.note(format!("  trash folder {id}: {r:?}"));
             }
@@ -1106,7 +1213,6 @@ async fn act(devices: &[Device], rng: &mut Rng, ledger: &mut Ledger, step: usize
         }
         17 => {
             if rng.below(3) == 0 {
-                ledger.emptied.push(step);
                 let in_trash: Vec<String> = d.with_conn(|conn| {
                     conn.prepare(
                         "SELECT f.content_hash FROM files f JOIN folders d ON d.id = f.folder_id
@@ -1182,12 +1288,16 @@ struct OldDivergence {
     content_missing: usize,
     /// Records 1.0.0 could not apply: (written by this build, error, op).
     refused: Vec<(&'static str, String, String)>,
+    /// Files that do not open, and why only 1.0.0 could have kept them.
+    allowed: Vec<String>,
 }
 
 async fn run(seed: u64, before: usize, after: usize) -> OldDivergence {
     let storage = tempfile::tempdir().unwrap();
     let mut rng = Rng::new(seed);
     let vault_id = Uuid::new_v4();
+    DAY.store(0, Ordering::SeqCst);
+    SWEPT_BY_1_0_0.lock().unwrap().clear();
 
     let first = Device::old(vault_id, None, storage.path());
     let keys = first.keys();
@@ -1262,12 +1372,13 @@ async fn run(seed: u64, before: usize, after: usize) -> OldDivergence {
     });
     assert!(clashes.is_empty(), "seed {seed}: names clash: {clashes:?}");
 
-    // Every file shown opens with its bytes, on every device, unless its
-    // content was deleted for good on purpose somewhere.
+    // Every file shown opens with its bytes, on every device, unless only
+    // the 1.0.0 device could have kept it.
+    ledger.learn_purges(&devices[1]);
+    let mut allowed = Vec::new();
     for (i, d) in devices.iter().enumerate() {
         for (id, hash) in files_with(d, false) {
             let expected = hash.as_ref().and_then(|h| ledger.added.get(h));
-            let excused = hash.as_ref().is_some_and(|h| ledger.may_be_gone(h));
             match read(d, id).await {
                 Ok(bytes) => {
                     if let Some(expected) = expected {
@@ -1277,13 +1388,13 @@ async fn run(seed: u64, before: usize, after: usize) -> OldDivergence {
                         );
                     }
                 }
-                Err(e) if excused && d.is_old() => {
-                    println!("seed {seed}: 1.0.0 shows file {id}, deleted for good elsewhere: {e}");
-                }
-                Err(e) => panic!(
-                    "seed {seed}: file {id} does not open on device {i} ({}): {e}",
-                    if d.is_old() { "1.0.0" } else { "this build" },
-                ),
+                Err(e) => match only_1_0_0_could_have_kept(&devices, d, id, &e, &ledger) {
+                    Some(why) => allowed.push(format!("file {id} on device {i}: {e}: {why}")),
+                    None => panic!(
+                        "seed {seed}: file {id} does not open on device {i} ({}): {e}",
+                        if d.is_old() { "1.0.0" } else { "this build" },
+                    ),
+                },
             }
         }
     }
@@ -1313,7 +1424,57 @@ async fn run(seed: u64, before: usize, after: usize) -> OldDivergence {
             + differ(&old.2, &reference.2),
         content_missing: kept.difference(&on_old).count(),
         refused: ledger.refused.into_values().collect(),
+        allowed,
     }
+}
+
+/// Why a file that does not open on `device` is a loss only the 1.0.0 device
+/// could have avoided, or `None` when it is not.
+fn only_1_0_0_could_have_kept(
+    devices: &[Device],
+    device: &Device,
+    file: Uuid,
+    error: &str,
+    ledger: &Ledger,
+) -> Option<&'static str> {
+    use silentsilo_vfs::{OpBody, VaultOp};
+    let (blob, key, hash): (String, String, Option<String>) = device.with_conn(|conn| {
+        conn.query_row(
+            "SELECT blob_id, blob_key, content_hash FROM files WHERE id = ?1",
+            [file.to_string()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+    });
+    let blob = Uuid::parse_str(&blob).unwrap();
+    if device.is_old() && hash.is_some_and(|h| ledger.may_be_gone(&h)) {
+        return Some("a purge elsewhere named it");
+    }
+    let held_here = devices
+        .iter()
+        .filter(|d| !d.is_old())
+        .any(|d| d.root.join(format!("blobs/{blob}.sslo")).is_file());
+    if SWEPT_BY_1_0_0.lock().unwrap().contains(&blob) && !held_here {
+        return Some("a 1.0.0 sweep deleted it and no device on this build holds it");
+    }
+    if device.is_old() && error.contains("decryption failed") {
+        let records = devices[1].with_conn(|conn| silentsilo_vfs::all_ops(conn).unwrap());
+        let written_with = records.iter().find_map(|r| match &r.op {
+            OpBody::Known(
+                VaultOp::AddFile {
+                    blob_id, blob_key, ..
+                }
+                | VaultOp::ReplaceFileContent {
+                    blob_id, blob_key, ..
+                },
+            ) if *blob_id == blob => Some(blob_key.clone()),
+            _ => None,
+        });
+        if written_with.is_some_and(|k| k != key) {
+            return Some("1.0.0 gave this conflict copy another edit's key");
+        }
+    }
+    None
 }
 
 fn seeds(default: std::ops::Range<u64>) -> Vec<u64> {
@@ -1332,6 +1493,7 @@ fn seeds(default: std::ops::Range<u64>) -> Vec<u64> {
 #[tokio::test]
 async fn a_1_0_0_device_beside_updated_ones_loses_nothing_and_breaks_nothing() {
     work_dirs_for_this_test();
+    a_file_1_0_0_dropped_is_put_back_after_its_sweep().await;
     for seed in seeds(1..5) {
         let old = run(seed, 60, 180).await;
         println!(
@@ -1341,7 +1503,62 @@ async fn a_1_0_0_device_beside_updated_ones_loses_nothing_and_breaks_nothing() {
         for (author, error, op) in &old.refused {
             println!("seed {seed}: 1.0.0 refused a record {author} wrote: {error}\n  {op}");
         }
+        for allowed in &old.allowed {
+            println!("seed {seed}: allowed, {allowed}");
+        }
     }
+}
+
+/// A file added to a folder another device purged meanwhile: this build
+/// moves it to the top, 1.0.0 received the purge first and drops it, then
+/// sweeps its content. The device that added it puts the content back.
+async fn a_file_1_0_0_dropped_is_put_back_after_its_sweep() {
+    let storage = tempfile::tempdir().unwrap();
+    let vault_id = Uuid::new_v4();
+    let first = Device::old(vault_id, None, storage.path());
+    let keys = first.keys();
+    let mut devices = vec![first];
+    for _ in 0..2 {
+        devices.push(Device::old(vault_id, Some(keys), storage.path()));
+    }
+    for (i, d) in devices.iter_mut().enumerate().skip(1) {
+        d.update(i);
+    }
+    let (old, adder, purger) = (&devices[0], &devices[1], &devices[2]);
+    let root = silentsilo_vfs::root_folder_id_for(vault_id);
+    let folder = on_vfs!(adder, |vfs| vfs.create_folder(root, "Docs").unwrap().id);
+    for d in [adder, purger, old, adder, purger, old] {
+        d.pass().await;
+    }
+
+    let (file, _) = import(adder, folder, "a.txt", b"added meanwhile").unwrap();
+    on_vfs!(purger, |vfs| {
+        vfs.trash_folder(folder).unwrap();
+        vfs.empty_trash().unwrap();
+    });
+    // 1.0.0 applies the purge, then the file into a folder it no longer has.
+    purger.pass().await;
+    old.pass().await;
+    adder.pass().await;
+    old.pass().await;
+    let blob: String = adder.with_conn(|conn| {
+        conn.query_row(
+            "SELECT blob_id FROM files WHERE id = ?1",
+            [file.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap()
+    });
+    let stored = storage.path().join(format!("blobs/{blob}.sslo"));
+    assert!(stored.is_file());
+    old.pass().await;
+    assert!(!stored.is_file(), "1.0.0 no longer sweeps what it dropped");
+
+    purger.pass().await;
+    assert!(read(purger, file).await.is_err());
+    adder.pass().await;
+    assert!(stored.is_file(), "not put back");
+    assert_eq!(read(purger, file).await.unwrap(), b"added meanwhile");
 }
 
 /// Where both versions keep working copies and blob bookkeeping. 1.0.0 has

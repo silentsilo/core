@@ -17,8 +17,36 @@ release notes should say.
   scratch of every silo that is not open, including what a crash, a kill or a
   power cut left for a silo that may never be opened again. Clients call them
   at start and after each lock.
+- The storage sweep puts back content a file still points at that a copy no
+  longer holds, from this device's cache or from another copy
+  (`restore_missing_blobs`, `SyncReport::blobs_restored`). It uses the
+  listing the sweep already makes, so it costs no extra request. Content no
+  row here references is never sent.
+
+### Changed
+
+- The sweep deletes content only once it has been unreferenced for 30 days
+  by this device's clock, on top of the two sightings
+  (`snapshot::gc_first_seen`, a new `blob_gc_seen` table beside the
+  candidates). Emptying the trash frees space in storage a month later.
 
 ### Fixed
+
+- A file moved on a device that had not yet received an edit or a purge of
+  it could lose its content. The move records the file again over the
+  content that device held; every other device had stopped referencing that
+  content and swept it after two sightings, so the moved file opened
+  nowhere. The grace period covers a device that syncs at least once a
+  month. Seen as 11 failures in 218 runs of `fleet.rs` with a sweep on every
+  pass, none since.
+- Beside a 1.0.0 device, content this build keeps and 1.0.0 has no row for
+  was swept by 1.0.0 for good: a file added to a folder another device
+  purged meanwhile (1.0.0 drops it, this build moves it to the top), or a
+  move made from a version 1.0.0 had already replaced or purged. A device on
+  this build that holds the bytes now puts them back on its daily sweep.
+  1.0.0 deletes them again two sweeps later for as long as it runs, so the
+  content can be missing from storage for up to a day at a time, and it is
+  lost only where no device on this build holds it.
 
 - The first unlock after an update rebuilt the derived tables one commit per
   record: 32 seconds on a 50,000-record log. The rebuild now runs in one
