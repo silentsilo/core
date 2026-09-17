@@ -11,6 +11,16 @@ release notes should say.
 
 ## [Unreleased]
 
+## [1.5.0] - Nothing readable left behind, and no lost edits
+
+No persisted format version changed, so the 1.0.0 fixtures still describe
+the current era. `SCHEMA_VERSION` is 3, which rebuilds each device's derived
+tables from its own log on the first open. The working copy of a silo's
+index is now ciphered with SQLCipher and kept across locks; `vault.db.enc`
+keeps its format. Purges written by this build carry marker ids in
+`file_ids`, which earlier clients ignore. Building now needs a Windows Perl
+(Strawberry) for the vendored OpenSSL; see the README.
+
 ### Added
 
 - `wipe_work_dirs_except` and `AppState::sweep_scratch`: remove the decrypted
