@@ -1,12 +1,14 @@
 //! Blob content moving through a real bucket.
 //!
-//! Skipped unless `SILENTSILO_TEST_S3_ENDPOINT` is set — see
-//! `silentsilo-s3`'s `live_roundtrip` tests for how to bring a server up.
+//! The ones that need one are skipped unless `SILENTSILO_TEST_S3_ENDPOINT`
+//! is set: see `silentsilo-s3`'s `live_roundtrip` tests for how to bring a
+//! server up. What a push reports as it goes is checked against a folder
+//! instead, since the question there is the pacing rather than the backend.
 
 use silentsilo_core::S3Config;
 use silentsilo_s3::S3Client;
 use silentsilo_store::ObjectStore;
-use silentsilo_sync::{fetch_blob, push_blobs, push_pending_blobs};
+use silentsilo_sync::{BlobPush, fetch_blob, push_blobs, push_blobs_reporting, push_pending_blobs};
 use silentsilo_vault::{list_local_blob_ids, list_undelivered_blob_ids, record_blob_present};
 
 /// One backup target, the same one across the calls in a test.
@@ -213,4 +215,163 @@ async fn pushing_a_blob_whose_file_is_gone_is_skipped_quietly() {
         .unwrap();
     assert_eq!(outcome.uploaded, 0);
     assert!(outcome.failed.is_empty());
+}
+
+/// A store that takes the bytes in pieces with a pause between them, the way
+/// a link slower than a local disk does. A folder underneath, so this runs
+/// with or without a bucket: what is being checked is the pacing of the
+/// reports, not the backend.
+struct Slow(silentsilo_store::FolderStore);
+
+impl Slow {
+    const PIECES: usize = 4;
+    const PAUSE: std::time::Duration = std::time::Duration::from_millis(120);
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for Slow {
+    async fn put(&self, key: &str, body: Vec<u8>) -> Result<(), silentsilo_store::StoreError> {
+        self.0.put(key, body).await
+    }
+
+    async fn get(&self, key: &str) -> Result<Vec<u8>, silentsilo_store::StoreError> {
+        self.0.get(key).await
+    }
+
+    async fn head(&self, key: &str) -> Result<Option<i64>, silentsilo_store::StoreError> {
+        self.0.head(key).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), silentsilo_store::StoreError> {
+        self.0.delete(key).await
+    }
+
+    async fn list(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<silentsilo_store::StoredObject>, silentsilo_store::StoreError> {
+        self.0.list(prefix).await
+    }
+
+    fn describe(&self) -> String {
+        self.0.describe()
+    }
+
+    async fn put_from_file_reporting(
+        &self,
+        key: &str,
+        source: &std::path::Path,
+        progress: silentsilo_store::Progress<'_>,
+    ) -> Result<(), silentsilo_store::StoreError> {
+        let bytes = std::fs::read(source)
+            .map_err(|e| silentsilo_store::StoreError::Other(e.to_string()))?;
+        self.0.put(key, bytes.clone()).await?;
+
+        let piece = bytes.len().div_ceil(Self::PIECES).max(1);
+        let mut sent = 0;
+        while sent < bytes.len() {
+            let now = piece.min(bytes.len() - sent);
+            tokio::time::sleep(Self::PAUSE).await;
+            sent += now;
+            if progress(now as u64).is_break() {
+                return Err(silentsilo_store::StoreError::Cancelled);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The thing this exists for: one large file has to move a number while it
+/// is going up. A count of blobs stands still for the whole of a gigabyte,
+/// which is what makes a backup look like it has hung.
+#[tokio::test]
+async fn one_large_blob_reports_its_bytes_while_it_goes_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Slow(silentsilo_store::FolderStore::new(dir.path().to_path_buf()));
+    let vault = Vault::new();
+    let content = vec![4u8; 2 * 1024 * 1024];
+    let id = vault.add_local_blob(&content);
+
+    let mut seen: Vec<BlobPush> = Vec::new();
+    let outcome = push_blobs_reporting(
+        &store as &dyn ObjectStore,
+        &vault.root,
+        target(),
+        &[id],
+        &mut |step| seen.push(step),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(outcome.uploaded, 1);
+    let first = *seen.first().unwrap();
+    assert_eq!(
+        (first.blob_id, first.done, first.total, first.bytes_done),
+        (id, 0, 1, 0),
+        "the blob is named before anything of it has gone"
+    );
+    assert!(
+        seen.iter()
+            .any(|s| s.bytes_done > 0 && s.bytes_done < s.bytes_total),
+        "nothing was said while the blob was going up: {seen:?}"
+    );
+    let last = *seen.last().unwrap();
+    assert_eq!(
+        (last.bytes_done, last.bytes_total),
+        (content.len() as u64, content.len() as u64),
+        "the last word on a blob is all of it"
+    );
+    assert!(
+        seen.windows(2).all(|w| w[0].bytes_done <= w[1].bytes_done),
+        "and it never goes backwards: {seen:?}"
+    );
+    assert_eq!(
+        store.head(&format!("blobs/{id}.sslo")).await.unwrap(),
+        Some(content.len() as i64)
+    );
+}
+
+/// Every blob is still named before it is looked at, whatever happens to it
+/// next. A client draws "file 3 of 12" from that, and a blob already in
+/// storage or gone from this device has to count the same as one that is
+/// sent.
+#[tokio::test]
+async fn every_blob_is_named_before_it_is_looked_at() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = silentsilo_store::FolderStore::new(dir.path().to_path_buf());
+    let vault = Vault::new();
+    let already = vault.add_local_blob(b"already up there");
+    let fresh = vault.add_local_blob(b"not yet");
+    let gone = vault.add_local_blob(b"evicted between the listing and now");
+    store
+        .put(
+            &format!("blobs/{already}.sslo"),
+            b"already up there".to_vec(),
+        )
+        .await
+        .unwrap();
+    vault.evict(gone);
+
+    let mut named: Vec<(usize, usize, Uuid, u64)> = Vec::new();
+    let outcome = push_blobs_reporting(
+        &store as &dyn ObjectStore,
+        &vault.root,
+        target(),
+        &[already, fresh, gone],
+        &mut |step| named.push((step.done, step.total, step.blob_id, step.bytes_done)),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!((outcome.uploaded, outcome.already_present), (1, 1));
+    let starts: Vec<(usize, usize, Uuid, u64)> = named
+        .iter()
+        .copied()
+        .filter(|(_, _, _, bytes)| *bytes == 0)
+        .collect();
+    assert_eq!(
+        starts,
+        vec![(0, 3, already, 0), (1, 3, fresh, 0), (2, 3, gone, 0)],
+        "each blob is named once, in order, before it is looked at"
+    );
 }

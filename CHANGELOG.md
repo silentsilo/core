@@ -40,6 +40,16 @@ release notes should say.
   the object rather than after it. Whatever already landed stays: the next
   run skips it. A client passes `&mut |progress: SeedProgress| …` where it
   passed `&mut |done, total| …`.
+- **Breaking for clients**: a sync pass reports bytes while a single large
+  blob uploads, not only between blobs. `push_blobs_reporting` takes
+  `&mut |step: BlobPush|` instead of `&mut |done, total, blob_id|`, and
+  `PushStep::Blob` carries that same `BlobPush` (blobs done and total, the
+  blob id, bytes done and the blob's size) instead of three named fields.
+  Every blob is still named once before it is looked at; one being sent
+  reports again as it goes, at most every 250 ms, and once more with all of
+  it up. `silentsilo_app::SyncProgress` gained `bytes_done` and
+  `bytes_total`, zero on the phases counted in items, and resolves the file
+  a blob belongs to once per blob rather than once per report.
 - Three oplog calls a client makes with the silo held no longer scale with
   the history. `replay` applies a batch in one transaction with a savepoint
   per record, instead of a commit per record; a record still stands or falls

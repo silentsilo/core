@@ -701,22 +701,58 @@ pub async fn push_blobs(
     target: Uuid,
     blob_ids: &[Uuid],
 ) -> Result<BlobPushOutcome, SyncError> {
-    push_blobs_reporting(client, vault_root, target, blob_ids, &mut |_, _, _| {}).await
+    push_blobs_reporting(client, vault_root, target, blob_ids, &mut |_| {}).await
 }
 
+/// How far one blob's upload has got.
+///
+/// Both counts in one report, because neither alone says anything useful
+/// while a single large file goes up: the blob count stands still for the
+/// whole of a gigabyte, and the byte count alone hides how many files are
+/// still to come.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct BlobPush {
+    /// Blobs finished before this one, and how many there are in all.
+    pub done: usize,
+    pub total: usize,
+    pub blob_id: Uuid,
+    /// Bytes of this blob that have gone up, and what it measures on disk.
+    /// Both zero for one already in storage or no longer on this device:
+    /// the report still names it, because checking is what the pass is
+    /// doing at that moment.
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+}
+
+/// How often a blob upload says where it has got to. The same pacing as a
+/// seed, and for the same reason: a client turns each of these into an
+/// event, and a gigabyte at 512 KiB a report is two thousand of them.
+const BLOB_REPORT_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// [`push_blobs`], naming each blob before it is checked and sent, with how
-/// many came before it.
+/// many came before it and how much of it has gone up.
+///
+/// Every blob is reported before it is looked at, with nothing sent yet,
+/// and one that is uploaded is reported again with all of it up. In between,
+/// a blob big enough to take a while reports as it goes.
 pub async fn push_blobs_reporting(
     client: &dyn ObjectStore,
     vault_root: &Path,
     target: Uuid,
     blob_ids: &[Uuid],
-    progress: &mut (dyn FnMut(usize, usize, Uuid) + Send),
+    progress: &mut (dyn FnMut(BlobPush) + Send),
 ) -> Result<BlobPushOutcome, SyncError> {
     let mut outcome = BlobPushOutcome::default();
 
     for (done, blob_id) in blob_ids.iter().enumerate() {
-        progress(done, blob_ids.len(), *blob_id);
+        let mut step = BlobPush {
+            done,
+            total: blob_ids.len(),
+            blob_id: *blob_id,
+            bytes_done: 0,
+            bytes_total: 0,
+        };
+        progress(step);
         let path = vault_root.join("blobs").join(format!("{blob_id}.sslo"));
         if !path.is_file() {
             // Already evicted, or trashed and purged between listing and
@@ -747,7 +783,26 @@ pub async fn push_blobs_reporting(
 
         // Streamed from disk: a blob is whatever size the user stored, and
         // holding it whole in memory capped file size at available RAM.
-        match client.put_from_file(&key, &path).await {
+        step.bytes_total = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let sent = {
+            let mut last = std::time::Instant::now();
+            let mut watch = |moved: u64| {
+                // Clamped to the size on disk: a backend that runs an
+                // operation again on a fresh connection reports its bytes
+                // twice, and a bar that overshoots is worse than one that
+                // pauses.
+                step.bytes_done = (step.bytes_done + moved).min(step.bytes_total);
+                if last.elapsed() >= BLOB_REPORT_EVERY {
+                    last = std::time::Instant::now();
+                    progress(step);
+                }
+                std::ops::ControlFlow::Continue(())
+            };
+            client
+                .put_from_file_reporting(&key, &path, &mut watch)
+                .await
+        };
+        match sent {
             Ok(()) => {
                 // Only now: marking a blob synced before the upload lands
                 // would make it evictable while the bucket has no copy,
@@ -755,6 +810,10 @@ pub async fn push_blobs_reporting(
                 record_blob_delivered(vault_root, *blob_id, target)
                     .map_err(|e| SyncError::Vault(e.to_string()))?;
                 outcome.uploaded += 1;
+                // The whole of it, whatever the pacing let through: the last
+                // blob of a pass has no next report to correct it.
+                step.bytes_done = step.bytes_total;
+                progress(step);
             }
             Err(e) => outcome.failed.push((*blob_id, e.to_string())),
         }
@@ -2448,12 +2507,10 @@ pub async fn push_everything_to(
 pub enum PushStep {
     /// About to send record `done + 1` of `total`.
     Ops { done: usize, total: usize },
-    /// About to check, and if missing send, this blob.
-    Blob {
-        done: usize,
-        total: usize,
-        blob_id: Uuid,
-    },
+    /// A blob being checked and sent, and how far its upload has got. One
+    /// large file reports several times, so a status line moves while it
+    /// goes up rather than after it.
+    Blob(BlobPush),
 }
 
 /// [`push_everything_to`], reporting each record and blob as it goes.
@@ -2512,13 +2569,7 @@ pub async fn push_everything_to_reporting(
         silo.vault_root,
         target.id,
         &pending,
-        &mut |done, total, blob_id| {
-            progress(PushStep::Blob {
-                done,
-                total,
-                blob_id,
-            })
-        },
+        &mut |step| progress(PushStep::Blob(step)),
     )
     .await
     {

@@ -276,6 +276,14 @@ what lets a seed put a number on one large blob instead of a counter that
 sits still for minutes, and what lets Stop land inside an object rather than
 after it.
 
+An ordinary pass says the same thing: `push_blobs_reporting` names each blob
+before it looks at it, then reports how much of it has gone up, at most every
+250 ms, ending with all of it. The pacing is the point as much as the number:
+a client turns each report into an event, and a gigabyte at 512 KiB a report
+would be two thousand of them. Nothing stops a pass inside a blob, because no
+client has a stop for a pass to answer; that callback always says carry on,
+and a cancel would be one argument on the call.
+
 The sweep keeps a candidate for 30 days after this device first saw it
 unreferenced (`snapshot::gc_first_seen`). A move records the file again over
 the content its device holds, and a device that has not synced for days can

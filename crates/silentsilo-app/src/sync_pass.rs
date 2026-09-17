@@ -100,6 +100,12 @@ pub struct SyncProgress {
     /// How many of `total` came before this step.
     pub done: usize,
     pub total: usize,
+    /// How much of the file this step moves has moved, and how big it is.
+    /// Both zero where the step is not one file's bytes: a status line on a
+    /// single large upload needs these, since `done` stands still for the
+    /// whole of it.
+    pub bytes_done: u64,
+    pub bytes_total: u64,
     /// The file this step moves, when it is one the silo lists.
     pub file_id: Option<String>,
     pub name: Option<String>,
@@ -108,28 +114,66 @@ pub struct SyncProgress {
 /// Tells the interface where the pass is. A blob is named by the file it
 /// belongs to, read without touching the silo's idle timer: a background
 /// pass is not use.
+///
+/// `named` is what the last report resolved, so a blob reporting its bytes
+/// several times looks its file up once: the lookup takes the session lock,
+/// and taking it four times a second for a gigabyte would be this reporting
+/// its own progress into the way of everything else.
+#[allow(clippy::too_many_arguments)]
 fn report_progress(
     state: &AppState,
     host: &dyn Host,
     silo_id: Uuid,
     phase: &'static str,
-    done: usize,
-    total: usize,
+    step: ProgressStep,
     blob_id: Option<Uuid>,
+    named: &mut Option<(Uuid, Option<(Uuid, String)>)>,
 ) {
-    let file = blob_id.and_then(|blob| {
-        let sessions = state.sessions.lock().ok()?;
-        let session = sessions.get(&silo_id)?;
-        Vfs::new(session).file_for_blob(blob).ok().flatten()
-    });
+    let file = match blob_id {
+        None => None,
+        Some(blob) => {
+            if named.as_ref().is_none_or(|(seen, _)| *seen != blob) {
+                let found = (|| {
+                    let sessions = state.sessions.lock().ok()?;
+                    let session = sessions.get(&silo_id)?;
+                    Vfs::new(session).file_for_blob(blob).ok().flatten()
+                })();
+                *named = Some((blob, found));
+            }
+            named.as_ref().and_then(|(_, file)| file.clone())
+        }
+    };
     host.emit(AppEvent::SyncProgress(SyncProgress {
         silo_id: silo_id.to_string(),
         phase,
-        done,
-        total,
+        done: step.done,
+        total: step.total,
+        bytes_done: step.bytes_done,
+        bytes_total: step.bytes_total,
         file_id: file.as_ref().map(|(id, _)| id.to_string()),
         name: file.map(|(_, name)| name),
     }));
+}
+
+/// The four numbers a progress report carries, so the call does not take
+/// four bare integers in a row.
+#[derive(Debug, Default, Clone, Copy)]
+struct ProgressStep {
+    done: usize,
+    total: usize,
+    bytes_done: u64,
+    bytes_total: u64,
+}
+
+impl ProgressStep {
+    /// A step counted in items rather than bytes.
+    fn counted(done: usize, total: usize) -> Self {
+        Self {
+            done,
+            total,
+            ..Self::default()
+        }
+    }
 }
 
 /// Records go by in the thousands; a status line needs a tenth of that.
@@ -520,6 +564,9 @@ pub async fn run_sync_pass(
             base: base.as_ref(),
             vault_root: &root,
         };
+        // What the last blob report resolved to a file, so several reports
+        // about one blob cost one lookup.
+        let mut named = None;
         let outcome = sync::push_everything_to_reporting(
             &sync::TargetPush {
                 id: target.id,
@@ -531,21 +578,30 @@ pub async fn run_sync_pass(
             &mut |step| match step {
                 sync::PushStep::Ops { done, total } => {
                     if worth_saying(done, total) {
-                        report_progress(state, host, silo.id, "sending-changes", done, total, None);
+                        report_progress(
+                            state,
+                            host,
+                            silo.id,
+                            "sending-changes",
+                            ProgressStep::counted(done, total),
+                            None,
+                            &mut named,
+                        );
                     }
                 }
-                sync::PushStep::Blob {
-                    done,
-                    total,
-                    blob_id,
-                } => report_progress(
+                sync::PushStep::Blob(blob) => report_progress(
                     state,
                     host,
                     silo.id,
                     "uploading",
-                    done,
-                    total,
-                    Some(blob_id),
+                    ProgressStep {
+                        done: blob.done,
+                        total: blob.total,
+                        bytes_done: blob.bytes_done,
+                        bytes_total: blob.bytes_total,
+                    },
+                    Some(blob.blob_id),
+                    &mut named,
                 ),
             },
         )
@@ -607,7 +663,15 @@ pub async fn run_sync_pass(
             local_horizon,
             &mut |done, total| {
                 if worth_saying(done, total) {
-                    report_progress(state, host, silo.id, "fetching-changes", done, total, None);
+                    report_progress(
+                        state,
+                        host,
+                        silo.id,
+                        "fetching-changes",
+                        ProgressStep::counted(done, total),
+                        None,
+                        &mut None,
+                    );
                 }
             },
         )
@@ -719,7 +783,15 @@ pub async fn run_sync_pass(
         vault_id,
         every_target.len() > 1,
         &|done: usize, total: usize| {
-            report_progress(state, host, silo.id, "importing", done, total, None)
+            report_progress(
+                state,
+                host,
+                silo.id,
+                "importing",
+                ProgressStep::counted(done, total),
+                None,
+                &mut None,
+            )
         },
     )
     .await;
@@ -896,15 +968,16 @@ async fn fetch_missing_for_full_copy(
 
     let mut fetched = 0;
     let batch: Vec<Uuid> = missing.into_iter().take(FULL_COPY_FETCH_PER_PASS).collect();
+    let mut named = None;
     for (done, blob_id) in batch.iter().copied().enumerate() {
         report_progress(
             state,
             host,
             silo.id,
             "downloading",
-            done,
-            batch.len(),
+            ProgressStep::counted(done, batch.len()),
             Some(blob_id),
+            &mut named,
         );
         // One object that will not come down must not stop the rest. It was
         // a `break`, so a single blob missing from the bucket, or one whose
