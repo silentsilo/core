@@ -1,4 +1,4 @@
-﻿//! Persistence for the user's S3 connection details.
+//! Persistence for the user's S3 connection details.
 //!
 //! Kept next to `device_store` and using the same keyring-with-DPAPI-fallback
 //! discipline, because the secret access key is exactly the kind of thing
@@ -80,8 +80,8 @@ pub fn save_s3_config(silo_id: Uuid, config: &StoreConfig) -> Result<(), VaultEr
 
     // Same verify-after-write as device credentials: some Windows Credential
     // Manager setups report success without the entry becoming readable.
-    if let Ok(entry) = keyring_entry(silo_id)
-        && entry.set_password(&json).is_ok()
+    if crate::keychain::set_password(KEYRING_SERVICE, &format!("{KEYRING_USER}:{silo_id}"), &json)
+        .is_ok()
         && let Ok(verify) = keyring_entry(silo_id)
         && matches!(verify.get_password(), Ok(stored) if stored == json)
     {
@@ -211,11 +211,14 @@ pub fn save_targets(silo_id: Uuid, targets: &[BackupTarget]) -> Result<(), Vault
     let json = String::from_utf8(crate::format::encode(&targets.to_vec())?)
         .map_err(|e| VaultError::Crypto(e.to_string()))?;
 
-    let stored_in_keyring = targets_keyring(silo_id)
-        .ok()
-        .filter(|entry| entry.set_password(&json).is_ok())
-        .and_then(|_| targets_keyring(silo_id).ok())
-        .is_some_and(|verify| matches!(verify.get_password(), Ok(held) if held == json));
+    let stored_in_keyring = crate::keychain::set_password(
+        KEYRING_SERVICE,
+        &format!("{KEYRING_USER}-list:{silo_id}"),
+        &json,
+    )
+    .ok()
+    .and_then(|()| targets_keyring(silo_id).ok())
+    .is_some_and(|verify| matches!(verify.get_password(), Ok(held) if held == json));
 
     // The single slot below holds only the first entry, so a real list keeps
     // the file too: a lost keyring entry would otherwise read as one target

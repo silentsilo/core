@@ -33,6 +33,11 @@ release notes should say.
 
 ### Security
 
+- Windows Credential Manager entries (device secret, storage settings, the
+  target list) are written with `CRED_PERSIST_LOCAL_MACHINE` instead of
+  keyring's roaming `CRED_PERSIST_ENTERPRISE`, so a domain roaming profile
+  no longer copies them to other machines. Reads are unchanged; an existing
+  entry is rewritten local the next time it is saved.
 - Key envelopes, revocation markers, inbox keys and senders, `vault.json`,
   `keys/content.kek` and `recovery.env` are refused unread above 64 KiB
   (`MAX_SMALL_OBJECT_BYTES`), judged from the listing or a HEAD. A hostile

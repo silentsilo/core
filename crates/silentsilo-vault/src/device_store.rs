@@ -67,10 +67,7 @@ fn read_fallback_file(silo_id: Uuid) -> Option<LocalVaultAuth> {
 /// `is_provisioned`/`load_credentials` unable to find credentials that were
 /// supposedly just saved.
 fn keyring_roundtrips(silo_id: Uuid, json: &str) -> bool {
-    let Ok(entry) = keyring_entry(silo_id) else {
-        return false;
-    };
-    if entry.set_password(json).is_err() {
+    if crate::keychain::set_password(KEYRING_SERVICE, &keyring_user(silo_id), json).is_err() {
         return false;
     }
     let Ok(verify_entry) = keyring_entry(silo_id) else {
@@ -184,7 +181,11 @@ fn unwrap_protected(raw: &[u8]) -> Option<Vec<u8>> {
 /// other's secret in the keyring — which is what a fixed entry name would
 /// do, silently, leaving every silo but the last one unopenable.
 fn keyring_entry(silo_id: Uuid) -> Result<Entry, keyring::Error> {
-    Entry::new(KEYRING_SERVICE, &format!("{KEYRING_USER}:{silo_id}"))
+    Entry::new(KEYRING_SERVICE, &keyring_user(silo_id))
+}
+
+fn keyring_user(silo_id: Uuid) -> String {
+    format!("{KEYRING_USER}:{silo_id}")
 }
 
 #[cfg(test)]

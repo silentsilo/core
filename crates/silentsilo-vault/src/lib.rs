@@ -17,6 +17,7 @@ mod fido_store;
 pub mod format;
 mod kdf;
 mod kek_store;
+mod keychain;
 mod openssl;
 pub mod protected;
 pub mod recovery;

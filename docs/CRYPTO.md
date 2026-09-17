@@ -29,7 +29,11 @@ It lives outside the vault directory, under the machine's local application
 data, and so does the fallback file holding the device secret when the OS
 keyring will not take it. Neither travels with the folder. Files the user
 opens are decrypted there too, in the clear, until the lock or the next start
-removes them.
+removes them. On Windows the keyring entries (the device secret and the
+storage settings with their secrets) are written with
+`CRED_PERSIST_LOCAL_MACHINE`, so a roaming domain profile does not copy them
+to other machines; an entry an earlier build wrote with the roaming
+`CRED_PERSIST_ENTERPRISE` is rewritten local on its next save.
 
 Two limits of that sentence, stated here rather than left to be discovered:
 
