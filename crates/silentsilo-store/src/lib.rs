@@ -22,6 +22,9 @@ mod webdav;
 
 pub use folder::FolderStore;
 pub use sftp::{SftpAuth, SftpConfig, SftpStore, probe_host_key};
+/// Android only: set up certificate checks for S3 and WebDAV before any sync.
+#[cfg(target_os = "android")]
+pub use silentsilo_s3::tls::init_android_tls;
 pub use webdav::{WebDavConfig, WebDavStore};
 
 /// One stored object, as `list` reports it.

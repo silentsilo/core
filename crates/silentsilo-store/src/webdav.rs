@@ -61,7 +61,11 @@ impl WebDavStore {
         Ok(Self {
             // A server that stops answering must not hold a sync pass forever.
             // Per read, not per request, so a large upload is not cut off.
+            // The same platform verifier as S3, and on Android its readiness check.
             client: Client::builder()
+                .tls_backend_preconfigured(
+                    silentsilo_s3::tls::client_config().map_err(StoreError::Other)?,
+                )
                 .connect_timeout(std::time::Duration::from_secs(30))
                 .read_timeout(std::time::Duration::from_secs(120))
                 .build()
@@ -639,5 +643,26 @@ mod tests {
             panic!("an address with no scheme must be refused");
         };
         assert!(err.to_string().contains("https://"), "got: {err}");
+    }
+
+    /// A server that is not speaking TLS behind an https address: the shared
+    /// verifier config is accepted by reqwest and the handshake fails as an error.
+    #[tokio::test]
+    async fn an_https_address_goes_through_the_shared_tls_config() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                use tokio::io::AsyncWriteExt;
+                let _ = socket.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await;
+            }
+        });
+        let store = WebDavStore::new(WebDavConfig {
+            url: format!("https://127.0.0.1:{port}/dav"),
+            username: "a".into(),
+            password: "b".into(),
+        })
+        .expect("reqwest takes the preconfigured TLS");
+        assert!(store.get("x").await.is_err());
     }
 }

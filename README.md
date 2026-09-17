@@ -103,6 +103,26 @@ the path, and the NDK's `clang.exe` as `CC_aarch64_linux_android` with
 `CFLAGS_aarch64_linux_android=--target=aarch64-linux-android31`: OpenSSL's
 build runs under `sh`, which loses the backslash in the `.cmd` wrapper's path.
 
+### HTTPS on Android
+
+S3 and WebDAV check certificates with Android's own verifier
+(`rustls-platform-verifier`), which calls into the JVM. An app linking these
+crates has to do three things, or every HTTPS handshake fails with "secure
+connections are not set up":
+
+1. Call `silentsilo_store::init_android_tls(env, context)` once from its JNI
+   entry point, before any sync, with the raw `JNIEnv` pointer and a raw
+   reference to the application `Context`. Raw pointers, so the app can use
+   any `jni` release.
+2. Ship the verifier's Kotlin half. It comes inside the
+   `rustls-platform-verifier-android` crate as a local Maven repository: add
+   that crate's `maven` folder as a repository (find it with
+   `cargo metadata --filter-platform aarch64-linux-android`) and depend on
+   `rustls:rustls-platform-verifier:latest.release`. The crate's README has
+   the Gradle snippet.
+3. Keep the class from shrinking:
+   `-keep, includedescriptorclasses class org.rustls.platformverifier.** { *; }`
+
 ## Docs
 
 Persisted formats, their versions, and what an older build does when it meets

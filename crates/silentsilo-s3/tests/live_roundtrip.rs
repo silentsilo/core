@@ -152,3 +152,43 @@ async fn wrong_credentials_report_something_actionable() {
         "a rejected signature should say so, got: {err}"
     );
 }
+
+/// The HTTP client Android uses, over plain HTTP here: signing, streamed
+/// bodies, listings and a 404 all go through it the way they do on a phone.
+#[tokio::test]
+async fn the_platform_verifier_client_does_everything_the_default_one_does() {
+    let Some(cfg) = config() else {
+        silentsilo_testkit::skip_or_fail("SILENTSILO_TEST_S3_ENDPOINT is not set");
+        return;
+    };
+    let client = S3Client::with_platform_verifier(cfg).unwrap();
+    client.test_connection().await.unwrap();
+
+    let payload: Vec<u8> = (0u8..=255).cycle().take(300_000).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("up");
+    std::fs::write(&source, &payload).unwrap();
+    client.put_file("blobs/big.sslo", &source).await.unwrap();
+    let back = dir.path().join("down");
+    client.get_file("blobs/big.sslo", &back).await.unwrap();
+    assert_eq!(std::fs::read(&back).unwrap(), payload);
+
+    assert_eq!(client.head("blobs/big.sslo").await.unwrap(), Some(300_000));
+    assert_eq!(client.head("blobs/absent.sslo").await.unwrap(), None);
+    let listed = client.list("blobs/").await.unwrap();
+    assert_eq!(listed.len(), 1);
+    client.delete("blobs/big.sslo").await.unwrap();
+}
+
+/// An HTTPS address on a server that speaks plain HTTP: the handshake fails
+/// as an error, never a panic or a hang.
+#[tokio::test]
+async fn a_failed_handshake_is_an_error() {
+    let Some(mut cfg) = config() else {
+        silentsilo_testkit::skip_or_fail("SILENTSILO_TEST_S3_ENDPOINT is not set");
+        return;
+    };
+    cfg.endpoint = cfg.endpoint.replacen("http://", "https://", 1);
+    let client = S3Client::with_platform_verifier(cfg).unwrap();
+    assert!(client.put("x", b"y".to_vec()).await.is_err());
+}

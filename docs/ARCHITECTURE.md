@@ -400,6 +400,14 @@ Read this before "fixing" any of it.
 - **S3 HEAD treats 403 as absent.** A prefix-scoped credential gets 403 for
   a missing key; callers use HEAD to decide whether to write, writes are
   idempotent, and a genuinely bad credential fails loudly on PUT.
+- **S3 brings its own HTTP client on Android only.** The SDK's client reads
+  root certificates from files, and a phone has none where it looks, so every
+  handshake failed. It also takes no custom verifier. On Android `silentsilo-s3`
+  hands the SDK a small hyper client (`https.rs`) with the platform verifier
+  from `tls.rs`; desktop keeps the SDK's client and native roots. WebDAV uses
+  the same `tls::client_config` everywhere. That verifier panics on Android
+  until the app calls `init_android_tls`, so it sits behind a readiness check
+  that refuses the handshake instead (README, "HTTPS on Android").
 - **`SetDeviceLabel` and `AnnounceDevice` are separate ops** so a machine
   re-announcing its hostname can never overwrite a name a person typed.
   Empty label means "no label", deliberately.

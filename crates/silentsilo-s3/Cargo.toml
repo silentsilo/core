@@ -10,11 +10,23 @@ license.workspace = true
 silentsilo-core = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 aws-credential-types = { workspace = true }
-aws-smithy-types = { workspace = true }
-aws-smithy-runtime-api = { workspace = true }
+aws-smithy-types = { workspace = true, features = ["http-body-1-x"] }
+aws-smithy-runtime-api = { workspace = true, features = ["http-1x"] }
 thiserror = { workspace = true }
+# The platform verifier for S3 and WebDAV alike, and the HTTP client that
+# hands it to the SDK on Android. All already in the tree through the SDK and
+# reqwest.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rustls-platform-verifier = "0.7"
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "tls12"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+tokio = { workspace = true, features = ["time"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = { version = "0.22", default-features = false }
 
 [dev-dependencies]
 silentsilo-testkit = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }

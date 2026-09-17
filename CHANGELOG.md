@@ -11,6 +11,21 @@ release notes should say.
 
 ## [Unreleased]
 
+### Added
+
+- `silentsilo_store::init_android_tls` (Android only): gives the platform
+  certificate verifier the JVM and the app context. The app also has to ship
+  the verifier's Kotlin component; see the README.
+
+### Fixed
+
+- HTTPS to S3 and WebDAV works on Android. S3 found no root certificates on
+  a phone, and WebDAV panicked in the handshake because its verifier was
+  never set up. Both now use Android's verifier, and a handshake before
+  `init_android_tls` fails with an error instead of a panic. Desktop keeps
+  the SDK's client and native roots for S3; WebDAV passes the same platform
+  verifier to reqwest explicitly.
+
 ### Security
 
 - rustls 0.23.45 (RUSTSEC-2026-0285) and h2 0.4.19 (RUSTSEC-2026-0258) in the

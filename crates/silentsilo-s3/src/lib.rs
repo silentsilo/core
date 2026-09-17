@@ -12,6 +12,8 @@ use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
 use silentsilo_core::S3Config;
 
 mod error;
+mod https;
+pub mod tls;
 pub use error::S3Error;
 
 /// An object as returned by [`S3Client::list`].
@@ -49,6 +51,17 @@ impl S3Client {
     /// static credentials rather than the default chain, whose IMDS probe
     /// stalls for seconds on a desktop machine.
     pub fn new(config: S3Config) -> Result<Self, S3Error> {
+        // Android has no root files for the SDK to read; its own verifier instead.
+        Self::build(config, cfg!(target_os = "android"))
+    }
+
+    /// [`Self::new`] with the platform verifier on any OS, for tests.
+    #[doc(hidden)]
+    pub fn with_platform_verifier(config: S3Config) -> Result<Self, S3Error> {
+        Self::build(config, true)
+    }
+
+    fn build(config: S3Config, platform_verifier: bool) -> Result<Self, S3Error> {
         if config.bucket.trim().is_empty() {
             return Err(S3Error::Config("bucket is required".into()));
         }
@@ -74,7 +87,7 @@ impl S3Client {
             config.region.trim().to_string()
         };
 
-        let sdk_config = aws_sdk_s3::Config::builder()
+        let builder = aws_sdk_s3::Config::builder()
             .behavior_version(BehaviorVersion::latest())
             .region(Region::new(region))
             .endpoint_url(config.endpoint.trim().trim_end_matches('/'))
@@ -93,8 +106,13 @@ impl S3Client {
             )
             .response_checksum_validation(
                 aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired,
-            )
-            .build();
+            );
+        let sdk_config = if platform_verifier {
+            builder.http_client(https::platform_client().map_err(S3Error::Config)?)
+        } else {
+            builder
+        }
+        .build();
 
         Ok(Self {
             client: Client::from_conf(sdk_config),
