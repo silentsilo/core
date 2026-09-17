@@ -40,6 +40,14 @@ release notes should say.
   the object rather than after it. Whatever already landed stays: the next
   run skips it. A client passes `&mut |progress: SeedProgress| …` where it
   passed `&mut |done, total| …`.
+- Three oplog calls a client makes with the silo held no longer scale with
+  the history. `replay` applies a batch in one transaction with a savepoint
+  per record, instead of a commit per record; a record still stands or falls
+  on its own and everything before a refused one is kept. `mark_delivered`
+  writes one prepared statement under one savepoint, instead of a commit per
+  record, and nests inside a transaction the caller already holds.
+  `pending_ops_for` reads the payloads out before decoding them, so the
+  statement is no longer open for the whole of the parsing.
 
 ### Fixed
 

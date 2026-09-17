@@ -3480,20 +3480,61 @@ pub struct ReplayReport {
 pub fn replay(conn: &Connection, mut records: Vec<OpRecord>) -> CoreResult<ReplayReport> {
     records.sort_by_key(|r| r.sort_key());
 
+    // One transaction for the batch. Each record used to commit on its own,
+    // so fetching a few thousand of them was a few thousand commits, and a
+    // pull on a large silo spent its time there with the silo held. A record
+    // still stands or falls on its own: a savepoint around each one costs
+    // nothing on disk, and everything applied before a record this build
+    // refuses is committed before the refusal goes up, so the device keeps
+    // what it could read rather than meeting the same wall from further back
+    // every pass. Skipped when the caller already holds a transaction, which
+    // is then the one that decides.
+    let batch = if conn.is_autocommit() {
+        Some(conn.unchecked_transaction().map_err(db)?)
+    } else {
+        None
+    };
+    let one_at_a_time = batch.is_some();
+
     let mut report = ReplayReport::default();
+    let mut refused = None;
     for record in &records {
-        match apply_op(conn, record)? {
-            ApplyOutcome::Applied => report.applied += 1,
-            ApplyOutcome::AlreadyApplied => report.already_applied += 1,
-            ApplyOutcome::Obsolete => report.obsolete += 1,
-            ApplyOutcome::Renamed { from, to } => {
+        let outcome = if one_at_a_time {
+            conn.execute_batch("SAVEPOINT replay_one").map_err(db)?;
+            let outcome = apply_op(conn, record);
+            if outcome.is_ok() {
+                conn.execute_batch("RELEASE replay_one").map_err(db)?;
+            } else {
+                let _ = conn.execute_batch("ROLLBACK TO replay_one; RELEASE replay_one");
+            }
+            outcome
+        } else {
+            apply_op(conn, record)
+        };
+
+        match outcome {
+            Ok(ApplyOutcome::Applied) => report.applied += 1,
+            Ok(ApplyOutcome::AlreadyApplied) => report.already_applied += 1,
+            Ok(ApplyOutcome::Obsolete) => report.obsolete += 1,
+            Ok(ApplyOutcome::Renamed { from, to }) => {
                 report.applied += 1;
                 report.renamed.push((from, to));
             }
-            ApplyOutcome::Skipped => report.skipped += 1,
+            Ok(ApplyOutcome::Skipped) => report.skipped += 1,
+            Err(e) => {
+                refused = Some(e);
+                break;
+            }
         }
     }
-    Ok(report)
+
+    if let Some(batch) = batch {
+        batch.commit().map_err(db)?;
+    }
+    match refused {
+        Some(e) => Err(e),
+        None => Ok(report),
+    }
 }
 
 // ── Emitting local changes ──────────────────────────────────────────
@@ -3783,13 +3824,19 @@ pub fn pending_ops_for(conn: &Connection, target: Uuid) -> CoreResult<Vec<OpReco
              ORDER BY o.lamport, o.device_id, o.op_id",
         )
         .map_err(|e| CoreError::Database(e.to_string()))?;
-    let rows = stmt
+    // Read out first, decoded after. Decoding inside the loop kept the
+    // statement open for the whole of it, and on a silo with a long history
+    // that is the database held for as long as parsing every record takes,
+    // with whatever the caller's lock covers held behind it.
+    let payloads = stmt
         .query_map([target.to_string()], |row| row.get::<_, String>(0))
+        .map_err(|e| CoreError::Database(e.to_string()))?
+        .collect::<rusqlite::Result<Vec<String>>>()
         .map_err(|e| CoreError::Database(e.to_string()))?;
+    drop(stmt);
 
-    let mut out = Vec::new();
-    for row in rows {
-        let payload = row.map_err(|e| CoreError::Database(e.to_string()))?;
+    let mut out = Vec::with_capacity(payloads.len());
+    for payload in payloads {
         out.push(OpRecord::from_bytes(payload.as_bytes())?);
     }
     Ok(out)
@@ -3799,15 +3846,41 @@ pub fn pending_ops_for(conn: &Connection, target: Uuid) -> CoreResult<Vec<OpReco
 ///
 /// Called after the write, never before: a record marked as delivered without
 /// having arrived is one this device will never offer again.
+///
+/// One savepoint and one prepared statement for the lot. A row each was a
+/// commit each, and a target owed a long history paid that per record while
+/// the caller held the silo. A savepoint rather than a transaction because
+/// the caller may already have one open, and it covers the whole list either
+/// way: half a list marked would be the other half never offered again.
 pub fn mark_delivered(conn: &Connection, target: Uuid, records: &[OpRecord]) -> CoreResult<()> {
-    for record in records {
-        conn.execute(
-            "INSERT OR IGNORE INTO op_delivery(target, op_id) VALUES (?1, ?2)",
-            params![target.to_string(), record.op_id.to_string()],
-        )
-        .map_err(|e| CoreError::Database(e.to_string()))?;
+    if records.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    let db = |e: rusqlite::Error| CoreError::Database(e.to_string());
+    conn.execute_batch("SAVEPOINT mark_delivered").map_err(db)?;
+
+    let written = (|| -> CoreResult<()> {
+        let mut stmt = conn
+            .prepare_cached("INSERT OR IGNORE INTO op_delivery(target, op_id) VALUES (?1, ?2)")
+            .map_err(db)?;
+        let target = target.to_string();
+        for record in records {
+            stmt.execute(params![target, record.op_id.to_string()])
+                .map_err(db)?;
+        }
+        Ok(())
+    })();
+
+    match written {
+        Ok(()) => {
+            conn.execute_batch("RELEASE mark_delivered").map_err(db)?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK TO mark_delivered; RELEASE mark_delivered");
+            Err(e)
+        }
+    }
 }
 
 /// Marks as pushed every record that every listed target now holds, and
@@ -6878,6 +6951,95 @@ mod emission_tests {
             "the clock must not move past a record we refused"
         );
         assert_eq!(all_ops(d.conn()).unwrap().len(), 1, "and it is not stored");
+    }
+
+    #[test]
+    fn a_batch_keeps_everything_before_a_record_it_refuses() {
+        // The batch is one transaction, so this is the property that had to
+        // survive making it one: what was applied before a record this build
+        // cannot read stays applied. Rolled back with it, every pass would
+        // fetch the same records and meet the same wall with nothing to show
+        // for the work.
+        let d = Device::new();
+        let root = d.root();
+        let under = d.make(
+            5,
+            VaultOp::CreateFolder {
+                id: Uuid::new_v4(),
+                parent_id: root,
+                name: "Acte".into(),
+            },
+        );
+        let over = d.make(
+            95,
+            VaultOp::CreateFolder {
+                id: Uuid::new_v4(),
+                parent_id: root,
+                name: "Facturi".into(),
+            },
+        );
+
+        let err = replay(d.conn(), vec![under, from_the_future(90, false), over]).unwrap_err();
+        assert!(
+            matches!(&err, CoreError::UnsupportedOperation(op) if op == "set_file_colour"),
+            "got {err:?}"
+        );
+
+        let tree = d.snapshot();
+        assert!(
+            tree.iter().any(|row| row.contains("Acte")),
+            "the record under the wall was lost: {tree:?}"
+        );
+        assert!(
+            !tree.iter().any(|row| row.contains("Facturi")),
+            "nothing past the wall may be applied: {tree:?}"
+        );
+        assert_eq!(
+            read_lamport(d.conn()).unwrap(),
+            5,
+            "the clock stops at the wall"
+        );
+    }
+
+    #[test]
+    fn a_delivery_is_noted_whether_or_not_the_caller_holds_a_transaction() {
+        // The rows go in under a savepoint so the list is marked all at once
+        // instead of a commit per record. A savepoint nests, which is what
+        // the sync pass needs: it already has a transaction open around this.
+        let d = Device::new();
+        let root = d.root();
+        let records: Vec<OpRecord> = (1..=3)
+            .map(|l| {
+                d.make(
+                    l,
+                    VaultOp::CreateFolder {
+                        id: Uuid::new_v4(),
+                        parent_id: root,
+                        name: format!("folder-{l}"),
+                    },
+                )
+            })
+            .collect();
+        replay(d.conn(), records.clone()).unwrap();
+
+        let target = Uuid::new_v4();
+        assert_eq!(
+            pending_ops_for(d.conn(), target).unwrap().len(),
+            3,
+            "a target that has never been written to is owed everything"
+        );
+
+        mark_delivered(d.conn(), target, &records).unwrap();
+        assert_eq!(pending_count_for(d.conn(), target).unwrap(), 0);
+
+        let tx = d.conn().unchecked_transaction().unwrap();
+        mark_delivered(d.conn(), target, &records).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            pending_count_for(d.conn(), target).unwrap(),
+            0,
+            "marking the same list again is not an error and changes nothing"
+        );
     }
 
     #[test]

@@ -202,6 +202,13 @@ ones, inside one transaction with the Lamport reservation and the log row,
 so the write path cannot drift from the replay path and a crash cannot
 leave an effect without its record.
 
+`replay` takes one transaction for the whole batch, with a savepoint around
+each record. A record still stands or falls on its own, and everything
+applied before a record this build refuses is committed before the refusal
+goes up, so a device keeps what it could read rather than meeting the same
+wall from further back every pass. When the caller already holds a
+transaction, that one decides and `replay` adds nothing.
+
 Name resolution is the subtle part. Uniqueness is per folder,
 case-insensitive and Unicode-composed (`names::fold`). The `name_claims`
 table records which operation claimed which name; ranks within a claim
