@@ -258,6 +258,17 @@ row written concurrently on another device may still need the bytes. All
 transfers stream through disk (`put_from_file`/`get_to_file`); nothing
 holds a whole blob in memory.
 
+Every backend also answers the same two transfers with a byte count as it
+goes: `put_from_file_reporting` and `get_to_file_reporting` take a callback
+that receives the bytes moved since the last call and answers whether to
+carry on. A `ControlFlow::Break` stops the transfer and the call returns
+`StoreError::Cancelled`, which `SyncError` carries through as `Cancelled`.
+The default implementations move the whole file and report it once at the
+end, so a backend that has not been taught to stream still answers. That is
+what lets a seed put a number on one large blob instead of a counter that
+sits still for minutes, and what lets Stop land inside an object rather than
+after it.
+
 The sweep keeps a candidate for 30 days after this device first saw it
 unreferenced (`snapshot::gc_first_seen`). A move records the file again over
 the content its device holds, and a device that has not synced for days can
@@ -412,6 +423,28 @@ Read this before "fixing" any of it.
 - **Seeding size-skips only `blobs/`.** Everything else is rewritten in
   place at identical length by rotation, so "same key, same size" would
   skip the one write that matters.
+- **A seeded object counts its size once, not twice.** It moves twice, down
+  from the source and up to the destination, and `SeedProgress.bytes_total`
+  is the size of the silo: each leg credits half the object, and whatever is
+  left is credited when the object is done with, skipped and failed ones
+  included. So the bar ends where the object count does. Counting the bytes
+  that actually cross this machine would show a total twice the size of the
+  thing being copied, which is a number nobody can check against their
+  storage.
+- **A stop on the last progress report still stops.** Whether the final
+  chunk falls inside a backend's loop or after it is an accident of that
+  backend, and an answer that depends on it would make Stop work on SFTP and
+  not on S3. An upload stopped that way leaves the key untouched wherever
+  the backend writes through a temporary name (a folder, SFTP) and may leave
+  the whole object where it does not (WebDAV, a small S3 PUT). Never a short
+  one: the seed re-copies it on the next run either way.
+- **S3 uploads any file over 16 MiB in parts**, a sync pass as well as a
+  seed. One PUT reports nothing until it ends, cannot be stopped, and S3
+  refuses a single PUT over 5 GiB, which capped what a silo could hold at
+  that per file. Parts are sequential, and
+  a stop or a failure aborts the upload rather than leaving parts that are
+  billed and invisible. Below the threshold it stays one PUT, which is every
+  record, every snapshot and most blobs.
 - **S3 HEAD treats 403 as absent.** A prefix-scoped credential gets 403 for
   a missing key; callers use HEAD to decide whether to write, writes are
   idempotent, and a genuinely bad credential fails loudly on PUT.

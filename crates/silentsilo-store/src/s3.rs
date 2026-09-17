@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 use silentsilo_s3::{S3Client, S3Error};
 
-use crate::{ObjectStore, StoreError, StoredObject};
+use crate::{ObjectStore, Progress, StoreError, StoredObject};
 
 /// Keeps the distinctions the caller can act on.
 ///
@@ -15,6 +15,11 @@ use crate::{ObjectStore, StoreError, StoredObject};
 /// and flattening both into one message is how a user ends up checking their
 /// credentials because their wifi dropped.
 fn map(err: S3Error) -> StoreError {
+    // The caller's own decision, not a provider failure, and the layer
+    // above tells the two apart.
+    if matches!(err, S3Error::Cancelled) {
+        return StoreError::Cancelled;
+    }
     let text = err.to_string();
     let lower = text.to_lowercase();
     // A lifecycle rule moved this object to an archive class after it was
@@ -63,6 +68,28 @@ impl ObjectStore for S3Client {
 
     async fn get_to_file(&self, key: &str, dest: &std::path::Path) -> Result<(), StoreError> {
         S3Client::get_file(self, key, dest).await.map_err(map)
+    }
+
+    async fn put_from_file_reporting(
+        &self,
+        key: &str,
+        path: &std::path::Path,
+        progress: Progress<'_>,
+    ) -> Result<(), StoreError> {
+        S3Client::put_file_reporting(self, key, path, progress)
+            .await
+            .map_err(map)
+    }
+
+    async fn get_to_file_reporting(
+        &self,
+        key: &str,
+        dest: &std::path::Path,
+        progress: Progress<'_>,
+    ) -> Result<(), StoreError> {
+        S3Client::get_file_reporting(self, key, dest, progress)
+            .await
+            .map_err(map)
     }
 
     async fn copy(&self, from: &str, to: &str) -> Result<(), StoreError> {

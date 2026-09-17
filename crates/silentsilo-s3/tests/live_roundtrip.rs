@@ -192,3 +192,70 @@ async fn a_failed_handshake_is_an_error() {
     let client = S3Client::with_platform_verifier(cfg).unwrap();
     assert!(client.put("x", b"y".to_vec()).await.is_err());
 }
+
+/// A file past the multipart threshold goes up in parts, which is what puts
+/// a number on a large blob while it is moving and what lifts the 5 GiB
+/// ceiling a single PUT has. The parts have to come back as one object.
+#[tokio::test]
+async fn a_large_file_goes_up_in_parts_and_says_so_as_it_goes() {
+    let client = client_or_skip!();
+    let len = (S3Client::MULTIPART_ABOVE + 3 * 1024 * 1024) as usize;
+    let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("big.sslo");
+    let back = dir.path().join("back.sslo");
+    std::fs::write(&source, &payload).unwrap();
+
+    let mut reports: Vec<u64> = Vec::new();
+    client
+        .put_file_reporting("blobs/parts.sslo", &source, &mut |bytes| {
+            reports.push(bytes);
+            std::ops::ControlFlow::Continue(())
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        reports.len() > 1,
+        "one report for a file this size is the counter that sits still: {reports:?}"
+    );
+    assert_eq!(reports.iter().sum::<u64>(), len as u64);
+    assert_eq!(
+        client.head("blobs/parts.sslo").await.unwrap(),
+        Some(len as i64)
+    );
+
+    let mut down: Vec<u64> = Vec::new();
+    client
+        .get_file_reporting("blobs/parts.sslo", &back, &mut |bytes| {
+            down.push(bytes);
+            std::ops::ControlFlow::Continue(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(down.iter().sum::<u64>(), len as u64);
+    assert_eq!(std::fs::read(&back).unwrap(), payload, "the parts rejoined");
+}
+
+/// A stop during a multipart upload aborts it. Parts left behind are billed
+/// and invisible: they are not the object and no listing shows them.
+#[tokio::test]
+async fn a_stopped_multipart_upload_leaves_no_object() {
+    let client = client_or_skip!();
+    let len = (S3Client::MULTIPART_ABOVE + 3 * 1024 * 1024) as usize;
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("big.sslo");
+    std::fs::write(&source, vec![9u8; len]).unwrap();
+
+    let stopped = client
+        .put_file_reporting("blobs/stopped.sslo", &source, &mut |_| {
+            std::ops::ControlFlow::Break(())
+        })
+        .await;
+
+    assert!(
+        matches!(stopped, Err(silentsilo_s3::S3Error::Cancelled)),
+        "got {stopped:?}"
+    );
+    assert_eq!(client.head("blobs/stopped.sslo").await.unwrap(), None);
+}

@@ -4,6 +4,8 @@
 //! `SILENTSILO_TEST_S3_ENDPOINT`; the folder pass always runs, so the
 //! contract is exercised on every `cargo test`.
 
+use std::ops::ControlFlow;
+
 use silentsilo_core::S3Config;
 use silentsilo_store::{
     FolderStore, ObjectStore, SftpAuth, SftpConfig, SftpStore, StoreError, WebDavConfig,
@@ -519,6 +521,121 @@ async fn a_download_that_finds_nothing_reports_it() {
         assert!(
             matches!(result, Err(StoreError::NotFound(_))),
             "{}: expected NotFound, got {result:?}",
+            store.describe()
+        );
+    })
+    .await;
+}
+
+/// The reporting transfers carry the same bytes as the plain ones and say
+/// so as they go: what they report has to add up to the file, on every
+/// backend, or a progress bar drawn from it lies in both directions.
+#[tokio::test]
+async fn what_a_transfer_reports_adds_up_to_the_file() {
+    for_each_store(|store| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("blob.sslo");
+        let restored = dir.path().join("restored.sslo");
+        // Not a round multiple of any backend's buffer, so a boundary bug
+        // shows up as a count that does not add up.
+        let bytes: Vec<u8> = (0..(1024 * 1024 + 7)).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&source, &bytes).unwrap();
+
+        let mut up: Vec<u64> = Vec::new();
+        store
+            .put_from_file_reporting("blobs/watched.sslo", &source, &mut |moved| {
+                up.push(moved);
+                ControlFlow::Continue(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            up.iter().sum::<u64>(),
+            bytes.len() as u64,
+            "{}: the upload reported {up:?}",
+            store.describe()
+        );
+        assert_eq!(
+            store.head("blobs/watched.sslo").await.unwrap(),
+            Some(bytes.len() as i64),
+            "{}: the object is not the size that went up",
+            store.describe()
+        );
+
+        let mut down: Vec<u64> = Vec::new();
+        store
+            .get_to_file_reporting("blobs/watched.sslo", &restored, &mut |moved| {
+                down.push(moved);
+                ControlFlow::Continue(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            down.iter().sum::<u64>(),
+            bytes.len() as u64,
+            "{}: the download reported {down:?}",
+            store.describe()
+        );
+        assert_eq!(
+            std::fs::read(&restored).unwrap(),
+            bytes,
+            "{}: the bytes came back different",
+            store.describe()
+        );
+    })
+    .await;
+}
+
+/// Stopping a transfer is answered as a stop rather than as a failure, and
+/// it never leaves half an object behind: a truncated blob is content that
+/// decrypts to nothing, and nothing above this layer would notice.
+#[tokio::test]
+async fn a_stopped_transfer_says_so_and_leaves_nothing_half_written() {
+    for_each_store(|store| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("blob.sslo");
+        let dest = dir.path().join("down.sslo");
+        let bytes: Vec<u8> = (0..(1024 * 1024 + 7)).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&source, &bytes).unwrap();
+
+        let stopped = store
+            .put_from_file_reporting("blobs/stopped.sslo", &source, &mut |_| {
+                ControlFlow::Break(())
+            })
+            .await;
+        assert!(
+            matches!(stopped, Err(StoreError::Cancelled)),
+            "{}: a stop is not a failure to retry: got {stopped:?}",
+            store.describe()
+        );
+        // Either the key was never written or the whole object is there.
+        // Which of the two depends on where the backend can break off, but
+        // a short object is never an answer.
+        match store.head("blobs/stopped.sslo").await.unwrap() {
+            None => {}
+            Some(size) => assert_eq!(
+                size,
+                bytes.len() as i64,
+                "{}: a stopped upload left part of an object",
+                store.describe()
+            ),
+        }
+
+        store
+            .put_from_file("blobs/whole.sslo", &source)
+            .await
+            .unwrap();
+        let stopped = store
+            .get_to_file_reporting("blobs/whole.sslo", &dest, &mut |_| ControlFlow::Break(()))
+            .await;
+        assert!(
+            matches!(stopped, Err(StoreError::Cancelled)),
+            "{}: got {stopped:?}",
+            store.describe()
+        );
+        assert!(
+            !dest.exists(),
+            "{}: a stopped download left a file a caller would take for an object",
             store.describe()
         );
     })

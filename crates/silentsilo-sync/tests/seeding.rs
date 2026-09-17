@@ -5,12 +5,13 @@
 //! gigabytes over a home connection.
 
 use silentsilo_crypto::generate_dek;
-use silentsilo_store::{FolderStore, ObjectStore};
+use silentsilo_store::{FolderStore, ObjectStore, Progress, StoreError, StoredObject};
 use silentsilo_sync::{
-    BLOBS_PREFIX, MANIFEST_KEY, OPS_PREFIX, fetch_all_ops_above, push_ops, put_manifest,
-    read_manifest, seed_target,
+    BLOBS_PREFIX, MANIFEST_KEY, OPS_PREFIX, SeedProgress, fetch_all_ops_above, push_ops,
+    put_manifest, read_manifest, seed_target,
 };
 use silentsilo_vfs::{OpRecord, VaultOp};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use uuid::Uuid;
 
 fn record(lamport: u64, device_id: Uuid) -> OpRecord {
@@ -60,7 +61,7 @@ async fn a_seeded_target_holds_everything_the_first_one_did() {
     let outcome = seed_target(
         &source as &dyn ObjectStore,
         &dest as &dyn ObjectStore,
-        &mut |_, _| {},
+        &mut |_| {},
         &|| false,
     )
     .await
@@ -101,7 +102,7 @@ async fn running_it_again_copies_only_what_is_missing() {
     seed_target(
         &source as &dyn ObjectStore,
         &dest as &dyn ObjectStore,
-        &mut |_, _| {},
+        &mut |_| {},
         &|| false,
     )
     .await
@@ -119,7 +120,7 @@ async fn running_it_again_copies_only_what_is_missing() {
     let second = seed_target(
         &source as &dyn ObjectStore,
         &dest as &dyn ObjectStore,
-        &mut |_, _| {},
+        &mut |_| {},
         &|| false,
     )
     .await
@@ -137,37 +138,50 @@ async fn running_it_again_copies_only_what_is_missing() {
     );
 }
 
-/// Progress is reported against a total known before the first byte moves,
-/// because the listing arrives whole. A count going up towards an unknown end
-/// is not progress on an operation that runs for hours.
+/// Progress is reported against totals known before the first byte moves,
+/// because the listing arrives whole and carries every size. A count going up
+/// towards an unknown end is not progress on an operation that runs for hours.
 #[tokio::test]
-async fn progress_counts_towards_a_total_known_up_front() {
+async fn progress_counts_towards_totals_known_up_front() {
     let source_dir = tempfile::tempdir().unwrap();
     let dest_dir = tempfile::tempdir().unwrap();
     let source = FolderStore::new(source_dir.path().to_path_buf());
     let dest = FolderStore::new(dest_dir.path().to_path_buf());
 
     populate(&source as &dyn ObjectStore, &generate_dek(), Uuid::new_v4()).await;
+    let stored: u64 = source
+        .list("")
+        .await
+        .unwrap()
+        .iter()
+        .map(|o| o.size as u64)
+        .sum();
 
-    let mut seen: Vec<(usize, usize)> = Vec::new();
+    let mut seen: Vec<SeedProgress> = Vec::new();
     seed_target(
         &source as &dyn ObjectStore,
         &dest as &dyn ObjectStore,
-        &mut |done, total| seen.push((done, total)),
+        &mut |progress| seen.push(progress),
         &|| false,
     )
     .await
     .unwrap();
 
+    let first = seen.first().copied().unwrap();
+    assert_eq!(first.objects_done, 0, "the first report is before the work");
+    assert_eq!(first.objects_total, 8, "the total is known at the start");
+    assert_eq!(first.bytes_total, stored, "and so is the size of the silo");
+
+    let last = seen.last().copied().unwrap();
+    assert_eq!(last.objects_done, 8);
     assert_eq!(
-        seen.first(),
-        Some(&(0, 8)),
-        "the total is known at the start"
+        last.bytes_done, stored,
+        "the bar ends where the object count does"
     );
-    assert_eq!(seen.last(), Some(&(8, 8)));
     assert!(
-        seen.windows(2).all(|w| w[0].0 <= w[1].0),
-        "and it never goes backwards"
+        seen.windows(2)
+            .all(|w| w[0].objects_done <= w[1].objects_done && w[0].bytes_done <= w[1].bytes_done),
+        "and neither number goes backwards: {seen:?}"
     );
 }
 
@@ -185,7 +199,7 @@ async fn seeding_needs_no_key_and_changes_no_bytes() {
     seed_target(
         &source as &dyn ObjectStore,
         &dest as &dyn ObjectStore,
-        &mut |_, _| {},
+        &mut |_| {},
         &|| false,
     )
     .await
@@ -218,7 +232,7 @@ async fn a_cancelled_seed_stops_and_says_so() {
     let result = seed_target(
         &source as &dyn ObjectStore,
         &dest as &dyn ObjectStore,
-        &mut |_, _| {},
+        &mut |_| {},
         &|| true,
     )
     .await;
@@ -254,7 +268,7 @@ async fn an_object_resealed_at_the_same_size_is_still_copied() {
     let outcome = seed_target(
         &source as &dyn ObjectStore,
         &dest as &dyn ObjectStore,
-        &mut |_, _| {},
+        &mut |_| {},
         &|| false,
     )
     .await
@@ -266,4 +280,166 @@ async fn an_object_resealed_at_the_same_size_is_still_copied() {
         b"sealed under the new key".to_vec(),
         "a same-size record was not refreshed"
     );
+}
+
+/// A store that hands its bytes over in pieces with a pause between them,
+/// the way a link slower than a local disk does. Everything else is the
+/// folder underneath. Without it a seed of any test-sized silo finishes
+/// inside one reporting interval, and nothing about pacing can be checked.
+struct Slow(FolderStore);
+
+impl Slow {
+    /// How many pieces one object arrives in.
+    const PIECES: usize = 4;
+    const PAUSE: std::time::Duration = std::time::Duration::from_millis(120);
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for Slow {
+    async fn put(&self, key: &str, body: Vec<u8>) -> Result<(), StoreError> {
+        self.0.put(key, body).await
+    }
+
+    async fn get(&self, key: &str) -> Result<Vec<u8>, StoreError> {
+        self.0.get(key).await
+    }
+
+    async fn head(&self, key: &str) -> Result<Option<i64>, StoreError> {
+        self.0.head(key).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.0.delete(key).await
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<StoredObject>, StoreError> {
+        self.0.list(prefix).await
+    }
+
+    fn describe(&self) -> String {
+        self.0.describe()
+    }
+
+    async fn get_to_file_reporting(
+        &self,
+        key: &str,
+        dest: &std::path::Path,
+        progress: Progress<'_>,
+    ) -> Result<(), StoreError> {
+        let bytes = self.0.get(key).await?;
+        std::fs::write(dest, &bytes).map_err(|e| StoreError::Other(e.to_string()))?;
+
+        let piece = bytes.len().div_ceil(Self::PIECES).max(1);
+        let mut sent = 0;
+        while sent < bytes.len() {
+            let now = piece.min(bytes.len() - sent);
+            tokio::time::sleep(Self::PAUSE).await;
+            sent += now;
+            if progress(now as u64).is_break() {
+                let _ = std::fs::remove_file(dest);
+                return Err(StoreError::Cancelled);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The whole point: a single large object has to move the bar while it is
+/// moving. An object counter sits still for minutes on one blob, which is
+/// what makes people think the copy has hung and pull the cable.
+#[tokio::test]
+async fn a_large_object_reports_its_bytes_on_the_way() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let dest_dir = tempfile::tempdir().unwrap();
+    let source = Slow(FolderStore::new(source_dir.path().to_path_buf()));
+    let dest = FolderStore::new(dest_dir.path().to_path_buf());
+
+    let blob = format!("{BLOBS_PREFIX}{}.sslo", Uuid::new_v4());
+    source.put(&blob, vec![3u8; 4 * 1024 * 1024]).await.unwrap();
+
+    let mut seen: Vec<SeedProgress> = Vec::new();
+    seed_target(
+        &source as &dyn ObjectStore,
+        &dest as &dyn ObjectStore,
+        &mut |progress| seen.push(progress),
+        &|| false,
+    )
+    .await
+    .unwrap();
+
+    let midway: Vec<&SeedProgress> = seen
+        .iter()
+        .filter(|p| p.objects_done == 0 && p.bytes_done > 0 && p.bytes_done < p.bytes_total)
+        .collect();
+    assert!(
+        !midway.is_empty(),
+        "nothing was reported while the one object was moving: {seen:?}"
+    );
+    let last = seen.last().copied().unwrap();
+    assert_eq!(last.bytes_done, last.bytes_total);
+    assert_eq!(last.objects_done, 1);
+}
+
+/// Stop has to land inside the object being copied, not after it, and what
+/// already landed stays: the seed exists for silos that take hours, and
+/// starting over is not an option a person would choose.
+#[tokio::test]
+async fn a_stop_lands_inside_an_object_and_the_next_run_carries_on() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let dest_dir = tempfile::tempdir().unwrap();
+    let source = Slow(FolderStore::new(source_dir.path().to_path_buf()));
+    let dest = FolderStore::new(dest_dir.path().to_path_buf());
+    let dek = generate_dek();
+
+    populate(&source as &dyn ObjectStore, &dek, Uuid::new_v4()).await;
+    let expected = source.list("").await.unwrap().len();
+
+    // True from the second time it is asked, which is inside the first
+    // object's transfer: once at the top of the loop, then on every report.
+    let asked = AtomicUsize::new(0);
+    let result = seed_target(
+        &source as &dyn ObjectStore,
+        &dest as &dyn ObjectStore,
+        &mut |_| {},
+        &|| asked.fetch_add(1, Ordering::SeqCst) >= 1,
+    )
+    .await;
+
+    assert!(
+        matches!(result, Err(silentsilo_sync::SyncError::Cancelled)),
+        "got {result:?}"
+    );
+    let after_stop = dest.list("").await.unwrap();
+    assert!(
+        after_stop.len() < expected,
+        "the stop came too late to prove anything: {after_stop:?}"
+    );
+    for entry in &after_stop {
+        assert_eq!(
+            entry.size,
+            source.head(&entry.key).await.unwrap().unwrap(),
+            "{} landed short",
+            entry.key
+        );
+    }
+
+    let outcome = seed_target(
+        &source as &dyn ObjectStore,
+        &dest as &dyn ObjectStore,
+        &mut |_| {},
+        &|| false,
+    )
+    .await
+    .unwrap();
+
+    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    assert_eq!(dest.list("").await.unwrap().len(), expected);
+    for entry in source.list("").await.unwrap() {
+        assert_eq!(
+            source.get(&entry.key).await.unwrap(),
+            dest.get(&entry.key).await.unwrap(),
+            "{} did not come across whole",
+            entry.key
+        );
+    }
 }

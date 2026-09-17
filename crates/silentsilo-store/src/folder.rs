@@ -4,11 +4,19 @@
 //! The asymmetry with putting a *silo* in such a folder: that shares one
 //! snapshot file and produces conflict copies; sharing the log converges.
 
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 
-use crate::{ObjectStore, StoreError, StoredObject};
+use crate::{ObjectStore, Progress, StoreError, StoredObject};
+
+/// How much moves between two reports. Small enough that a bar on a slow
+/// drive moves smoothly, large enough that the per-chunk bookkeeping costs
+/// nothing next to the copy itself.
+const CHUNK: usize = 512 * 1024;
 
 pub struct FolderStore {
     root: PathBuf,
@@ -61,7 +69,6 @@ impl ObjectStore for FolderStore {
         // then unplugs, renamed-but-unwritten is the same as lost.
         let temp = temp_beside(&path);
         {
-            use std::io::Write;
             let mut file = std::fs::File::create(&temp).map_err(|e| Self::map_io(e, key))?;
             file.write_all(&body).map_err(|e| Self::map_io(e, key))?;
             file.sync_all().map_err(|e| Self::map_io(e, key))?;
@@ -102,6 +109,43 @@ impl ObjectStore for FolderStore {
             .map_err(|e| Self::map_io(e, key))
     }
 
+    async fn put_from_file_reporting(
+        &self,
+        key: &str,
+        source: &Path,
+        progress: Progress<'_>,
+    ) -> Result<(), StoreError> {
+        let path = self.path_for(key)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| Self::map_io(e, key))?;
+        }
+        // Same temp-then-sync-then-rename as `put_from_file`, so a stopped
+        // copy leaves the key exactly as it was rather than half of it.
+        let temp = temp_beside(&path);
+        if let Err(e) = copy_watched(source.to_path_buf(), temp.clone(), true, key, progress).await
+        {
+            let _ = std::fs::remove_file(&temp);
+            return Err(e);
+        }
+        silentsilo_core::rename_with_retry(&temp, &path).map_err(|e| Self::map_io(e, key))
+    }
+
+    async fn get_to_file_reporting(
+        &self,
+        key: &str,
+        dest: &Path,
+        progress: Progress<'_>,
+    ) -> Result<(), StoreError> {
+        let source = self.path_for(key)?;
+        if let Err(e) = copy_watched(source, dest.to_path_buf(), false, key, progress).await {
+            // A partial file left where a caller expects an object reads as
+            // content that decrypts to nothing.
+            let _ = std::fs::remove_file(dest);
+            return Err(e);
+        }
+        Ok(())
+    }
+
     async fn get(&self, key: &str) -> Result<Vec<u8>, StoreError> {
         std::fs::read(self.path_for(key)?).map_err(|e| Self::map_io(e, key))
     }
@@ -138,6 +182,69 @@ impl ObjectStore for FolderStore {
 
     fn describe(&self) -> String {
         self.root.display().to_string()
+    }
+}
+
+/// Copies a file chunk by chunk, telling the caller how far it has got
+/// while it runs and stopping where it is when the caller says to.
+///
+/// The copy itself is blocking `std::fs`, and on a multi-gigabyte file it
+/// would hold an async worker for minutes, so it runs on a blocking thread.
+/// What crosses back is a byte count per chunk over a channel of one: the
+/// callback belongs to the caller's thread, and a channel that small keeps
+/// the two within a chunk of each other, so a stop lands on the next one.
+async fn copy_watched(
+    source: PathBuf,
+    dest: PathBuf,
+    flush: bool,
+    key: &str,
+    progress: Progress<'_>,
+) -> Result<(), StoreError> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let halt = stop.clone();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<u64>(1);
+
+    let copy = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        let mut input = std::fs::File::open(&source)?;
+        // Created only once the source opened, so a missing object leaves no
+        // empty file behind.
+        let mut output = std::fs::File::create(&dest)?;
+        let mut buf = vec![0u8; CHUNK];
+        loop {
+            if halt.load(Ordering::Relaxed) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "stopped",
+                ));
+            }
+            let read = input.read(&mut buf)?;
+            if read == 0 {
+                break;
+            }
+            output.write_all(&buf[..read])?;
+            // A closed receiver means the caller is gone; the copy still
+            // finishes rather than failing over a lost progress report.
+            let _ = tx.blocking_send(read as u64);
+        }
+        if flush {
+            output.sync_all()?;
+        }
+        Ok(())
+    });
+
+    // Drains until the copy drops its sender, which is the copy ending.
+    while let Some(moved) = rx.recv().await {
+        if progress(moved).is_break() {
+            stop.store(true, Ordering::Relaxed);
+        }
+    }
+
+    match copy.await {
+        Ok(Ok(())) if stop.load(Ordering::Relaxed) => Err(StoreError::Cancelled),
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) if stop.load(Ordering::Relaxed) => Err(StoreError::Cancelled),
+        Ok(Err(e)) => Err(FolderStore::map_io(e, key)),
+        Err(e) => Err(StoreError::Other(e.to_string())),
     }
 }
 

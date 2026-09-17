@@ -13,9 +13,33 @@ release notes should say.
 
 ### Added
 
+- Byte-level progress and a responsive stop while copying objects between
+  storages. `ObjectStore` gained `put_from_file_reporting` and
+  `get_to_file_reporting`, which take a callback receiving the bytes moved
+  since the last call and answering whether to carry on; a `Break` stops the
+  transfer and returns the new `StoreError::Cancelled`. The default
+  implementations move the whole file and report it once at the end, so an
+  implementation outside this repository keeps working. All four backends
+  report as they go: SFTP and a folder per 512 KiB chunk, S3 and WebDAV per
+  chunk downloading, WebDAV from the body as it is read, and S3 per part.
+- S3 uploads any file over 16 MiB in parts, a sync pass as well as a seed.
+  Alongside the progress it lifts the 5 GiB ceiling a single PUT has, which
+  until now was the largest file a silo could hold. A stop or a failure
+  aborts the upload, so no parts are left billed and invisible.
 - `silentsilo_store::init_android_tls` (Android only): gives the platform
   certificate verifier the JVM and the app context. The app also has to ship
   the verifier's Kotlin component; see the README.
+
+### Changed
+
+- **Breaking for clients**: `seed_target` reports a `SeedProgress` struct
+  (objects done and total, bytes done and total) instead of two `usize`
+  arguments, at most once every 250 ms, and asks `cancel` on every progress
+  report as well as between objects. Filling one copy from another now moves
+  a number while a single large blob is transferring, and Stop lands inside
+  the object rather than after it. Whatever already landed stays: the next
+  run skips it. A client passes `&mut |progress: SeedProgress| …` where it
+  passed `&mut |done, total| …`.
 
 ### Fixed
 

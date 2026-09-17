@@ -6,6 +6,7 @@
 //! keys in lexicographic order (operation keys are zero-padded, so that
 //! *is* logical order), and a key is written once and never rewritten.
 
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
@@ -45,6 +46,61 @@ pub enum StoreError {
     Unreachable(String),
     #[error("storage error: {0}")]
     Other(String),
+    /// A progress callback answered [`ControlFlow::Break`]. Not a failure:
+    /// the caller asked to stop, whatever landed stays where it is, and
+    /// running the operation again carries on.
+    #[error("stopped")]
+    Cancelled,
+}
+
+/// Bytes as they move, for a caller drawing a progress bar: each call says
+/// how many went since the last one.
+///
+/// The answer decides whether the transfer carries on. A
+/// [`ControlFlow::Break`] stops it and the call returns
+/// [`StoreError::Cancelled`], which is how a Stop reaches the middle of a
+/// large object instead of waiting for it to finish. A `Break` on the last
+/// report counts too: whether the final chunk fell inside or outside the
+/// loop is an accident of the backend, and the answer must not depend on it.
+/// An upload stopped that way leaves the key as it was wherever the backend
+/// writes through a temporary name.
+pub type Progress<'a> = &'a mut (dyn FnMut(u64) -> ControlFlow<()> + Send);
+
+/// A progress callback an operation that may run twice can reach.
+///
+/// The SFTP backend runs an operation's body again on a connection that
+/// turned out to be dead, so the body cannot own the callback. A second
+/// attempt reports its bytes again from zero; a caller adding up bytes
+/// across objects clamps to the size it listed.
+pub(crate) struct SharedProgress<'a> {
+    sink: std::sync::Mutex<Progress<'a>>,
+}
+
+impl<'a> SharedProgress<'a> {
+    pub(crate) fn new(sink: Progress<'a>) -> Self {
+        Self {
+            sink: std::sync::Mutex::new(sink),
+        }
+    }
+
+    pub(crate) fn report(&self, bytes: u64) -> ControlFlow<()> {
+        match self.sink.lock() {
+            Ok(mut sink) => (*sink)(bytes),
+            // A callback that panicked poisoned the lock. Carrying on with
+            // no progress is better than failing a transfer over it.
+            Err(_) => ControlFlow::Continue(()),
+        }
+    }
+}
+
+/// The whole file in one report, for a backend that cannot say more as it
+/// goes. Used by the trait's default implementations.
+fn report_whole(path: &Path, progress: Progress<'_>) -> Result<(), StoreError> {
+    let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    match progress(len) {
+        ControlFlow::Continue(()) => Ok(()),
+        ControlFlow::Break(()) => Err(StoreError::Cancelled),
+    }
 }
 
 /// What a place a backup lives in does about deletion. Two facts rather
@@ -84,6 +140,34 @@ pub trait ObjectStore: Send + Sync {
     async fn get_to_file(&self, key: &str, path: &Path) -> Result<(), StoreError> {
         let body = self.get(key).await?;
         std::fs::write(path, body).map_err(|e| StoreError::Other(e.to_string()))
+    }
+
+    /// [`ObjectStore::put_from_file`], saying how many bytes went up as they
+    /// go and stopping when the callback says to.
+    ///
+    /// The default moves the whole file and reports it once at the end, so a
+    /// backend that has not been taught to stream still answers the same
+    /// questions, one object at a time.
+    async fn put_from_file_reporting(
+        &self,
+        key: &str,
+        path: &Path,
+        progress: Progress<'_>,
+    ) -> Result<(), StoreError> {
+        self.put_from_file(key, path).await?;
+        report_whole(path, progress)
+    }
+
+    /// [`ObjectStore::get_to_file`], saying how many bytes came down as they
+    /// arrive. Same default as [`ObjectStore::put_from_file_reporting`].
+    async fn get_to_file_reporting(
+        &self,
+        key: &str,
+        path: &Path,
+        progress: Progress<'_>,
+    ) -> Result<(), StoreError> {
+        self.get_to_file(key, path).await?;
+        report_whole(path, progress)
     }
 
     /// Copies an object to another key, replacing whatever is there.

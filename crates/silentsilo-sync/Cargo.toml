@@ -25,7 +25,9 @@ tempfile = { workspace = true }
 [dev-dependencies]
 silentsilo-testkit = { workspace = true }
 silentsilo-s3 = { workspace = true }
-tokio = { workspace = true }
+# `time` for the test double that hands its bytes over slowly, which is the
+# only way a seed of a test-sized silo takes longer than one report.
+tokio = { workspace = true, features = ["time"] }
 uuid = { workspace = true }
 # Test doubles implementing ObjectStore, e.g. a store that corrupts writes.
 async-trait = "0.1"

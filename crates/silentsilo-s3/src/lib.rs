@@ -4,12 +4,21 @@
 //! before it gets here (see `silentsilo-crypto`). Its only job is putting
 //! opaque bytes at a key and getting them back.
 
+use std::ops::ControlFlow;
+
 use aws_credential_types::Credentials;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{BehaviorVersion, Region};
-use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::primitives::{ByteStream, Length};
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
 use silentsilo_core::S3Config;
+
+/// Bytes as they move, for a caller drawing a progress bar: each call says
+/// how many went since the last one, and the answer says whether to carry
+/// on. See `silentsilo_store::Progress`, which this is the same thing as one
+/// layer down.
+pub type Progress<'a> = &'a mut (dyn FnMut(u64) -> ControlFlow<()> + Send);
 
 mod error;
 mod https;
@@ -193,8 +202,16 @@ impl S3Client {
     }
 
     /// [`Self::put`] streaming from a file, so a blob is never held whole in
-    /// memory on the way up.
+    /// memory on the way up. A large file goes up in parts, so every upload
+    /// path here has the same ceiling, which is none.
     pub async fn put_file(&self, key: &str, path: &std::path::Path) -> Result<(), S3Error> {
+        self.put_file_reporting(key, path, &mut |_| ControlFlow::Continue(()))
+            .await
+    }
+
+    /// One PUT, whatever the size. The single-request half of
+    /// [`Self::put_file_reporting`].
+    async fn put_file_whole(&self, key: &str, path: &std::path::Path) -> Result<(), S3Error> {
         let body = ByteStream::from_path(path)
             .await
             .map_err(|e| S3Error::Transport(e.to_string()))?;
@@ -209,8 +226,160 @@ impl S3Client {
         Ok(())
     }
 
+    /// Above this a file goes up in parts. One PUT says nothing until it is
+    /// over, cannot be stopped, and S3 refuses a single PUT over 5 GiB,
+    /// which until now capped what a silo could hold at that per file.
+    pub const MULTIPART_ABOVE: u64 = 16 * 1024 * 1024;
+
+    /// One part. The smallest S3 accepts is 5 MiB; larger parts mean fewer
+    /// requests and a coarser bar, and this is the SDK's own default.
+    const PART_SIZE: u64 = 16 * 1024 * 1024;
+
+    /// S3's limit on parts in one upload. Past it the part size grows, so a
+    /// file of any size still goes up.
+    const MAX_PARTS: u64 = 10_000;
+
+    /// [`Self::put_file`], saying how many bytes went up as they go and
+    /// stopping when the callback says to.
+    ///
+    /// A file over [`Self::MULTIPART_ABOVE`] goes up in parts, so progress
+    /// and a stop land every part rather than once at the end. A stop, or
+    /// any failure, aborts the upload: parts left behind are billed and
+    /// invisible.
+    pub async fn put_file_reporting(
+        &self,
+        key: &str,
+        path: &std::path::Path,
+        progress: Progress<'_>,
+    ) -> Result<(), S3Error> {
+        let len = std::fs::metadata(path)
+            .map_err(|e| S3Error::Transport(e.to_string()))?
+            .len();
+        if len <= Self::MULTIPART_ABOVE {
+            self.put_file_whole(key, path).await?;
+            return match progress(len) {
+                ControlFlow::Continue(()) => Ok(()),
+                ControlFlow::Break(()) => Err(S3Error::Cancelled),
+            };
+        }
+
+        let full_key = self.config.key(key);
+        let started = self
+            .client
+            .create_multipart_upload()
+            .bucket(&self.config.bucket)
+            .key(&full_key)
+            .send()
+            .await
+            .map_err(|e| S3Error::from_sdk("upload", e))?;
+        let Some(upload_id) = started.upload_id().map(str::to_string) else {
+            return Err(S3Error::Service(
+                "the provider started an upload without an id".into(),
+            ));
+        };
+
+        match self
+            .upload_parts(&full_key, &upload_id, path, len, progress)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = self
+                    .client
+                    .abort_multipart_upload()
+                    .bucket(&self.config.bucket)
+                    .key(&full_key)
+                    .upload_id(&upload_id)
+                    .send()
+                    .await;
+                Err(e)
+            }
+        }
+    }
+
+    /// The parts of one multipart upload, in order, and the request that
+    /// completes it. Split out so every way of failing aborts the upload.
+    async fn upload_parts(
+        &self,
+        full_key: &str,
+        upload_id: &str,
+        path: &std::path::Path,
+        len: u64,
+        progress: Progress<'_>,
+    ) -> Result<(), S3Error> {
+        let part_size = Self::PART_SIZE.max(len.div_ceil(Self::MAX_PARTS));
+        let mut finished: Vec<CompletedPart> = Vec::new();
+        let mut offset = 0u64;
+        let mut number = 1i32;
+
+        while offset < len {
+            let size = part_size.min(len - offset);
+            let body = ByteStream::read_from()
+                .path(path)
+                .offset(offset)
+                .length(Length::Exact(size))
+                .build()
+                .await
+                .map_err(|e| S3Error::Transport(e.to_string()))?;
+
+            let uploaded = self
+                .client
+                .upload_part()
+                .bucket(&self.config.bucket)
+                .key(full_key)
+                .upload_id(upload_id)
+                .part_number(number)
+                .body(body)
+                .send()
+                .await
+                .map_err(|e| S3Error::from_sdk("upload", e))?;
+
+            finished.push(
+                CompletedPart::builder()
+                    .part_number(number)
+                    .set_e_tag(uploaded.e_tag().map(str::to_string))
+                    .build(),
+            );
+            offset += size;
+            number += 1;
+
+            if progress(size).is_break() {
+                return Err(S3Error::Cancelled);
+            }
+        }
+
+        self.client
+            .complete_multipart_upload()
+            .bucket(&self.config.bucket)
+            .key(full_key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .set_parts(Some(finished))
+                    .build(),
+            )
+            .send()
+            .await
+            .map_err(|e| S3Error::from_sdk("upload", e))?;
+        Ok(())
+    }
+
     /// [`Self::get`] streaming into a file, chunk by chunk.
     pub async fn get_file(&self, key: &str, dest: &std::path::Path) -> Result<(), S3Error> {
+        self.get_file_reporting(key, dest, &mut |_| ControlFlow::Continue(()))
+            .await
+    }
+
+    /// [`Self::get_file`], saying how many bytes arrived as they arrive and
+    /// stopping when the callback says to. A stopped download leaves no
+    /// file: half an object where a caller expects a whole one reads as
+    /// content that decrypts to nothing.
+    pub async fn get_file_reporting(
+        &self,
+        key: &str,
+        dest: &std::path::Path,
+        progress: Progress<'_>,
+    ) -> Result<(), S3Error> {
         let output = self
             .client
             .get_object()
@@ -224,6 +393,7 @@ impl S3Client {
         let mut file =
             std::fs::File::create(dest).map_err(|e| S3Error::Transport(e.to_string()))?;
         let mut body = output.body;
+        let mut stopped = false;
         while let Some(chunk) = body
             .try_next()
             .await
@@ -231,9 +401,19 @@ impl S3Client {
         {
             file.write_all(&chunk)
                 .map_err(|e| S3Error::Transport(e.to_string()))?;
+            if progress(chunk.len() as u64).is_break() {
+                stopped = true;
+                break;
+            }
         }
         file.flush()
             .map_err(|e| S3Error::Transport(e.to_string()))?;
+
+        if stopped {
+            drop(file);
+            let _ = std::fs::remove_file(dest);
+            return Err(S3Error::Cancelled);
+        }
         Ok(())
     }
 

@@ -4,12 +4,55 @@
 //! and `href`s come back in the server's own dialect, so normalising them
 //! back to our keys is the fiddly part.
 
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::task::{Context, Poll};
+
 use async_trait::async_trait;
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use reqwest::{Client, Method, StatusCode};
+use tokio::io::{AsyncRead, ReadBuf};
 
-use crate::{ObjectStore, StoreError, StoredObject};
+use crate::{ObjectStore, Progress, StoreError, StoredObject};
+
+/// How often the upload's byte count is looked at while the request is in
+/// flight. The body is read by reqwest inside one `send`, so the count is
+/// polled beside it rather than reported from inside.
+const UPLOAD_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Counts the bytes reqwest pulls out of the file for a streaming PUT, and
+/// fails the body when the caller stops the transfer, which drops the
+/// request rather than uploading the rest.
+struct CountingReader {
+    file: tokio::fs::File,
+    moved: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+}
+
+impl AsyncRead for CountingReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.stop.load(Ordering::Relaxed) {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "stopped",
+            )));
+        }
+        let before = buf.filled().len();
+        let me = self.get_mut();
+        let polled = Pin::new(&mut me.file).poll_read(cx, buf);
+        if matches!(polled, Poll::Ready(Ok(()))) {
+            let read = buf.filled().len().saturating_sub(before);
+            me.moved.fetch_add(read as u64, Ordering::Relaxed);
+        }
+        polled
+    }
+}
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct WebDavConfig {
@@ -224,6 +267,21 @@ impl ObjectStore for WebDavStore {
     }
 
     async fn put_from_file(&self, key: &str, source: &std::path::Path) -> Result<(), StoreError> {
+        self.put_from_file_reporting(key, source, &mut |_| std::ops::ControlFlow::Continue(()))
+            .await
+    }
+
+    async fn get_to_file(&self, key: &str, dest: &std::path::Path) -> Result<(), StoreError> {
+        self.get_to_file_reporting(key, dest, &mut |_| std::ops::ControlFlow::Continue(()))
+            .await
+    }
+
+    async fn put_from_file_reporting(
+        &self,
+        key: &str,
+        source: &std::path::Path,
+        progress: Progress<'_>,
+    ) -> Result<(), StoreError> {
         self.ensure_parents(key).await?;
         let file = tokio::fs::File::open(source)
             .await
@@ -233,23 +291,63 @@ impl ObjectStore for WebDavStore {
             .await
             .map_err(|e| StoreError::Other(format!("{key}: {e}")))?
             .len();
+
+        // The body is read inside `send`, and a streaming body has to own
+        // everything it touches, so the count crosses back through an
+        // atomic that this side reads while the request is in flight.
+        let moved = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = CountingReader {
+            file,
+            moved: moved.clone(),
+            stop: stop.clone(),
+        };
         // An explicit length, so the body goes up identity-encoded: several
         // WebDAV servers refuse a chunked PUT.
-        let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
-        let response = self
+        let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(reader));
+        let send = self
             .request(Method::PUT, &self.url_for(key))
             .header(reqwest::header::CONTENT_LENGTH, len)
             .body(body)
-            .send()
-            .await
-            .map_err(Self::map_send)?;
+            .send();
+        tokio::pin!(send);
+
+        let mut reported = 0u64;
+        let sent = loop {
+            tokio::select! {
+                answer = &mut send => break answer,
+                () = tokio::time::sleep(UPLOAD_POLL) => {
+                    let seen = moved.load(Ordering::Relaxed);
+                    if seen > reported && progress(seen - reported).is_break() {
+                        stop.store(true, Ordering::Relaxed);
+                    }
+                    reported = seen;
+                }
+            }
+        };
+
+        // Whatever the last poll missed, including the whole of a small
+        // upload that finished before the first one.
+        let seen = moved.load(Ordering::Relaxed);
+        let stopped = stop.load(Ordering::Relaxed)
+            || (seen > reported && progress(seen - reported).is_break());
+        if stopped {
+            return Err(StoreError::Cancelled);
+        }
+
+        let response = sent.map_err(Self::map_send)?;
         if !response.status().is_success() {
             return Err(Self::map_status(response.status(), key));
         }
         Ok(())
     }
 
-    async fn get_to_file(&self, key: &str, dest: &std::path::Path) -> Result<(), StoreError> {
+    async fn get_to_file_reporting(
+        &self,
+        key: &str,
+        dest: &std::path::Path,
+        progress: Progress<'_>,
+    ) -> Result<(), StoreError> {
         let mut response = self
             .request(Method::GET, &self.url_for(key))
             .send()
@@ -262,12 +360,23 @@ impl ObjectStore for WebDavStore {
         use std::io::Write;
         let mut file =
             std::fs::File::create(dest).map_err(|e| StoreError::Other(format!("{key}: {e}")))?;
+        let mut stopped = false;
         while let Some(chunk) = response.chunk().await.map_err(Self::map_send)? {
             file.write_all(&chunk)
                 .map_err(|e| StoreError::Other(format!("{key}: {e}")))?;
+            if progress(chunk.len() as u64).is_break() {
+                stopped = true;
+                break;
+            }
         }
         file.flush()
             .map_err(|e| StoreError::Other(format!("{key}: {e}")))?;
+
+        if stopped {
+            drop(file);
+            let _ = std::fs::remove_file(dest);
+            return Err(StoreError::Cancelled);
+        }
         Ok(())
     }
 

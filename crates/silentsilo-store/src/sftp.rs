@@ -14,7 +14,10 @@ use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::OpenFlags;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::{ObjectStore, StoreError, StoredObject};
+use crate::{ObjectStore, Progress, SharedProgress, StoreError, StoredObject};
+
+/// How much goes over the wire between two progress reports.
+const CHUNK: usize = 512 * 1024;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "method", rename_all = "kebab-case")]
@@ -251,7 +254,9 @@ impl SftpStore {
     {
         let conn = self.session().await?;
         match op(conn.clone()).await {
-            Err(err) if conn.ssh.is_closed() => {
+            // A stop is the caller's decision, not a dead connection, and
+            // running the operation again would undo it.
+            Err(err) if conn.ssh.is_closed() && !matches!(err, StoreError::Cancelled) => {
                 self.retire(&conn).await;
                 let _ = err;
                 let fresh = self.session().await?;
@@ -484,11 +489,32 @@ impl ObjectStore for SftpStore {
     }
 
     async fn put_from_file(&self, key: &str, source: &std::path::Path) -> Result<(), StoreError> {
+        self.put_from_file_reporting(key, source, &mut |_| std::ops::ControlFlow::Continue(()))
+            .await
+    }
+
+    async fn get_to_file(&self, key: &str, dest: &std::path::Path) -> Result<(), StoreError> {
+        self.get_to_file_reporting(key, dest, &mut |_| std::ops::ControlFlow::Continue(()))
+            .await
+    }
+
+    async fn put_from_file_reporting(
+        &self,
+        key: &str,
+        source: &std::path::Path,
+        progress: Progress<'_>,
+    ) -> Result<(), StoreError> {
+        // Shared rather than owned: `run` may run this body a second time on
+        // a fresh connection.
+        let progress = SharedProgress::new(progress);
+        let progress = &progress;
+
         self.run(|sftp| async move {
             self.ensure_parents(&sftp, key).await?;
 
             // Same temp-and-rename shape as `put`, streamed in pieces so a
-            // blob is never held whole in memory.
+            // blob is never held whole in memory, and so a stop leaves the
+            // key as it was.
             let final_path = self.path_for(key);
             let temp_path = temp_beside(&final_path);
             let mut local = tokio::fs::File::open(source)
@@ -502,7 +528,8 @@ impl ObjectStore for SftpStore {
                 .await
                 .map_err(|e| StoreError::Other(format!("{key}: {e}")))?;
 
-            let mut buf = vec![0u8; 512 * 1024];
+            let mut buf = vec![0u8; CHUNK];
+            let mut stopped = false;
             loop {
                 let n = local
                     .read(&mut buf)
@@ -515,18 +542,34 @@ impl ObjectStore for SftpStore {
                     .write_all(&buf[..n])
                     .await
                     .map_err(|e| StoreError::Other(format!("{key}: {e}")))?;
+                if progress.report(n as u64).is_break() {
+                    stopped = true;
+                    break;
+                }
             }
             remote
                 .shutdown()
                 .await
                 .map_err(|e| StoreError::Other(format!("{key}: {e}")))?;
 
+            if stopped {
+                let _ = sftp.remove_file(temp_path).await;
+                return Err(StoreError::Cancelled);
+            }
             replace(&sftp, temp_path, final_path, key).await
         })
         .await
     }
 
-    async fn get_to_file(&self, key: &str, dest: &std::path::Path) -> Result<(), StoreError> {
+    async fn get_to_file_reporting(
+        &self,
+        key: &str,
+        dest: &std::path::Path,
+        progress: Progress<'_>,
+    ) -> Result<(), StoreError> {
+        let progress = SharedProgress::new(progress);
+        let progress = &progress;
+
         self.run(|sftp| async move {
             let mut remote = sftp.open(self.path_for(key)).await.map_err(|e| {
                 if missing(&e) {
@@ -539,7 +582,8 @@ impl ObjectStore for SftpStore {
                 .await
                 .map_err(|e| StoreError::Other(format!("{key}: {e}")))?;
 
-            let mut buf = vec![0u8; 512 * 1024];
+            let mut buf = vec![0u8; CHUNK];
+            let mut stopped = false;
             loop {
                 let n = remote
                     .read(&mut buf)
@@ -552,11 +596,23 @@ impl ObjectStore for SftpStore {
                     .write_all(&buf[..n])
                     .await
                     .map_err(|e| StoreError::Other(format!("{key}: {e}")))?;
+                if progress.report(n as u64).is_break() {
+                    stopped = true;
+                    break;
+                }
             }
             local
                 .flush()
                 .await
                 .map_err(|e| StoreError::Other(format!("{key}: {e}")))?;
+
+            if stopped {
+                // Half an object where the caller expects a whole one reads
+                // as content that decrypts to nothing.
+                drop(local);
+                let _ = tokio::fs::remove_file(dest).await;
+                return Err(StoreError::Cancelled);
+            }
             Ok(())
         })
         .await

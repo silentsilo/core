@@ -785,14 +785,104 @@ pub struct SeedOutcome {
 /// copy never looks like a silo that lost its history.
 const SEED_PREFIXES: [&str; 4] = [BLOBS_PREFIX, OPS_PREFIX, SNAPSHOTS_PREFIX, KEYS_PREFIX];
 
+/// How often a seed says where it has got to. A silo is hundreds of
+/// thousands of objects and a single blob can take minutes, so the reports
+/// are paced by the clock rather than by the work.
+const SEED_REPORT_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How far a seed has got.
+///
+/// Objects and bytes both, because neither alone says anything useful: a
+/// counter of objects sits still for minutes on one large blob, and bytes
+/// alone hide that a thousand tiny records are what is left.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct SeedProgress {
+    pub objects_done: usize,
+    pub objects_total: usize,
+    /// Bytes of the silo accounted for. An object counts its listed size
+    /// once, half as it comes down and half as it goes up, so the total is
+    /// the size of the silo rather than twice it. An object skipped or
+    /// failed is credited whole when it is done with, so the bar ends where
+    /// the object count does.
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+}
+
+/// Keeps the count and paces the reports.
+struct SeedReporter<'a> {
+    sink: &'a mut (dyn FnMut(SeedProgress) + Send),
+    state: SeedProgress,
+    last: std::time::Instant,
+    /// The size the listing gave for the object in hand, what has been
+    /// credited towards it, and what both legs have moved of it.
+    object_size: u64,
+    credited: u64,
+    moved: u64,
+}
+
+impl<'a> SeedReporter<'a> {
+    fn new(sink: &'a mut (dyn FnMut(SeedProgress) + Send), state: SeedProgress) -> Self {
+        Self {
+            sink,
+            state,
+            // In the past, so the first report goes out rather than waiting.
+            // Checked, because on a machine that booted a moment ago there
+            // is no such instant and plain subtraction panics.
+            last: std::time::Instant::now()
+                .checked_sub(SEED_REPORT_EVERY)
+                .unwrap_or_else(std::time::Instant::now),
+            object_size: 0,
+            credited: 0,
+            moved: 0,
+        }
+    }
+
+    fn start_object(&mut self, size: u64) {
+        self.object_size = size;
+        self.credited = 0;
+        self.moved = 0;
+    }
+
+    /// Bytes a backend moved, of either leg.
+    fn moved(&mut self, bytes: u64) {
+        self.moved = self.moved.saturating_add(bytes);
+        // Clamped to the listed size: a backend that runs an operation
+        // again after a dead connection reports its bytes twice, and a bar
+        // that overshoots is worse than one that pauses.
+        let credit = (self.moved / 2).min(self.object_size);
+        if credit > self.credited {
+            self.state.bytes_done += credit - self.credited;
+            self.credited = credit;
+        }
+        self.emit(false);
+    }
+
+    /// Whatever happened to it, the object is behind us.
+    fn finish_object(&mut self) {
+        self.state.bytes_done += self.object_size - self.credited;
+        self.credited = self.object_size;
+        self.state.objects_done += 1;
+        self.emit(false);
+    }
+
+    fn emit(&mut self, force: bool) {
+        if force || self.last.elapsed() >= SEED_REPORT_EVERY {
+            self.last = std::time::Instant::now();
+            (self.sink)(self.state);
+        }
+    }
+}
+
 /// Copies one target's contents into another, on ciphertext throughout: no
-/// key needed. Both directions are the same operation. `cancel` is asked
-/// between objects; stopping mid-seed is safe, the next run skips what
-/// already landed.
+/// key needed. Both directions are the same operation.
+///
+/// `cancel` is asked between objects and again on every progress report, so
+/// a stop lands in the middle of a large blob rather than after it.
+/// Stopping is safe: what already landed stays, and the next run skips it.
 pub async fn seed_target(
     from: &dyn ObjectStore,
     to: &dyn ObjectStore,
-    progress: &mut (dyn FnMut(usize, usize) + Send),
+    progress: &mut (dyn FnMut(SeedProgress) + Send),
     cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<SeedOutcome, SyncError> {
     let mut outcome = SeedOutcome::default();
@@ -804,9 +894,24 @@ pub async fn seed_target(
     // The manifest is one fixed key rather than a prefix, and it goes last.
     let manifest_size = from.head(MANIFEST_KEY).await?;
 
-    let total = work.len() + usize::from(manifest_size.is_some());
-    progress(0, total);
-    let mut done = 0;
+    // The listing carries every size, so both totals are known before the
+    // first byte moves. A number climbing towards an unknown end is not
+    // progress on an operation that runs for hours.
+    let bytes_total = work
+        .iter()
+        .map(|entry| entry.size.max(0) as u64)
+        .sum::<u64>()
+        + manifest_size.unwrap_or(0).max(0) as u64;
+    let mut reporter = SeedReporter::new(
+        progress,
+        SeedProgress {
+            objects_done: 0,
+            objects_total: work.len() + usize::from(manifest_size.is_some()),
+            bytes_done: 0,
+            bytes_total,
+        },
+    );
+    reporter.emit(true);
 
     // One staging file, reused: objects pass through disk rather than
     // memory, since a blob is whatever size the user stored.
@@ -820,6 +925,8 @@ pub async fn seed_target(
         if cancel() {
             return Err(SyncError::Cancelled);
         }
+        reporter.start_object(entry.size.max(0) as u64);
+
         // A blob already there at the same size is treated as already
         // there: blob keys are written once and never rewritten, so "same
         // key, same size" is a strong statement, and a deeper check would
@@ -829,28 +936,45 @@ pub async fn seed_target(
         // and a size check would skip the one write that matters.
         if entry.key.starts_with(BLOBS_PREFIX) && to.head(&entry.key).await? == Some(entry.size) {
             outcome.skipped += 1;
-            done += 1;
-            progress(done, total);
+            reporter.finish_object();
             continue;
         }
-        match from.get_to_file(&entry.key, &staged).await {
+
+        let fetched = {
+            let mut watch = watcher(&mut reporter, cancel);
+            from.get_to_file_reporting(&entry.key, &staged, &mut watch)
+                .await
+        };
+        match fetched {
             Ok(()) => {
                 let len = std::fs::metadata(&staged).map(|m| m.len()).unwrap_or(0);
-                match to.put_from_file(&entry.key, &staged).await {
+                let sent = {
+                    let mut watch = watcher(&mut reporter, cancel);
+                    to.put_from_file_reporting(&entry.key, &staged, &mut watch)
+                        .await
+                };
+                match sent {
                     Ok(()) => {
                         outcome.copied += 1;
                         outcome.bytes += len;
                     }
+                    Err(StoreError::Cancelled) => return Err(SyncError::Cancelled),
                     Err(e) => outcome.failed.push((entry.key.clone(), e.to_string())),
                 }
             }
+            Err(StoreError::Cancelled) => return Err(SyncError::Cancelled),
             Err(e) => outcome.failed.push((entry.key.clone(), e.to_string())),
         }
-        done += 1;
-        progress(done, total);
+        reporter.finish_object();
     }
 
-    if manifest_size.is_some() {
+    if let Some(size) = manifest_size {
+        if cancel() {
+            return Err(SyncError::Cancelled);
+        }
+        reporter.start_object(size.max(0) as u64);
+        // Small and fixed, so it goes through memory like every other
+        // caller of it does.
         match from.get(MANIFEST_KEY).await {
             Ok(bytes) => match to.put(MANIFEST_KEY, bytes).await {
                 Ok(()) => outcome.copied += 1,
@@ -862,11 +986,27 @@ pub async fn seed_target(
                 .failed
                 .push((MANIFEST_KEY.to_string(), e.to_string())),
         }
-        done += 1;
-        progress(done, total);
+        reporter.finish_object();
     }
 
+    reporter.emit(true);
     Ok(outcome)
+}
+
+/// The callback a backend reports into: it moves the count along and
+/// answers with the user's stop.
+fn watcher<'a>(
+    reporter: &'a mut SeedReporter<'_>,
+    cancel: &'a (dyn Fn() -> bool + Sync),
+) -> impl FnMut(u64) -> std::ops::ControlFlow<()> + Send + 'a {
+    move |bytes| {
+        reporter.moved(bytes);
+        if cancel() {
+            std::ops::ControlFlow::Break(())
+        } else {
+            std::ops::ControlFlow::Continue(())
+        }
+    }
 }
 
 // ── Checking a silo against its storage ─────────────────────────────
@@ -1928,7 +2068,12 @@ impl From<CoreError> for SyncError {
 
 impl From<StoreError> for SyncError {
     fn from(err: StoreError) -> Self {
-        SyncError::Storage(err.to_string())
+        // A stop is the user's own decision, and every caller above tells it
+        // apart from a failure to retry.
+        match err {
+            StoreError::Cancelled => SyncError::Cancelled,
+            other => SyncError::Storage(other.to_string()),
+        }
     }
 }
 

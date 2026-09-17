@@ -14,6 +14,11 @@ pub enum S3Error {
     /// The provider answered, and said no.
     #[error("{0}")]
     Service(String),
+
+    /// A progress callback asked for the transfer to stop. Not a failure:
+    /// nothing is left half-written, and running it again carries on.
+    #[error("stopped")]
+    Cancelled,
 }
 
 impl S3Error {
