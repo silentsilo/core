@@ -19,6 +19,17 @@ release notes should say.
 
 ### Fixed
 
+- A backup target can no longer disappear from the list after it is added.
+  Windows Credential Manager refuses a blob over 2560 bytes, which is 1280
+  characters because the blob is UTF-16, and one SFTP target carrying its
+  private key passes that on its own. The refused write fell back to the
+  file, the keyring entry kept the shorter list it had taken before, and
+  `load_targets` reads the entry first: the target just added was gone on
+  the next read, eviction counted fewer copies than the user had configured,
+  and the next save wrote the short list back. The entry is now deleted once
+  the file holds the list, so the two copies cannot disagree. The storage
+  settings and the device credentials had the same shape and were fixed with
+  it. `s3_store.rs` has a test that writes a list Credential Manager refuses.
 - HTTPS to S3 and WebDAV works on Android. S3 found no root certificates on
   a phone, and WebDAV panicked in the handshake because its verifier was
   never set up. Both now use Android's verifier, and a handshake before

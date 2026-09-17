@@ -89,7 +89,13 @@ pub fn save_s3_config(silo_id: Uuid, config: &StoreConfig) -> Result<(), VaultEr
         return Ok(());
     }
 
-    write_fallback_config(silo_id, config)
+    // The file is now the only copy, so whatever the entry still holds is
+    // older and `load_s3_config` reads it first. It goes, after the file is
+    // safely written and never before. See `save_targets` for the size this
+    // happens at.
+    write_fallback_config(silo_id, config)?;
+    forget_keyring_entry(|| keyring_entry(silo_id));
+    Ok(())
 }
 
 /// Disconnects sync and forgets every target. Best-effort: a missing entry
@@ -228,7 +234,16 @@ pub fn save_targets(silo_id: Uuid, targets: &[BackupTarget]) -> Result<(), Vault
             let _ = std::fs::remove_file(targets_path(silo_id));
         }
     } else {
+        // Windows Credential Manager refuses a blob over
+        // `CRED_MAX_CREDENTIAL_BLOB_SIZE`, 2560 bytes, and the blob is
+        // UTF-16, so a list over 1280 characters is refused: one SFTP target
+        // with its private key passes that on its own. The file takes it,
+        // but `load_targets` reads the entry first, so the shorter list the
+        // entry still holds came back instead and the target just added was
+        // gone. The entry goes, after the file is written and never before,
+        // so the two copies cannot disagree and a list never shrinks.
         write_fallback_targets(silo_id, json.as_bytes())?;
+        forget_keyring_entry(|| targets_keyring(silo_id));
     }
 
     match targets.first() {
@@ -485,6 +500,87 @@ mod target_list_tests {
             load_targets(scratch.id()).is_empty(),
             "nothing about the storage may survive forgetting the silo"
         );
+    }
+
+    /// A list Windows Credential Manager will not take, which is not a
+    /// contrived size: `CRED_MAX_CREDENTIAL_BLOB_SIZE` is 2560 bytes and the
+    /// blob is UTF-16, so 1280 characters of JSON is the real ceiling, and
+    /// one SFTP target carrying its private key passes it on its own.
+    ///
+    /// The bug: the write was refused, the file was written, and the entry
+    /// kept the shorter list it had taken last time. `load_targets` reads
+    /// the entry first, so a target the user had just added was gone on the
+    /// next read, and the next save wrote the shortened list back over the
+    /// real one.
+    #[cfg(windows)]
+    #[test]
+    fn a_list_credential_manager_refuses_never_reads_back_short() {
+        let scratch = Scratch::new();
+        let disk = BackupTarget {
+            config: folder("D:/Backups"),
+            label: "Disk".into(),
+            role: TargetRole::Working,
+        };
+        save_targets(scratch.id(), std::slice::from_ref(&disk)).unwrap();
+        if targets_keyring(scratch.id())
+            .and_then(|entry| entry.get_password())
+            .is_err()
+        {
+            // Nothing to prove on a machine whose keyring took nothing.
+            eprintln!("skipped: this machine's keyring did not hold a short list");
+            return;
+        }
+
+        let long = vec![
+            disk.clone(),
+            BackupTarget {
+                config: StoreConfig::Sftp(silentsilo_store::SftpConfig {
+                    host: "nas.example.com".into(),
+                    port: 22,
+                    username: "silo".into(),
+                    auth: silentsilo_store::SftpAuth::Key {
+                        // The shape and size of a real OpenSSH key.
+                        private_key: format!(
+                            "-----BEGIN OPENSSH PRIVATE KEY-----\n{}\n-----END OPENSSH PRIVATE KEY-----\n",
+                            "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABlwAAAAdzc2gtcn"
+                                .repeat(24)
+                        ),
+                        passphrase: None,
+                    },
+                    path: "/srv/silo".into(),
+                    host_fingerprint: Some(format!("SHA256:{}", "a".repeat(43))),
+                }),
+                label: "The NAS".into(),
+                role: TargetRole::Working,
+            },
+        ];
+        // The blob is UTF-16, so the 2560-byte ceiling is 1280 characters.
+        let written = String::from_utf8(crate::format::encode(&long).unwrap()).unwrap();
+        assert!(
+            written.encode_utf16().count() * 2 > 2560,
+            "this list has to be one Credential Manager refuses, got {} characters",
+            written.chars().count()
+        );
+
+        save_targets(scratch.id(), &long).unwrap();
+
+        let back = load_targets(scratch.id());
+        assert_eq!(
+            back.len(),
+            long.len(),
+            "a target the user added disappeared on the next read"
+        );
+        assert_eq!(back[1].label, "The NAS");
+        // Whatever this machine's Credential Manager did with it, the two
+        // copies must not disagree: the file is read only when the entry is
+        // gone, so an entry that stayed behind is a shorter list waiting.
+        if let Ok(held) = targets_keyring(scratch.id()).and_then(|e| e.get_password()) {
+            let from_entry: Vec<BackupTarget> =
+                crate::format::decode("the backup targets", held.as_bytes()).unwrap();
+            assert_eq!(from_entry.len(), long.len(), "the keyring entry is stale");
+        }
+
+        clear_s3_config(scratch.id());
     }
 
     #[test]

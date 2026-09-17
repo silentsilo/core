@@ -91,7 +91,17 @@ pub fn save_credentials(creds: &LocalVaultAuth) -> Result<(), VaultError> {
     // Keyring write didn't verifiably persist on this machine — fall back to
     // a local file so provisioning still succeeds. `load_credentials` already
     // supports this path (and retries the keyring next time it's called).
-    write_fallback_file(creds.vault_id, &json)
+    //
+    // Whatever the entry still holds is then older than the file, and
+    // `load_credentials` reads the entry first, so it goes: after the file
+    // is written and never before. A device secret does not change once a
+    // silo is provisioned, so nothing has come back stale this way yet, but
+    // the shape is the one that lost a backup target in `s3_store`.
+    write_fallback_file(creds.vault_id, &json)?;
+    if let Ok(entry) = keyring_entry(creds.vault_id) {
+        let _ = entry.delete_credential();
+    }
+    Ok(())
 }
 
 /// The keyring-unavailable fallback: DPAPI-wraps (where available) and

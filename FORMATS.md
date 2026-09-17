@@ -126,7 +126,7 @@ holds a copy.
 |---|---|---|---|
 | Credentials | `credentials.json` | `SILO_FILE_VERSION = 1`, `silentsilo-vault/format.rs` | Refuses rather than reading as "no silo here" |
 | Storage settings | `s3.config.json` | `SILO_FILE_VERSION` | The one connection a joined or recovered device starts with |
-| Backup targets | `targets.config.json` | `SILO_FILE_VERSION` | Every copy, in order. Kept as a file as well as in the keychain whenever there is more than one, because the single slot above holds only the first |
+| Backup targets | `targets.config.json` | `SILO_FILE_VERSION` | Every copy, in order. Kept as a file as well as in the keychain whenever there is more than one, because the single slot above holds only the first. A keychain that refuses the write (Windows Credential Manager takes 2560 bytes, UTF-16, so 1280 characters) has its entry deleted once the file is written, because reads prefer the entry and a stale one is a target silently gone |
 | Silo list | `silos.json` | `SILO_FILE_VERSION` | Where the silos are. Losing it costs the list, not the data |
 | Cache settings | `cache_settings.json` | **No version.** Plain JSON | One number, the local cache ceiling. Unreadable reads as the default, so there is nothing a version could save |
 | Protected folders | `protected.enc` | `SILO_FILE_VERSION`, inside a sealed payload under the content KEK | Which folders on this computer the silo copies from. Absolute local paths, so they describe what someone keeps and where; kept beside the ledger of what has already been imported, and out of a folder that travels. Sealed since core 1.6.0; a plaintext `protected.json` from an earlier release is read once, written back sealed and removed |
