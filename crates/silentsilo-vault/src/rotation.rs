@@ -94,7 +94,22 @@ pub fn commit_rotation(root: &Path) -> Result<(), VaultError> {
     // it before the KEK above is in place would report a finished rotation
     // over a half-applied one.
     std::fs::remove_file(staged_dek_path(root))?;
+    retire_page_key(root);
     Ok(())
+}
+
+/// The working copy's `vault.key` is sealed under the retired DEK, which must
+/// not open anything here once the rotation is over. The key staged under the
+/// new DEK takes its place; without one it just goes, and the next unlock
+/// exports a fresh copy. Best effort: unlock promotes a staged key anyway.
+fn retire_page_key(root: &Path) {
+    let paths = crate::VaultPaths::new(root.to_path_buf());
+    let staged = paths.db_key_staged_path();
+    if staged.is_file() && silentsilo_core::rename_with_retry(&staged, &paths.db_key_path()).is_ok()
+    {
+        return;
+    }
+    let _ = std::fs::remove_file(paths.db_key_path());
 }
 
 /// Throws a staged rotation away.

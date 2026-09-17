@@ -443,6 +443,9 @@ Read this before "fixing" any of it.
   takes the copy with it: a crashed session's changes, and the next unlock's
   reuse. `stage_local_backup` seals it
   under the new DEK too, so a crash after a rotation commits still adopts.
+  `commit_rotation` moves it over `vault.key` right away (or deletes
+  `vault.key` when there is none), so the retired DEK opens nothing here
+  after the commit.
 - **The working copy outlives the lock.** Exporting a 12 MB index into a
   fresh SQLCipher copy took 600 ms of every unlock. Reuse is decided by
   fingerprint, not by timestamps: each snapshot write records the BLAKE3 of

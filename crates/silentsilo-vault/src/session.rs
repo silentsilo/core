@@ -1645,6 +1645,53 @@ mod tests {
         assert_eq!(marker(&again.conn), "after");
     }
 
+    /// After a rotation commits, nothing in the work directory opens with
+    /// the retired DEK: the page key sealed under it is replaced at once,
+    /// not at the next unlock.
+    #[test]
+    fn a_committed_rotation_leaves_no_page_key_under_the_retired_dek() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let session = silo_with_marker(&root, "secret", "kept");
+        session.backup_locally().unwrap();
+        let paths = session.paths.clone();
+        let old_dek = session.dek.clone();
+        assert!(read_page_key(&paths.db_key_path(), &old_dek).is_some());
+
+        let new_dek = generate_dek();
+        crate::rotation::stage_rotation(&root, &new_dek, &session.kek, &session.dek).unwrap();
+        session
+            .stage_local_backup(&new_dek, &paths.db_enc_staged_path())
+            .unwrap();
+        crate::rotation::commit_rotation(&root).unwrap();
+
+        assert!(read_page_key(&paths.db_key_path(), &old_dek).is_none());
+        assert!(read_page_key(&paths.db_key_path(), &new_dek).is_some());
+        assert!(!paths.db_key_staged_path().exists());
+
+        silentsilo_core::rename_with_retry(&paths.db_enc_staged_path(), &paths.db_enc_path())
+            .unwrap();
+        drop(session);
+        let reopened = VaultSession::open_with_dek(root, new_dek).unwrap();
+        assert_eq!(marker(&reopened.conn), "kept");
+    }
+
+    /// A rotation committed with no staged page key drops the stale one.
+    #[test]
+    fn a_stale_page_key_without_a_staged_one_is_removed() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let session = silo_with_marker(&root, "secret", "kept");
+        session.backup_locally().unwrap();
+        let paths = session.paths.clone();
+        assert!(paths.db_key_path().is_file());
+
+        crate::rotation::stage_rotation(&root, &generate_dek(), &session.kek, &session.dek)
+            .unwrap();
+        crate::rotation::commit_rotation(&root).unwrap();
+        assert!(!paths.db_key_path().exists());
+    }
+
     /// The desktop locks every silo right after a rotation commits, and the
     /// lock snapshots with the session's DEK, which is the old one. Sealing
     /// under it would put `vault.db.enc` and its shadow copy under a key

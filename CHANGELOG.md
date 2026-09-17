@@ -33,6 +33,10 @@ release notes should say.
 
 ### Security
 
+- A committed rotation replaces the working copy's `vault.key` at once with
+  the one staged under the new DEK, or deletes it when none was staged.
+  Until the next unlock it stayed sealed under the retired DEK, which with
+  local disk access still opened the ciphered working copy.
 - Windows Credential Manager entries (device secret, storage settings, the
   target list) are written with `CRED_PERSIST_LOCAL_MACHINE` instead of
   keyring's roaming `CRED_PERSIST_ENTERPRISE`, so a domain roaming profile
