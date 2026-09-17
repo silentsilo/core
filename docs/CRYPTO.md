@@ -357,6 +357,19 @@ strong as its weakest envelope, and a memorable phrase is roughly forty bits.
 | Salt | 16 bytes, random per envelope, stored with it |
 | Wrapped DEK | Sealed envelope, above |
 | Envelope version | `1` |
+| `auth` | BLAKE3 keyed by `derive_key("silentsilo recovery envelope auth v1", content KEK)` over the fields above, hex. Optional, added in core 1.6.0 |
+
+The tag is not what protects the code: the wrapped DEK is already AEAD
+ciphertext, and a wrong envelope simply fails to open. What it protects is the
+decision every device makes about *which* envelope is the silo's. That
+decision ran on `created_at`, a number whoever can write to the bucket
+chooses, so they could bring back a code that had been turned off, or replace
+the envelope each device keeps locally with one that opens nothing, found out
+only when someone reached for it. The content KEK never leaves a device and
+never rotates, so a tag under it is something storage cannot produce.
+Untagged envelopes still open, and a device adopts one only while its own is
+untagged too. [FORMATS.md](../FORMATS.md), "The recovery envelope", has the
+exact rules and what an older client does with the field.
 
 The KDF parameters are **stored in the envelope** rather than assumed by the
 code that reads it. Retuning them, which a security audit is a likely reason to

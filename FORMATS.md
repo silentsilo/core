@@ -23,7 +23,7 @@ Anything else needs a version discriminator first.
 | Operation record | `ops/…` | `skippable` flag per record, plus `seq` and `prev`, `silentsilo-vfs/oplog.rs` | Skips a record marked ignorable, refuses on anything else. A record without `seq` is refused outright. `ReplaceFileContent.replaces` is optional and absent when unset, so a record without it decodes and is applied the old way, without conflict detection |
 | Sealed payload | wraps every op record | `SEAL_VERSION = 1`, `silentsilo-crypto/sealed.rs` | Refuses, naming the version |
 | Blob | `blobs/….sslo` | `SSLO_VERSION = 1`, `silentsilo-crypto/blob.rs` | Refuses, naming the version |
-| Recovery envelope | `recovery.env` | `RECOVERY_ENVELOPE_VERSION = 1`, plus stored KDF parameters | Refuses on a newer structure; a parameter change needs no bump |
+| Recovery envelope | `recovery.env` | `RECOVERY_ENVELOPE_VERSION = 1`, plus stored KDF parameters and an optional `auth` tag | Refuses on a newer structure; a parameter change needs no bump. `auth` is absent from the JSON when there is none, so a client that does not know it reads and rewrites the rest unchanged (below) |
 | Key envelopes | `keys/….env` | **No file version.** Plain JSON of one enrolled key, carrying `kind` (what unwraps its `wrapped_dek`) and `derivation` (how that key was derived from the authenticator) | Ignores an envelope whose `kind` or `derivation` it does not know, and refuses by name when none is left it can use |
 | Content KEK | `keys/content.kek` | Sealed payload under the vault DEK | Refuses, naming the version |
 | Inbox key | `inbox/keys/….sealed` | `INBOX_VERSION = 1` inside a sealed payload under the content KEK, `silentsilo-sync/inbox.rs` | 1.0.0 never lists `inbox/`. A build with the inbox skips a key it cannot read |
@@ -49,7 +49,10 @@ recovery code.
    salt stored beside it, using the parameters in the envelope rather than
    assumed ones, then open the sealed payload. Out comes the 32-byte DEK.
    Normalising means uppercasing, dropping separators, and mapping the
-   letter and digit pairs the alphabet excludes.
+   letter and digit pairs the alphabet excludes. An `auth` field, if the
+   envelope has one, is for devices deciding which envelope to keep (below);
+   a reader with the code can ignore it, since the code either opens the
+   envelope or does not.
 
 3. **`keys/content.kek`** is a sealed payload under the DEK. Inside is the
    32-byte content KEK. Every file's key is wrapped under this, not under the
@@ -253,6 +256,54 @@ already buy. If the shape of a `fido2` envelope ever has to change
 incompatibly, ship it as a new kind. Every client from the first release
 onward skips what it does not recognise and says so when nothing is left,
 which is the behaviour a version field would have been for.
+
+## The recovery envelope
+
+`recovery.env` in the bucket and `keys/recovery.json` in the silo folder hold
+the same JSON: the version, the Argon2id parameters, the salt, the wrapped
+DEK, `created_at`, and since core 1.6.0 an optional `auth`.
+
+`auth` is a tag over every other field, hex, 32 bytes: BLAKE3 keyed by
+`blake3::derive_key("silentsilo recovery envelope auth v1", content_kek)`
+over the same context string, a zero byte, then `version`, `m_cost`, `t_cost`
+and `p_cost` big-endian, `created_at` as a signed 64-bit big-endian integer,
+and `algorithm`, `salt` and `wrapped_dek` each as a big-endian 64-bit length
+followed by its bytes. The content KEK is what keys it because the KEK never
+rotates and never leaves a device: whoever can write to the bucket cannot
+make one.
+
+Why it exists: `created_at` decides which envelope a device adopts and which
+one a disable marker retires, and until 1.6.0 nothing stopped a writer in
+the bucket from choosing that number. An old envelope with a new date brought
+back a code that had been turned off; an envelope full of nonsense replaced
+the local copy on every device and was discovered at recovery, which is the
+worst possible moment.
+
+The rules, all in `silentsilo_sync::settle_recovery_envelope`:
+
+- **A device adopts a stored envelope only when its tag verifies.** Not when
+  it is merely newer.
+- **Unless its own has no tag either**, which means no device on this silo
+  has run 1.6.0 yet. Nothing is lost by behaving as 1.5.0 did there, and
+  refusing would strand a fleet that has not updated.
+- **A device tags the envelope it already holds.** The local copy is as
+  trustworthy as the disk it sits on, so a silo set up before 1.6.0 becomes
+  authenticated on the next pass without anyone writing a new code down. Only
+  a missing tag is filled in: one that does not verify is left alone and
+  reported, because this device is not the one to bless it.
+- **A newer stored envelope that is not tagged is left where it is, and
+  reported.** The client says so rather than silently keeping the older code.
+
+What an older client does: it parses the envelope, ignores `auth`, and opens
+the DEK with the code exactly as before, which is the first of the two
+acceptable answers. When it rewrites the object it drops the field, because
+it serializes the fields it knows. So while a 1.0.0 device is still syncing a
+silo, the tag in the bucket comes and goes and the two devices rewrite the
+object past each other once per pass. Harmless, and it stops when the older
+device updates. The consequence worth knowing: a recovery code regenerated on
+a 1.0.0 device is not adopted by a 1.6.0 device, which keeps the older code it
+holds and says so. `crates/silentsilo-fixture/tests/byte_vectors.rs` runs
+1.0.0's own code over an envelope written today, both directions.
 
 ## Who administers a key
 

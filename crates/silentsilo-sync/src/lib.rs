@@ -1931,6 +1931,20 @@ pub async fn newer_recovery_envelope(
         .filter(|stored| stored.created_at > local.created_at))
 }
 
+/// What a pass decided about the silo's recovery envelope.
+#[derive(Debug, Default, Clone)]
+pub struct RecoverySettlement {
+    /// The envelope this device holds afterwards, which is the one to
+    /// publish. `None` when the silo has no recovery code.
+    pub envelope: Option<RecoveryEnvelope>,
+    /// A newer envelope in a target was left where it was because it carries
+    /// no tag this silo's KEK verifies, while the local one does. Either a
+    /// client older than core 1.6.0 rewrote it, or someone with write access
+    /// to storage did. The two are indistinguishable, so the local envelope
+    /// is kept and the caller says so.
+    pub refused_unauthenticated: bool,
+}
+
 /// Brings this device's recovery envelope in line with storage before a push,
 /// and returns the one to publish.
 ///
@@ -1939,11 +1953,20 @@ pub async fn newer_recovery_envelope(
 /// allows it, so a device that had not heard does not put it back. A code
 /// made on another device since is kept here instead of this device's older
 /// one. `targets` pairs each store with whether it allows deletes.
+///
+/// What decides adoption is the envelope's tag, not its date. `created_at`
+/// is chosen by whoever wrote the object, so on its own it let a writer in
+/// the bucket bring back a code that had been turned off, or replace the
+/// envelope on every device with one that opens nothing. A tag needs the
+/// content KEK, which storage never sees. An untagged envelope is adopted
+/// only while this device's own is untagged too, which is a silo where no
+/// device has run core 1.6.0 yet and nothing has been lost either way.
 pub async fn settle_recovery_envelope(
     targets: &[(&dyn ObjectStore, bool)],
     kek: &ContentKek,
     vault_root: &std::path::Path,
-) -> Option<RecoveryEnvelope> {
+) -> RecoverySettlement {
+    let mut settlement = RecoverySettlement::default();
     let mut recovery = silentsilo_vault::load_recovery_envelope(vault_root).ok();
 
     let mut disabled_at: Option<i64> = None;
@@ -1968,6 +1991,9 @@ pub async fn settle_recovery_envelope(
     }
 
     if let Some(local) = recovery.as_ref() {
+        // A silo whose local envelope carries no tag has not met core 1.6.0
+        // yet, so an untagged one in storage is the ordinary case there.
+        let require_tag = local.is_authentic(kek);
         let mut newest: Option<RecoveryEnvelope> = None;
         for (store, _) in targets {
             if let Ok(Some(found)) = newer_recovery_envelope(*store, local).await
@@ -1976,6 +2002,10 @@ pub async fn settle_recovery_envelope(
                     .is_none_or(|n| found.created_at > n.created_at)
                 && disabled_at.is_none_or(|off| found.created_at > off)
             {
+                if require_tag && !found.is_authentic(kek) {
+                    settlement.refused_unauthenticated = true;
+                    continue;
+                }
                 newest = Some(found);
             }
         }
@@ -1985,7 +2015,21 @@ pub async fn settle_recovery_envelope(
             recovery = Some(newer);
         }
     }
-    recovery
+
+    // The upgrade path for a silo written before core 1.6.0: this device
+    // tags the envelope it already holds, which is as trustworthy as the
+    // disk it sits on, so the code on paper stays the one that works. Only
+    // a missing tag is filled in; a tag that does not verify is left alone
+    // and reported, because this device is not the one to bless it.
+    if let Some(envelope) = recovery.as_mut()
+        && envelope.auth.is_none()
+    {
+        envelope.authenticate(kek);
+        let _ = silentsilo_vault::save_recovery_envelope(vault_root, envelope);
+    }
+
+    settlement.envelope = recovery;
+    settlement
 }
 
 /// `None` when no recovery code has been set up for this vault.

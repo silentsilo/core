@@ -112,8 +112,9 @@ async fn create_inner(root: &Path, compact: bool) -> Result<(), String> {
 
     // Sealed under a known code rather than a security key, which is what
     // lets the fixture be opened by a test with no hardware attached.
-    let envelope = silentsilo_vault::seal_under_code_for_fixtures(&session.dek, FIXTURE_CODE)
-        .map_err(|e| e.to_string())?;
+    let envelope =
+        silentsilo_vault::seal_under_code_for_fixtures(&session.dek, FIXTURE_CODE, &session.kek)
+            .map_err(|e| e.to_string())?;
     save_recovery_envelope(&session.paths.root, &envelope).map_err(|e| e.to_string())?;
     silentsilo_sync::push_recovery_envelope(&*store, &envelope)
         .await

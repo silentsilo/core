@@ -253,14 +253,14 @@ mod tests {
         let (old, kek) = silo(dir.path(), &wrap_key);
         let new = generate_dek();
 
-        let (old_code, old_envelope) = crate::create_recovery_envelope(&old).unwrap();
+        let (old_code, old_envelope) = crate::create_recovery_envelope(&old, &kek).unwrap();
         crate::save_recovery_envelope(dir.path(), &old_envelope).unwrap();
 
         stage_rotation(dir.path(), &new, &kek, &old).unwrap();
         commit_rotation(dir.path()).unwrap();
 
         // What the resume path does once the keys are in force.
-        let (new_code, new_envelope) = crate::create_recovery_envelope(&new).unwrap();
+        let (new_code, new_envelope) = crate::create_recovery_envelope(&new, &kek).unwrap();
         crate::save_recovery_envelope(dir.path(), &new_envelope).unwrap();
 
         let stored = crate::load_recovery_envelope(dir.path()).unwrap();

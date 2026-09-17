@@ -95,11 +95,12 @@ fn the_enrolled_keys_save_while_something_holds_the_file() {
 #[test]
 fn the_recovery_envelope_saves_while_something_holds_the_file() {
     let (dir, _session) = silo();
-    let (_, first) = create_recovery_envelope(&generate_dek()).unwrap();
+    let kek = silentsilo_crypto::generate_content_kek();
+    let (_, first) = create_recovery_envelope(&generate_dek(), &kek).unwrap();
     save_recovery_envelope(dir.path(), &first).unwrap();
 
     let scanner = HeldOpen::reading(&dir.path().join("keys").join("recovery.json"));
-    let (code, replacement) = create_recovery_envelope(&generate_dek()).unwrap();
+    let (code, replacement) = create_recovery_envelope(&generate_dek(), &kek).unwrap();
     save_recovery_envelope(dir.path(), &replacement)
         .expect("a held envelope must not fail the save");
     drop(scanner);

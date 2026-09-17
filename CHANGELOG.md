@@ -33,6 +33,17 @@ release notes should say.
 
 ### Security
 
+- The recovery envelope carries a tag keyed by the content KEK, and a device
+  adopts a stored envelope only when that tag verifies. `created_at` alone
+  decided which envelope a device kept, and that number is chosen by whoever
+  writes the object: a bucket writer could bring back a code that had been
+  turned off, or replace the local envelope on every device with one that
+  opens nothing, which nobody would notice until they needed it. The field is
+  optional and left out of the JSON when absent, so a client from 1.0.0
+  onward reads and opens an envelope written today unchanged; a device tags
+  the envelope it already holds on its next pass, so a silo made before this
+  needs no new code written down. `create_recovery_envelope` and
+  `seal_under_code_for_fixtures` take the content KEK.
 - A committed rotation replaces the working copy's `vault.key` at once with
   the one staged under the new DEK, or deletes it when none was staged.
   Until the next unlock it stayed sealed under the retired DEK, which with

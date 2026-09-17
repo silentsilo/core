@@ -101,7 +101,11 @@ fn no_recovery_envelope_can_panic_the_reader() {
     // milliseconds. The ceiling on those parameters is also what makes it
     // finish at all, since a damaged m_cost otherwise asks for terabytes.
     let dek = silentsilo_crypto::generate_dek();
-    let (_code, envelope) = silentsilo_vault::create_recovery_envelope(&dek).unwrap();
+    let (_code, envelope) = silentsilo_vault::create_recovery_envelope(
+        &dek,
+        &silentsilo_crypto::generate_content_kek(),
+    )
+    .unwrap();
     let valid = serde_json::to_vec(&envelope).unwrap();
 
     for seed in 0..300u64 {

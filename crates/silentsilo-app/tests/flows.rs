@@ -57,7 +57,8 @@ async fn origin() -> Origin {
     vfs.create_folder(vfs.root_folder_id().unwrap(), "From A")
         .unwrap();
 
-    let (code, envelope) = silentsilo_vault::create_recovery_envelope(&session.dek).unwrap();
+    let (code, envelope) =
+        silentsilo_vault::create_recovery_envelope(&session.dek, &session.kek).unwrap();
     silentsilo_vault::save_recovery_envelope(&root, &envelope).unwrap();
     enrol_device_key(&session, &key([7; 32], "aa11")).unwrap();
 

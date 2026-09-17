@@ -67,7 +67,8 @@ async fn publish(session: &VaultSession, store: &dyn ObjectStore, blobs: &[Uuid]
         .await
         .unwrap();
 
-    let (code, recovery) = silentsilo_vault::create_recovery_envelope(&session.dek).unwrap();
+    let (code, recovery) =
+        silentsilo_vault::create_recovery_envelope(&session.dek, &session.kek).unwrap();
     silentsilo_sync::push_recovery_envelope(store, &recovery)
         .await
         .unwrap();

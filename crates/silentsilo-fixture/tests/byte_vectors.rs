@@ -165,6 +165,72 @@ fn the_recovery_envelope_still_decodes() {
         "the salt moved"
     );
     assert_eq!(envelope.wrapped_dek, "deadbeef", "the wrapped dek moved");
+    assert!(
+        envelope.auth.is_none(),
+        "an envelope from before the tag must not read as tagged"
+    );
+}
+
+/// The same envelope, tagged by a silo whose content KEK is 32 bytes of
+/// `0x4b`. The tag is a pure function of the fields and the KEK, so this is
+/// the one vector that would catch the message the tag covers being encoded
+/// differently: every envelope already in a bucket would stop verifying and
+/// no device would adopt another's recovery code again.
+const RECOVERY_ENVELOPE_TAGGED: &str = r#"{"version":1,"kdf":{"algorithm":"argon2id","m_cost":65536,"t_cost":3,"p_cost":1},"salt":"0102030405060708090a0b0c0d0e0f10","wrapped_dek":"deadbeef","created_at":1700000000,"auth":"734d978872c0f1f4178dd9650ba83bd507d0057b385f4fc3d9f23438b11bbb88"}"#;
+
+#[test]
+fn the_recovery_envelope_tag_still_verifies() {
+    let kek = silentsilo_crypto::ContentKek::from_bytes([0x4b; 32]);
+    let envelope: RecoveryEnvelope =
+        serde_json::from_str(RECOVERY_ENVELOPE_TAGGED).expect("a tagged envelope no longer reads");
+
+    assert!(
+        envelope.is_authentic(&kek),
+        "the tag this build makes is no longer the tag it made"
+    );
+
+    // And the tag is what it is for: the fields it covers cannot be edited
+    // by anyone who does not hold the KEK.
+    let mut redated = envelope.clone();
+    redated.created_at += 1;
+    assert!(!redated.is_authentic(&kek));
+}
+
+/// What 1.0.0 does with a tagged envelope: reads it, opens it with the code,
+/// and writes it back without the field. Both halves matter. The first is
+/// the compatibility rule (it ignores the new thing safely); the second is
+/// why a newer device refuses to adopt an envelope a 1.0.0 device
+/// republished, and says so rather than taking it.
+#[test]
+fn an_installed_1_0_0_client_opens_a_tagged_recovery_envelope() {
+    use silentsilo_vault_v1_0_0 as v1_0_0;
+
+    let dek = silentsilo_crypto::generate_dek();
+    let kek = silentsilo_crypto::generate_content_kek();
+    let (code, envelope) =
+        silentsilo_vault::create_recovery_envelope(&dek, &kek).expect("this build writes one");
+    let written = serde_json::to_string(&envelope).unwrap();
+    assert!(written.contains("\"auth\""), "the tag is not being written");
+
+    let old: v1_0_0::RecoveryEnvelope =
+        serde_json::from_str(&written).expect("1.0.0 must parse an envelope written today");
+    let opened = v1_0_0::unwrap_with_code(&old, &code)
+        .expect("1.0.0 must still recover the key from the code on paper");
+    assert_eq!(opened.as_bytes(), dek.as_bytes());
+
+    // 1.0.0 saving it back drops the field it never knew about.
+    let through_old = serde_json::to_string(&old).unwrap();
+    assert!(!through_old.contains("auth"), "got {through_old}");
+    let back: RecoveryEnvelope = serde_json::from_str(&through_old).unwrap();
+    assert!(
+        !back.is_authentic(&kek),
+        "a stripped envelope must not read as tagged"
+    );
+    assert!(
+        silentsilo_vault::unwrap_with_code(&back, &code).is_ok(),
+        "and it must still open, or a 1.0.0 device in the fleet would cost \
+         everyone their recovery code"
+    );
 }
 
 /// A key envelope as published to `keys/<credential_id>.env`: plain JSON of

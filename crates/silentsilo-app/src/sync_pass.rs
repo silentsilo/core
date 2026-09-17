@@ -466,7 +466,16 @@ pub async fn run_sync_pass(
         .iter()
         .map(|t| (&*t.store, t.role.allows_delete()))
         .collect();
-    let recovery = sync::settle_recovery_envelope(&recovery_targets, &kek, &root).await;
+    let settled = sync::settle_recovery_envelope(&recovery_targets, &kek, &root).await;
+    if settled.refused_unauthenticated {
+        host.warn(
+            "recovery",
+            "a newer recovery envelope in storage carries no tag from this silo, \
+             so the code this device holds was kept. Check for a device still on \
+             an older release before changing the recovery code.",
+        );
+    }
+    let recovery = settled.envelope;
     let mut keys = load_fido_keys(&root).ok();
 
     for target in &targets {

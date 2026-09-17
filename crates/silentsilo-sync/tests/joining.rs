@@ -228,7 +228,8 @@ async fn a_recovery_envelope_reaches_a_machine_that_has_never_seen_the_vault() {
     // but the bucket and a piece of paper.
     let client = client_or_skip!();
     let dek = silentsilo_crypto::generate_dek();
-    let (code, envelope) = silentsilo_vault::create_recovery_envelope(&dek).unwrap();
+    let kek = silentsilo_crypto::generate_content_kek();
+    let (code, envelope) = silentsilo_vault::create_recovery_envelope(&dek, &kek).unwrap();
 
     push_recovery_envelope(&client as &dyn ObjectStore, &envelope)
         .await
@@ -262,8 +263,11 @@ async fn revoking_recovery_stops_the_written_down_code_everywhere() {
     // Clearing only the local copy would leave the paper copy working from
     // any other machine — the opposite of what turning it off means.
     let client = client_or_skip!();
-    let (_, envelope) =
-        silentsilo_vault::create_recovery_envelope(&silentsilo_crypto::generate_dek()).unwrap();
+    let (_, envelope) = silentsilo_vault::create_recovery_envelope(
+        &silentsilo_crypto::generate_dek(),
+        &silentsilo_crypto::generate_content_kek(),
+    )
+    .unwrap();
     push_recovery_envelope(&client as &dyn ObjectStore, &envelope)
         .await
         .unwrap();
@@ -283,12 +287,13 @@ async fn revoking_recovery_stops_the_written_down_code_everywhere() {
 async fn replacing_a_recovery_code_invalidates_the_old_one() {
     let client = client_or_skip!();
     let dek = silentsilo_crypto::generate_dek();
-    let (old_code, old) = silentsilo_vault::create_recovery_envelope(&dek).unwrap();
+    let kek = silentsilo_crypto::generate_content_kek();
+    let (old_code, old) = silentsilo_vault::create_recovery_envelope(&dek, &kek).unwrap();
     push_recovery_envelope(&client as &dyn ObjectStore, &old)
         .await
         .unwrap();
 
-    let (new_code, new) = silentsilo_vault::create_recovery_envelope(&dek).unwrap();
+    let (new_code, new) = silentsilo_vault::create_recovery_envelope(&dek, &kek).unwrap();
     push_recovery_envelope(&client as &dyn ObjectStore, &new)
         .await
         .unwrap();

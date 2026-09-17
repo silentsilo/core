@@ -377,16 +377,21 @@ async fn a_device_that_missed_a_new_recovery_code_does_not_put_the_old_one_back(
     *a.host.targets.lock().unwrap() = vec![target()];
     *b.host.targets.lock().unwrap() = vec![target()];
     let dek = a.keys().0;
+    let kek = a.state.sessions.lock().unwrap()[&a.silo.id].kek.clone();
 
-    let (_, mut old) = silentsilo_vault::create_recovery_envelope(&dek).unwrap();
+    let (_, mut old) = silentsilo_vault::create_recovery_envelope(&dek, &kek).unwrap();
     old.created_at = 100;
+    // The date is covered by the tag, so a test that moves it has to stamp
+    // the envelope again or it is asking about a rejected one.
+    old.authenticate(&kek);
     silentsilo_vault::save_recovery_envelope(&a.silo.path, &old).unwrap();
     silentsilo_vault::save_recovery_envelope(&b.silo.path, &old).unwrap();
     a.pass().await;
     b.pass().await;
 
-    let (_, mut new) = silentsilo_vault::create_recovery_envelope(&dek).unwrap();
+    let (_, mut new) = silentsilo_vault::create_recovery_envelope(&dek, &kek).unwrap();
     new.created_at = 200;
+    new.authenticate(&kek);
     silentsilo_vault::save_recovery_envelope(&a.silo.path, &new).unwrap();
     a.pass().await;
     b.pass().await;
@@ -417,8 +422,9 @@ async fn a_recovery_code_turned_off_stays_off_on_a_device_that_had_not_heard() {
     let kek = a.state.sessions.lock().unwrap()[&a.silo.id].kek.clone();
     let store = silentsilo_store::FolderStore::new(storage.path().to_path_buf());
 
-    let (_, mut old) = silentsilo_vault::create_recovery_envelope(&dek).unwrap();
+    let (_, mut old) = silentsilo_vault::create_recovery_envelope(&dek, &kek).unwrap();
     old.created_at = 100;
+    old.authenticate(&kek);
     silentsilo_vault::save_recovery_envelope(&a.silo.path, &old).unwrap();
     silentsilo_vault::save_recovery_envelope(&b.silo.path, &old).unwrap();
     a.pass().await;
@@ -444,8 +450,9 @@ async fn a_recovery_code_turned_off_stays_off_on_a_device_that_had_not_heard() {
     assert!(silentsilo_vault::load_recovery_envelope(&b.silo.path).is_err());
 
     // A code made after that is the silo's code again, everywhere.
-    let (_, mut new) = silentsilo_vault::create_recovery_envelope(&dek).unwrap();
+    let (_, mut new) = silentsilo_vault::create_recovery_envelope(&dek, &kek).unwrap();
     new.created_at = 200;
+    new.authenticate(&kek);
     silentsilo_vault::save_recovery_envelope(&b.silo.path, &new).unwrap();
     b.pass().await;
     a.pass().await;

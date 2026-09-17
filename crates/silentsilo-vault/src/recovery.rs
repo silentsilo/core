@@ -11,9 +11,13 @@ use serde::{Deserialize, Serialize};
 use crate::dek_store::{unwrap_dek_hex, wrap_dek_bytes};
 use crate::error::VaultError;
 use crate::kdf::KdfParams;
-use silentsilo_crypto::MasterDek;
+use silentsilo_crypto::{ContentKek, MasterDek};
 
 const RECOVERY_FILE: &str = "keys/recovery.json";
+
+/// Separates the tag's key from every other use of the content KEK, so a
+/// value from one is never a value for another.
+const AUTH_CONTEXT: &str = "silentsilo recovery envelope auth v1";
 
 /// Shape of the stored envelope.
 ///
@@ -43,6 +47,69 @@ pub struct RecoveryEnvelope {
     pub wrapped_dek: String,
     /// Unix seconds, so the UI can say how old the written-down code is.
     pub created_at: i64,
+    /// Tag over every field above, keyed by the content KEK. Whoever can
+    /// write to storage cannot produce one, so an envelope carrying a valid
+    /// tag is one a device on the silo wrote, at the date it says.
+    ///
+    /// Optional, and left out of the JSON when absent, for two reasons: an
+    /// envelope written before core 1.6.0 has none and must keep working,
+    /// and a client that does not know the field re-serializes the rest
+    /// byte for byte. See `FORMATS.md`, "The recovery envelope".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<String>,
+}
+
+impl RecoveryEnvelope {
+    /// The bytes the tag covers, length-prefixed so no two envelopes can
+    /// produce the same message by moving a character across a boundary.
+    fn auth_message(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(160);
+        out.extend_from_slice(AUTH_CONTEXT.as_bytes());
+        out.push(0);
+        out.extend_from_slice(&self.version.to_be_bytes());
+        out.extend_from_slice(&self.kdf.m_cost.to_be_bytes());
+        out.extend_from_slice(&self.kdf.t_cost.to_be_bytes());
+        out.extend_from_slice(&self.kdf.p_cost.to_be_bytes());
+        out.extend_from_slice(&self.created_at.to_be_bytes());
+        for field in [
+            self.kdf.algorithm.as_str(),
+            self.salt.as_str(),
+            self.wrapped_dek.as_str(),
+        ] {
+            out.extend_from_slice(&(field.len() as u64).to_be_bytes());
+            out.extend_from_slice(field.as_bytes());
+        }
+        out
+    }
+
+    fn tag(&self, kek: &ContentKek) -> blake3::Hash {
+        let key = zeroize::Zeroizing::new(blake3::derive_key(AUTH_CONTEXT, kek.as_bytes()));
+        blake3::keyed_hash(&key, &self.auth_message())
+    }
+
+    /// Stamps the tag. Called where the envelope is made, and on a local
+    /// envelope this device already trusts: a silo set up before core 1.6.0
+    /// becomes authenticated without asking anyone to write a new code down.
+    pub fn authenticate(&mut self, kek: &ContentKek) {
+        self.auth = Some(self.tag(kek).to_hex().to_string());
+    }
+
+    /// Whether this envelope carries a tag a device on this silo made.
+    ///
+    /// False for an envelope with no tag at all, which is the honest answer:
+    /// nothing tells a 1.5.0 envelope apart from one an attacker stripped.
+    /// Callers decide what to do with that; see
+    /// `silentsilo_sync::settle_recovery_envelope`.
+    pub fn is_authentic(&self, kek: &ContentKek) -> bool {
+        let Some(stored) = self.auth.as_deref() else {
+            return false;
+        };
+        let Ok(stored) = blake3::Hash::from_hex(stored) else {
+            return false;
+        };
+        // `blake3::Hash` compares in constant time.
+        self.tag(kek) == stored
+    }
 }
 
 pub fn recovery_path(vault_root: &Path) -> PathBuf {
@@ -105,9 +172,16 @@ pub fn normalize_code(input: &str) -> String {
 /// Returns the code, which is the only time it exists in readable form —
 /// nothing derived from it is stored except the envelope, so an app that
 /// fails to show it to the user has lost it too.
-pub fn create_recovery_envelope(dek: &MasterDek) -> Result<(String, RecoveryEnvelope), VaultError> {
+///
+/// The KEK is taken rather than added later so that no path can produce an
+/// envelope without a tag: an untagged one is adopted by nobody, and the
+/// device that made it would be the only one that could still recover.
+pub fn create_recovery_envelope(
+    dek: &MasterDek,
+    kek: &ContentKek,
+) -> Result<(String, RecoveryEnvelope), VaultError> {
     let code = generate_recovery_code();
-    let envelope = seal_under_code(dek, &code)?;
+    let envelope = seal_under_code(dek, &code, kek)?;
     Ok((code, envelope))
 }
 
@@ -119,17 +193,22 @@ pub fn create_recovery_envelope(dek: &MasterDek) -> Result<(String, RecoveryEnve
 pub fn seal_under_code_for_fixtures(
     dek: &MasterDek,
     code: &str,
+    kek: &ContentKek,
 ) -> Result<RecoveryEnvelope, VaultError> {
-    seal_under_code(dek, code)
+    seal_under_code(dek, code, kek)
 }
 
-fn seal_under_code(dek: &MasterDek, code: &str) -> Result<RecoveryEnvelope, VaultError> {
+fn seal_under_code(
+    dek: &MasterDek,
+    code: &str,
+    kek: &ContentKek,
+) -> Result<RecoveryEnvelope, VaultError> {
     let salt: [u8; 16] = rand::random();
     let kdf = KdfParams::recovery_code();
     let key = zeroize::Zeroizing::new(kdf.derive(normalize_code(code).as_bytes(), &salt)?);
     let wrapped = wrap_dek_bytes(dek, &key)?;
 
-    Ok(RecoveryEnvelope {
+    let mut envelope = RecoveryEnvelope {
         version: RECOVERY_ENVELOPE_VERSION,
         kdf,
         salt: hex::encode(salt),
@@ -138,7 +217,10 @@ fn seal_under_code(dek: &MasterDek, code: &str) -> Result<RecoveryEnvelope, Vaul
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0),
-    })
+        auth: None,
+    };
+    envelope.authenticate(kek);
+    Ok(envelope)
 }
 
 /// Recovers the DEK from a code the user typed.
@@ -184,7 +266,13 @@ pub fn clear_recovery_envelope(vault_root: &Path) {
 mod tests {
     use super::*;
     use crate::kdf::ARGON2ID;
-    use silentsilo_crypto::generate_dek;
+    use silentsilo_crypto::{generate_content_kek, generate_dek};
+
+    /// The KEK every test here tags with. A silo has exactly one, and it
+    /// never rotates, which is why it is what the tag is keyed by.
+    fn kek() -> ContentKek {
+        generate_content_kek()
+    }
 
     #[test]
     fn a_generated_code_reads_as_eight_groups_of_four() {
@@ -220,7 +308,7 @@ mod tests {
     #[test]
     fn a_code_round_trips_the_dek() {
         let dek = generate_dek();
-        let (code, envelope) = create_recovery_envelope(&dek).unwrap();
+        let (code, envelope) = create_recovery_envelope(&dek, &kek()).unwrap();
         let recovered = unwrap_with_code(&envelope, &code).unwrap();
         assert_eq!(recovered.as_bytes(), dek.as_bytes());
     }
@@ -231,7 +319,7 @@ mod tests {
         // spaces instead, and the letters Crockford excludes because
         // handwriting confuses them.
         let dek = generate_dek();
-        let (code, envelope) = create_recovery_envelope(&dek).unwrap();
+        let (code, envelope) = create_recovery_envelope(&dek, &kek()).unwrap();
 
         for variant in [
             code.to_lowercase(),
@@ -248,7 +336,7 @@ mod tests {
     #[test]
     fn a_wrong_code_is_refused_rather_than_returning_junk() {
         let dek = generate_dek();
-        let (_, envelope) = create_recovery_envelope(&dek).unwrap();
+        let (_, envelope) = create_recovery_envelope(&dek, &kek()).unwrap();
         assert!(unwrap_with_code(&envelope, "0000-0000-0000-0000-0000-0000-0000-0000").is_err());
     }
 
@@ -256,8 +344,8 @@ mod tests {
     fn one_code_does_not_open_another_vault() {
         // Each envelope carries its own salt, so the same code typed at a
         // different vault derives a different key.
-        let (code, _) = create_recovery_envelope(&generate_dek()).unwrap();
-        let (_, other) = create_recovery_envelope(&generate_dek()).unwrap();
+        let (code, _) = create_recovery_envelope(&generate_dek(), &kek()).unwrap();
+        let (_, other) = create_recovery_envelope(&generate_dek(), &kek()).unwrap();
         assert!(unwrap_with_code(&other, &code).is_err());
     }
 
@@ -267,7 +355,7 @@ mod tests {
         // constants: retuning the KDF, which a security audit is likely to
         // ask for, must not invalidate codes already written on paper.
         let dek = generate_dek();
-        let (code, mut envelope) = create_recovery_envelope(&dek).unwrap();
+        let (code, mut envelope) = create_recovery_envelope(&dek, &kek()).unwrap();
 
         // Rewrap under deliberately different settings, as an older build
         // would have produced.
@@ -291,7 +379,7 @@ mod tests {
     #[test]
     fn an_unknown_derivation_is_refused_with_something_the_ui_can_say() {
         let dek = generate_dek();
-        let (code, mut envelope) = create_recovery_envelope(&dek).unwrap();
+        let (code, mut envelope) = create_recovery_envelope(&dek, &kek()).unwrap();
         envelope.kdf.algorithm = "scrypt".into();
 
         // Mapped away because `MasterDek` deliberately has no `Debug`.
@@ -305,7 +393,7 @@ mod tests {
     #[test]
     fn a_future_envelope_is_refused_rather_than_read_as_this_one() {
         let dek = generate_dek();
-        let (code, mut envelope) = create_recovery_envelope(&dek).unwrap();
+        let (code, mut envelope) = create_recovery_envelope(&dek, &kek()).unwrap();
         envelope.version = RECOVERY_ENVELOPE_VERSION + 1;
 
         assert!(unwrap_with_code(&envelope, &code).is_err());
@@ -315,7 +403,7 @@ mod tests {
     fn an_envelope_survives_a_save_and_load() {
         let dir = tempfile::tempdir().unwrap();
         let dek = generate_dek();
-        let (code, envelope) = create_recovery_envelope(&dek).unwrap();
+        let (code, envelope) = create_recovery_envelope(&dek, &kek()).unwrap();
 
         assert!(!has_recovery_code(dir.path()));
         save_recovery_envelope(dir.path(), &envelope).unwrap();
@@ -329,5 +417,98 @@ mod tests {
 
         clear_recovery_envelope(dir.path());
         assert!(!has_recovery_code(dir.path()));
+    }
+
+    #[test]
+    fn a_new_envelope_carries_a_tag_only_this_silo_can_make() {
+        let kek = kek();
+        let (_, envelope) = create_recovery_envelope(&generate_dek(), &kek).unwrap();
+
+        assert!(envelope.is_authentic(&kek));
+        assert!(
+            !envelope.is_authentic(&generate_content_kek()),
+            "another silo's KEK must not verify this envelope"
+        );
+    }
+
+    #[test]
+    fn every_field_the_adoption_rules_read_is_covered() {
+        // The two attacks: an old envelope given a new date so it is adopted
+        // as the current code, and any field swapped for another envelope's.
+        let kek = kek();
+        let (_, envelope) = create_recovery_envelope(&generate_dek(), &kek).unwrap();
+        let (_, other) = create_recovery_envelope(&generate_dek(), &kek).unwrap();
+
+        let mut redated = envelope.clone();
+        redated.created_at += 86_400;
+        assert!(!redated.is_authentic(&kek), "the date is not covered");
+
+        let mut swapped = envelope.clone();
+        swapped.wrapped_dek = other.wrapped_dek.clone();
+        assert!(
+            !swapped.is_authentic(&kek),
+            "the wrapped DEK is not covered"
+        );
+
+        let mut resalted = envelope.clone();
+        resalted.salt = other.salt.clone();
+        assert!(!resalted.is_authentic(&kek), "the salt is not covered");
+
+        let mut retuned = envelope.clone();
+        retuned.kdf.m_cost = 19_456;
+        assert!(
+            !retuned.is_authentic(&kek),
+            "the parameters are not covered"
+        );
+
+        let mut renumbered = envelope.clone();
+        renumbered.version += 1;
+        assert!(!renumbered.is_authentic(&kek), "the version is not covered");
+    }
+
+    #[test]
+    fn an_envelope_from_before_the_tag_reads_and_can_be_stamped() {
+        // A silo set up by 1.5.0. Its envelope has to keep opening, and the
+        // device that holds it locally can tag it without a new code.
+        let kek = kek();
+        let dek = generate_dek();
+        let (code, mut envelope) = create_recovery_envelope(&dek, &kek).unwrap();
+        envelope.auth = None;
+
+        assert!(!envelope.is_authentic(&kek));
+        assert_eq!(
+            unwrap_with_code(&envelope, &code).unwrap().as_bytes(),
+            dek.as_bytes(),
+            "an untagged envelope must still open"
+        );
+
+        envelope.authenticate(&kek);
+        assert!(envelope.is_authentic(&kek));
+    }
+
+    #[test]
+    fn an_untagged_envelope_is_written_exactly_as_1_5_0_wrote_it() {
+        // What keeps a mixed fleet quiet: the field is absent from the JSON
+        // rather than null, so the bytes an older client compares against are
+        // the bytes it would have produced itself.
+        let kek = kek();
+        let (_, mut envelope) = create_recovery_envelope(&generate_dek(), &kek).unwrap();
+        envelope.auth = None;
+
+        let json = serde_json::to_string(&envelope).unwrap();
+        assert!(!json.contains("auth"), "got {json}");
+
+        envelope.authenticate(&kek);
+        assert!(serde_json::to_string(&envelope).unwrap().contains("auth"));
+    }
+
+    #[test]
+    fn a_junk_tag_is_refused_rather_than_panicking() {
+        let kek = kek();
+        let (_, mut envelope) = create_recovery_envelope(&generate_dek(), &kek).unwrap();
+        for junk in ["", "zz", "not hex at all", &"aa".repeat(31)] {
+            envelope.auth = Some(junk.to_string());
+            assert!(!envelope.is_authentic(&kek), "{junk:?} was accepted");
+        }
     }
 }
