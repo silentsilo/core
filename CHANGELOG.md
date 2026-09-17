@@ -9,7 +9,7 @@ This repository has its own version line, separate from the desktop
 application's. A client pins a tag from here; the tag it pins is what its
 release notes should say.
 
-## [Unreleased]
+## [1.6.0] - Storage you do not have to trust, and bytes you can watch
 
 ### Added
 
