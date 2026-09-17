@@ -430,6 +430,11 @@ Read this before "fixing" any of it.
 - **`MAX_OP_BYTES` rejects from the listing**, before download: storage is
   untrusted and an object sized to exhaust memory must never be fetched.
   Same posture as the Argon2 parameter ceiling on `recovery.env`.
+  Key envelopes, revocation markers, inbox keys and senders, the manifest,
+  the KEK envelope and `recovery.env` get `MAX_SMALL_OBJECT_BYTES` (64 KiB)
+  the same way, from the listing or a HEAD. A server that answers the HEAD
+  small and the GET huge still gets its bytes read: `ObjectStore::get` has no
+  limit.
 - **The working copy is not called `vault.db`, and its key sits beside
   it.** An older release after a downgrade decrypts the snapshot over
   anything named `vault.db`, with the ciphered WAL still beside it; under

@@ -52,11 +52,9 @@ pub async fn is_key_revoked(
     kek: &ContentKek,
     credential_id: &str,
 ) -> Result<bool, SyncError> {
-    let key = marker_key(credential_id);
-    if client.head(&key).await?.is_none() {
+    let Some(bytes) = crate::fetch_small(client, &marker_key(credential_id)).await? else {
         return Ok(false);
-    }
-    let bytes = client.get(&key).await?;
+    };
     Ok(unseal_with_key(&bytes, kek.as_bytes())
         .ok()
         .and_then(|plain| serde_json::from_slice::<RevocationMarker>(&plain).ok())
@@ -70,11 +68,9 @@ pub async fn revoked_at(
     kek: &ContentKek,
     credential_id: &str,
 ) -> Result<Option<i64>, SyncError> {
-    let key = marker_key(credential_id);
-    if client.head(&key).await?.is_none() {
+    let Some(bytes) = crate::fetch_small(client, &marker_key(credential_id)).await? else {
         return Ok(None);
-    }
-    let bytes = client.get(&key).await?;
+    };
     Ok(unseal_with_key(&bytes, kek.as_bytes())
         .ok()
         .and_then(|plain| serde_json::from_slice::<RevocationMarker>(&plain).ok())
@@ -137,6 +133,10 @@ pub async fn reconcile_key_envelopes(
     let mut published = Vec::new();
     let mut marked = HashSet::new();
     for entry in client.list(KEYS_PREFIX).await? {
+        // Storage is untrusted: nothing that size is a marker or an envelope.
+        if crate::too_large(entry.size) {
+            continue;
+        }
         if let Some(name) = entry.key.strip_prefix(REVOKED_PREFIX) {
             let Some(id) = name.strip_suffix(".sealed") else {
                 continue;

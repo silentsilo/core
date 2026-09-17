@@ -291,6 +291,43 @@ pub fn usable_prefix(
 /// build wrote whole.
 const MAX_OP_BYTES: i64 = 4 * 1024 * 1024;
 
+/// Ceiling for key envelopes, revocation markers, inbox keys and senders,
+/// the manifest, the KEK envelope and `recovery.env`, checked against the
+/// listing or a HEAD before download. The largest real one, an envelope with
+/// a 2048-character credential id, is a few KiB.
+pub const MAX_SMALL_OBJECT_BYTES: i64 = 64 * 1024;
+
+/// Whether storage reports `size` for an object that should be small.
+pub(crate) fn too_large(size: i64) -> bool {
+    size > MAX_SMALL_OBJECT_BYTES
+}
+
+/// A small object whose size storage reported, refused unread when no real
+/// one is that large.
+pub(crate) async fn get_small(
+    client: &dyn ObjectStore,
+    key: &str,
+    size: i64,
+) -> Result<Vec<u8>, SyncError> {
+    if too_large(size) {
+        return Err(SyncError::Storage(format!(
+            "{key} is {size} bytes, far larger than it can be"
+        )));
+    }
+    Ok(client.get(key).await?)
+}
+
+/// [`get_small`] after a HEAD. `None` when the object is absent.
+pub(crate) async fn fetch_small(
+    client: &dyn ObjectStore,
+    key: &str,
+) -> Result<Option<Vec<u8>>, SyncError> {
+    match client.head(key).await? {
+        Some(size) => get_small(client, key, size).await.map(Some),
+        None => Ok(None),
+    }
+}
+
 /// One full pass: push what is local-only, pull what is new, replay it.
 ///
 /// Replaying a contiguous run above the local high-water mark is exactly the
@@ -1545,7 +1582,10 @@ pub async fn publish_content_kek(
     client: &dyn ObjectStore,
     envelope: &[u8],
 ) -> Result<bool, SyncError> {
-    if client.head(CONTENT_KEK_KEY).await?.is_some()
+    if client
+        .head(CONTENT_KEK_KEY)
+        .await?
+        .is_some_and(|size| !too_large(size))
         && client
             .get(CONTENT_KEK_KEY)
             .await
@@ -1568,8 +1608,7 @@ pub async fn publish_content_kek_checked(
     dek: &MasterDek,
     envelope: &[u8],
 ) -> Result<bool, SyncError> {
-    if client.head(CONTENT_KEK_KEY).await?.is_some() {
-        let held = client.get(CONTENT_KEK_KEY).await?;
+    if let Some(held) = fetch_small(client, CONTENT_KEK_KEY).await? {
         if unseal(&held, dek).is_ok() {
             return Ok(false);
         }
@@ -1587,10 +1626,7 @@ pub async fn publish_content_kek_checked(
 /// refusal rather than a reason to mint one: content already there is
 /// wrapped under a key this device would then never have.
 pub async fn fetch_content_kek(client: &dyn ObjectStore) -> Result<Option<Vec<u8>>, SyncError> {
-    if client.head(CONTENT_KEK_KEY).await?.is_none() {
-        return Ok(None);
-    }
-    Ok(Some(client.get(CONTENT_KEK_KEY).await?))
+    fetch_small(client, CONTENT_KEK_KEY).await
 }
 
 /// Whether this device's vault key still opens the silo's published KEK
@@ -1676,10 +1712,9 @@ pub async fn refuse_foreign_vault(
 /// `None` when the prefix holds no vault yet — the normal state when
 /// connecting a fresh bucket, not a failure.
 pub async fn read_manifest(client: &dyn ObjectStore) -> Result<Option<VaultManifest>, SyncError> {
-    if client.head(MANIFEST_KEY).await?.is_none() {
+    let Some(bytes) = fetch_small(client, MANIFEST_KEY).await? else {
         return Ok(None);
-    }
-    let bytes = client.get(MANIFEST_KEY).await?;
+    };
     let manifest: VaultManifest =
         serde_json::from_slice(&bytes).map_err(|e| SyncError::Vault(e.to_string()))?;
     if manifest.version > MANIFEST_VERSION {
@@ -1741,7 +1776,10 @@ pub async fn publish_key_envelopes(
         // Written only when the bytes differ, compared by content: a
         // re-wrapped DEK has exactly the same length, so a size check would
         // skip the write that matters most after a rotation.
-        if client.head(&key_path).await?.is_some()
+        if client
+            .head(&key_path)
+            .await?
+            .is_some_and(|size| !too_large(size))
             && client.get(&key_path).await.is_ok_and(|held| held == bytes)
         {
             continue;
@@ -1779,6 +1817,10 @@ pub async fn fetch_key_envelopes(
 ) -> Result<Vec<StoredFidoCredential>, SyncError> {
     let mut out = Vec::new();
     for entry in client.list(KEYS_PREFIX).await? {
+        if too_large(entry.size) {
+            eprintln!("skipping oversized key envelope {}", entry.key);
+            continue;
+        }
         let bytes = client.get(&entry.key).await?;
         match serde_json::from_slice::<StoredFidoCredential>(&bytes) {
             Ok(credential) => out.push(credential),
@@ -1859,7 +1901,10 @@ pub async fn ensure_recovery_envelope(
     envelope: &RecoveryEnvelope,
 ) -> Result<bool, SyncError> {
     let bytes = serde_json::to_vec(envelope).map_err(|e| SyncError::Vault(e.to_string()))?;
-    if client.head(RECOVERY_KEY).await?.is_some()
+    if client
+        .head(RECOVERY_KEY)
+        .await?
+        .is_some_and(|size| !too_large(size))
         && let Ok(held) = client.get(RECOVERY_KEY).await
     {
         if held == bytes {
@@ -1947,10 +1992,9 @@ pub async fn settle_recovery_envelope(
 pub async fn fetch_recovery_envelope(
     client: &dyn ObjectStore,
 ) -> Result<Option<RecoveryEnvelope>, SyncError> {
-    if client.head(RECOVERY_KEY).await?.is_none() {
+    let Some(bytes) = fetch_small(client, RECOVERY_KEY).await? else {
         return Ok(None);
-    }
-    let bytes = client.get(RECOVERY_KEY).await?;
+    };
     serde_json::from_slice(&bytes)
         .map(Some)
         .map_err(|e| SyncError::Vault(e.to_string()))

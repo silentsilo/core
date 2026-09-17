@@ -33,6 +33,10 @@ release notes should say.
 
 ### Security
 
+- Key envelopes, revocation markers, inbox keys and senders, `vault.json`,
+  `keys/content.kek` and `recovery.env` are refused unread above 64 KiB
+  (`MAX_SMALL_OBJECT_BYTES`), judged from the listing or a HEAD. A hostile
+  provider could answer one with enough bytes to exhaust memory.
 - OpenSSL no longer reads a configuration file. The vendored build has the
   build machine's path compiled in as OPENSSLDIR, and a config there, or one
   named by `OPENSSL_CONF`, could load a provider library into the app, the

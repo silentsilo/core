@@ -204,6 +204,9 @@ async fn load_inbox_keys(
 ) -> Result<Vec<(Uuid, EcSecret)>, SyncError> {
     let mut out = Vec::new();
     for entry in client.list(INBOX_KEYS_PREFIX).await? {
+        if crate::too_large(entry.size) {
+            continue;
+        }
         let Ok(bytes) = client.get(&entry.key).await else {
             continue;
         };
@@ -255,6 +258,9 @@ async fn load_senders(
 ) -> Result<Vec<Sender>, SyncError> {
     let mut out = Vec::new();
     for entry in client.list(INBOX_SENDERS_PREFIX).await? {
+        if crate::too_large(entry.size) {
+            continue;
+        }
         let bytes = match client.get(&entry.key).await {
             Ok(bytes) => bytes,
             // Removed since the listing: that sender is no longer allowed.
