@@ -172,8 +172,11 @@ property:
   otherwise. Only removing the silo deletes the copy. Unlock and snapshots
   move the decrypted index through memory only (CRYPTO.md, "Local
   metadata"). Beside it, kept across locks, the cache
-  directory: `cache.db` (blob bookkeeping) and `protected.db`. Nothing here
-  may ever land in the silo folder.
+  directory: `cache.db` (blob bookkeeping), and the protected folders'
+  list and import ledger (`protected.enc`, `protected.sqlcipher` and its
+  key `protected.key`), which between them name every mirrored file by its
+  full local path and are therefore encrypted, under the content KEK so a
+  rotation cannot strand them. Nothing here may ever land in the silo folder.
 - **The bucket** (per target): `vault.json` (the only plaintext object, one
   random UUID), `ops/`, `blobs/`, `snapshots/`, `keys/*.env`,
   `keys/content.kek`, `recovery.env`. Layout and versions are FORMATS.md's

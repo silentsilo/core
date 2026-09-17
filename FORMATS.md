@@ -129,10 +129,14 @@ holds a copy.
 | Backup targets | `targets.config.json` | `SILO_FILE_VERSION` | Every copy, in order. Kept as a file as well as in the keychain whenever there is more than one, because the single slot above holds only the first |
 | Silo list | `silos.json` | `SILO_FILE_VERSION` | Where the silos are. Losing it costs the list, not the data |
 | Cache settings | `cache_settings.json` | **No version.** Plain JSON | One number, the local cache ceiling. Unreadable reads as the default, so there is nothing a version could save |
-| Protected folders | `protected.json` | `SILO_FILE_VERSION` | Which folders on this computer the silo copies from. Absolute local paths, so they describe what someone keeps and where; kept beside the ledger of what has already been imported, and out of a folder that travels |
+| Protected folders | `protected.enc` | `SILO_FILE_VERSION`, inside a sealed payload under the content KEK | Which folders on this computer the silo copies from. Absolute local paths, so they describe what someone keeps and where; kept beside the ledger of what has already been imported, and out of a folder that travels. Sealed since core 1.6.0; a plaintext `protected.json` from an earlier release is read once, written back sealed and removed |
 
-Not formats, and deliberately so: the working copy of a silo
-(`vault.sqlcipher`, ciphered by SQLCipher 4) and its page key (`vault.key`,
+Not formats, and deliberately so: the import ledger of the protected folders
+(`protected.sqlcipher`, ciphered by SQLCipher 4 under `protected.key`, which
+is sealed under the content KEK rather than the DEK so a rotation cannot
+strand it; a plaintext `protected.db` from before core 1.6.0 is moved into it
+row by row and removed), and the working copy of a silo
+(`vault.sqlcipher`, ciphered by SQLCipher 4) with its page key (`vault.key`,
 `vault.key.next`, sealed under the DEK in the envelope above). They are
 machine-local and kept across locks, and a copy that does not open, or no
 longer stands for `vault.db.enc` as it is on disk, is rebuilt from it. The

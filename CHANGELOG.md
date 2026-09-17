@@ -33,6 +33,18 @@ release notes should say.
 
 ### Security
 
+- The protected folders' list and import ledger are encrypted. Between them
+  they named every mirrored file by its full local path, in the clear beside
+  the blob cache, and they outlived locking the silo and removing it. The
+  list is a sealed payload (`protected.enc`) and the ledger is a SQLCipher
+  database (`protected.sqlcipher`) under a random page key, both under the
+  content KEK, which never rotates: sealed under the DEK a rotation would
+  leave the ledger unreadable, and a ledger that reads as empty means every
+  protected file imported a second time. A `protected.json` or `protected.db`
+  from an earlier release is read once, taken over and removed. A ledger that
+  will not open is an error rather than an empty one, for the same reason.
+  `load_protected`, `save_protected`, `load_seen` and `mark_seen` take the
+  content KEK, so a client reads them only while the silo is unlocked.
 - An old `keys/content.kek` put back in storage is told apart from a key
   rotation, and reported as what it is. Both look the same from the envelope
   alone, so every device went to `needs_rejoin` and the rejoin then failed on
