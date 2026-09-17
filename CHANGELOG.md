@@ -25,6 +25,11 @@ release notes should say.
   `init_android_tls` fails with an error instead of a panic. Desktop keeps
   the SDK's client and native roots for S3; WebDAV passes the same platform
   verifier to reqwest explicitly.
+- Joining a silo no longer trusts the `policy` on fetched key envelopes. A
+  recovery-code join clears it everywhere; a key join keeps `org` only on
+  the key that opened the silo. Storage could plant an `org` envelope nobody
+  can prove, which then refused rotation and recovery-code changes on the
+  joined device.
 
 ### Security
 

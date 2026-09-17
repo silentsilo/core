@@ -218,6 +218,11 @@ So the rule for anything reading these:
   an organisation's key is not tombstoned on another device's say-so, since
   retiring one needs its proof. 1.0.0 skips the markers, so a 1.0.0 client
   neither sees keys enrolled after it joined nor honours a marker.
+- **A joining device keeps `policy` only where it was proven** (after core
+  1.5.0). Joining with the recovery code clears `policy` on every
+  envelope it saves; joining with a key keeps `org` on that key alone, since
+  its holder just unwrapped the DEK with it. A 1.5.0 client saved the
+  envelopes verbatim, so storage could plant an `org` key nobody holds.
 - **Turning the recovery code off leaves a marker too** (core 1.4.0), the
   same sealed JSON under `keys/revoked/recovery.sealed`, with
   `credential_id` `"recovery"` and `revoked_at` the time it was turned off.

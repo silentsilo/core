@@ -34,6 +34,8 @@ pub struct RecoveryJoin {
     dek: MasterDek,
     /// Absent for a key join on a silo that never set up a code.
     envelope: Option<RecoveryEnvelope>,
+    /// The organisation key that opened this join, proven by its wrap key.
+    proven_org_key: Option<String>,
 }
 
 impl RecoveryJoin {
@@ -64,6 +66,7 @@ pub async fn recovery_join_begin(
         vault_id: manifest.vault_id,
         dek,
         envelope: Some(envelope),
+        proven_org_key: None,
     })
 }
 
@@ -103,13 +106,12 @@ pub async fn key_join_open(
     credential_id: &str,
     wrap_key: &[u8; 32],
 ) -> Result<RecoveryJoin, String> {
-    let wrapped = offer
+    let key = offer
         .keys
         .iter()
         .find(|k| k.credential_id == credential_id && !k.wrapped_dek.is_empty())
-        .map(|k| k.wrapped_dek.as_str())
         .ok_or_else(|| "That security key isn't one of this silo's keys.".to_string())?;
-    let dek = silentsilo_vault::unwrap_dek_hex(wrapped, wrap_key)
+    let dek = silentsilo_vault::unwrap_dek_hex(&key.wrapped_dek, wrap_key)
         .map_err(|_| "That security key could not open the silo.".to_string())?;
     // A removed key's envelope can come back: a device that had not heard
     // of the removal publishes it again. The revocation marker decides.
@@ -130,6 +132,9 @@ pub async fn key_join_open(
         vault_id: offer.vault_id,
         dek,
         envelope,
+        // Whoever holds this key can always prove it, so its policy cannot
+        // lock anyone out.
+        proven_org_key: key.managed().then(|| key.credential_id.clone()),
     })
 }
 
@@ -171,7 +176,7 @@ pub async fn recovery_join_provision(
     // does not become a key of this device.
     let mut keys = sync::fetch_key_envelopes(store).await.unwrap_or_default();
     let mut usable = Vec::with_capacity(keys.len());
-    for key in keys.drain(..) {
+    for mut key in keys.drain(..) {
         if key.revoked || !sync::plausible_credential_id(&key.credential_id) {
             continue;
         }
@@ -180,6 +185,12 @@ pub async fn recovery_join_provision(
             .unwrap_or(true)
         {
             continue;
+        }
+        // Policy is unauthenticated: an "org" planted on a key nobody can
+        // prove would refuse rotation and recovery changes here for good.
+        // Only the key that opened this join, and proved it, keeps it.
+        if join.proven_org_key.as_deref() != Some(key.credential_id.as_str()) {
+            key.policy.clear();
         }
         usable.push(key);
     }

@@ -275,3 +275,76 @@ async fn a_removed_key_whose_envelope_came_back_does_not_join() {
         "That security key was removed from this silo."
     );
 }
+
+/// Writes `policy` into a published envelope, as anyone with storage access
+/// can, or plants a new one for `id` with an envelope nothing opens.
+async fn plant_policy(store: &FolderStore, id: &str, policy: &str) {
+    use silentsilo_store::ObjectStore;
+    let object = format!("keys/{id}.env");
+    let mut envelope: serde_json::Value = match store.get(&object).await {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap(),
+        Err(_) => {
+            let mut fake = serde_json::from_slice::<serde_json::Value>(
+                &store.get("keys/aa11.env").await.unwrap(),
+            )
+            .unwrap();
+            fake["credential_id"] = id.into();
+            fake["wrapped_dek"] = "00".repeat(60).into();
+            fake
+        }
+    };
+    envelope["policy"] = policy.into();
+    store
+        .put(&object, serde_json::to_vec(&envelope).unwrap())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_planted_organisation_policy_does_not_survive_a_recovery_join() {
+    let origin = origin().await;
+    let store = FolderStore::new(origin.storage.clone());
+    plant_policy(&store, "aa11", silentsilo_vault::POLICY_ORG).await;
+    plant_policy(&store, "cc33", silentsilo_vault::POLICY_ORG).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("joined");
+    let session = join(&origin, root.clone()).await;
+    let keys = silentsilo_vault::load_fido_keys(&root).unwrap();
+    assert!(keys.keys.iter().any(|k| k.credential_id == "cc33"));
+    assert!(!keys.is_org_controlled(), "{:?}", keys.keys);
+
+    // So rotation-style changes are not refused for lack of an org proof.
+    let without_fake = silentsilo_vault::StoredFidoKeys {
+        keys: keys
+            .keys
+            .into_iter()
+            .filter(|k| k.credential_id != "cc33")
+            .collect(),
+    };
+    silentsilo_vault::save_fido_keys(&root, &without_fake, silentsilo_vault::Authority::Machine)
+        .unwrap();
+    drop(session);
+}
+
+#[tokio::test]
+async fn a_key_join_keeps_the_policy_only_of_the_key_that_proved_it() {
+    let origin = origin().await;
+    let store = FolderStore::new(origin.storage.clone());
+    plant_policy(&store, "aa11", silentsilo_vault::POLICY_ORG).await;
+    plant_policy(&store, "cc33", silentsilo_vault::POLICY_ORG).await;
+
+    let offer = key_join_begin(&store).await.unwrap();
+    let joined = key_join_open(&store, &offer, "aa11", &[7; 32])
+        .await
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("silo");
+    let _session = recovery_join_provision(&store, &joined, root.clone(), "secret-b")
+        .await
+        .unwrap();
+
+    let keys = silentsilo_vault::load_fido_keys(&root).unwrap();
+    let managed: Vec<_> = keys.managed().map(|k| k.credential_id.clone()).collect();
+    assert_eq!(managed, vec!["aa11".to_string()]);
+}
