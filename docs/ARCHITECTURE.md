@@ -127,9 +127,21 @@ storage is re-sealed, because an object under a key that existed only in
 memory is one nothing opens. Going backwards is never attempted; a second
 rotation cannot be staged over a pending one. A device that was not kept in
 the rotation is detected on its next pass, before it pushes: the published
-KEK envelope only opens under the current DEK, and `key_still_current` turns
+KEK envelope only opens under the current DEK, and `kek_envelope_state` turns
 that into `needs_rejoin`. Without that gate, the stale device pushed records
 nobody could read and overwrote the rotated KEK envelope with its own.
+
+The same check answers a second question, because that envelope alone cannot
+tell a rotation from someone putting an old copy of it back. The reseal works
+through `ops/` and `snapshots/` and writes `keys/content.kek` last, so an
+envelope under a newer key always has records under that key beside it. A
+device that cannot open the envelope therefore reads the newest records: when
+they open under its own key, no rotation happened and the object was replaced
+(`KekState::Replaced`), reported as storage having been written to rather
+than as `needs_rejoin`. Rejoining reads the same object, so the old answer
+sent a whole fleet round a loop with no way out. With nothing readable to
+compare against the answer stays `Rotated`. The join flows say the same two
+things (`flows::kek_refusal`).
 
 ## Data at rest
 

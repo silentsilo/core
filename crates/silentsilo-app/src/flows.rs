@@ -70,6 +70,30 @@ pub async fn recovery_join_begin(
     })
 }
 
+/// What to tell someone whose credential opened the silo but not the
+/// content key beside it.
+///
+/// The two cases need different sentences and one of them used to be
+/// reported as a crypto error. A rotation is something to act on with a
+/// current credential; a content key that disagrees with the records around
+/// it is storage having been written to, and joining again reads the same
+/// object, so saying "rejoin" would send someone round a loop that cannot
+/// end.
+async fn kek_refusal(store: &dyn ObjectStore, dek: &MasterDek) -> String {
+    match sync::kek_envelope_state(store, dek).await {
+        Ok(sync::KekState::Replaced) => "This silo's content key in storage does not open with \
+             the credential that just opened the silo, while the records beside it do. A key \
+             rotation cannot leave it that way, so that object was replaced or put back from an \
+             older copy. Restore the storage from a copy, or join from a device that already has \
+             the silo."
+            .to_string(),
+        _ => "This silo's key was rotated after this storage was last written to by a device \
+             holding the credential you used. Use a credential that was kept through the \
+             rotation, or the recovery code shown when it was done."
+            .to_string(),
+    }
+}
+
 /// A silo in storage and the key envelopes a device could join it with.
 pub struct KeyJoinOffer {
     pub vault_id: Uuid,
@@ -119,7 +143,10 @@ pub async fn key_join_open(
         .await
         .map_err(|e| e.to_string())?
     {
-        let kek = silentsilo_vault::unwrap_kek_bytes(&sealed, &dek).map_err(|e| e.to_string())?;
+        let kek = match silentsilo_vault::unwrap_kek_bytes(&sealed, &dek) {
+            Ok(kek) => kek,
+            Err(_) => return Err(kek_refusal(store, &dek).await),
+        };
         if sync::is_key_revoked(store, &kek, credential_id)
             .await
             .map_err(|e| e.to_string())?
@@ -152,8 +179,10 @@ pub async fn recovery_join_provision(
         .ok_or_else(|| {
             "This storage has no content key yet, so there is nothing here to recover.".to_string()
         })?;
-    let kek =
-        silentsilo_vault::unwrap_kek_bytes(&kek_envelope, &join.dek).map_err(|e| e.to_string())?;
+    let kek = match silentsilo_vault::unwrap_kek_bytes(&kek_envelope, &join.dek) {
+        Ok(kek) => kek,
+        Err(_) => return Err(kek_refusal(store, &join.dek).await),
+    };
     let session = VaultSession::provision_with_dek(
         root.clone(),
         join.vault_id,

@@ -49,6 +49,14 @@ pub struct SyncReport {
     /// credential or the recovery code.
     #[serde(default)]
     pub needs_rejoin: bool,
+    /// The silo's content key in storage does not open with this device's
+    /// key, while the records beside it still do. A rotation cannot leave a
+    /// target that way, so the object was replaced or put back from an older
+    /// copy. Nothing was pushed, and rejoining would not help: the storage
+    /// is what has to be fixed. Separate from `needs_rejoin` because the
+    /// screen has to say something else entirely.
+    #[serde(default)]
+    pub key_material_replaced: bool,
     /// Records dropped from the bucket by a compaction this pass ran, so the
     /// status line can say the log got shorter rather than leaving the user
     /// wondering what the extra work was.
@@ -399,8 +407,8 @@ pub async fn run_sync_pass(
     // key nobody else holds, and its stale KEK envelope would overwrite the
     // rotated one in the bucket. The first target that answers decides.
     for target in &targets {
-        match sync::key_still_current(&*target.store, &dek).await {
-            Ok(Some(false)) => {
+        match sync::kek_envelope_state(&*target.store, &dek).await {
+            Ok(sync::KekState::Rotated) => {
                 return Ok(announce(
                     host,
                     silo,
@@ -411,11 +419,35 @@ pub async fn run_sync_pass(
                     },
                 ));
             }
-            Ok(Some(true)) => break,
+            // Records here open under this key and the content key does
+            // not, which no rotation produces. Rejoining reads the same
+            // object, so telling the user to rejoin would send them round a
+            // loop that cannot end.
+            Ok(sync::KekState::Replaced) => {
+                host.warn(
+                    "keys",
+                    &format!(
+                        "{}: the silo's content key there does not open with this device's key, \
+                         while the records beside it do. A rotation cannot do that, so the object \
+                         was replaced or put back from an older copy. Nothing was sent.",
+                        target.label
+                    ),
+                );
+                return Ok(announce(
+                    host,
+                    silo,
+                    SyncReport {
+                        configured: true,
+                        key_material_replaced: true,
+                        ..SyncReport::default()
+                    },
+                ));
+            }
+            Ok(sync::KekState::Current) => break,
             // Nothing there to compare against: a new silo, or a copy caught
             // between the removal and the rename of an SFTP overwrite. The
             // next copy is asked rather than taking that as an answer.
-            Ok(None) => continue,
+            Ok(sync::KekState::Absent) => continue,
             // Unreachable: ask the next copy rather than deciding blind.
             Err(_) => continue,
         }
@@ -754,6 +786,7 @@ pub async fn run_sync_pass(
             .collect(),
         needs_rebuild: false,
         needs_rejoin: false,
+        key_material_replaced: false,
         compacted,
         targets: statuses,
         skipped: false,

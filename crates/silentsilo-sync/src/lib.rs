@@ -1629,19 +1629,93 @@ pub async fn fetch_content_kek(client: &dyn ObjectStore) -> Result<Option<Vec<u8
     fetch_small(client, CONTENT_KEK_KEY).await
 }
 
+/// What a target's published KEK envelope says about this device's key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KekState {
+    /// The target holds none yet: a new silo, or a copy caught between the
+    /// removal and the rename of an SFTP overwrite.
+    Absent,
+    /// It opens under this device's key.
+    Current,
+    /// It does not open, and neither do the records beside it. The silo's
+    /// key was rotated from another device and this one was not kept: it
+    /// must rejoin with a current credential, and until then must not push,
+    /// because its records would be sealed under a key nobody else holds and
+    /// its stale envelope would overwrite the rotated one.
+    Rotated,
+    /// It does not open, but records here still do. No rotation can leave a
+    /// target in that state: `reseal_under_new_key` works through `ops/` and
+    /// `snapshots/` first and writes this object last, so an envelope under
+    /// a newer key always has records under that key beside it. The object
+    /// was replaced or put back from an older copy.
+    Replaced,
+}
+
+/// How many records are read before deciding. One would do on a healthy
+/// target; a handful means a single damaged object does not decide it.
+const KEK_WITNESSES: usize = 5;
+
+/// Why this device's vault key does not open the silo's published KEK
+/// envelope, when it does not.
+///
+/// Rolling that object back is cheap for anyone who can write to storage and
+/// it used to read as a rotation: every device went to `needs_rejoin`, and
+/// the rejoin could not succeed either, because the envelope a joining device
+/// fetches is the same broken one. The whole fleet then sat behind a message
+/// telling it to do something that does not work. The records are what tell
+/// the two apart, and they are already there.
+pub async fn kek_envelope_state(
+    client: &dyn ObjectStore,
+    dek: &MasterDek,
+) -> Result<KekState, SyncError> {
+    let Some(envelope) = fetch_content_kek(client).await? else {
+        return Ok(KekState::Absent);
+    };
+    if unseal(&envelope, dek).is_ok() {
+        return Ok(KekState::Current);
+    }
+
+    // The newest records, because a rotation that reached the envelope had
+    // already been through all of them. An unreadable one is taken as a
+    // rotation, which is what this build did before it asked at all.
+    let mut listing = client.list(OPS_PREFIX).await?;
+    listing.sort_by(|a, b| a.key.cmp(&b.key));
+    let mut witnesses = 0;
+    for entry in listing.iter().rev() {
+        if witnesses == KEK_WITNESSES {
+            break;
+        }
+        if entry.size > MAX_OP_BYTES {
+            continue;
+        }
+        let Ok(sealed) = client.get(&entry.key).await else {
+            continue;
+        };
+        if unseal(&sealed, dek).is_err() {
+            return Ok(KekState::Rotated);
+        }
+        witnesses += 1;
+    }
+    // A silo with no readable record to compare against says nothing, so the
+    // answer stays the careful one.
+    if witnesses == 0 {
+        return Ok(KekState::Rotated);
+    }
+    Ok(KekState::Replaced)
+}
+
 /// Whether this device's vault key still opens the silo's published KEK
-/// envelope. `None` when the target holds none yet. `false` means the key
-/// was rotated from another device and this one was not kept: it must not
-/// push, because its records would be sealed under a key nobody else holds
-/// and its own stale KEK envelope would overwrite the rotated one.
+/// envelope. `None` when the target holds none yet. `false` covers both ways
+/// it can fail; [`kek_envelope_state`] is the one that tells them apart.
 pub async fn key_still_current(
     client: &dyn ObjectStore,
     dek: &MasterDek,
 ) -> Result<Option<bool>, SyncError> {
-    match fetch_content_kek(client).await? {
-        None => Ok(None),
-        Some(envelope) => Ok(Some(unseal(&envelope, dek).is_ok())),
-    }
+    Ok(match kek_envelope_state(client, dek).await? {
+        KekState::Absent => None,
+        KekState::Current => Some(true),
+        KekState::Rotated | KekState::Replaced => Some(false),
+    })
 }
 /// Identifies which vault a prefix holds, for a device joining it.
 pub const MANIFEST_KEY: &str = "vault.json";

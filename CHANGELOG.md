@@ -33,6 +33,16 @@ release notes should say.
 
 ### Security
 
+- An old `keys/content.kek` put back in storage is told apart from a key
+  rotation, and reported as what it is. Both look the same from the envelope
+  alone, so every device went to `needs_rejoin` and the rejoin then failed on
+  the same object: one PUT by anyone who could write to the bucket stopped a
+  whole fleet with a message telling it to do something that cannot work. A
+  device that cannot open the envelope now reads the newest records, which a
+  rotation re-seals first, and says the object was replaced
+  (`SyncReport::key_material_replaced`) rather than asking for a rejoin. The
+  join flows give the two cases different messages instead of a crypto error.
+  New: `silentsilo_sync::kek_envelope_state` and `KekState`.
 - The recovery envelope carries a tag keyed by the content KEK, and a device
   adopts a stored envelope only when that tag verifies. `created_at` alone
   decided which envelope a device kept, and that number is chosen by whoever

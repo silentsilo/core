@@ -241,6 +241,80 @@ async fn a_device_the_key_moved_on_from_is_told_before_it_pushes() {
 }
 
 #[tokio::test]
+async fn a_rolled_back_content_key_is_told_apart_from_a_rotation() {
+    // Putting an old `keys/content.kek` back is one PUT for anyone who can
+    // write to storage, and it used to read exactly like a rotation: every
+    // device went to `needs_rejoin`, and the rejoin fetched the same object
+    // and failed too. The records decide, because a rotation re-seals them
+    // before it touches the envelope.
+    let dir = tempfile::tempdir().unwrap();
+    let store = FolderStore::new(dir.path().to_path_buf());
+    let old = generate_dek();
+    let new = generate_dek();
+    populate(&store as &dyn ObjectStore, &old).await;
+    let before = store.get(CONTENT_KEK_KEY).await.unwrap();
+
+    reseal_under_new_key(&store as &dyn ObjectStore, &old, &new, &mut |_, _| {})
+        .await
+        .unwrap();
+
+    assert_eq!(
+        state(&store, &new).await,
+        silentsilo_sync::KekState::Current
+    );
+    assert_eq!(
+        state(&store, &old).await,
+        silentsilo_sync::KekState::Rotated,
+        "a device left out of the rotation has to hear that it was"
+    );
+
+    // Now the rollback: the envelope from before the rotation, over records
+    // the rotation left under the new key.
+    store.put(CONTENT_KEK_KEY, before).await.unwrap();
+
+    assert_eq!(
+        state(&store, &new).await,
+        silentsilo_sync::KekState::Replaced,
+        "a rolled-back envelope must not read as a rotation"
+    );
+}
+
+#[tokio::test]
+async fn a_silo_with_nothing_to_compare_against_reads_as_a_rotation() {
+    // No records, or none this key opens, means the envelope is the only
+    // evidence there is. The answer stays the careful one rather than
+    // accusing storage on no evidence.
+    let dir = tempfile::tempdir().unwrap();
+    let store = FolderStore::new(dir.path().to_path_buf());
+    let mine = generate_dek();
+    let theirs = generate_dek();
+
+    assert_eq!(
+        state(&store, &mine).await,
+        silentsilo_sync::KekState::Absent
+    );
+
+    let kek = generate_content_kek();
+    publish_content_kek(
+        &store as &dyn ObjectStore,
+        &seal(kek.as_bytes(), &theirs).unwrap(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        state(&store, &mine).await,
+        silentsilo_sync::KekState::Rotated
+    );
+}
+
+async fn state(store: &FolderStore, dek: &MasterDek) -> silentsilo_sync::KekState {
+    silentsilo_sync::kek_envelope_state(store as &dyn ObjectStore, dek)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
 async fn a_pass_leaves_a_current_content_key_alone_and_never_writes_over_a_rotated_one() {
     let dir = tempfile::tempdir().unwrap();
     let store = silentsilo_store::FolderStore::new(dir.path().to_path_buf());
