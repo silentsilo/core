@@ -262,6 +262,7 @@ pub fn capture_at(conn: &Connection, vault_id: Uuid, horizon: u64) -> CoreResult
         )));
     }
 
+    silentsilo_vault::init_openssl();
     let scratch = Connection::open_in_memory().map_err(db)?;
     init_schema(&scratch, vault_id)?;
     for record in records.iter().filter(|r| r.lamport <= horizon) {

@@ -216,6 +216,7 @@ pub async fn open(store: &dyn ObjectStore, code: &str) -> Result<Backup, Extract
         .await
         .map_err(|e| ExtractError::Storage(e.to_string()))?;
 
+    silentsilo_vault::init_openssl();
     let conn =
         rusqlite::Connection::open_in_memory().map_err(|e| ExtractError::Vault(e.to_string()))?;
     conn.execute_batch("PRAGMA foreign_keys=ON;")

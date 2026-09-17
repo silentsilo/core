@@ -167,6 +167,7 @@ fn seen_db_path(vault_root: &Path) -> PathBuf {
 
 fn open_seen_db(vault_root: &Path) -> Result<rusqlite::Connection, VaultError> {
     crate::workdir::create_private_dir(&crate::workdir::cache_dir_for(vault_root))?;
+    crate::init_openssl();
     let conn = rusqlite::Connection::open(seen_db_path(vault_root))?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.execute_batch(

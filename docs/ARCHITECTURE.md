@@ -400,6 +400,13 @@ Read this before "fixing" any of it.
 - **S3 HEAD treats 403 as absent.** A prefix-scoped credential gets 403 for
   a missing key; callers use HEAD to decide whether to write, writes are
   idempotent, and a genuinely bad credential fails loudly on PUT.
+- **`init_openssl` before every connection.** SQLCipher's vendored OpenSSL
+  was built with the build machine's path as OPENSSLDIR and would read
+  `openssl.cnf` from there, or from `OPENSSL_CONF`, when SQLite first
+  initialises; a config can load a provider library. Every place here that
+  opens a connection initialises OpenSSL first with no config
+  (`silentsilo-vault/openssl.rs`). A client that opens its own connection has
+  to call it too. `tests/openssl_config.rs` proves it in a child process.
 - **S3 brings its own HTTP client on Android only.** The SDK's client reads
   root certificates from files, and a phone has none where it looks, so every
   handshake failed. It also takes no custom verifier. On Android `silentsilo-s3`

@@ -17,6 +17,7 @@ mod fido_store;
 pub mod format;
 mod kdf;
 mod kek_store;
+mod openssl;
 pub mod protected;
 pub mod recovery;
 pub mod registry;
@@ -49,6 +50,7 @@ pub use fido_store::{
 };
 pub use kdf::derive_vault_key;
 pub use kek_store::{kek_path, load_kek, save_kek, unwrap_kek_bytes, wrap_kek_bytes};
+pub use openssl::init_openssl;
 pub use protected::{
     FileStat, PendingImport, ProtectedFolder, ProtectedFolders, load_protected, plan_scan,
     save_protected,

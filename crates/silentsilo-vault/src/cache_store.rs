@@ -45,6 +45,7 @@ fn now() -> i64 {
 
 fn open_cache_db(vault_root: &Path) -> Result<Connection, VaultError> {
     crate::workdir::create_private_dir(&crate::workdir::cache_dir_for(vault_root))?;
+    crate::init_openssl();
     let conn = Connection::open(cache_db_path(vault_root))?;
     // Parallel uploads (mapPool in the frontend) open this file from multiple
     // threads at once — without a busy timeout a concurrent writer gets an

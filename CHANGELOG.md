@@ -28,6 +28,11 @@ release notes should say.
 
 ### Security
 
+- OpenSSL no longer reads a configuration file. The vendored build has the
+  build machine's path compiled in as OPENSSLDIR, and a config there, or one
+  named by `OPENSSL_CONF`, could load a provider library into the app, the
+  extractor or the fixture tool. `silentsilo_vault::init_openssl` runs before
+  every SQLite connection this workspace opens.
 - rustls 0.23.45 (RUSTSEC-2026-0285) and h2 0.4.19 (RUSTSEC-2026-0258) in the
   lockfile, with aws-lc-rs 1.18 which rustls 0.23.45 needs. CI runs
   `cargo audit` on every push.

@@ -578,6 +578,7 @@ fn reuse_working_copy(paths: &VaultPaths, dek: &MasterDek) -> Option<Connection>
 /// the plaintext files are removed before this returns. `None` leaves the
 /// caller to build from the snapshot, which removes them too.
 fn adopt_plaintext_working_copy(paths: &VaultPaths, dek: &MasterDek) -> Option<Connection> {
+    crate::init_openssl();
     let image = {
         let conn = Connection::open(paths.legacy_db_path()).ok()?;
         conn.execute_batch("PRAGMA busy_timeout=5000;").ok()?;
@@ -747,6 +748,7 @@ fn write_working_copy(
         .to_str()
         .ok_or_else(|| VaultError::Corrupted("working copy path is not UTF-8".into()))?;
     {
+        crate::init_openssl();
         let mut mem = Connection::open_in_memory()?;
         // A file image in WAL mode says so in bytes 18 and 19, and an
         // in-memory database cannot open a WAL. Legacy mode reads the same.
@@ -778,6 +780,7 @@ fn write_working_copy(
 /// Opens a ciphered database. The key goes first: nothing may read the file
 /// before it is set.
 fn open_ciphered(path: &Path, key: &[u8; 32]) -> Result<Connection, VaultError> {
+    crate::init_openssl();
     let conn = Connection::open(path)?;
     conn.pragma_update(None, "key", key_literal(key).as_str())?;
     // Sorts and temporary tables in memory, never in a plain temp file.

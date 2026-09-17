@@ -4221,6 +4221,7 @@ dependencies = [
  "blake3",
  "hex",
  "keyring",
+ "openssl-sys",
  "rand 0.9.5",
  "rusqlite",
  "serde",
