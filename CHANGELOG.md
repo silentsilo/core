@@ -11,6 +11,12 @@ release notes should say.
 
 ## [Unreleased]
 
+### Security
+
+- rustls 0.23.45 (RUSTSEC-2026-0285) and h2 0.4.19 (RUSTSEC-2026-0258) in the
+  lockfile, with aws-lc-rs 1.18 which rustls 0.23.45 needs. CI runs
+  `cargo audit` on every push.
+
 ## [1.5.0] - Nothing readable left behind, and no lost edits
 
 No persisted format version changed, so the 1.0.0 fixtures still describe

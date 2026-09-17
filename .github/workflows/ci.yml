@@ -79,6 +79,24 @@ jobs:
       - run: cargo check --all --locked
       - run: cargo test -p silentsilo-fixture --locked
 
+  # Known advisories in the locked tree. A vulnerability fails the job;
+  # unsound and yanked warnings only print. Ignores sit in .cargo/audit.toml,
+  # each with its reason. Pinned so a new cargo-audit release cannot turn
+  # the build red on its own.
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: audit
+      - run: cargo install cargo-audit --locked --version 0.22.2
+      - run: cargo audit
+
   # The dependency direction, as a test rather than as a paragraph. Nothing
   # in this repository may reach a user interface: not Tauri, not a webview,
   # not the desktop application's OS integration crate. A crate that starts
