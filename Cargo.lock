@@ -3925,19 +3925,19 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-app"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "hex",
  "rusqlite",
  "serde",
  "serde_json",
- "silentsilo-core 1.6.0",
- "silentsilo-crypto 1.6.0",
- "silentsilo-store 1.6.0",
- "silentsilo-sync 1.6.0",
+ "silentsilo-core 1.6.1",
+ "silentsilo-crypto 1.6.1",
+ "silentsilo-store 1.6.1",
+ "silentsilo-sync 1.6.1",
  "silentsilo-testkit",
- "silentsilo-vault 1.6.0",
- "silentsilo-vfs 1.6.0",
+ "silentsilo-vault 1.6.1",
+ "silentsilo-vfs 1.6.1",
  "tempfile",
  "tokio",
  "uuid",
@@ -3956,7 +3956,7 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-core"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "serde",
  "tempfile",
@@ -3981,7 +3981,7 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-crypto"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "aes-gcm 0.10.3",
  "blake3",
@@ -3990,7 +3990,7 @@ dependencies = [
  "p256",
  "rand 0.9.5",
  "sha2 0.10.9",
- "silentsilo-core 1.6.0",
+ "silentsilo-core 1.6.1",
  "tempfile",
  "thiserror",
  "uuid",
@@ -3999,18 +3999,18 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-extract"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "base64",
  "hex",
  "rusqlite",
  "serde_json",
- "silentsilo-core 1.6.0",
- "silentsilo-crypto 1.6.0",
- "silentsilo-store 1.6.0",
- "silentsilo-sync 1.6.0",
- "silentsilo-vault 1.6.0",
- "silentsilo-vfs 1.6.0",
+ "silentsilo-core 1.6.1",
+ "silentsilo-crypto 1.6.1",
+ "silentsilo-store 1.6.1",
+ "silentsilo-sync 1.6.1",
+ "silentsilo-vault 1.6.1",
+ "silentsilo-vfs 1.6.1",
  "tempfile",
  "tokio",
  "uuid",
@@ -4018,7 +4018,7 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-fido"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "aes 0.8.4",
  "base64",
@@ -4045,24 +4045,24 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-fixture"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "blake3",
  "hex",
  "rusqlite",
  "serde_json",
  "silentsilo-app",
- "silentsilo-core 1.6.0",
+ "silentsilo-core 1.6.1",
  "silentsilo-crypto 1.0.0",
- "silentsilo-crypto 1.6.0",
+ "silentsilo-crypto 1.6.1",
  "silentsilo-store 1.0.0",
- "silentsilo-store 1.6.0",
+ "silentsilo-store 1.6.1",
  "silentsilo-sync 1.0.0",
- "silentsilo-sync 1.6.0",
+ "silentsilo-sync 1.6.1",
  "silentsilo-vault 1.0.0",
- "silentsilo-vault 1.6.0",
+ "silentsilo-vault 1.6.1",
  "silentsilo-vfs 1.0.0",
- "silentsilo-vfs 1.6.0",
+ "silentsilo-vfs 1.6.1",
  "tempfile",
  "tokio",
  "uuid",
@@ -4083,7 +4083,7 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-s3"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "aws-credential-types",
  "aws-sdk-s3",
@@ -4094,7 +4094,7 @@ dependencies = [
  "jni",
  "rustls",
  "rustls-platform-verifier",
- "silentsilo-core 1.6.0",
+ "silentsilo-core 1.6.1",
  "silentsilo-testkit",
  "tempfile",
  "thiserror",
@@ -4125,7 +4125,7 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-store"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "async-trait",
  "percent-encoding",
@@ -4134,8 +4134,8 @@ dependencies = [
  "russh",
  "russh-sftp",
  "serde",
- "silentsilo-core 1.6.0",
- "silentsilo-s3 1.6.0",
+ "silentsilo-core 1.6.1",
+ "silentsilo-s3 1.6.1",
  "silentsilo-testkit",
  "tempfile",
  "thiserror",
@@ -4165,20 +4165,20 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-sync"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "async-trait",
  "hex",
  "rusqlite",
  "serde",
  "serde_json",
- "silentsilo-core 1.6.0",
- "silentsilo-crypto 1.6.0",
- "silentsilo-s3 1.6.0",
- "silentsilo-store 1.6.0",
+ "silentsilo-core 1.6.1",
+ "silentsilo-crypto 1.6.1",
+ "silentsilo-s3 1.6.1",
+ "silentsilo-store 1.6.1",
  "silentsilo-testkit",
- "silentsilo-vault 1.6.0",
- "silentsilo-vfs 1.6.0",
+ "silentsilo-vault 1.6.1",
+ "silentsilo-vfs 1.6.1",
  "tempfile",
  "thiserror",
  "tokio",
@@ -4188,7 +4188,7 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-testkit"
-version = "1.6.0"
+version = "1.6.1"
 
 [[package]]
 name = "silentsilo-vault"
@@ -4214,7 +4214,7 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-vault"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "aes-gcm 0.10.3",
  "argon2 0.5.3",
@@ -4226,9 +4226,9 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
- "silentsilo-core 1.6.0",
- "silentsilo-crypto 1.6.0",
- "silentsilo-store 1.6.0",
+ "silentsilo-core 1.6.1",
+ "silentsilo-crypto 1.6.1",
+ "silentsilo-store 1.6.1",
  "silentsilo-testkit",
  "tempfile",
  "thiserror",
@@ -4258,7 +4258,7 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-vfs"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "base64",
  "blake3",
@@ -4267,9 +4267,9 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
- "silentsilo-core 1.6.0",
- "silentsilo-crypto 1.6.0",
- "silentsilo-vault 1.6.0",
+ "silentsilo-core 1.6.1",
+ "silentsilo-crypto 1.6.1",
+ "silentsilo-vault 1.6.1",
  "tempfile",
  "unicode-normalization",
  "uuid",
