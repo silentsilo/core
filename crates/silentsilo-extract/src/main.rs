@@ -15,9 +15,10 @@ silentsilo-extract  ·  read a SilentSilo backup with only a recovery code
   silentsilo-extract list    --from <folder> --code <recovery code>
   silentsilo-extract extract --from <folder> --code <recovery code> --to <folder>
 
-  --from   the backup: a folder holding vault.json, ops/ and blobs/.
-           A bucket works too, once mirrored to a folder with rclone or
-           the like. What is copied down is ciphertext throughout.
+  --from   the backup: a folder holding vault.json, recovery.env, keys/,
+           snapshots/, ops/ and blobs/. All of them are needed. A bucket
+           works too, once mirrored whole to a folder with rclone or the
+           like. What is copied down is ciphertext throughout.
   --code   the 32-character code from your emergency kit. Dashes and case
            do not matter.
   --to     where to write the files. Created if it is not there.
