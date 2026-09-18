@@ -206,6 +206,22 @@ pub trait ObjectStore: Send + Sync {
         Protection::default()
     }
 
+    /// Aborts unfinished uploads under `prefix` that began more than
+    /// `older_than` ago, and returns how many went.
+    ///
+    /// Only S3 has these: a multipart upload whose process died keeps its
+    /// parts stored and billed, and no listing shows them. Every other
+    /// backend writes through a temporary name or in one request, so the
+    /// default has nothing to do. A younger upload may be another device's,
+    /// still running.
+    async fn abort_stale_uploads(
+        &self,
+        _prefix: &str,
+        _older_than: std::time::Duration,
+    ) -> Result<usize, StoreError> {
+        Ok(0)
+    }
+
     /// Round-trips a probe object, so a misconfiguration is found while the
     /// user is still looking at the settings that caused it.
     async fn check(&self) -> Result<(), StoreError> {

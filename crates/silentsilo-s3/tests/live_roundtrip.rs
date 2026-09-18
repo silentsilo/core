@@ -259,3 +259,128 @@ async fn a_stopped_multipart_upload_leaves_no_object() {
     );
     assert_eq!(client.head("blobs/stopped.sslo").await.unwrap(), None);
 }
+
+/// Unfinished uploads are listed by prefix, and MinIO answers only for a
+/// prefix that is a whole key, with an empty list otherwise. AWS lists by
+/// any prefix. So these tests ask per key, which both answer; the prefix
+/// sweep is the same code with a shorter prefix.
+async fn pending(client: &S3Client, key: &str) -> Vec<silentsilo_s3::PendingUpload> {
+    client
+        .pending_uploads(key)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|u| u.key == key)
+        .collect()
+}
+
+const DAY: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// A process killed mid-upload aborts nothing. The retry that follows
+/// uploads the same key again, and has to take the dead upload's parts with
+/// it, or they stay billed and invisible for good.
+#[tokio::test]
+async fn a_retried_upload_clears_what_a_killed_one_left() {
+    let client = client_or_skip!();
+    client
+        .start_abandoned_upload("blobs/killed.sslo", vec![1u8; 1024])
+        .await
+        .unwrap();
+    // Shares the prefix, not the key: not this upload's to abort.
+    client
+        .start_abandoned_upload("blobs/killed.sslo.other", vec![2u8; 1024])
+        .await
+        .unwrap();
+    assert_eq!(pending(&client, "blobs/killed.sslo").await.len(), 1);
+
+    let len = (S3Client::MULTIPART_ABOVE + 1024 * 1024) as usize;
+    let payload: Vec<u8> = (0..len).map(|i| (i % 253) as u8).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("up");
+    let back = dir.path().join("down");
+    std::fs::write(&source, &payload).unwrap();
+    client.put_file("blobs/killed.sslo", &source).await.unwrap();
+
+    assert!(pending(&client, "blobs/killed.sslo").await.is_empty());
+    assert_eq!(pending(&client, "blobs/killed.sslo.other").await.len(), 1);
+    client.get_file("blobs/killed.sslo", &back).await.unwrap();
+    assert_eq!(
+        std::fs::read(&back).unwrap(),
+        payload,
+        "the object is whole"
+    );
+
+    client
+        .abort_uploads_started_before(
+            "blobs/killed.sslo.other",
+            std::time::SystemTime::now() + DAY,
+        )
+        .await
+        .unwrap();
+}
+
+/// The sweep aborts an upload older than its threshold and leaves a younger
+/// one, which may be another device's still running. The threshold is set
+/// between the two uploads' start times as the server reports them, so the
+/// test does not depend on this machine's clock agreeing with the server's.
+#[tokio::test]
+async fn only_uploads_older_than_the_cutoff_are_aborted() {
+    let client = client_or_skip!();
+    let key = "blobs/aged.sslo";
+    client
+        .start_abandoned_upload(key, vec![1u8; 1024])
+        .await
+        .unwrap();
+    // Start times may be kept to the second.
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+    client
+        .start_abandoned_upload(key, vec![2u8; 1024])
+        .await
+        .unwrap();
+
+    let mut times: Vec<std::time::SystemTime> = pending(&client, key)
+        .await
+        .iter()
+        .map(|u| u.initiated.expect("the server gives a start time"))
+        .collect();
+    times.sort();
+    assert_eq!(times.len(), 2);
+    let (old, fresh) = (times[0], times[1]);
+    assert!(old < fresh, "{times:?}");
+    let cutoff = old + fresh.duration_since(old).unwrap() / 2;
+
+    assert_eq!(
+        client
+            .abort_uploads_started_before(key, cutoff)
+            .await
+            .unwrap(),
+        1
+    );
+    let left = pending(&client, key).await;
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].initiated, Some(fresh), "the younger one stays");
+
+    client
+        .abort_uploads_started_before(key, fresh + DAY)
+        .await
+        .unwrap();
+    assert!(pending(&client, key).await.is_empty());
+}
+
+/// More unfinished uploads than one listing page holds (1000): the ones past
+/// the first page are found too.
+#[tokio::test]
+async fn unfinished_uploads_are_listed_past_one_page() {
+    let client = client_or_skip!();
+    let key = "blobs/many.sslo";
+    for _ in 0..1010 {
+        client.start_abandoned_upload(key, vec![0u8]).await.unwrap();
+    }
+    assert_eq!(pending(&client, key).await.len(), 1010);
+    let aborted = client
+        .abort_uploads_started_before(key, std::time::SystemTime::now() + DAY)
+        .await
+        .unwrap();
+    assert_eq!(aborted, 1010);
+    assert!(pending(&client, key).await.is_empty());
+}

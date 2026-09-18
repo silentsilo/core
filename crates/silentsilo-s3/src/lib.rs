@@ -34,6 +34,16 @@ pub struct ObjectEntry {
     pub etag: Option<String>,
 }
 
+/// A multipart upload that was started and neither completed nor aborted,
+/// as [`S3Client::pending_uploads`] returns it.
+#[derive(Debug, Clone)]
+pub struct PendingUpload {
+    pub key: String,
+    pub upload_id: String,
+    /// When the provider says it began, if it says.
+    pub initiated: Option<std::time::SystemTime>,
+}
+
 /// What a bucket does about deletion, as the bucket reports it.
 ///
 /// Two separate facts, because they fail differently. Versioning alone means
@@ -245,7 +255,8 @@ impl S3Client {
     /// A file over [`Self::MULTIPART_ABOVE`] goes up in parts, so progress
     /// and a stop land every part rather than once at the end. A stop, or
     /// any failure, aborts the upload: parts left behind are billed and
-    /// invisible.
+    /// invisible. Unfinished uploads of the same key are aborted first, which
+    /// is what cleans up after a process that was killed mid-upload.
     pub async fn put_file_reporting(
         &self,
         key: &str,
@@ -264,19 +275,10 @@ impl S3Client {
         }
 
         let full_key = self.config.key(key);
-        let started = self
-            .client
-            .create_multipart_upload()
-            .bucket(&self.config.bucket)
-            .key(&full_key)
-            .send()
-            .await
-            .map_err(|e| S3Error::from_sdk("upload", e))?;
-        let Some(upload_id) = started.upload_id().map(str::to_string) else {
-            return Err(S3Error::Service(
-                "the provider started an upload without an id".into(),
-            ));
-        };
+        // A process killed mid-upload aborts nothing, and the retry that
+        // follows starts a second upload, orphaning the first one's parts.
+        self.abort_uploads_of(&full_key).await;
+        let upload_id = self.create_upload(&full_key).await?;
 
         match self
             .upload_parts(&full_key, &upload_id, path, len, progress)
@@ -284,17 +286,162 @@ impl S3Client {
         {
             Ok(()) => Ok(()),
             Err(e) => {
-                let _ = self
-                    .client
-                    .abort_multipart_upload()
-                    .bucket(&self.config.bucket)
-                    .key(&full_key)
-                    .upload_id(&upload_id)
-                    .send()
-                    .await;
+                let _ = self.abort_upload(&full_key, &upload_id).await;
                 Err(e)
             }
         }
+    }
+
+    async fn create_upload(&self, full_key: &str) -> Result<String, S3Error> {
+        let started = self
+            .client
+            .create_multipart_upload()
+            .bucket(&self.config.bucket)
+            .key(full_key)
+            .send()
+            .await
+            .map_err(|e| S3Error::from_sdk("upload", e))?;
+        started
+            .upload_id()
+            .map(str::to_string)
+            .ok_or_else(|| S3Error::Service("the provider started an upload without an id".into()))
+    }
+
+    async fn abort_upload(&self, full_key: &str, upload_id: &str) -> Result<(), S3Error> {
+        self.client
+            .abort_multipart_upload()
+            .bucket(&self.config.bucket)
+            .key(full_key)
+            .upload_id(upload_id)
+            .send()
+            .await
+            .map_err(|e| S3Error::from_sdk("abort upload", e))?;
+        Ok(())
+    }
+
+    /// Aborts every unfinished upload of exactly `full_key`. Best effort: a
+    /// provider without ListMultipartUploads must not stop the upload.
+    async fn abort_uploads_of(&self, full_key: &str) {
+        let pending = match self.list_uploads(full_key).await {
+            Ok(pending) => pending,
+            Err(e) => {
+                eprintln!("could not list unfinished uploads before an upload: {e}");
+                return;
+            }
+        };
+        // The prefix also matches longer keys; only this one is ours to abort.
+        for upload in pending.iter().filter(|u| u.key == full_key) {
+            if let Err(e) = self.abort_upload(full_key, &upload.upload_id).await {
+                eprintln!("could not abort an unfinished upload: {e}");
+            }
+        }
+    }
+
+    /// Every unfinished multipart upload under `full_prefix`, with full
+    /// keys, following the listing's markers across pages.
+    async fn list_uploads(&self, full_prefix: &str) -> Result<Vec<PendingUpload>, S3Error> {
+        let mut found = Vec::new();
+        let mut key_marker: Option<String> = None;
+        let mut id_marker: Option<String> = None;
+        loop {
+            let output = self
+                .client
+                .list_multipart_uploads()
+                .bucket(&self.config.bucket)
+                .prefix(full_prefix)
+                .set_key_marker(key_marker.take())
+                .set_upload_id_marker(id_marker.take())
+                .send()
+                .await
+                .map_err(|e| S3Error::from_sdk("list uploads", e))?;
+
+            for upload in output.uploads() {
+                let (Some(key), Some(id)) = (upload.key(), upload.upload_id()) else {
+                    continue;
+                };
+                found.push(PendingUpload {
+                    key: key.to_string(),
+                    upload_id: id.to_string(),
+                    initiated: upload
+                        .initiated()
+                        .and_then(|t| std::time::SystemTime::try_from(*t).ok()),
+                });
+            }
+
+            if !output.is_truncated().unwrap_or(false) {
+                break;
+            }
+            key_marker = output.next_key_marker().map(str::to_string);
+            id_marker = output.next_upload_id_marker().map(str::to_string);
+            // A truncated page with no marker would list the same page forever.
+            if key_marker.is_none() && id_marker.is_none() {
+                break;
+            }
+        }
+        Ok(found)
+    }
+
+    /// Unfinished multipart uploads under `relative_prefix`, keys relative to
+    /// the configured prefix like [`Self::list`]. Their parts are billed and
+    /// show in no object listing.
+    pub async fn pending_uploads(
+        &self,
+        relative_prefix: &str,
+    ) -> Result<Vec<PendingUpload>, S3Error> {
+        let strip = self.config.key("");
+        let mut pending = self.list_uploads(&self.config.key(relative_prefix)).await?;
+        for upload in &mut pending {
+            if let Some(relative) = upload.key.strip_prefix(&strip) {
+                upload.key = relative.to_string();
+            }
+        }
+        Ok(pending)
+    }
+
+    /// Aborts the unfinished uploads under `relative_prefix` that the
+    /// provider says began before `cutoff`, and returns how many went. One
+    /// with no start time is left alone: nothing says it is not running now.
+    /// An abort that fails is skipped, since another device may have just
+    /// finished or aborted that upload itself.
+    pub async fn abort_uploads_started_before(
+        &self,
+        relative_prefix: &str,
+        cutoff: std::time::SystemTime,
+    ) -> Result<usize, S3Error> {
+        let pending = self.list_uploads(&self.config.key(relative_prefix)).await?;
+        let mut aborted = 0;
+        for upload in pending {
+            if !upload.initiated.is_some_and(|t| t < cutoff) {
+                continue;
+            }
+            if self
+                .abort_upload(&upload.key, &upload.upload_id)
+                .await
+                .is_ok()
+            {
+                aborted += 1;
+            }
+        }
+        Ok(aborted)
+    }
+
+    /// Starts a multipart upload of `key`, sends `part` as its first part and
+    /// leaves it unfinished, as a process killed mid-upload does. For tests.
+    #[doc(hidden)]
+    pub async fn start_abandoned_upload(&self, key: &str, part: Vec<u8>) -> Result<(), S3Error> {
+        let full_key = self.config.key(key);
+        let upload_id = self.create_upload(&full_key).await?;
+        self.client
+            .upload_part()
+            .bucket(&self.config.bucket)
+            .key(&full_key)
+            .upload_id(&upload_id)
+            .part_number(1)
+            .body(ByteStream::from(part))
+            .send()
+            .await
+            .map_err(|e| S3Error::from_sdk("upload", e))?;
+        Ok(())
     }
 
     /// The parts of one multipart upload, in order, and the request that

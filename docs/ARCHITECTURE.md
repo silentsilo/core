@@ -460,6 +460,18 @@ Read this before "fixing" any of it.
   a stop or a failure aborts the upload rather than leaving parts that are
   billed and invisible. Below the threshold it stays one PUT, which is every
   record, every snapshot and most blobs.
+- **A multipart upload first aborts every unfinished upload of its key.**
+  A killed process aborts nothing, and the retry that always follows starts
+  a second upload, so the first one's parts would stay billed and invisible
+  for good. Another device sending the same key at that moment (two devices
+  putting back the same missing blob) loses its upload and retries on a
+  later pass; the bytes are the same either way. The daily blob sweep also
+  aborts unfinished uploads older than 24 hours under `blobs/`, `snapshots/`
+  and `inbox/`, for content deleted before anything retried it. Never
+  younger: that may be another device mid-upload. Never from the bucket
+  root: another program's uploads may live there. MinIO lists unfinished
+  uploads only for a whole key, so there the sweep finds nothing, and MinIO
+  expires them itself.
 - **S3 HEAD treats 403 as absent.** A prefix-scoped credential gets 403 for
   a missing key; callers use HEAD to decide whether to write, writes are
   idempotent, and a genuinely bad credential fails loudly on PUT.

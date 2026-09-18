@@ -1703,6 +1703,27 @@ pub async fn sweep_orphan_blobs(
     Ok(outcome)
 }
 
+/// Where this app writes objects large enough to go up in parts. Listed one
+/// by one rather than swept from the root, so a bucket shared with other
+/// software never has its uploads touched, even with no prefix set.
+const LARGE_OBJECT_PREFIXES: [&str; 3] = [BLOBS_PREFIX, SNAPSHOTS_PREFIX, "inbox/"];
+
+/// Aborts the unfinished uploads a killed process left under this silo's
+/// prefixes, once they are older than `older_than`, and returns how many
+/// went. A retry of the same key cleans its own; this is for content deleted
+/// before anything retried it. `older_than` has to leave room for another
+/// device's upload that is still running.
+pub async fn abort_stale_uploads(
+    store: &dyn ObjectStore,
+    older_than: std::time::Duration,
+) -> Result<usize, SyncError> {
+    let mut aborted = 0;
+    for prefix in LARGE_OBJECT_PREFIXES {
+        aborted += store.abort_stale_uploads(prefix, older_than).await?;
+    }
+    Ok(aborted)
+}
+
 /// How many missing blobs one pass puts back per target.
 const RESTORE_PER_PASS: usize = 100;
 

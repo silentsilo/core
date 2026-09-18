@@ -641,3 +641,51 @@ async fn a_stopped_transfer_says_so_and_leaves_nothing_half_written() {
     })
     .await;
 }
+
+/// Every backend answers the stale-upload sweep, with nothing to do on an
+/// empty prefix. Only S3 has unfinished uploads at all.
+#[tokio::test]
+async fn every_backend_answers_the_stale_upload_sweep() {
+    for_each_store(|store| async move {
+        let day = std::time::Duration::from_secs(24 * 60 * 60);
+        assert_eq!(store.abort_stale_uploads("blobs/", day).await.unwrap(), 0);
+    })
+    .await;
+}
+
+/// An unfinished upload younger than the sweep's age is left alone through
+/// the trait: it may be another device's, still running.
+#[tokio::test]
+async fn the_s3_sweep_leaves_a_young_upload_alone() {
+    let Some(endpoint) = std::env::var("SILENTSILO_TEST_S3_ENDPOINT").ok() else {
+        silentsilo_testkit::skip_or_fail("S3: SILENTSILO_TEST_S3_ENDPOINT is not set");
+        return;
+    };
+    let client = silentsilo_s3::S3Client::new(S3Config {
+        endpoint,
+        region: "us-east-1".into(),
+        bucket: std::env::var("SILENTSILO_TEST_S3_BUCKET").unwrap_or_else(|_| "vault-test".into()),
+        prefix: format!("contract-{}", Uuid::new_v4()),
+        access_key_id: std::env::var("SILENTSILO_TEST_S3_KEY")
+            .unwrap_or_else(|_| "silentsilo".into()),
+        secret_access_key: std::env::var("SILENTSILO_TEST_S3_SECRET")
+            .unwrap_or_else(|_| "silentsilo123".into()),
+        path_style: true,
+    })
+    .unwrap();
+    let key = "blobs/running.sslo";
+    client
+        .start_abandoned_upload(key, vec![1u8; 1024])
+        .await
+        .unwrap();
+
+    let store: &dyn ObjectStore = &client;
+    let hour = std::time::Duration::from_secs(60 * 60);
+    assert_eq!(store.abort_stale_uploads(key, hour).await.unwrap(), 0);
+    assert_eq!(client.pending_uploads(key).await.unwrap().len(), 1);
+
+    client
+        .abort_uploads_started_before(key, std::time::SystemTime::now() + hour)
+        .await
+        .unwrap();
+}

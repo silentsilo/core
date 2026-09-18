@@ -9,6 +9,26 @@ This repository has its own version line, separate from the desktop
 application's. A client pins a tag from here; the tag it pins is what its
 release notes should say.
 
+## [Unreleased]
+
+### Fixed
+
+- An S3 multipart upload cut short by a killed process no longer leaves its
+  parts billed and invisible for good. Before starting a multipart upload,
+  `S3Client` aborts every unfinished upload of that exact key, so the retry
+  cleans up after the upload it replaces. A provider without
+  ListMultipartUploads still uploads; the cleanup is skipped.
+
+### Added
+
+- `ObjectStore::abort_stale_uploads`, with a default that does nothing, and
+  `silentsilo_sync::abort_stale_uploads`. The daily blob sweep in
+  `silentsilo-app` now also aborts unfinished uploads older than 24 hours
+  under `blobs/`, `snapshots/` and `inbox/`, on targets that allow deletes.
+  That covers content deleted before anything uploaded it again. A younger
+  upload is left alone, since it may be another device's, still running.
+- `S3Client::pending_uploads` and `S3Client::abort_uploads_started_before`.
+
 ## [1.6.0] - Storage you do not have to trust, and bytes you can watch
 
 ### Added

@@ -46,6 +46,16 @@ key the updater checks. The public half is in
 [`SIGNING-PUBKEY.txt`](SIGNING-PUBKEY.txt). This repository publishes tags,
 not releases.
 
+## Unfinished uploads on S3
+
+Files over 16 MiB go up to S3 in parts. If the app is killed mid-upload, the
+parts already sent stay in the bucket, billed, and no object listing shows
+them. SilentSilo aborts them when it uploads that file again, and its daily
+sweep aborts any older than 24 hours. As a second line of defence, add a
+lifecycle rule to the bucket with the action "AbortIncompleteMultipartUpload"
+(7 days is a sensible value). Most S3-compatible providers accept the same
+rule.
+
 ## Dev
 
 ```bash

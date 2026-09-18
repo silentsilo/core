@@ -52,6 +52,12 @@ fn map(err: S3Error) -> StoreError {
     }
 }
 
+/// A provider saying it does not implement the request at all.
+fn is_unsupported(err: &S3Error) -> bool {
+    let text = err.to_string().to_lowercase();
+    text.contains("(501)") || text.contains("notimplemented")
+}
+
 #[async_trait]
 impl ObjectStore for S3Client {
     async fn put(&self, key: &str, body: Vec<u8>) -> Result<(), StoreError> {
@@ -134,6 +140,23 @@ impl ObjectStore for S3Client {
                 size: e.size,
             })
             .collect())
+    }
+
+    async fn abort_stale_uploads(
+        &self,
+        prefix: &str,
+        older_than: std::time::Duration,
+    ) -> Result<usize, StoreError> {
+        let cutoff = std::time::SystemTime::now()
+            .checked_sub(older_than)
+            .unwrap_or(std::time::UNIX_EPOCH);
+        match S3Client::abort_uploads_started_before(self, prefix, cutoff).await {
+            Ok(aborted) => Ok(aborted),
+            // Some S3-compatible servers have no ListMultipartUploads. Then
+            // there is nothing this can do, which is not worth a warning a day.
+            Err(e) if is_unsupported(&e) => Ok(0),
+            Err(e) => Err(map(e)),
+        }
     }
 
     fn describe(&self) -> String {

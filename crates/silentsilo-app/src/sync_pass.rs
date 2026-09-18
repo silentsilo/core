@@ -837,7 +837,7 @@ pub async fn run_sync_pass(
     if view_complete {
         for target in targets.iter().filter(|t| t.role.allows_delete()) {
             blobs_restored +=
-                run_blob_sweep(state, silo, (target.id, &*target.store), &reachable).await?;
+                run_blob_sweep(state, host, silo, (target.id, &*target.store), &reachable).await?;
         }
     }
 
@@ -1079,13 +1079,19 @@ const BLOB_SWEEP_INTERVAL_SECS: i64 = 24 * 60 * 60;
 /// margin, past which such a device has to rebuild anyway.
 const BLOB_SWEEP_GRACE_SECS: i64 = 30 * 24 * 60 * 60;
 
+/// How old an unfinished upload has to be before the sweep aborts it. A
+/// younger one may be another device's, still sending a large file.
+const STALE_UPLOAD_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
 /// Deletes content nothing references, at most once a day, and only what
 /// was unreferenced on an earlier sweep and for the whole grace period. The
 /// same listing puts back content a file points at that the target lost.
 /// Runs after a successful pass, when the referenced set is trustworthy.
+/// Also aborts unfinished uploads older than [`STALE_UPLOAD_AGE`].
 /// Errors are swallowed: housekeeping. Returns how many blobs went back.
 async fn run_blob_sweep(
     state: &AppState,
+    host: &dyn Host,
     silo: &SiloEntry,
     target: (Uuid, &dyn ObjectStore),
     reachable: &[(Uuid, &dyn ObjectStore)],
@@ -1126,6 +1132,16 @@ async fn run_blob_sweep(
         (referenced, first_seen)
     };
     let (referenced, first_seen) = plan;
+
+    // With the blob sweep because it deletes too, and lists: once a day, and
+    // only on a target whose role allows deletes.
+    if let Err(e) = sync::abort_stale_uploads(store, STALE_UPLOAD_AGE).await {
+        host.warn(
+            "sweep",
+            &format!("unfinished uploads were not cleared: {e}"),
+        );
+    }
+
     // Only a candidate past its grace may go on this sweep.
     let due: std::collections::HashSet<Uuid> = first_seen
         .iter()
