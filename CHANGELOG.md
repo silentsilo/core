@@ -11,6 +11,8 @@ release notes should say.
 
 ## [Unreleased]
 
+## [1.7.0] - The same silo on every device
+
 ### Fixed
 
 - Emptying the trash no longer removes content that no copy holds yet. A
