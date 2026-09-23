@@ -9,6 +9,44 @@ This repository has its own version line, separate from the desktop
 application's. A client pins a tag from here; the tag it pins is what its
 release notes should say.
 
+## [Unreleased]
+
+### Fixed
+
+- A key rotation commits the re-wrapped keys and the new recovery envelope
+  with the key itself (`rotation::commit_rotation_with`). They were written
+  after the commit, so a crash or a locked file in between left the new key
+  in force and nothing that opened it. `finish_interrupted_commit` finishes
+  a commit that stopped after the KEK moved; `load_fido_keys` and
+  `rotation_pending` call it.
+- A folder target whose root is gone (an unplugged drive) lists as
+  `Unreachable` instead of empty, so it no longer counts as reached with a
+  horizon of 0.
+- `lowest_snapshot_horizon` ignores a target below the highest horizon whose
+  records do not reach it: a stale, never-compacted copy no longer hides that
+  a device fell behind. The `silentsilo-app` pass marks every target failed
+  and backs off when none answers, instead of stopping with an error.
+- `reseal_under_new_key` reports records and snapshots that open under
+  neither key in `ResealOutcome::unreadable` rather than in `failed`, so one
+  corrupt object no longer blocks a rotation for good. The KEK envelope
+  still fails.
+- A silo whose `vault.db.enc` is missing opens from the shadow copy or a
+  staged snapshot, and `VaultPaths::exists` and `SiloEntry::is_present`
+  count those.
+- `send_item_from` leaves an item alone once its envelope is in the inbox,
+  and `stage_item` checks the blob header against the envelope before and
+  after the copy. A resend no longer lets an import record content sealed
+  under another blob id.
+
+### Added
+
+- `seed_target_checked`, which copies records, snapshots and the KEK envelope
+  only when they open under the current key, and key envelopes and the
+  manifest only where the destination has none. `SeedOutcome::stale` counts
+  what it left behind.
+- `ObjectStore::get_prefix`, with a default that reads the object whole;
+  the folder and S3 backends read only the bytes asked for.
+
 ## [1.6.1] - No parts left behind
 
 ### Fixed

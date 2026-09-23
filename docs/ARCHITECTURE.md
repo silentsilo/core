@@ -117,10 +117,25 @@ client application):
 stateDiagram-v2
     [*] --> Staged: stage_rotation writes .next key files
     Staged --> Resealed: reseal_under_new_key per deletable target (idempotent, resumable)
-    Resealed --> Committed: commit_keys_and_snapshot (staged db written, keys renamed, db renamed)
+    Resealed --> Committed: commit_rotation_with (keys and recovery staged, KEK renamed, the rest renamed)
     Staged --> Staged: crash → resume with any enrolled key
-    Committed --> [*]: envelopes rewrapped, new recovery code shown, silos locked
+    Committed --> [*]: new recovery code shown, silos locked
 ```
+
+`commit_rotation_with` takes the re-wrapped `fido.json` and the new
+`recovery.json` and writes them as `.next` beside their targets before it
+moves the KEK. Moving the KEK is the point of no return; everything after is
+renames, and `finish_interrupted_commit` (called by `load_fido_keys` and
+`rotation_pending`) finishes them with no key. Writing the keys after the
+commit, as the app used to, left a window where the new key was in force and
+nothing on disk opened it.
+
+A rotation reaches every target or does not start: a target whose settings
+will not open stops it before the first touch, since one skipped keeps the
+old key readable there. An object that opens under neither key does not stop
+it (`ResealOutcome.unreadable`): nobody could read it before either, and one
+corrupt record otherwise blocked every rotation and resume for good. The KEK
+envelope is the exception and still fails it.
 
 The order is forced: the staged key is durable on disk before any object in
 storage is re-sealed, because an object under a key that existed only in
@@ -187,8 +202,11 @@ Object keys sort meaningfully: op keys are
 apply order and both the Lamport value and the op id can be read without
 downloading. Snapshot keys are the zero-padded horizon. Only `blobs/` keys
 are immutable-by-key; everything else may be rewritten in place (rotation
-re-seals, envelopes re-wrap), which is why seeding size-skips blobs alone
-and copies the rest unconditionally.
+re-seals, envelopes re-wrap), which is why seeding size-skips blobs alone.
+The app seeds with `seed_target_checked`: records, snapshots and the KEK
+envelope are copied only when they open under the current key, and key
+envelopes and the manifest only where the destination has none, so an
+append-only copy that missed a rotation cannot undo it on another target.
 
 ## The operation log
 
@@ -239,6 +257,15 @@ stranded). A device that falls below the horizon gets `needs_rebuild` and
 comes back via the snapshot with a fresh device id, because its old chain
 positions died with the log. Append-only targets keep their whole log and
 still receive the snapshot, which is what a joining device replays from.
+
+Whether a device is behind is judged against the lowest horizon across the
+targets that answer. A target below the highest horizon counts only when its
+records reach that horizon: a drive left in a drawer since before the others
+were compacted has a low horizon because it is stale, and it does not hold
+what they pruned. A folder target whose root is gone (an unplugged drive)
+lists as `Unreachable`, never as empty; a missing prefix under an existing
+root is still an empty listing. When no target answers, the pass marks each
+one failed and backs off instead of stopping with an error.
 
 ## Blob lifecycle
 
@@ -324,7 +351,13 @@ that. What keeps them agreeing:
 - before an item leaves the inbox its content is checked in `blobs/` and
   copied again when missing. A device that recorded an item and stayed locked
   for days can find that copy swept by another device, which does not know
-  the file yet.
+  the file yet;
+- a sender never sends an item again once its envelope is in the inbox. A
+  resend used to seal the same item under a new blob id at the same size
+  and overwrite the content, so an import between scan and copy recorded
+  bytes whose header named another blob. The import also reads the header
+  (`get_prefix`, 82 bytes) before and after the copy and refuses content
+  sealed for another item or blob, which covers senders on older builds.
 
 ## Recovery matrix
 
@@ -437,7 +470,8 @@ Read this before "fixing" any of it.
   refuses a record this build wrote given only what its author held.
 - **Seeding size-skips only `blobs/`.** Everything else is rewritten in
   place at identical length by rotation, so "same key, same size" would
-  skip the one write that matters.
+  skip the one write that matters. Which side is current is decided by the
+  key (`seed_target_checked`), not by size or time.
 - **A seeded object counts its size once, not twice.** It moves twice, down
   from the source and up to the destination, and `SeedProgress.bytes_total`
   is the size of the silo: each leg credits half the object, and whatever is
@@ -528,7 +562,10 @@ Read this before "fixing" any of it.
   image was taken, so a recorded fingerprint always means "this copy holds
   that snapshot or more". An unlock reuses the copy only when the file on
   disk matches one (a rotation's staged `.next` included), or when the
-  snapshot is damaged and the shadow copy matches. Anything else that wrote
+  snapshot is damaged and the shadow copy matches. A missing `vault.db.enc`
+  is put back from the shadow copy (or a staged snapshot) on unlock, and
+  `VaultPaths::exists` and `SiloEntry::is_present` count those too: a sync
+  client that removed the snapshot left a silo shown as unplugged. Anything else that wrote
   the snapshot (a rotation elsewhere, a repair, a restored file, another
   release) gets a fresh export. A lock also records `locked`; a copy that has
   it is used as is, with no `quick_check` (130 ms on 12 MB), because the lock

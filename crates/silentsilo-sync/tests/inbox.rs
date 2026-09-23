@@ -82,7 +82,10 @@ async fn setup() -> Setup {
 
 impl Setup {
     async fn send(&self) -> Uuid {
-        let item_id = Uuid::now_v7();
+        self.send_as(Uuid::now_v7()).await
+    }
+
+    async fn send_as(&self, item_id: Uuid) -> Uuid {
         let signer = &self.signer;
         send_item(
             &self.store,
@@ -351,6 +354,42 @@ async fn content_that_is_not_the_signed_size_is_not_staged() {
         .put(&format!("{INBOX_ITEMS_PREFIX}{item_id}.sslo"), vec![0; 10])
         .await
         .unwrap();
+    assert!(stage_item(&s.store, &scan.ready[0]).await.is_err());
+    assert!(s.store.list("blobs/").await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn sending_an_item_already_in_the_inbox_again_changes_nothing() {
+    let s = setup().await;
+    let item_id = s.send().await;
+    let content = format!("{INBOX_ITEMS_PREFIX}{item_id}.sslo");
+    let envelope = format!("{INBOX_ITEMS_PREFIX}{item_id}.env");
+    let before = (
+        s.store.get(&content).await.unwrap(),
+        s.store.get(&envelope).await.unwrap(),
+    );
+
+    s.send_as(item_id).await;
+
+    assert_eq!(s.store.get(&content).await.unwrap(), before.0);
+    assert_eq!(s.store.get(&envelope).await.unwrap(), before.1);
+    assert_eq!(s.import().await, 1);
+}
+
+#[tokio::test]
+async fn content_resealed_under_another_blob_id_is_not_staged() {
+    // What an older build's resend did: same item, same size, a new blob
+    // id in the header. Recorded, it opened as "blob identity mismatch".
+    let s = setup().await;
+    let item_id = s.send().await;
+    let scan = scan_inbox(&s.store, s.session.vault_id, &s.session.kek)
+        .await
+        .unwrap();
+    let key = format!("{INBOX_ITEMS_PREFIX}{item_id}.sslo");
+    let mut bytes = s.store.get(&key).await.unwrap();
+    bytes[26..42].copy_from_slice(Uuid::new_v4().as_bytes());
+    s.store.put(&key, bytes).await.unwrap();
+
     assert!(stage_item(&s.store, &scan.ready[0]).await.is_err());
     assert!(s.store.list("blobs/").await.unwrap().is_empty());
 }

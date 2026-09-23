@@ -144,9 +144,13 @@ impl VaultPaths {
     ///
     /// Asks only about the encrypted snapshot: the working copy lives
     /// elsewhere, so its presence says something about this machine's
-    /// session rather than about the folder.
+    /// session rather than about the folder. The shadow copy and a staged
+    /// snapshot count too: a sync client that removed `vault.db.enc` leaves
+    /// a silo that opens from them, and one that must not be created over.
     pub fn exists(&self) -> bool {
         self.db_enc_path().is_file()
+            || self.db_enc_backup_path().is_file()
+            || self.db_enc_staged_path().is_file()
     }
 }
 
@@ -461,7 +465,18 @@ fn open_database(paths: &VaultPaths, dek: &MasterDek) -> Result<Connection, Vaul
 
     let enc_path = paths.db_enc_path();
     if !enc_path.is_file() {
-        return Err(VaultError::NotFound);
+        // Put back from the shadow copy, and the usual path below decides
+        // whether it opens, falling back to a staged snapshot if not.
+        if paths.db_enc_backup_path().is_file() {
+            std::fs::copy(paths.db_enc_backup_path(), &enc_path)?;
+        } else if paths.db_enc_staged_path().is_file() {
+            let image = adopt_staged_snapshot(paths, dek)?;
+            let conn = write_working_copy(paths, &image, &enc_path, dek)?;
+            mark_unchanged(&conn);
+            return Ok(conn);
+        } else {
+            return Err(VaultError::NotFound);
+        }
     }
     let (image, source) = match decrypt_vault_bytes(&enc_path, dek) {
         Ok(image) => (image, enc_path),
@@ -2052,6 +2067,29 @@ mod tests {
         std::fs::write(paths.db_enc_backup_path(), older_shadow).unwrap();
         let reopened = VaultSession::open_with_dek(root, dek).unwrap();
         assert_eq!(marker(&reopened.conn), "one");
+    }
+
+    /// A sync client that removed `vault.db.enc` leaves the shadow copy. The
+    /// silo still counts as there and opens from it, with or without the
+    /// working copy.
+    #[test]
+    fn a_missing_snapshot_opens_from_the_shadow_copy() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let session = silo_with_marker(&root, "secret", "kept");
+        let paths = lock(session);
+
+        std::fs::remove_file(paths.db_enc_path()).unwrap();
+        assert!(paths.exists());
+        let reopened = VaultSession::open_with_device_secret(root.clone(), "secret").unwrap();
+        assert_eq!(marker(&reopened.conn), "kept");
+        let paths = lock(reopened);
+
+        std::fs::remove_file(paths.db_enc_path()).unwrap();
+        crate::workdir::wipe_work_dir(&paths.root);
+        let reopened = VaultSession::open_with_device_secret(root, "secret").unwrap();
+        assert_eq!(marker(&reopened.conn), "kept");
+        assert!(paths.db_enc_path().is_file(), "put back");
     }
 
     /// A session opened from a kept copy that then crashes still keeps its

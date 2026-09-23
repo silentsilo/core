@@ -345,6 +345,10 @@ pub async fn send_item(
 /// [`send_item`] reading the content from `source` instead of opening
 /// `item.source`: a descriptor another app handed over has no path this
 /// app may open.
+///
+/// An item whose envelope is already in the inbox was sent in full and is
+/// left alone. Sending it again would put content under a new blob id over
+/// the object an import may be copying at that moment.
 pub async fn send_item_from(
     client: &dyn ObjectStore,
     identity: &SenderIdentity,
@@ -352,6 +356,13 @@ pub async fn send_item_from(
     source: &mut (dyn std::io::Read + Send),
     sign: &ItemSigner<'_>,
 ) -> Result<(), SyncError> {
+    if client
+        .head(&item_envelope_object(item.item_id))
+        .await?
+        .is_some()
+    {
+        return Ok(());
+    }
     let content_key = silentsilo_crypto::generate_content_key();
     let blob_id = Uuid::new_v4();
     let staged = tempfile::NamedTempFile::new().map_err(|e| SyncError::Vault(e.to_string()))?;
@@ -575,7 +586,9 @@ fn open_envelope(
 }
 
 /// Copies the item's content to where the silo keeps content. Refuses when
-/// the object in the inbox is not the size the signed envelope names.
+/// the object in the inbox is not the size the signed envelope names, or
+/// its header names another item or blob: a resend from an older build
+/// replaces the content under a new blob id at the same size.
 pub async fn stage_item(client: &dyn ObjectStore, item: &ReadyItem) -> Result<(), SyncError> {
     let source = item_blob_object(item.item_id);
     match client.head(&source).await? {
@@ -592,7 +605,15 @@ pub async fn stage_item(client: &dyn ObjectStore, item: &ReadyItem) -> Result<()
     // Content already under that id is never replaced: the id is the
     // sender's word, and another file's content may live there.
     match client.head(&dest).await? {
-        Some(size) if size >= 0 && size as u64 == item.blob_size => return Ok(()),
+        Some(size) if size >= 0 && size as u64 == item.blob_size => {
+            return if header_matches(client, &dest, item).await? {
+                Ok(())
+            } else {
+                Err(SyncError::Storage(format!(
+                    "{dest} already holds other content"
+                )))
+            };
+        }
         Some(_) => {
             return Err(SyncError::Storage(format!(
                 "{dest} already holds other content"
@@ -600,8 +621,34 @@ pub async fn stage_item(client: &dyn ObjectStore, item: &ReadyItem) -> Result<()
         }
         None => {}
     }
+    if !header_matches(client, &source, item).await? {
+        return Err(SyncError::Storage(format!(
+            "{source} was replaced after its envelope was read"
+        )));
+    }
     client.copy(&source, &dest).await?;
+    // Checked again where it landed: the inbox object can still change
+    // between the check above and the copy.
+    if !header_matches(client, &dest, item).await? {
+        let _ = client.delete(&dest).await;
+        return Err(SyncError::Storage(format!(
+            "{source} was replaced while it was copied"
+        )));
+    }
     Ok(())
+}
+
+/// Whether the blob at `key` was sealed for this item under this blob id.
+async fn header_matches(
+    client: &dyn ObjectStore,
+    key: &str,
+    item: &ReadyItem,
+) -> Result<bool, SyncError> {
+    let head = client
+        .get_prefix(key, silentsilo_crypto::HEADER_SIZE as u64)
+        .await?;
+    Ok(silentsilo_crypto::BlobHeader::from_bytes(&head)
+        .is_ok_and(|h| h.file_id == item.item_id && h.blob_id == item.blob_id))
 }
 
 /// Whether the item's content is where the silo keeps content, at the size

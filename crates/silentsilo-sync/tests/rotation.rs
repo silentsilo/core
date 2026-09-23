@@ -158,6 +158,49 @@ async fn an_interrupted_pass_finishes_on_the_next_run() {
     assert_eq!(again.already, 6);
 }
 
+/// A corrupt record opened under no key before the rotation, so it cannot
+/// be what stops one. Left in place and named; the rest carries on.
+#[tokio::test]
+async fn a_corrupt_record_does_not_block_a_rotation() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FolderStore::new(dir.path().to_path_buf());
+    let old = generate_dek();
+    let new = generate_dek();
+
+    populate(&store as &dyn ObjectStore, &old).await;
+    let broken = store.list(OPS_PREFIX).await.unwrap()[0].key.clone();
+    store.put(&broken, vec![0u8; 64]).await.unwrap();
+
+    let outcome = reseal_under_new_key(&store as &dyn ObjectStore, &old, &new, &mut |_, _| {})
+        .await
+        .unwrap();
+
+    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    assert_eq!(outcome.unreadable, vec![broken.clone()]);
+    assert_eq!(outcome.resealed, 5);
+    assert_eq!(store.get(&broken).await.unwrap(), vec![0u8; 64]);
+}
+
+/// The KEK envelope is different: without it nothing opens, so one that
+/// opens under neither key stops the rotation.
+#[tokio::test]
+async fn a_corrupt_content_key_envelope_still_stops_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FolderStore::new(dir.path().to_path_buf());
+    let old = generate_dek();
+    let new = generate_dek();
+
+    populate(&store as &dyn ObjectStore, &old).await;
+    store.put(CONTENT_KEK_KEY, vec![0u8; 64]).await.unwrap();
+
+    let outcome = reseal_under_new_key(&store as &dyn ObjectStore, &old, &new, &mut |_, _| {})
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.failed.len(), 1);
+    assert_eq!(outcome.failed[0].0, CONTENT_KEK_KEY);
+}
+
 /// The KEK envelope is the one object that must arrive: without it a joining
 /// device has no way to open any content at all.
 #[tokio::test]

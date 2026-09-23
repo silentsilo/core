@@ -302,12 +302,7 @@ pub fn save_fido_keys(
     keys: &StoredFidoKeys,
     authority: Authority<'_>,
 ) -> Result<(), VaultError> {
-    if matches!(authority, Authority::Machine)
-        && let Ok(stored) = load_fido_keys(vault_root)
-        && removes_organisation_access(&stored, keys)
-    {
-        return Err(VaultError::OrganisationKeyRequired);
-    }
+    check_authority(vault_root, keys, authority)?;
 
     // Atomic: this file holds every enrolled key's envelope, and on a silo
     // with no recovery code it is the only door.
@@ -315,7 +310,27 @@ pub fn save_fido_keys(
     Ok(())
 }
 
+/// The organisation guard [`save_fido_keys`] applies, for a caller that
+/// writes the same file another way (a rotation stages it before committing).
+pub(crate) fn check_authority(
+    vault_root: &Path,
+    keys: &StoredFidoKeys,
+    authority: Authority<'_>,
+) -> Result<(), VaultError> {
+    if matches!(authority, Authority::Machine)
+        && let Ok(stored) = load_fido_keys(vault_root)
+        && removes_organisation_access(&stored, keys)
+    {
+        return Err(VaultError::OrganisationKeyRequired);
+    }
+    Ok(())
+}
+
+/// Reads the enrolled keys, first finishing a key change a crash stopped
+/// after its point of no return (see [`crate::rotation`]): until then this
+/// file still holds the envelopes of the key that is no longer in force.
 pub fn load_fido_keys(vault_root: &Path) -> Result<StoredFidoKeys, VaultError> {
+    let _ = crate::rotation::finish_interrupted_commit(vault_root);
     let path = fido_keys_path(vault_root);
     let keys: StoredFidoKeys = crate::format::decode("the enrolled keys", &std::fs::read(path)?)?;
     if keys.keys.is_empty() {

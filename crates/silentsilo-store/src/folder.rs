@@ -150,6 +150,17 @@ impl ObjectStore for FolderStore {
         std::fs::read(self.path_for(key)?).map_err(|e| Self::map_io(e, key))
     }
 
+    async fn get_prefix(&self, key: &str, len: u64) -> Result<Vec<u8>, StoreError> {
+        use std::io::Read;
+        let path = self.path_for(key)?;
+        let file = std::fs::File::open(&path).map_err(|e| Self::map_io(e, key))?;
+        let mut out = Vec::new();
+        file.take(len)
+            .read_to_end(&mut out)
+            .map_err(|e| Self::map_io(e, key))?;
+        Ok(out)
+    }
+
     async fn head(&self, key: &str) -> Result<Option<i64>, StoreError> {
         match std::fs::metadata(self.path_for(key)?) {
             Ok(meta) => Ok(Some(meta.len() as i64)),
@@ -170,6 +181,15 @@ impl ObjectStore for FolderStore {
 
     async fn list(&self, prefix: &str) -> Result<Vec<StoredObject>, StoreError> {
         let base = self.path_for(prefix.trim_end_matches('/'))?;
+        // A missing prefix is an empty listing; a missing root is a drive
+        // that is not plugged in. Reading that as empty would make the
+        // target look reached with nothing on it.
+        if !self.root.is_dir() {
+            return Err(StoreError::Unreachable(format!(
+                "{} is not available",
+                self.root.display()
+            )));
+        }
         let mut out = Vec::new();
         let mut seen = std::collections::HashSet::new();
         collect(&base, &self.root, &mut out, &mut seen)?;

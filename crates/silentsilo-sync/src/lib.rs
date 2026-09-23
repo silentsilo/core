@@ -359,6 +359,50 @@ pub async fn sync_ops(
     })
 }
 
+/// The lowest horizon across every target: the right question is whether
+/// *anywhere* still has what this device is missing, not whether the most
+/// compacted target does. Zero means never compacted, the strongest answer.
+/// An unreachable target is skipped rather than treated as zero, or a
+/// device would convince itself it is fine and silently miss records.
+///
+/// A target below the highest horizon counts only if its records reach that
+/// horizon. A drive left unplugged since before the others were compacted
+/// has a low horizon because it is stale, and it does not hold what they
+/// pruned.
+pub async fn lowest_snapshot_horizon(clients: &[&dyn ObjectStore]) -> Result<u64, SyncError> {
+    let mut reached: Vec<(&dyn ObjectStore, u64)> = Vec::new();
+    for client in clients {
+        if let Ok(horizon) = snapshot_horizon(*client).await {
+            reached.push((*client, horizon));
+        }
+    }
+    let Some(highest) = reached.iter().map(|(_, h)| *h).max() else {
+        // Nothing answered. Reporting zero would say "no target has been
+        // compacted", which is a claim, not an observation.
+        return Err(SyncError::Storage(
+            "no backup target could be reached".into(),
+        ));
+    };
+
+    let mut lowest = highest;
+    for (client, horizon) in reached {
+        if horizon >= lowest {
+            continue;
+        }
+        let Ok(listed) = client.list(OPS_PREFIX).await else {
+            continue;
+        };
+        let reaches = listed
+            .iter()
+            .filter_map(|entry| lamport_from_key(&entry.key))
+            .any(|lamport| lamport >= highest);
+        if reaches {
+            lowest = horizon;
+        }
+    }
+    Ok(lowest)
+}
+
 /// Refuses to sync a device that has fallen below the snapshot horizon:
 /// it is about to be rebuilt, and pushing its pending records first would
 /// put changes into the bucket that nobody would ever apply. The bound is
@@ -366,36 +410,6 @@ pub async fn sync_ops(
 /// values are not unique across devices, so a device resting exactly on the
 /// horizon may still be missing records at it, and those objects can no
 /// longer be re-fetched once pruned.
-/// The lowest horizon across every target: the right question is whether
-/// *anywhere* still has what this device is missing, not whether the most
-/// compacted target does. Zero means never compacted, the strongest answer.
-/// An unreachable target is skipped rather than treated as zero, or a
-/// device would convince itself it is fine and silently miss records.
-pub async fn lowest_snapshot_horizon(clients: &[&dyn ObjectStore]) -> Result<u64, SyncError> {
-    let mut lowest: Option<u64> = None;
-    let mut reached = 0;
-
-    for client in clients {
-        let Ok(horizon) = snapshot_horizon(*client).await else {
-            continue;
-        };
-        reached += 1;
-        lowest = Some(match lowest {
-            Some(current) => current.min(horizon),
-            None => horizon,
-        });
-    }
-
-    if reached == 0 {
-        // Nothing answered. Reporting zero would say "no target has been
-        // compacted", which is a claim, not an observation.
-        return Err(SyncError::Storage(
-            "no backup target could be reached".into(),
-        ));
-    }
-    Ok(lowest.unwrap_or(0))
-}
-
 async fn check_horizon(client: &dyn ObjectStore, applied_through: u64) -> Result<(), SyncError> {
     let horizon = lowest_snapshot_horizon(&[client]).await?;
     if horizon > 0 && applied_through <= horizon {
@@ -837,6 +851,11 @@ pub struct SeedOutcome {
     /// unreadable object should not throw away the several hundred gigabytes
     /// that did move.
     pub failed: Vec<(String, String)>,
+    /// Records, snapshots or the KEK envelope that do not open under the
+    /// silo's current key: the source was not rotated with the rest. Left
+    /// behind, or they would overwrite the current ones. Only
+    /// [`seed_target_checked`] counts these.
+    pub stale: usize,
 }
 
 /// Everything a silo keeps in its storage, in the order it is worth
@@ -938,9 +957,42 @@ impl<'a> SeedReporter<'a> {
 /// `cancel` is asked between objects and again on every progress report, so
 /// a stop lands in the middle of a large blob rather than after it.
 /// Stopping is safe: what already landed stays, and the next run skips it.
+///
+/// It trusts the source. A source that missed a rotation puts objects under
+/// the old key over the current ones; the app uses [`seed_target_checked`].
 pub async fn seed_target(
     from: &dyn ObjectStore,
     to: &dyn ObjectStore,
+    progress: &mut (dyn FnMut(SeedProgress) + Send),
+    cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<SeedOutcome, SyncError> {
+    seed(from, to, None, progress, cancel).await
+}
+
+/// [`seed_target`] for a device that holds the silo's key, which decides
+/// what may be written over:
+///
+/// - records, snapshots and the KEK envelope are copied only when they open
+///   under `current`, so an append-only copy that kept the old key cannot
+///   undo a rotation on the other side;
+/// - key envelopes and revocation markers, which `current` does not open,
+///   are copied only where the destination has none; the sync pass that
+///   follows publishes this device's own;
+/// - the manifest likewise, so a newer one is never put back.
+pub async fn seed_target_checked(
+    from: &dyn ObjectStore,
+    to: &dyn ObjectStore,
+    current: &MasterDek,
+    progress: &mut (dyn FnMut(SeedProgress) + Send),
+    cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<SeedOutcome, SyncError> {
+    seed(from, to, Some(current), progress, cancel).await
+}
+
+async fn seed(
+    from: &dyn ObjectStore,
+    to: &dyn ObjectStore,
+    current: Option<&MasterDek>,
     progress: &mut (dyn FnMut(SeedProgress) + Send),
     cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<SeedOutcome, SyncError> {
@@ -998,6 +1050,18 @@ pub async fn seed_target(
             reporter.finish_object();
             continue;
         }
+        let sealed = entry.key.starts_with(OPS_PREFIX)
+            || entry.key.starts_with(SNAPSHOTS_PREFIX)
+            || entry.key == CONTENT_KEK_KEY;
+        if current.is_some()
+            && !sealed
+            && entry.key.starts_with(KEYS_PREFIX)
+            && to.head(&entry.key).await?.is_some()
+        {
+            outcome.skipped += 1;
+            reporter.finish_object();
+            continue;
+        }
 
         let fetched = {
             let mut watch = watcher(&mut reporter, cancel);
@@ -1006,6 +1070,14 @@ pub async fn seed_target(
         };
         match fetched {
             Ok(()) => {
+                if let Some(dek) = current
+                    && sealed
+                    && !opens_under(&staged, dek)
+                {
+                    outcome.stale += 1;
+                    reporter.finish_object();
+                    continue;
+                }
                 let len = std::fs::metadata(&staged).map(|m| m.len()).unwrap_or(0);
                 let sent = {
                     let mut watch = watcher(&mut reporter, cancel);
@@ -1027,6 +1099,15 @@ pub async fn seed_target(
         reporter.finish_object();
     }
 
+    let manifest_size = match manifest_size {
+        Some(size) if current.is_some() && to.head(MANIFEST_KEY).await?.is_some() => {
+            reporter.start_object(size.max(0) as u64);
+            outcome.skipped += 1;
+            reporter.finish_object();
+            None
+        }
+        other => other,
+    };
     if let Some(size) = manifest_size {
         if cancel() {
             return Err(SyncError::Cancelled);
@@ -1050,6 +1131,12 @@ pub async fn seed_target(
 
     reporter.emit(true);
     Ok(outcome)
+}
+
+/// Whether a staged object opens under `dek`. Read whole, as every sealed
+/// object is when it is used.
+fn opens_under(path: &Path, dek: &MasterDek) -> bool {
+    std::fs::read(path).is_ok_and(|bytes| unseal(&bytes, dek).is_ok())
 }
 
 /// The callback a backend reports into: it moves the count along and
@@ -1262,10 +1349,16 @@ pub struct ResealOutcome {
     /// Objects that already opened under the new key, so a pass that was
     /// interrupted picks up where it stopped rather than starting over.
     pub already: usize,
-    /// Objects that opened under neither key, with why. Reported rather than
-    /// raised: one unreadable object must not abandon a rotation halfway,
-    /// which is the state with no good way out.
+    /// Objects that could not be read or written this time, with why.
+    /// Reported rather than raised: one failure must not abandon a rotation
+    /// halfway, which is the state with no good way out. Running again may
+    /// get past them, so a rotation is not finished while any are left.
     pub failed: Vec<(String, String)>,
+    /// Records and snapshots that opened under neither key. Nobody could
+    /// read them before the rotation either, so they are left as they are
+    /// and do not hold it up; a corrupt object would otherwise block it for
+    /// good. The KEK envelope is never here: it lands in `failed`.
+    pub unreadable: Vec<String>,
 }
 
 /// Everything in storage that is sealed under the vault DEK.
@@ -1335,10 +1428,11 @@ pub async fn reseal_under_new_key(
                 },
                 Err(e) => outcome.failed.push((key, e.to_string())),
             },
-            Err(_) => outcome.failed.push((
+            Err(_) if key == CONTENT_KEK_KEY => outcome.failed.push((
                 key,
                 "opens under neither the old key nor the new one".to_string(),
             )),
+            Err(_) => outcome.unreadable.push(key),
         }
         progress(done + 1, total);
     }

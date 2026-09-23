@@ -129,6 +129,29 @@ async fn head_answers_without_moving_the_bytes() {
 }
 
 #[tokio::test]
+async fn a_prefix_read_returns_the_first_bytes_only() {
+    for_each_store(|store| async move {
+        let content: Vec<u8> = (0u8..=255).cycle().take(5000).collect();
+        store.put("blobs/p.sslo", content.clone()).await.unwrap();
+
+        assert_eq!(
+            store.get_prefix("blobs/p.sslo", 82).await.unwrap(),
+            content[..82]
+        );
+        assert_eq!(
+            store.get_prefix("blobs/p.sslo", 9000).await.unwrap(),
+            content,
+            "shorter than asked is the whole object"
+        );
+        assert!(matches!(
+            store.get_prefix("blobs/none.sslo", 82).await,
+            Err(StoreError::NotFound(_))
+        ));
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn listing_is_ordered_by_key() {
     for_each_store(|store| async move {
         // Operation keys are the Lamport counter zero-padded, so
@@ -346,6 +369,18 @@ async fn sftp_refuses_a_server_whose_key_is_not_the_pinned_one() {
         err.to_string().contains("identity has changed"),
         "the message has to say what happened: got {err}"
     );
+}
+
+#[tokio::test]
+async fn a_folder_store_whose_root_is_gone_cannot_be_listed() {
+    // An unplugged drive. Listed as empty, it would count as a target that
+    // was reached and holds nothing.
+    let dir = tempfile::tempdir().unwrap();
+    let store = FolderStore::new(dir.path().join("unplugged"));
+    assert!(matches!(
+        store.list("vault/").await,
+        Err(StoreError::Unreachable(_))
+    ));
 }
 
 #[tokio::test]

@@ -281,6 +281,7 @@ struct OpenTarget {
     /// meant to be append-only should not depend on a bucket policy being
     /// configured correctly for that to hold.
     role: silentsilo_vault::TargetRole,
+    last_success: i64,
 }
 
 /// Syncs one silo, named rather than assumed: more than one can be open,
@@ -378,6 +379,7 @@ pub async fn run_sync_pass(
                     store,
                     owed,
                     role: target.role,
+                    last_success,
                 });
             }
             Err(e) => {
@@ -407,9 +409,38 @@ pub async fn run_sync_pass(
     // records nobody will ever apply, and tell this user their work was
     // saved. The lowest horizon across targets decides it.
     let stores: Vec<&dyn ObjectStore> = targets.iter().map(|t| &*t.store).collect();
-    let horizon = sync::lowest_snapshot_horizon(&stores)
-        .await
-        .map_err(|e| e.to_string())?;
+    let horizon = match sync::lowest_snapshot_horizon(&stores).await {
+        Ok(horizon) => horizon,
+        // Every target opened and none answered: a drive that is not
+        // plugged in, a server that is down. Each one fails and backs off.
+        Err(e) => {
+            let failed: Vec<TargetStatus> = targets
+                .iter()
+                .map(|t| TargetStatus {
+                    id: t.id.to_string(),
+                    label: t.label.clone(),
+                    ops_pushed: 0,
+                    blobs_uploaded: 0,
+                    failed: Some(e.to_string()),
+                    last_success: t.last_success,
+                    retry_in: 0,
+                    waiting: false,
+                    ops_behind: t.owed.len(),
+                })
+                .collect();
+            resting.extend(failed);
+            record_target_outcomes(state, silo, &resting, now)?;
+            return Ok(announce(
+                host,
+                silo,
+                SyncReport {
+                    configured: true,
+                    targets: resting,
+                    ..SyncReport::default()
+                },
+            ));
+        }
+    };
     // What this device received, not the highest record it holds: its own
     // records count in the latter. Before a complete fetch has recorded a
     // watermark, the old bound.
@@ -426,8 +457,13 @@ pub async fn run_sync_pass(
         // The listing's word for the horizon is only a name. Checked against
         // the snapshots themselves before a rebuild is asked for: a copy
         // under a higher name would ask for one on every pass.
+        // Targets whose listing is below `horizon` were left out of it as
+        // stale, and are left out here too.
         let mut verified: Option<u64> = None;
         for target in &targets {
+            if !matches!(sync::snapshot_horizon(&*target.store).await, Ok(h) if h >= horizon) {
+                continue;
+            }
             if let Ok(found) = sync::verified_snapshot_horizon(&*target.store, &dek).await {
                 verified = Some(verified.map_or(found, |v| v.min(found)));
             }

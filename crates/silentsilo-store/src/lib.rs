@@ -127,6 +127,14 @@ pub trait ObjectStore: Send + Sync {
     /// that — blobs are chunk-encrypted files, not streams.
     async fn get(&self, key: &str) -> Result<Vec<u8>, StoreError>;
 
+    /// The first `len` bytes of an object, or all of it when shorter: a
+    /// blob's header without its content. The default reads it whole.
+    async fn get_prefix(&self, key: &str, len: u64) -> Result<Vec<u8>, StoreError> {
+        let mut body = self.get(key).await?;
+        body.truncate(usize::try_from(len).unwrap_or(usize::MAX));
+        Ok(body)
+    }
+
     /// Writes an object from a file on disk. Backends override this to
     /// stream, which is what keeps a blob the size of a video out of
     /// memory; the default is for backends that can only take a buffer.

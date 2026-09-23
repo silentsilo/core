@@ -68,6 +68,10 @@ impl ObjectStore for S3Client {
         S3Client::get(self, key).await.map_err(map)
     }
 
+    async fn get_prefix(&self, key: &str, len: u64) -> Result<Vec<u8>, StoreError> {
+        S3Client::get_prefix(self, key, len).await.map_err(map)
+    }
+
     async fn put_from_file(&self, key: &str, path: &std::path::Path) -> Result<(), StoreError> {
         S3Client::put_file(self, key, path).await.map_err(map)
     }

@@ -898,6 +898,9 @@ async fn the_lowest_horizon_is_the_one_that_counts() {
     put_snapshot(&behind, &dek, &snapshot_at(vault_id, 50))
         .await
         .unwrap();
+    let device = Uuid::new_v4();
+    let records: Vec<OpRecord> = (51..=101).map(|l| record(l, device)).collect();
+    push_ops(&behind, &dek, &records).await.unwrap();
 
     let lowest = silentsilo_sync::lowest_snapshot_horizon(&[&ahead, &behind])
         .await
@@ -912,16 +915,68 @@ async fn a_target_that_has_never_been_compacted_wins() {
     let (_a, compacted) = store();
     let (_b, untouched) = store();
     let dek = generate_dek();
+    let device = Uuid::new_v4();
 
     put_snapshot(&compacted, &dek, &snapshot_at(Uuid::new_v4(), 900))
         .await
         .unwrap();
+    let records: Vec<OpRecord> = (1..=905).map(|l| record(l, device)).collect();
+    push_ops(&untouched, &dek, &records).await.unwrap();
 
     assert_eq!(
         silentsilo_sync::lowest_snapshot_horizon(&[&compacted, &untouched])
             .await
             .unwrap(),
         0
+    );
+}
+
+#[tokio::test]
+async fn a_stale_target_does_not_vouch_for_what_it_never_received() {
+    // A drive left in a drawer since record 40, while the other target went
+    // on and was compacted at 900. Its horizon is 0 because it is stale, and
+    // it does not hold 41 to 900.
+    let (_a, compacted) = store();
+    let (_b, stale) = store();
+    let (_c, empty) = store();
+    let dek = generate_dek();
+    let device = Uuid::new_v4();
+
+    put_snapshot(&compacted, &dek, &snapshot_at(Uuid::new_v4(), 900))
+        .await
+        .unwrap();
+    let records: Vec<OpRecord> = (1..=40).map(|l| record(l, device)).collect();
+    push_ops(&stale, &dek, &records).await.unwrap();
+
+    assert_eq!(
+        silentsilo_sync::lowest_snapshot_horizon(&[&compacted, &stale, &empty])
+            .await
+            .unwrap(),
+        900
+    );
+}
+
+#[tokio::test]
+async fn an_unplugged_drive_is_not_read_as_an_empty_target() {
+    let (_a, compacted) = store();
+    let gone = tempfile::tempdir().unwrap();
+    let unplugged = FolderStore::new(gone.path().join("E-drive"));
+    let dek = generate_dek();
+
+    put_snapshot(&compacted, &dek, &snapshot_at(Uuid::new_v4(), 900))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        silentsilo_sync::lowest_snapshot_horizon(&[&compacted, &unplugged])
+            .await
+            .unwrap(),
+        900
+    );
+    assert!(
+        silentsilo_sync::lowest_snapshot_horizon(&[&unplugged])
+            .await
+            .is_err()
     );
 }
 

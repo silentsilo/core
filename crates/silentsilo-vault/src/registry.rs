@@ -37,7 +37,7 @@ impl SiloEntry {
     /// should show up as unavailable rather than as a silo that fails to
     /// open for reasons nobody can see.
     pub fn is_present(&self) -> bool {
-        self.path.join("vault.db.enc").is_file() || self.path.join("vault.db").is_file()
+        crate::VaultPaths::new(self.path.clone()).exists() || self.path.join("vault.db").is_file()
     }
 }
 
@@ -393,6 +393,8 @@ mod tests {
         assert!(!silo.is_present());
 
         std::fs::create_dir_all(&silo.path).unwrap();
+        std::fs::write(silo.path.join("vault.db.enc.bak"), b"x").unwrap();
+        assert!(silo.is_present(), "the shadow copy alone opens");
         std::fs::write(silo.path.join("vault.db.enc"), b"x").unwrap();
         assert!(silo.is_present());
     }

@@ -37,8 +37,95 @@ pub fn staged_kek_path(root: &Path) -> PathBuf {
 ///
 /// Checked on unlock. The answer being yes is not an error: it means the last
 /// attempt stopped somewhere, and the work in front of it is well defined.
+/// A commit that got past its point of no return is finished first, so it
+/// is not reported as a rotation still to resume.
 pub fn rotation_pending(root: &Path) -> bool {
+    let _ = finish_interrupted_commit(root);
     staged_dek_path(root).exists()
+}
+
+fn staged_keys_path(root: &Path) -> PathBuf {
+    staged(crate::fido_store::fido_keys_path(root))
+}
+
+fn staged_recovery_path(root: &Path) -> PathBuf {
+    staged(crate::recovery::recovery_path(root))
+}
+
+/// Puts a staged rotation in force together with the files that go with it:
+/// the enrolled keys re-wrapped under the new key, and the recovery envelope
+/// made for it.
+///
+/// These used to be written after [`commit_rotation`], by the caller. An
+/// error or a crash in between (a sync client holding a file was enough)
+/// left the new KEK in force, the staged key deleted, and every key and
+/// recovery code still opening the old one: a silo nothing could open again.
+///
+/// Now they are written beside their targets first, as `.next`. Moving the
+/// KEK is the point of no return; everything after it is renames, and a
+/// crash anywhere in them is finished by [`finish_interrupted_commit`], which
+/// needs no key. A crash before it leaves the silo as it was, still pending.
+pub fn commit_rotation_with(
+    root: &Path,
+    keys: &crate::StoredFidoKeys,
+    authority: crate::Authority<'_>,
+    recovery: Option<&crate::RecoveryEnvelope>,
+) -> Result<(), VaultError> {
+    if !staged_kek_path(root).is_file() || !staged_dek_path(root).is_file() {
+        return Err(VaultError::Corrupted("no key change is staged".into()));
+    }
+    crate::fido_store::check_authority(root, keys, authority)?;
+    crate::workdir::write_private(&staged_keys_path(root), &crate::format::encode(keys)?)?;
+    match recovery {
+        Some(envelope) => {
+            let json = serde_json::to_vec_pretty(envelope)
+                .map_err(|e| VaultError::Crypto(e.to_string()))?;
+            crate::workdir::write_private(&staged_recovery_path(root), &json)?;
+        }
+        None => {
+            let _ = std::fs::remove_file(staged_recovery_path(root));
+        }
+    }
+    // The point of no return.
+    silentsilo_core::rename_with_retry(&staged_kek_path(root), &kek_path(root))?;
+    finish_committed(root)
+}
+
+/// Finishes a commit that got past moving the KEK. The staged key is still
+/// on disk while the staged KEK is gone only in that window: staging writes
+/// the KEK first and the key second.
+///
+/// Returns whether there was anything to finish.
+pub fn finish_interrupted_commit(root: &Path) -> Result<bool, VaultError> {
+    if staged_dek_path(root).exists() && !staged_kek_path(root).exists() {
+        finish_committed(root)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn finish_committed(root: &Path) -> Result<(), VaultError> {
+    for (staged, target) in [
+        (
+            staged_keys_path(root),
+            crate::fido_store::fido_keys_path(root),
+        ),
+        (
+            staged_recovery_path(root),
+            crate::recovery::recovery_path(root),
+        ),
+    ] {
+        if staged.is_file() {
+            silentsilo_core::rename_with_retry(&staged, &target)?;
+        }
+    }
+    // Last, because its absence is what says the rotation is over.
+    match std::fs::remove_file(staged_dek_path(root)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+        _ => {}
+    }
+    retire_page_key(root);
+    Ok(())
 }
 
 /// Writes the new key and the re-wrapped KEK without putting either in
@@ -83,10 +170,11 @@ pub fn load_staged_dek(root: &Path, old_dek: &MasterDek) -> Result<MasterDek, Va
     Ok(MasterDek::from_bytes(key))
 }
 
-/// Puts the staged KEK in force and clears the pending marker. The new
-/// key's own envelopes live in `keys/fido.json`, written by the caller
-/// right after this. Rotation does not touch `master.dek.enc`: once a
-/// security key is enrolled, unlock reads each key's envelope from
+/// Puts the staged KEK in force and clears the pending marker, and nothing
+/// else. A client with enrolled keys uses [`commit_rotation_with`] instead:
+/// writing `keys/fido.json` after this leaves a window in which no key and
+/// no recovery code opens the silo. Rotation does not touch `master.dek.enc`:
+/// once a security key is enrolled, unlock reads each key's envelope from
 /// `keys/fido.json` and that file is never consulted.
 pub fn commit_rotation(root: &Path) -> Result<(), VaultError> {
     silentsilo_core::rename_with_retry(&staged_kek_path(root), &kek_path(root))?;
@@ -120,6 +208,8 @@ fn retire_page_key(root: &Path) {
 pub fn discard_staged(root: &Path) {
     let _ = std::fs::remove_file(staged_dek_path(root));
     let _ = std::fs::remove_file(staged_kek_path(root));
+    let _ = std::fs::remove_file(staged_keys_path(root));
+    let _ = std::fs::remove_file(staged_recovery_path(root));
 }
 
 #[cfg(test)]
@@ -136,6 +226,162 @@ mod tests {
         save_dek(dir, &dek, wrap_key).unwrap();
         save_kek(dir, &kek, &dek).unwrap();
         (dek, kek)
+    }
+
+    fn keys(id: &str, wrapped: &str, policy: &str) -> crate::StoredFidoKeys {
+        crate::StoredFidoKeys {
+            keys: vec![crate::StoredFidoCredential {
+                kind: crate::KIND_FIDO2.to_string(),
+                derivation: crate::DERIVATION_HMAC_V1.to_string(),
+                policy: policy.into(),
+                credential_id: id.into(),
+                public_key: "3059".into(),
+                key_slot: 0,
+                rp_id: "silentsilo.com".into(),
+                label: "Key".into(),
+                wrapped_dek: wrapped.into(),
+                platform: false,
+                revoked: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn committing_with_the_keys_puts_all_of_it_in_force_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (old, kek) = silo(dir.path(), &[3u8; 32]);
+        crate::save_fido_keys(dir.path(), &keys("aa", "01", ""), crate::Authority::Machine)
+            .unwrap();
+        let new = generate_dek();
+        stage_rotation(dir.path(), &new, &kek, &old).unwrap();
+        let (_code, envelope) = crate::create_recovery_envelope(&new, &kek).unwrap();
+
+        commit_rotation_with(
+            dir.path(),
+            &keys("aa", "02", ""),
+            crate::Authority::Machine,
+            Some(&envelope),
+        )
+        .unwrap();
+
+        assert!(!rotation_pending(dir.path()));
+        assert_eq!(
+            load_kek(dir.path(), &new).unwrap().as_bytes(),
+            kek.as_bytes()
+        );
+        assert_eq!(
+            crate::load_fido_keys(dir.path()).unwrap().keys[0].wrapped_dek,
+            "02"
+        );
+        assert_eq!(
+            crate::load_recovery_envelope(dir.path())
+                .unwrap()
+                .wrapped_dek,
+            envelope.wrapped_dek
+        );
+        assert!(!staged_keys_path(dir.path()).exists());
+        assert!(!staged_recovery_path(dir.path()).exists());
+    }
+
+    /// The crash this exists for: past the point of no return, before the
+    /// keys moved. The next read of the keys finishes the job, with no key.
+    #[test]
+    fn a_commit_stopped_after_the_kek_moved_finishes_on_the_next_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let (old, kek) = silo(dir.path(), &[3u8; 32]);
+        crate::save_fido_keys(dir.path(), &keys("aa", "01", ""), crate::Authority::Machine)
+            .unwrap();
+        let new = generate_dek();
+        stage_rotation(dir.path(), &new, &kek, &old).unwrap();
+        let (_code, envelope) = crate::create_recovery_envelope(&new, &kek).unwrap();
+
+        // What commit_rotation_with does up to its point of no return.
+        crate::workdir::write_private(
+            &staged_keys_path(dir.path()),
+            &crate::format::encode(&keys("aa", "02", "")).unwrap(),
+        )
+        .unwrap();
+        crate::workdir::write_private(
+            &staged_recovery_path(dir.path()),
+            &serde_json::to_vec_pretty(&envelope).unwrap(),
+        )
+        .unwrap();
+        silentsilo_core::rename_with_retry(&staged_kek_path(dir.path()), &kek_path(dir.path()))
+            .unwrap();
+
+        assert_eq!(
+            crate::load_fido_keys(dir.path()).unwrap().keys[0].wrapped_dek,
+            "02"
+        );
+        assert!(
+            !rotation_pending(dir.path()),
+            "finished, not left to resume"
+        );
+        assert_eq!(
+            crate::load_recovery_envelope(dir.path())
+                .unwrap()
+                .wrapped_dek,
+            envelope.wrapped_dek
+        );
+        assert_eq!(
+            load_kek(dir.path(), &new).unwrap().as_bytes(),
+            kek.as_bytes()
+        );
+    }
+
+    /// Before the KEK moves nothing has changed, and staged files from that
+    /// attempt are not promoted by anyone reading the keys.
+    #[test]
+    fn a_commit_stopped_before_the_kek_moved_leaves_the_old_silo() {
+        let dir = tempfile::tempdir().unwrap();
+        let (old, kek) = silo(dir.path(), &[3u8; 32]);
+        crate::save_fido_keys(dir.path(), &keys("aa", "01", ""), crate::Authority::Machine)
+            .unwrap();
+        stage_rotation(dir.path(), &generate_dek(), &kek, &old).unwrap();
+        crate::workdir::write_private(
+            &staged_keys_path(dir.path()),
+            &crate::format::encode(&keys("aa", "02", "")).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            crate::load_fido_keys(dir.path()).unwrap().keys[0].wrapped_dek,
+            "01"
+        );
+        assert!(rotation_pending(dir.path()));
+        assert_eq!(
+            load_kek(dir.path(), &old).unwrap().as_bytes(),
+            kek.as_bytes()
+        );
+
+        discard_staged(dir.path());
+        assert!(!staged_keys_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn committing_cannot_drop_an_organisation_key_without_its_proof() {
+        let dir = tempfile::tempdir().unwrap();
+        let (old, kek) = silo(dir.path(), &[3u8; 32]);
+        crate::save_fido_keys(
+            dir.path(),
+            &keys("aa", "01", crate::POLICY_ORG),
+            crate::Authority::Machine,
+        )
+        .unwrap();
+        stage_rotation(dir.path(), &generate_dek(), &kek, &old).unwrap();
+
+        let refused = commit_rotation_with(
+            dir.path(),
+            &keys("bb", "02", ""),
+            crate::Authority::Machine,
+            None,
+        );
+        assert!(matches!(refused, Err(VaultError::OrganisationKeyRequired)));
+        assert!(rotation_pending(dir.path()), "nothing moved");
+        assert_eq!(
+            load_kek(dir.path(), &old).unwrap().as_bytes(),
+            kek.as_bytes()
+        );
     }
 
     #[test]

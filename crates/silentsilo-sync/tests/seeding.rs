@@ -8,7 +8,7 @@ use silentsilo_crypto::generate_dek;
 use silentsilo_store::{FolderStore, ObjectStore, Progress, StoreError, StoredObject};
 use silentsilo_sync::{
     BLOBS_PREFIX, MANIFEST_KEY, OPS_PREFIX, SeedProgress, fetch_all_ops_above, push_ops,
-    put_manifest, read_manifest, seed_target,
+    put_manifest, read_manifest, reseal_under_new_key, seed_target, seed_target_checked,
 };
 use silentsilo_vfs::{OpRecord, VaultOp};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -280,6 +280,97 @@ async fn an_object_resealed_at_the_same_size_is_still_copied() {
         b"sealed under the new key".to_vec(),
         "a same-size record was not refreshed"
     );
+}
+
+/// Two copies of one silo after a rotation that reached only one of them:
+/// the append-only copy still holds everything under the old key.
+async fn rotated_pair() -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    FolderStore,
+    FolderStore,
+    silentsilo_crypto::MasterDek,
+) {
+    let stale_dir = tempfile::tempdir().unwrap();
+    let rotated_dir = tempfile::tempdir().unwrap();
+    let stale = FolderStore::new(stale_dir.path().to_path_buf());
+    let rotated = FolderStore::new(rotated_dir.path().to_path_buf());
+    let old = generate_dek();
+    let new = generate_dek();
+
+    populate(&stale as &dyn ObjectStore, &old, Uuid::new_v4()).await;
+    seed_target(&stale, &rotated, &mut |_| {}, &|| false)
+        .await
+        .unwrap();
+    let outcome = reseal_under_new_key(&rotated, &old, &new, &mut |_, _| {})
+        .await
+        .unwrap();
+    assert_eq!(outcome.resealed, 4);
+    (stale_dir, rotated_dir, stale, rotated, new)
+}
+
+#[tokio::test]
+async fn a_checked_seed_does_not_undo_a_rotation() {
+    let (_a, _b, stale, rotated, new) = rotated_pair().await;
+
+    let outcome = seed_target_checked(&stale, &rotated, &new, &mut |_| {}, &|| false)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stale, 4, "{outcome:?}");
+    assert!(outcome.failed.is_empty());
+    let records = fetch_all_ops_above(&rotated, &new, 0).await.unwrap();
+    assert_eq!(
+        records.len(),
+        4,
+        "every record still opens under the new key"
+    );
+}
+
+#[tokio::test]
+async fn a_checked_seed_brings_a_stale_copy_up_to_the_current_key() {
+    let (_a, _b, stale, rotated, new) = rotated_pair().await;
+
+    let outcome = seed_target_checked(&rotated, &stale, &new, &mut |_| {}, &|| false)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stale, 0);
+    assert!(outcome.failed.is_empty());
+    let records = fetch_all_ops_above(&stale, &new, 0).await.unwrap();
+    assert_eq!(records.len(), 4);
+}
+
+#[tokio::test]
+async fn a_checked_seed_leaves_key_envelopes_and_the_manifest_that_are_there() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let dest_dir = tempfile::tempdir().unwrap();
+    let source = FolderStore::new(source_dir.path().to_path_buf());
+    let dest = FolderStore::new(dest_dir.path().to_path_buf());
+    let dek = generate_dek();
+
+    source
+        .put("keys/abc.env", b"older envelope".to_vec())
+        .await
+        .unwrap();
+    source
+        .put("keys/new.env", b"only here".to_vec())
+        .await
+        .unwrap();
+    dest.put("keys/abc.env", b"newer envelope".to_vec())
+        .await
+        .unwrap();
+    put_manifest(&source, Uuid::new_v4()).await.unwrap();
+    let kept = Uuid::new_v4();
+    put_manifest(&dest, kept).await.unwrap();
+
+    seed_target_checked(&source, &dest, &dek, &mut |_| {}, &|| false)
+        .await
+        .unwrap();
+
+    assert_eq!(dest.get("keys/abc.env").await.unwrap(), b"newer envelope");
+    assert_eq!(dest.get("keys/new.env").await.unwrap(), b"only here");
+    assert_eq!(read_manifest(&dest).await.unwrap().unwrap().vault_id, kept);
 }
 
 /// A store that hands its bytes over in pieces with a pause between them,

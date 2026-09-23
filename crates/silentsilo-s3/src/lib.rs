@@ -582,6 +582,31 @@ impl S3Client {
         Ok(bytes.to_vec())
     }
 
+    /// The first `len` bytes of an object, or all of it when shorter.
+    pub async fn get_prefix(&self, key: &str, len: u64) -> Result<Vec<u8>, S3Error> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let output = self
+            .client
+            .get_object()
+            .bucket(&self.config.bucket)
+            .key(self.config.key(key))
+            .range(format!("bytes=0-{}", len - 1))
+            .send()
+            .await
+            .map_err(|e| S3Error::from_sdk("download", e))?;
+
+        let bytes = output
+            .body
+            .collect()
+            .await
+            .map_err(|e| S3Error::Transport(e.to_string()))?;
+        let mut bytes = bytes.to_vec();
+        bytes.truncate(len as usize);
+        Ok(bytes)
+    }
+
     /// `Ok(None)` when the object simply isn't there, which is an expected
     /// state (nothing synced yet) rather than a failure.
     pub async fn head(&self, key: &str) -> Result<Option<i64>, S3Error> {

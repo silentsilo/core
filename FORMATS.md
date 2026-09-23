@@ -112,6 +112,7 @@ in this list; that lives on the machine instead, in the table after this one.
 | Recovery envelope | `keys/recovery.json` | Its own, as above | Its version means the shape of one wrapped key, not the file |
 | Index | `vault.db.enc` | `SCHEMA_VERSION = 3`, `silentsilo-vfs/schema.rs` | Not a format: see below |
 | Index, mid-rotation | `vault.db.enc.next` | Same envelope as `vault.db.enc` | Transient; unlock adopts it, see below |
+| Keys, mid-rotation | `keys/fido.json.next`, `keys/recovery.json.next` | Same as the files they replace | Transient, from core 1.7.0; see below |
 | Base snapshot | `vault_base` table in `vault.db` | `SNAPSHOT_VERSION = 1`, `silentsilo-vfs/snapshot.rs` | Refuses, naming the version |
 
 ## On this machine only
@@ -158,6 +159,19 @@ primary snapshot will not decrypt, `open_database` tries `vault.db.enc.next`
 before the shadow backup, and promotes it if it opens. It is tried under the
 key in force and nothing else, so an abandoned rotation's leftovers under a
 different key are not mistaken for the answer.
+
+### `keys/fido.json.next` and `keys/recovery.json.next`
+
+From core 1.7.0 a rotation writes the re-wrapped keys and the new recovery
+envelope beside their files before it moves the KEK, and renames them after.
+Same content as the files they replace, so nothing new to read. They exist
+only between those steps; the next read of `fido.json` (or the next check for
+a pending rotation) finishes the renames with no key needed.
+
+What an older client does with them: ignores them. It can only meet them
+after a crash inside that window on this machine, and then reads the old
+`fido.json`, whose keys open the old KEK, so the unlock fails. Updating
+finishes the renames. Before 1.7.0 the same crash left nothing to finish.
 
 ## The kind of a key
 
