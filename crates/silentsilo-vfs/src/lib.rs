@@ -18,11 +18,13 @@ pub use oplog::{
     init_oplog_core, init_oplog_derived, mark_delivered, next_lamport, observe_lamport,
     pending_count, pending_count_for, pending_ops, pending_ops_for, rebuild_derived,
     record_target_failure, record_target_success, replay, reset_target_backoff, settle_delivery,
-    target_failures, target_last_success, target_ready, target_retry_in, verify_chains,
+    target_failures, target_last_success, target_ready, target_retry_in, undelivered_own_ops,
+    verify_chains,
 };
 pub use ops::{AttachmentBlob, Vfs, guess_mime};
 pub use schema::{SCHEMA_VERSION, init_schema, root_folder_id_for};
 pub use snapshot::{
     CompactionPolicy, PruneReport, SNAPSHOT_VERSION, Snapshot, base_horizon, capture_at,
-    choose_horizon, compact_local, read_base, referenced_blobs, restore as restore_snapshot,
+    choose_horizon, compact_local, holds_more, read_base, referenced_blobs,
+    restore as restore_snapshot, state_at,
 };

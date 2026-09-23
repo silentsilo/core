@@ -47,6 +47,18 @@ impl RecoveryJoin {
 
 /// Reads the silo a store holds and opens its recovery envelope with `code`.
 /// Everything here can fail without leaving anything behind.
+/// What a refused recovery code says. A code made by a newer version is
+/// told apart from a wrong one: the format rules ask for an explicit "update"
+/// rather than a wrong-code message someone would keep retyping.
+fn code_refused(e: silentsilo_vault::VaultError) -> String {
+    if e.to_string().contains("needs a newer SilentSilo") {
+        "This recovery code was made by a newer version of SilentSilo. Update SilentSilo, then try again."
+            .into()
+    } else {
+        "That recovery code does not match this silo.".into()
+    }
+}
+
 pub async fn recovery_join_begin(
     store: &dyn ObjectStore,
     code: &str,
@@ -54,14 +66,23 @@ pub async fn recovery_join_begin(
     let manifest = sync::read_manifest(store)
         .await
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| "That bucket doesn't hold a silo.".to_string())?;
+        .ok_or_else(|| "That backup storage does not hold a silo.".to_string())?;
     let envelope = sync::fetch_recovery_envelope(store)
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "No recovery code was set up for this silo.".to_string())?;
 
-    let dek = unwrap_with_code(&envelope, code)
-        .map_err(|_| "That recovery code doesn't match this silo.".to_string())?;
+    // Argon2id takes a second of CPU and memory on purpose, so it runs off
+    // the async workers.
+    let (dek, envelope) = {
+        let code = code.to_string();
+        tokio::task::spawn_blocking(move || {
+            unwrap_with_code(&envelope, &code).map(|dek| (dek, envelope))
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(code_refused)?
+    };
     Ok(RecoveryJoin {
         vault_id: manifest.vault_id,
         dek,
@@ -106,7 +127,7 @@ pub async fn key_join_begin(store: &dyn ObjectStore) -> Result<KeyJoinOffer, Str
     let manifest = sync::read_manifest(store)
         .await
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| "That bucket doesn't hold a silo.".to_string())?;
+        .ok_or_else(|| "That backup storage does not hold a silo.".to_string())?;
     let keys = sync::fetch_key_envelopes(store)
         .await
         .map_err(|e| e.to_string())?;
@@ -284,11 +305,10 @@ pub fn open_with_recovery(
     code: &str,
     expected_vault_id: Uuid,
 ) -> Result<(VaultSession, VaultMeta), String> {
-    let dek = unwrap_with_code(envelope, code)
-        .map_err(|_| "That recovery code doesn't match this silo.".to_string())?;
+    let dek = unwrap_with_code(envelope, code).map_err(code_refused)?;
     let session = VaultSession::open_with_dek(root, dek).map_err(|e| e.to_string())?;
     if session.vault_id != expected_vault_id {
-        return Err("vault id mismatch".into());
+        return Err("That recovery code opens a different silo.".into());
     }
     let vfs = Vfs::new(&session);
     vfs.ensure_initialized().map_err(|e| e.to_string())?;

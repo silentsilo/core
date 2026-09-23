@@ -514,7 +514,9 @@ fn act(vfs: &Vfs, conn: &Connection, rng: &mut Rng) -> String {
             let segments: Vec<String> = (0..1 + rng.below(2))
                 .map(|_| rng.pick(FOLDER_NAMES).unwrap().to_string())
                 .collect();
-            let r = vfs.ensure_folder_path(&segments).map(|f| f.path);
+            let r = vfs
+                .ensure_folder_path(&segments, Uuid::from_u128(rng.next() as u128))
+                .map(|f| f.path);
             format!("folder path {segments:?}: {r:?}")
         }
     }

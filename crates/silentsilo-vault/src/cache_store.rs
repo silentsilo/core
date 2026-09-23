@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -376,6 +376,61 @@ pub fn enforce_cache_limit(vault_root: &Path, max_bytes: u64) -> Result<Vec<Uuid
 /// a file has been permanently deleted (trash emptied) and its blob no
 /// longer belongs anywhere, unlike `enforce_cache_limit` which only evicts
 /// already-synced blobs to free up space.
+/// What emptying the trash does with a blob nothing here references any
+/// more. It leaves this device only once some copy holds it: until then it
+/// is the only copy of content another device can still keep, an edit the
+/// purge's author had not seen (`oplog::settle_kept_edits`), and removing it
+/// lost that edit everywhere. The next pass uploads it, and the storage
+/// sweep takes it after its grace. A silo with no backup storage has no
+/// other device, so there it goes at once.
+pub fn release_purged_blob(
+    vault_root: &Path,
+    blob_id: Uuid,
+    has_storage: bool,
+) -> Result<(), VaultError> {
+    if has_storage {
+        let conn = open_cache_db(vault_root)?;
+        let synced: Option<i64> = conn
+            .query_row(
+                "SELECT synced FROM blob_cache WHERE blob_id = ?1",
+                params![blob_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if synced == Some(0) {
+            return Ok(());
+        }
+    }
+    remove_blob_from_cache(vault_root, blob_id)
+}
+
+/// Removes local content nothing here references once every copy holds it:
+/// what [`release_purged_blob`] kept for the push, after the push. Safe
+/// whatever the reference set says, since every copy has these bytes, the
+/// way eviction is.
+pub fn drop_delivered_unreferenced(
+    vault_root: &Path,
+    referenced: &std::collections::HashSet<Uuid>,
+) -> Result<usize, VaultError> {
+    let conn = open_cache_db(vault_root)?;
+    let mut stmt = conn.prepare("SELECT blob_id FROM blob_cache WHERE synced = 1")?;
+    let delivered: Vec<Uuid> = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .filter_map(|r| r.ok())
+        .filter_map(|id| Uuid::parse_str(&id).ok())
+        .collect();
+    drop(stmt);
+    drop(conn);
+    let mut dropped = 0;
+    for blob_id in delivered {
+        if !referenced.contains(&blob_id) {
+            remove_blob_from_cache(vault_root, blob_id)?;
+            dropped += 1;
+        }
+    }
+    Ok(dropped)
+}
+
 pub fn remove_blob_from_cache(vault_root: &Path, blob_id: Uuid) -> Result<(), VaultError> {
     let path = blobs_dir(vault_root).join(format!("{blob_id}.sslo"));
     let _ = std::fs::remove_file(&path);

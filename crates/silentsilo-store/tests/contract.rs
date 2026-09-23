@@ -384,6 +384,26 @@ async fn a_folder_store_whose_root_is_gone_cannot_be_listed() {
 }
 
 #[tokio::test]
+async fn a_folder_store_whose_root_is_gone_writes_nothing() {
+    // A write used to recreate the root, and the pass then filled it as a
+    // new, empty copy. Only `check`, run while the user adds the place,
+    // creates it.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("unplugged");
+    let store = FolderStore::new(root.clone());
+    let unreachable = |r: Result<(), StoreError>| matches!(r, Err(StoreError::Unreachable(_)));
+    assert!(unreachable(store.put("vault/ops/1", vec![1]).await));
+    assert!(unreachable(store.delete("vault/ops/1").await));
+    assert!(unreachable(store.head("vault/ops/1").await.map(|_| ())));
+    assert!(unreachable(store.get("vault/ops/1").await.map(|_| ())));
+    assert!(!root.exists());
+
+    store.check().await.unwrap();
+    assert!(root.is_dir());
+    store.put("vault/ops/1", vec![1]).await.unwrap();
+}
+
+#[tokio::test]
 async fn a_folder_store_refuses_a_key_that_climbs_out_of_it() {
     // Only reachable through a bug or a tampered silo, but this is the one
     // backend where a bad key becomes a write anywhere on the user's disk.

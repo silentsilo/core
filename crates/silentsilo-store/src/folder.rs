@@ -34,6 +34,7 @@ impl FolderStore {
     /// this is the one backend where a bad key becomes a write anywhere on
     /// the user's disk, so it is checked rather than assumed.
     fn path_for(&self, key: &str) -> Result<PathBuf, StoreError> {
+        self.reachable()?;
         let relative = PathBuf::from(key.replace('\\', "/"));
         if relative
             .components()
@@ -42,6 +43,20 @@ impl FolderStore {
             return Err(StoreError::Other(format!("refusing unsafe key: {key}")));
         }
         Ok(self.root.join(relative))
+    }
+
+    /// A missing root is a drive that is not plugged in, for every call. A
+    /// read would take it for an empty copy and a write would recreate it
+    /// and start filling it as one.
+    fn reachable(&self) -> Result<(), StoreError> {
+        if self.root.is_dir() {
+            Ok(())
+        } else {
+            Err(StoreError::Unreachable(format!(
+                "{} is not available",
+                self.root.display()
+            )))
+        }
     }
 
     fn map_io(err: std::io::Error, what: &str) -> StoreError {
@@ -180,16 +195,9 @@ impl ObjectStore for FolderStore {
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<StoredObject>, StoreError> {
+        // A missing prefix is an empty listing; a missing root is refused
+        // by `path_for`.
         let base = self.path_for(prefix.trim_end_matches('/'))?;
-        // A missing prefix is an empty listing; a missing root is a drive
-        // that is not plugged in. Reading that as empty would make the
-        // target look reached with nothing on it.
-        if !self.root.is_dir() {
-            return Err(StoreError::Unreachable(format!(
-                "{} is not available",
-                self.root.display()
-            )));
-        }
         let mut out = Vec::new();
         let mut seen = std::collections::HashSet::new();
         collect(&base, &self.root, &mut out, &mut seen)?;
@@ -202,6 +210,14 @@ impl ObjectStore for FolderStore {
 
     fn describe(&self) -> String {
         self.root.display().to_string()
+    }
+
+    /// The one call that creates the root: the user is adding or testing
+    /// this place, so a folder not made yet is expected, where during a
+    /// pass it means the drive is gone.
+    async fn check(&self) -> Result<(), StoreError> {
+        std::fs::create_dir_all(&self.root).map_err(|e| Self::map_io(e, "the folder"))?;
+        crate::probe(self).await
     }
 }
 

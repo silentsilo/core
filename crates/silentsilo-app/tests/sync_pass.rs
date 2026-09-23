@@ -260,6 +260,52 @@ async fn pressing_sync_clears_the_backoff() {
 }
 
 #[tokio::test]
+async fn a_never_delete_copy_on_the_old_key_does_not_send_the_device_to_rejoin() {
+    // A key replacement leaves never-delete copies alone, so to a device on
+    // the new key they look rotated. Listed first, it used to decide.
+    let archive = tempfile::tempdir().unwrap();
+    let working = tempfile::tempdir().unwrap();
+    let device = Device::new(Uuid::new_v4(), None);
+    *device.host.targets.lock().unwrap() = vec![
+        folder_target(archive.path().to_path_buf(), TargetRole::Archive),
+        folder_target(working.path().to_path_buf(), TargetRole::Working),
+    ];
+    device.make_folder("Documents");
+    let first = device.pass().await;
+    assert!(!first.needs_rejoin, "{first:?}");
+
+    // What the old key left on the archive: its own envelope, and a record
+    // newer than anything this device can read.
+    let old = silentsilo_crypto::generate_dek();
+    let store = silentsilo_store::FolderStore::new(archive.path().to_path_buf());
+    std::fs::write(
+        archive.path().join(silentsilo_sync::CONTENT_KEK_KEY),
+        silentsilo_crypto::seal(b"old envelope", &old).unwrap(),
+    )
+    .unwrap();
+    let record = silentsilo_vfs::OpRecord::authored(
+        Uuid::new_v4(),
+        9_999_999,
+        Uuid::new_v4(),
+        1_700_000_000,
+        9_999_999,
+        None,
+        silentsilo_vfs::VaultOp::CreateFolder {
+            id: Uuid::new_v4(),
+            parent_id: Uuid::new_v4(),
+            name: "old".into(),
+        },
+    );
+    silentsilo_sync::push_ops(&store, &old, &[record])
+        .await
+        .unwrap();
+
+    let second = device.pass().await;
+    assert!(!second.needs_rejoin, "{second:?}");
+    assert!(!second.key_material_replaced, "{second:?}");
+}
+
+#[tokio::test]
 async fn one_target_failing_does_not_mark_the_other_as_behind() {
     let good = tempfile::tempdir().unwrap();
     let dir = tempfile::tempdir().unwrap();
@@ -321,6 +367,72 @@ async fn a_pass_that_could_not_read_every_record_neither_sweeps_nor_compacts() {
     let report = device.pass().await;
     assert!(report.unreadable.is_empty(), "{report:?}");
     assert!(candidates(&device).contains(&orphan));
+}
+
+#[tokio::test]
+async fn records_sent_late_and_compacted_at_once_send_the_others_to_rebuild() {
+    // C wrote a folder offline, under a Lamport value A and B had long
+    // passed. Back online, it pushed and compacted in the same pass, before
+    // B fetched the record. B's received mark was above the horizon, so it
+    // never saw the folder and never knew it was missing anything.
+    let storage = tempfile::tempdir().unwrap();
+    let target = || folder_target(storage.path().to_path_buf(), TargetRole::Working);
+    let a = Device::new(Uuid::new_v4(), None);
+    let b = Device::new(a.vault_id(), Some(a.keys()));
+    let c = Device::new(a.vault_id(), Some(a.keys()));
+    for d in [&a, &b, &c] {
+        *d.host.targets.lock().unwrap() = vec![target()];
+    }
+    a.make_folder("Shared");
+    a.pass().await;
+    b.pass().await;
+    c.pass().await;
+
+    c.make_folder("Offline");
+    for i in 0..20 {
+        a.make_folder(&format!("A{i}"));
+    }
+    a.pass().await;
+    b.pass().await;
+
+    c.pass().await;
+    let dek = c.keys().0;
+    let snapshot = {
+        let sessions = c.state.sessions.lock().unwrap();
+        let session = &sessions[&c.silo.id];
+        let policy = silentsilo_vfs::CompactionPolicy {
+            retain_seconds: 0,
+            keep_recent: 1,
+            min_records: 0,
+        };
+        silentsilo_sync::plan_compaction(&session.conn, session.vault_id, &policy, i64::MAX / 4)
+            .unwrap()
+            .expect("a horizon")
+    };
+    let store = silentsilo_store::FolderStore::new(storage.path().to_path_buf());
+    silentsilo_sync::publish_compaction(&store, &dek, &snapshot, true)
+        .await
+        .unwrap();
+
+    let report = b.pass().await;
+    assert!(report.needs_rebuild, "{report:?}");
+    assert!(a.pass().await.needs_rebuild, "A missed it too");
+    assert!(
+        !c.pass().await.needs_rebuild,
+        "C agrees with its own snapshot"
+    );
+
+    let (snapshot, incoming) = silentsilo_sync::fetch_rebuild(&store, &dek)
+        .await
+        .unwrap()
+        .unwrap();
+    {
+        let mut sessions = b.state.sessions.lock().unwrap();
+        let session = sessions.get_mut(&b.silo.id).unwrap();
+        silentsilo_sync::apply_rebuild(&mut session.conn, &snapshot, incoming).unwrap();
+    }
+    assert!(b.folder_names().contains(&"Offline".to_string()));
+    assert!(!b.pass().await.needs_rebuild);
 }
 
 #[tokio::test]
@@ -467,4 +579,93 @@ async fn a_recovery_code_turned_off_stays_off_on_a_device_that_had_not_heard() {
             .salt,
         new.salt
     );
+}
+
+impl Device {
+    /// Imports a file, trashes it and purges it before any push, the way a
+    /// file edited and then deleted between two passes goes. Returns the
+    /// content it was the last reference to.
+    fn import_and_purge(&self) -> Uuid {
+        let root = {
+            let sessions = self.state.sessions.lock().unwrap();
+            Vfs::new(&sessions[&self.silo.id]).root_folder_id().unwrap()
+        };
+        let file = silentsilo_app::files::import_file(
+            &self.state,
+            &self.silo,
+            root,
+            &mut &b"edited, then deleted"[..],
+            "note.md",
+            None,
+        )
+        .unwrap();
+        let blobs = {
+            let sessions = self.state.sessions.lock().unwrap();
+            let vfs = Vfs::new(&sessions[&self.silo.id]);
+            vfs.trash_file(file.id).unwrap();
+            vfs.empty_trash().unwrap().1
+        };
+        assert_eq!(blobs, vec![file.blob_id]);
+        silentsilo_app::files::release_purged_blobs(
+            &self.host,
+            self.silo.id,
+            &self.silo.path,
+            &blobs,
+        );
+        file.blob_id
+    }
+
+    fn holds_blob(&self, blob: Uuid) -> bool {
+        silentsilo_vault::VaultPaths::new(self.silo.path.clone())
+            .blob_path(blob)
+            .is_file()
+    }
+}
+
+fn storage_holds_blob(storage: &std::path::Path, blob: Uuid) -> bool {
+    let name = format!("{blob}.sslo");
+    walk(storage)
+        .iter()
+        .any(|p| p.file_name().is_some_and(|n| n == name.as_str()))
+}
+
+fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(walk(&path));
+        } else {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// A device that has not seen this purge can still keep a file pointing at
+/// this content (an edit the purge's author had not seen), so it has to
+/// reach storage before it leaves the device. Removed at once, it was in
+/// none of the copies and the file could never be opened again.
+#[tokio::test]
+async fn content_purged_before_it_was_pushed_still_reaches_storage_first() {
+    let storage = tempfile::tempdir().unwrap();
+    let device = Device::new(Uuid::new_v4(), None);
+    *device.host.targets.lock().unwrap() = vec![folder_target(
+        storage.path().to_path_buf(),
+        TargetRole::Working,
+    )];
+
+    let blob = device.import_and_purge();
+    assert!(device.holds_blob(blob), "kept until a copy has it");
+
+    device.pass().await;
+    assert!(storage_holds_blob(storage.path(), blob), "pushed");
+    assert!(!device.holds_blob(blob), "and gone from here once it was");
+}
+
+#[tokio::test]
+async fn content_purged_on_a_silo_with_no_storage_goes_at_once() {
+    let device = Device::new(Uuid::new_v4(), None);
+    let blob = device.import_and_purge();
+    assert!(!device.holds_blob(blob), "no other device can want it");
 }

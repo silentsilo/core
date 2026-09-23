@@ -370,3 +370,58 @@ async fn a_cancelled_check_stops_and_says_so() {
 
     assert!(matches!(result, Err(silentsilo_sync::SyncError::Cancelled)));
 }
+
+/// Some WebDAV servers list every object with a size of 0.
+struct SizelessListing(FolderStore);
+
+#[async_trait::async_trait]
+impl ObjectStore for SizelessListing {
+    async fn put(&self, key: &str, body: Vec<u8>) -> Result<(), silentsilo_store::StoreError> {
+        self.0.put(key, body).await
+    }
+    async fn get(&self, key: &str) -> Result<Vec<u8>, silentsilo_store::StoreError> {
+        self.0.get(key).await
+    }
+    async fn head(&self, key: &str) -> Result<Option<i64>, silentsilo_store::StoreError> {
+        self.0.head(key).await
+    }
+    async fn delete(&self, key: &str) -> Result<(), silentsilo_store::StoreError> {
+        self.0.delete(key).await
+    }
+    async fn list(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<silentsilo_store::StoredObject>, silentsilo_store::StoreError> {
+        let mut listed = self.0.list(prefix).await?;
+        for object in &mut listed {
+            object.size = 0;
+        }
+        Ok(listed)
+    }
+    fn describe(&self) -> String {
+        self.0.describe()
+    }
+}
+
+#[tokio::test]
+async fn a_listing_without_sizes_is_asked_again_before_anything_is_called_damaged() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SizelessListing(FolderStore::new(dir.path().to_path_buf()));
+    let dek = generate_dek();
+    let (expected, keys) = populate(&store.0 as &dyn ObjectStore, &dek).await;
+
+    let report = verify_against(
+        &store as &dyn ObjectStore,
+        &dek,
+        &expected,
+        VerifyDepth::Listing,
+        &mut opener(keys),
+        &mut |_, _| {},
+        &|| false,
+    )
+    .await
+    .unwrap();
+
+    assert!(report.is_sound(), "{report:?}");
+    assert_eq!(report.blobs_checked, 3);
+}

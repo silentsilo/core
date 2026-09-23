@@ -1,0 +1,82 @@
+[package]
+name = "silentsilo-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "AGPL-3.0-or-later"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["rt"] }
+uuid = { version = "1", features = ["v4"] }
+silentsilo-crypto = { path = "../crates/silentsilo-crypto" }
+silentsilo-store = { path = "../crates/silentsilo-store" }
+silentsilo-sync = { path = "../crates/silentsilo-sync" }
+silentsilo-vault = { path = "../crates/silentsilo-vault" }
+silentsilo-vfs = { path = "../crates/silentsilo-vfs" }
+
+# Its own workspace: cargo-fuzz builds with nightly and sanitizers, which
+# the main workspace never should.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "sealed"
+path = "fuzz_targets/sealed.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "blob"
+path = "fuzz_targets/blob.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "op_record"
+path = "fuzz_targets/op_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snapshot"
+path = "fuzz_targets/snapshot.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "silo_files"
+path = "fuzz_targets/silo_files.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "manifest"
+path = "fuzz_targets/manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "inbox"
+path = "fuzz_targets/inbox.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "signature"
+path = "fuzz_targets/signature.rs"
+test = false
+doc = false
+bench = false

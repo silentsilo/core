@@ -201,3 +201,25 @@ pub fn import_file(
         )
         .map_err(|e| e.to_string())
 }
+
+/// What a purge leaves of the content it was the last reference to here.
+/// Content no copy holds yet stays until a push has sent it, since a device
+/// that has not seen this purge may still keep a file pointing at it; the
+/// pass removes it afterwards. Errors are logged: nothing is lost by
+/// leaving a file behind.
+pub fn release_purged_blobs(
+    host: &dyn Host,
+    silo_id: Uuid,
+    root: &std::path::Path,
+    blob_ids: &[Uuid],
+) {
+    let has_storage = !host.targets(silo_id).is_empty();
+    for blob_id in blob_ids {
+        if let Err(e) = silentsilo_vault::release_purged_blob(root, *blob_id, has_storage) {
+            host.warn(
+                "purge",
+                &format!("blob {blob_id} left in the local cache: {e}"),
+            );
+        }
+    }
+}

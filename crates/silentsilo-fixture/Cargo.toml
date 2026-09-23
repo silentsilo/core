@@ -28,6 +28,13 @@ silentsilo-sync-v1_0_0 = { package = "silentsilo-sync", git = "https://github.co
 silentsilo-store-v1_0_0 = { package = "silentsilo-store", git = "https://github.com/silentsilo/core", tag = "v1.0.0" }
 silentsilo-crypto-v1_0_0 = { package = "silentsilo-crypto", git = "https://github.com/silentsilo/core", tag = "v1.0.0" }
 silentsilo-vfs-v1_0_0 = { package = "silentsilo-vfs", git = "https://github.com/silentsilo/core", tag = "v1.0.0" }
+# The core desktop 1.1.0 and Android 1.1.0 ship, sync pass included.
+silentsilo-app-v1_6_1 = { package = "silentsilo-app", git = "https://github.com/silentsilo/core", tag = "v1.6.1" }
+silentsilo-vault-v1_6_1 = { package = "silentsilo-vault", git = "https://github.com/silentsilo/core", tag = "v1.6.1" }
+silentsilo-sync-v1_6_1 = { package = "silentsilo-sync", git = "https://github.com/silentsilo/core", tag = "v1.6.1" }
+silentsilo-store-v1_6_1 = { package = "silentsilo-store", git = "https://github.com/silentsilo/core", tag = "v1.6.1" }
+silentsilo-crypto-v1_6_1 = { package = "silentsilo-crypto", git = "https://github.com/silentsilo/core", tag = "v1.6.1" }
+silentsilo-vfs-v1_6_1 = { package = "silentsilo-vfs", git = "https://github.com/silentsilo/core", tag = "v1.6.1" }
 silentsilo-app = { workspace = true }
 hex = "0.4"
 blake3 = { workspace = true }

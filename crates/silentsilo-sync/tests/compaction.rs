@@ -40,6 +40,7 @@ fn snapshot_at(vault_id: Uuid, horizon: u64) -> Snapshot {
         passwords: Vec::new(),
         name_claims: Vec::new(),
         device_labels: Vec::new(),
+        purged: Default::default(),
     }
 }
 
@@ -381,6 +382,31 @@ async fn rebuilding_from_the_snapshot_catches_the_device_up() {
 }
 
 #[tokio::test]
+async fn a_rebuild_writes_again_only_what_no_copy_holds() {
+    // Beside a copy that never answers, `pushed` stays unset on every
+    // record, other devices' included. A rebuild wrote all of them again as
+    // new changes on top of the snapshot, replaying old history as current.
+    let (_dir, store, dek, awake, mut asleep, _) = silo_compacted_behind_a_sleeping_device().await;
+    asleep
+        .conn()
+        .execute("UPDATE oplog SET pushed = 0", [])
+        .unwrap();
+    asleep.author(added(asleep.root(), "offline.txt"));
+
+    let (snapshot, incoming) = fetch_rebuild(&store, &dek).await.unwrap().unwrap();
+    let outcome = apply_rebuild(&mut asleep.session.conn, &snapshot, incoming).unwrap();
+
+    assert_eq!(
+        outcome.kept_local, 1,
+        "only the offline change is written again"
+    );
+    let mut expected = awake.tree();
+    expected.push("file /::offline.txt".to_string());
+    expected.sort();
+    assert_eq!(asleep.tree(), expected);
+}
+
+#[tokio::test]
 async fn a_rebuilt_device_can_sync_again_and_be_followed() {
     let (_dir, store, dek, awake, mut asleep, _) = silo_compacted_behind_a_sleeping_device().await;
     rebootstrap_from_snapshot(&mut asleep.session.conn, &store, &dek)
@@ -558,6 +584,32 @@ async fn a_blob_comes_from_whichever_copy_holds_it() {
     // Nobody has it: the error names the fact rather than pretending.
     let absent = silentsilo_sync::fetch_blob_from_any(&stores, vault.path(), Uuid::new_v4()).await;
     assert!(absent.is_err());
+}
+
+#[tokio::test]
+async fn content_is_written_off_only_when_every_copy_answered_without_it() {
+    // A copy that did not answer may hold it. Written off anyway, the file
+    // would read as lost on this device until someone cleared the mark.
+    let (_dir_a, empty) = store();
+    let gone = tempfile::tempdir().unwrap();
+    let unplugged = FolderStore::new(gone.path().join("unplugged"));
+    let vault = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(vault.path().join("blobs")).unwrap();
+    let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+
+    let blob = Uuid::new_v4();
+    let with_unplugged: Vec<(Uuid, &dyn ObjectStore)> = vec![(a, &empty), (b, &unplugged)];
+    let result =
+        silentsilo_sync::fetch_blob_from_targets(&with_unplugged, vault.path(), blob, true).await;
+    assert!(result.is_err());
+    assert!(!silentsilo_vault::list_absent_blob_ids(vault.path()).contains(&blob));
+
+    let (_dir_b, also_empty) = store();
+    let answering: Vec<(Uuid, &dyn ObjectStore)> = vec![(a, &empty), (b, &also_empty)];
+    let result =
+        silentsilo_sync::fetch_blob_from_targets(&answering, vault.path(), blob, true).await;
+    assert!(result.is_err());
+    assert!(silentsilo_vault::list_absent_blob_ids(vault.path()).contains(&blob));
 }
 
 #[tokio::test]

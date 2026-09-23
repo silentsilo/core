@@ -126,7 +126,7 @@ impl Setup {
         for item in &scan.ready {
             if !vfs.file_id_known(item.item_id).unwrap() {
                 stage_item(&self.store, item).await.unwrap();
-                let folder = vfs.ensure_folder_path(&item.folder).unwrap();
+                let folder = vfs.ensure_folder_path(&item.folder, item.item_id).unwrap();
                 vfs.record_imported_file(
                     item.item_id,
                     folder.id,
@@ -217,7 +217,7 @@ async fn an_envelope_left_without_its_content_is_cleared_once_recorded() {
     let item = &scan.ready[0];
     stage_item(&s.store, item).await.unwrap();
     let vfs = Vfs::new(&s.session);
-    let folder = vfs.ensure_folder_path(&item.folder).unwrap();
+    let folder = vfs.ensure_folder_path(&item.folder, item.item_id).unwrap();
     vfs.record_imported_file(
         item.item_id,
         folder.id,

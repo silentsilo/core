@@ -109,6 +109,8 @@ pub struct SyncProgress {
     /// The file this step moves, when it is one the silo lists.
     pub file_id: Option<String>,
     pub name: Option<String>,
+    /// The copy an upload is going to, when there is more than one.
+    pub target: Option<String>,
 }
 
 /// Tells the interface where the pass is. A blob is named by the file it
@@ -128,6 +130,7 @@ fn report_progress(
     step: ProgressStep,
     blob_id: Option<Uuid>,
     named: &mut Option<(Uuid, Option<(Uuid, String)>)>,
+    target: Option<&str>,
 ) {
     let file = match blob_id {
         None => None,
@@ -152,6 +155,7 @@ fn report_progress(
         bytes_total: step.bytes_total,
         file_id: file.as_ref().map(|(id, _)| id.to_string()),
         name: file.map(|(_, name)| name),
+        target: target.map(str::to_string),
     }));
 }
 
@@ -321,7 +325,7 @@ pub async fn run_sync_pass(
         let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
         let session = sessions
             .get(&silo.id)
-            .ok_or_else(|| "Unlock the silo before syncing".to_string())?;
+            .ok_or_else(|| "Unlock the silo before syncing.".to_string())?;
         let conn = &session.conn;
 
         let mut due = Vec::new();
@@ -470,6 +474,13 @@ pub async fn run_sync_pass(
         }
         behind = verified.is_some_and(|v| v > local_horizon && known_through <= v);
     }
+    // The received mark can pass a horizon that still hides records this
+    // device never saw: written offline long ago, sent late, and folded into
+    // a snapshot and pruned before it fetched them. Once per new horizon,
+    // what its own log says is held against the snapshot.
+    if !behind && horizon > local_horizon {
+        behind = missed_below_horizon(state, silo, &targets, &dek, vault_id, local_horizon).await?;
+    }
     if behind {
         return Ok(announce(
             host,
@@ -485,53 +496,106 @@ pub async fn run_sync_pass(
     // Also before anything is sent: a device whose key was rotated away on
     // another machine must not push. Its records would be sealed under a
     // key nobody else holds, and its stale KEK envelope would overwrite the
-    // rotated one in the bucket. The first target that answers decides.
+    // rotated one in the bucket. Every copy that answers is asked and the
+    // gravest answer wins: a copy that missed the rotation still says
+    // current, and letting it decide pushed its stale envelope over the
+    // rotated one.
+    //
+    // Never-delete copies vote only on a silo that has no other kind. A
+    // rotation does not touch them, so to a device on the new key they
+    // always look rotated: counting them sent that device to rejoin in a
+    // loop, and letting them decide while the working copy was unplugged
+    // did the same.
+    let has_working = configured.iter().any(|t| t.role.allows_delete());
+    let mut states = Vec::new();
+    let mut archive_states = Vec::new();
+    let mut retired: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
     for target in &targets {
-        match sync::kek_envelope_state(&*target.store, &dek).await {
-            Ok(sync::KekState::Rotated) => {
-                return Ok(announce(
-                    host,
-                    silo,
-                    SyncReport {
-                        configured: true,
-                        needs_rejoin: true,
-                        ..SyncReport::default()
-                    },
-                ));
+        // Unreachable: it has no say, and the push below fails on it.
+        let Ok(state) = sync::kek_envelope_state(&*target.store, &dek).await else {
+            continue;
+        };
+        // Records here open under this key and the content key does not,
+        // which no rotation produces.
+        if state == sync::KekState::Replaced {
+            host.warn(
+                "keys",
+                &format!(
+                    "{}: the silo's content key there does not open with this device's key, \
+                     while the records beside it do. A rotation cannot do that, so the object \
+                     was replaced or put back from an older copy. Nothing was sent.",
+                    target.label
+                ),
+            );
+        }
+        if target.role.allows_delete() {
+            states.push(state);
+        } else {
+            if has_working && state == sync::KekState::Rotated {
+                retired.insert(target.id);
             }
-            // Records here open under this key and the content key does
-            // not, which no rotation produces. Rejoining reads the same
-            // object, so telling the user to rejoin would send them round a
-            // loop that cannot end.
-            Ok(sync::KekState::Replaced) => {
-                host.warn(
-                    "keys",
-                    &format!(
-                        "{}: the silo's content key there does not open with this device's key, \
-                         while the records beside it do. A rotation cannot do that, so the object \
-                         was replaced or put back from an older copy. Nothing was sent.",
-                        target.label
-                    ),
-                );
-                return Ok(announce(
-                    host,
-                    silo,
-                    SyncReport {
-                        configured: true,
-                        key_material_replaced: true,
-                        ..SyncReport::default()
-                    },
-                ));
-            }
-            Ok(sync::KekState::Current) => break,
-            // Nothing there to compare against: a new silo, or a copy caught
-            // between the removal and the rename of an SFTP overwrite. The
-            // next copy is asked rather than taking that as an answer.
-            Ok(sync::KekState::Absent) => continue,
-            // Unreachable: ask the next copy rather than deciding blind.
-            Err(_) => continue,
+            archive_states.push(state);
         }
     }
+    let deciding = if has_working {
+        gravest_kek_state(&states)
+    } else {
+        archive_states.first().copied()
+    };
+    match deciding {
+        Some(sync::KekState::Rotated) => {
+            return Ok(announce(
+                host,
+                silo,
+                SyncReport {
+                    configured: true,
+                    needs_rejoin: true,
+                    ..SyncReport::default()
+                },
+            ));
+        }
+        // Rejoining reads the same object, so telling the user to rejoin
+        // would send them round a loop that cannot end.
+        Some(sync::KekState::Replaced) => {
+            return Ok(announce(
+                host,
+                silo,
+                SyncReport {
+                    configured: true,
+                    key_material_replaced: true,
+                    ..SyncReport::default()
+                },
+            ));
+        }
+        // Current somewhere and nothing worse, or nothing to compare against
+        // yet (a new silo, a copy caught mid-overwrite).
+        _ => {}
+    }
+
+    // A never-delete copy that does not open under this key, on a silo with
+    // working copies, was left under the key a replacement retired. It
+    // takes nothing from this key again, so it is left out of the pass
+    // rather than failed and waited on: waiting held the inbox, the sweep
+    // and compaction for as long as it stayed configured.
+    let mut retired_statuses = Vec::new();
+    targets.retain(|t| {
+        if !retired.contains(&t.id) {
+            return true;
+        }
+        retired_statuses.push(TargetStatus {
+            id: t.id.to_string(),
+            label: t.label.clone(),
+            ops_pushed: 0,
+            blobs_uploaded: 0,
+            failed: Some(RETIRED_COPY.into()),
+            last_success: t.last_success,
+            retry_in: 0,
+            waiting: true,
+            ops_behind: t.owed.len(),
+        });
+        false
+    });
+    let live_targets = every_target.len() - retired.len();
 
     // Other devices' keys in, and this device's revocations out as markers,
     // before the push publishes anything: publishing first would put back a
@@ -590,6 +654,11 @@ pub async fn run_sync_pass(
     let recovery = settled.envelope;
     let mut keys = load_fido_keys(&root).ok();
 
+    let several_copies = targets.len() > 1;
+    // Targets that took everything they were owed. Kept apart from the
+    // status, which a later failed fetch also marks: what was delivered
+    // stays delivered, and the fetch failure is still reported.
+    let mut pushed_to: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
     for target in &targets {
         let silo_state = sync::SiloState {
             vault_id,
@@ -622,6 +691,7 @@ pub async fn run_sync_pass(
                             ProgressStep::counted(done, total),
                             None,
                             &mut named,
+                            None,
                         );
                     }
                 }
@@ -638,6 +708,7 @@ pub async fn run_sync_pass(
                     },
                     Some(blob.blob_id),
                     &mut named,
+                    several_copies.then_some(target.label.as_str()),
                 ),
             },
         )
@@ -662,6 +733,9 @@ pub async fn run_sync_pass(
         ops_pushed += outcome.ops_pushed;
         blobs_uploaded += outcome.blobs_uploaded;
         blobs_failed += outcome.blobs_failed;
+        if outcome.failed.is_none() {
+            pushed_to.insert(target.id);
+        }
         statuses.push(TargetStatus {
             id: target.id.to_string(),
             label: target.label.clone(),
@@ -707,6 +781,7 @@ pub async fn run_sync_pass(
                         ProgressStep::counted(done, total),
                         None,
                         &mut None,
+                        None,
                     );
                 }
             },
@@ -724,7 +799,7 @@ pub async fn run_sync_pass(
                 if let Some(status) = statuses.iter_mut().find(|s| s.id == target.id.to_string())
                     && status.failed.is_none()
                 {
-                    status.failed = Some(e.to_string());
+                    status.failed = Some(format!("Could not read changes from it: {e}"));
                 }
             }
         }
@@ -741,10 +816,8 @@ pub async fn run_sync_pass(
     unreadable.retain(|u| u.op_id.is_none_or(|id| !fetched_ids.contains(&id)));
     let (incoming, held_back) = sync::usable_prefix(incoming, &unreadable);
     // Everything every copy holds was read and nothing is held back.
-    let view_complete = !fetch_failed
-        && unreadable.is_empty()
-        && held_back == 0
-        && targets.len() == every_target.len();
+    let view_complete =
+        !fetch_failed && unreadable.is_empty() && held_back == 0 && targets.len() == live_targets;
     let fetched = incoming.len();
     for u in &unreadable {
         host.warn("sync", &format!("{} could not be read: {}", u.key, u.error));
@@ -754,7 +827,7 @@ pub async fn run_sync_pass(
         let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
         let session = sessions
             .get(&silo.id)
-            .ok_or_else(|| "Vault locked mid-sync".to_string())?;
+            .ok_or_else(|| "The silo was locked during the sync.".to_string())?;
         let report = replay(&session.conn, incoming).map_err(|e| e.to_string())?;
         if view_complete {
             silentsilo_vfs::snapshot::record_received_through(&session.conn, listed_through)
@@ -764,16 +837,23 @@ pub async fn run_sync_pass(
         // Written down per target, after the write and never before: a
         // record noted as delivered without having arrived is one this
         // device will never offer again.
+        //
+        // All of it in one transaction, across every target. `mark_delivered`
+        // takes a savepoint of its own and nests inside this one, so this is
+        // the only commit the sessions mutex pays for. Rolling back on the
+        // way out is the safe direction: the next pass offers the records
+        // again, finds them in storage and marks them then.
+        let delivery = session
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
         for target in &targets {
-            let reached = statuses
-                .iter()
-                .find(|s| s.id == target.id.to_string())
-                .is_some_and(|s| s.failed.is_none());
-            if reached {
+            if pushed_to.contains(&target.id) {
                 mark_delivered(&session.conn, target.id, &target.owed)
                     .map_err(|e| e.to_string())?;
             }
         }
+        delivery.commit().map_err(|e| e.to_string())?;
         report
     };
 
@@ -792,6 +872,16 @@ pub async fn run_sync_pass(
     // for a target that is no longer configured, so removing a copy and
     // adding another leaves nothing claiming the new one is up to date.
     silentsilo_vault::settle_blob_delivery(&root, &every_target).map_err(|e| e.to_string())?;
+    // Content a purge left here for the push, now that every copy has it.
+    let referenced = {
+        let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
+        sessions
+            .get(&silo.id)
+            .and_then(|session| Vfs::new(session).referenced_blobs_with_attachments().ok())
+    };
+    if let Some(referenced) = referenced {
+        let _ = silentsilo_vault::drop_delivered_unreferenced(&root, &referenced);
+    }
     record_target_outcomes(state, silo, &statuses, now)?;
 
     // ── The inbox ───────────────────────────────────────────────────
@@ -799,8 +889,9 @@ pub async fn run_sync_pass(
     // After the push, so an item recorded by an earlier pass has had its
     // record sent before it may leave the inbox. With more than one copy the
     // content comes down too, for the next push to spread.
-    let every_copy_reached = statuses.len() == every_target.len()
-        && statuses.iter().all(|s| s.failed.is_none() && !s.waiting);
+    let every_copy_reached =
+        statuses.len() == live_targets && statuses.iter().all(|s| s.failed.is_none() && !s.waiting);
+    statuses.extend(retired_statuses);
     let inbox_targets: Vec<crate::inbox_import::InboxTarget<'_>> = targets
         .iter()
         .map(|t| crate::inbox_import::InboxTarget {
@@ -827,6 +918,7 @@ pub async fn run_sync_pass(
                 ProgressStep::counted(done, total),
                 None,
                 &mut None,
+                None,
             )
         },
     )
@@ -940,6 +1032,80 @@ fn announce(host: &dyn Host, silo: &SiloEntry, report: SyncReport) -> SyncReport
 /// is a timestamp, failure lengthens the backoff. Targets the pass
 /// deliberately skipped are left alone: counting a skip as a failure would
 /// leave a disk plugged back in unwritten for hours.
+/// Whether a snapshot above this device's base holds something its own log
+/// does not at the same horizon. The horizon last found to agree is kept in
+/// `vault_meta`, so each one is fetched and replayed once.
+async fn missed_below_horizon(
+    state: &AppState,
+    silo: &SiloEntry,
+    targets: &[OpenTarget],
+    dek: &silentsilo_crypto::MasterDek,
+    vault_id: Uuid,
+    local_horizon: u64,
+) -> Result<bool, String> {
+    const CHECKED: &str = "snapshot_checked_through";
+    let checked: u64 = {
+        let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
+        let Some(session) = sessions.get(&silo.id) else {
+            return Ok(false);
+        };
+        session
+            .conn
+            .query_row(
+                "SELECT value FROM vault_meta WHERE key = ?1",
+                [CHECKED],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    };
+    for target in targets {
+        match sync::snapshot_horizon(&*target.store).await {
+            Ok(h) if h > local_horizon.max(checked) => {}
+            _ => continue,
+        }
+        let Ok(Some(theirs)) = sync::latest_snapshot(&*target.store, dek).await else {
+            continue;
+        };
+        let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
+        let Some(session) = sessions.get(&silo.id) else {
+            return Ok(false);
+        };
+        let Ok(mine) = silentsilo_vfs::state_at(&session.conn, vault_id, theirs.horizon) else {
+            continue;
+        };
+        if silentsilo_vfs::holds_more(&theirs, &mine) {
+            return Ok(true);
+        }
+        session
+            .conn
+            .execute(
+                "INSERT OR REPLACE INTO vault_meta(key, value) VALUES (?1, ?2)",
+                [CHECKED, &theirs.horizon.to_string()],
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(false)
+}
+
+/// Why a never-delete copy left under a replaced key gets nothing.
+pub const RETIRED_COPY: &str = "Kept under the encryption key that was replaced, so it gets no new \
+     backups. Remove it and add a new never-delete copy.";
+
+/// The answer that decides when copies disagree about the content key:
+/// rotated before replaced before current before absent. A rotation seen on
+/// any copy means this device's key is retired, whatever an older copy says.
+fn gravest_kek_state(states: &[sync::KekState]) -> Option<sync::KekState> {
+    let rank = |state: &sync::KekState| match state {
+        sync::KekState::Rotated => 3,
+        sync::KekState::Replaced => 2,
+        sync::KekState::Current => 1,
+        sync::KekState::Absent => 0,
+    };
+    states.iter().copied().max_by_key(rank)
+}
+
 fn record_target_outcomes(
     state: &AppState,
     silo: &SiloEntry,
@@ -981,6 +1147,20 @@ async fn fetch_missing_for_full_copy(
         return 0;
     }
 
+    // The blob directory is walked before the lock, not under it: on a full
+    // copy it is thousands of entries, and every command waits on that lock.
+    // Content no copy holds would be asked for, and fail, every pass.
+    let root = silo.path.clone();
+    let listed = tokio::task::spawn_blocking(move || {
+        silentsilo_vault::list_local_blob_ids(&root)
+            .into_iter()
+            .chain(silentsilo_vault::list_absent_blob_ids(&root))
+            .collect::<std::collections::HashSet<Uuid>>()
+    })
+    .await;
+    let Ok(here) = listed else {
+        return 0;
+    };
     let missing: Vec<Uuid> = {
         let Ok(sessions) = state.sessions.lock() else {
             return 0;
@@ -988,12 +1168,6 @@ async fn fetch_missing_for_full_copy(
         let Some(session) = sessions.get(&silo.id) else {
             return 0;
         };
-        // Content no copy holds would be asked for, and fail, every pass.
-        let here: std::collections::HashSet<Uuid> =
-            silentsilo_vault::list_local_blob_ids(&silo.path)
-                .into_iter()
-                .chain(silentsilo_vault::list_absent_blob_ids(&silo.path))
-                .collect();
         // With attachments: a full copy that left them out would restore
         // every file and no attachment.
         match Vfs::new(session).referenced_blobs_with_attachments() {
@@ -1014,6 +1188,7 @@ async fn fetch_missing_for_full_copy(
             ProgressStep::counted(done, batch.len()),
             Some(blob_id),
             &mut named,
+            None,
         );
         // One object that will not come down must not stop the rest. It was
         // a `break`, so a single blob missing from the bucket, or one whose
@@ -1220,4 +1395,103 @@ async fn run_blob_sweep(
     let _ = silentsilo_vfs::snapshot::set_gc_first_seen(&mut session.conn, target, &seen);
     let _ = silentsilo_vfs::snapshot::record_sweep(&session.conn, target, now);
     Ok(restored)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+
+    use silentsilo_store::{StoreError, StoredObject};
+    use silentsilo_vault::{BackupTarget, VaultSession};
+
+    use super::*;
+
+    struct Quiet;
+
+    impl Host for Quiet {
+        fn emit(&self, _event: AppEvent) {}
+        fn warn(&self, _area: &str, _detail: &str) {}
+        fn targets(&self, _silo_id: Uuid) -> Vec<BackupTarget> {
+            Vec::new()
+        }
+    }
+
+    /// A folder that counts the sweep's requests to abort unfinished uploads.
+    struct CountingStore {
+        inner: silentsilo_store::FolderStore,
+        aborts: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for CountingStore {
+        async fn put(&self, key: &str, body: Vec<u8>) -> Result<(), StoreError> {
+            self.inner.put(key, body).await
+        }
+        async fn get(&self, key: &str) -> Result<Vec<u8>, StoreError> {
+            self.inner.get(key).await
+        }
+        async fn head(&self, key: &str) -> Result<Option<i64>, StoreError> {
+            self.inner.head(key).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<StoredObject>, StoreError> {
+            self.inner.list(prefix).await
+        }
+        fn describe(&self) -> String {
+            self.inner.describe()
+        }
+        async fn abort_stale_uploads(
+            &self,
+            prefix: &str,
+            older_than: std::time::Duration,
+        ) -> Result<usize, StoreError> {
+            self.aborts.fetch_add(1, Ordering::SeqCst);
+            self.inner.abort_stale_uploads(prefix, older_than).await
+        }
+    }
+
+    #[tokio::test]
+    async fn the_sweep_aborts_stale_uploads_once_a_day() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = dir.path().join("silo");
+        let session = VaultSession::provision(root.clone(), Uuid::new_v4(), "s").unwrap();
+        Vfs::new(&session).ensure_initialized().unwrap();
+        let silo = SiloEntry {
+            id: Uuid::new_v4(),
+            name: "Sweep".into(),
+            path: root,
+            last_opened: 0,
+            auto_lock_minutes: None,
+        };
+        let state = AppState::default();
+        state.open_session(&Quiet, silo.id, session).unwrap();
+        let aborts = Arc::new(AtomicUsize::new(0));
+        let store = CountingStore {
+            inner: silentsilo_store::FolderStore::new(storage.path().to_path_buf()),
+            aborts: aborts.clone(),
+        };
+        let id = Uuid::new_v4();
+        let all: Vec<(Uuid, &dyn ObjectStore)> = vec![(id, &store)];
+        let sweep = || run_blob_sweep(&state, &Quiet, &silo, (id, &store), &all);
+
+        sweep().await.unwrap();
+        // One request per prefix: blobs/, snapshots/, inbox/.
+        assert_eq!(aborts.load(Ordering::SeqCst), 3);
+        sweep().await.unwrap();
+        assert_eq!(aborts.load(Ordering::SeqCst), 3, "swept twice a day");
+
+        state.sessions.lock().unwrap()[&silo.id]
+            .conn
+            .execute(
+                "DELETE FROM vault_meta WHERE key LIKE 'blob_sweep_at:%'",
+                [],
+            )
+            .unwrap();
+        sweep().await.unwrap();
+        assert_eq!(aborts.load(Ordering::SeqCst), 6);
+    }
 }

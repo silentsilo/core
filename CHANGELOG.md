@@ -13,15 +13,62 @@ release notes should say.
 
 ### Fixed
 
+- Emptying the trash no longer removes content that no copy holds yet. A
+  file edited and then purged before a push lost that edit everywhere when
+  another device's purge had not seen it and kept it: the kept file pointed
+  at content in none of the backups. `files::release_purged_blobs` keeps
+  such content until the pass has sent it, and the pass removes it once
+  every copy has it. Present since kept edits shipped; found by the soak
+  test.
+- A snapshot carries what purges left behind and the edit history of edited
+  files (`Snapshot::purged`), so a device rebuilt or joined from it no
+  longer drops a file added offline to a folder purged below the horizon, or
+  an edit to a purged file, that every other device keeps at the top. The
+  same holds for a purge above the horizon of a file edited below it. Left
+  out when empty; 1.0.0 and 1.6.1 read
+  such a snapshot and ignore the field (`snapshot_purge_memory.rs`).
+  `SNAPSHOT_VERSION` stays 1. Found by the soak test.
+- A device no longer misses records written offline long ago that another
+  device sent and compacted before it fetched them. They carry Lamport
+  values the others passed, so a received mark above the horizon hid them.
+  The `silentsilo-app` pass now replays its own log to each new horizon
+  once (`vfs::state_at`) and rebuilds when the snapshot holds something it
+  does not (`vfs::holds_more`). Present since compaction shipped; found by
+  the soak test.
+- Two devices importing the same inbox item put it in the same folder when
+  the import folder had been trashed or emptied from the trash.
+  `Vfs::ensure_folder_path` takes the item id and derives the folder id from
+  it where the plain derived id is taken; each device used to keep the item
+  in a folder of its own. Replay drops a folder creation only when a purge
+  of that id sorts after it, so a device whose base hides the purge can make
+  the folder again and every device keeps it. Two imports of one item that
+  still name two folders are settled by order: the creation first in the
+  order places the file everywhere. Found by the random lifecycle test.
+- A rebuild writes again only what this device wrote and no copy holds
+  (`vfs::undelivered_own_ops`). It took every record not yet on every copy,
+  so beside a copy that does not answer (an unplugged drive, a never-delete
+  copy under a replaced key) it wrote old history again as new changes,
+  other devices' records included: purged folders came back and older edits
+  landed on top of newer ones. Present since compaction shipped; found by
+  the random lifecycle test.
+- A device that was rebuilt from a snapshot, or had compacted before, no
+  longer publishes a snapshot missing everything below its base. `capture_at`
+  replayed the local log into an empty tree, and after a rebuild or an
+  earlier compaction that log starts at the base, so the second compaction
+  published a short snapshot and a device rebuilt from it lost what it left
+  out. It now starts from the base, like `rebuild_derived`, and
+  `choose_horizon` never picks a horizon at or below it. Present since
+  compaction shipped; found by the new mixed-fleet test against v1.6.1.
 - A key rotation commits the re-wrapped keys and the new recovery envelope
   with the key itself (`rotation::commit_rotation_with`). They were written
   after the commit, so a crash or a locked file in between left the new key
   in force and nothing that opened it. `finish_interrupted_commit` finishes
   a commit that stopped after the KEK moved; `load_fido_keys` and
   `rotation_pending` call it.
-- A folder target whose root is gone (an unplugged drive) lists as
-  `Unreachable` instead of empty, so it no longer counts as reached with a
-  horizon of 0.
+- A folder target whose root is gone (an unplugged drive) is `Unreachable`
+  for every call instead of empty, so it no longer counts as reached with a
+  horizon of 0, and a pass no longer recreates the root and fills it as a
+  new copy. `FolderStore::check` creates the root, for a place being added.
 - `lowest_snapshot_horizon` ignores a target below the highest horizon whose
   records do not reach it: a stale, never-compacted copy no longer hides that
   a device fell behind. The `silentsilo-app` pass marks every target failed
@@ -33,6 +80,22 @@ release notes should say.
 - A silo whose `vault.db.enc` is missing opens from the shadow copy or a
   staged snapshot, and `VaultPaths::exists` and `SiloEntry::is_present`
   count those.
+- The `silentsilo-app` pass asks every copy whether this device's key is
+  still current and takes the gravest answer, leaving never-delete copies
+  out unless the silo has no working copy. The first answer used to decide,
+  so a copy that missed a rotation could let a retired device push.
+- A never-delete copy left under a replaced key is left out of the pass
+  with `RETIRED_COPY` as its status. Waiting on it kept inbox items in the
+  inbox and stopped the sweep and compaction for as long as it stayed
+  configured. Found by the random lifecycle test.
+- `seal_for_lock` refuses, like `backup_locally`, when the silo's key changed
+  since the session opened, so a lock right after a rotation cannot seal the
+  retired key's snapshot over the new one.
+- A recovery code made by a newer version is refused with "update
+  SilentSilo" in the `silentsilo-app` flows instead of "does not match", and
+  the recovery join runs Argon2id off the async workers.
+- On Windows a security key prompt that ran out reports a timeout rather
+  than a generic failure.
 - `send_item_from` leaves an item alone once its envelope is in the inbox,
   and `stage_item` checks the blob header against the envelope before and
   after the copy. A resend no longer lets an import record content sealed
@@ -46,6 +109,10 @@ release notes should say.
   what it left behind.
 - `ObjectStore::get_prefix`, with a default that reads the object whole;
   the folder and S3 backends read only the bytes asked for.
+
+### Changed
+
+- `JoinPlan::FromSnapshot` holds its snapshot boxed.
 
 ## [1.6.1] - No parts left behind
 

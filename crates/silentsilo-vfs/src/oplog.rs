@@ -1005,7 +1005,7 @@ fn insert_version(
 }
 
 /// The id of the conflict copy a content record makes.
-fn copy_id_of(op_id: Uuid) -> Uuid {
+pub(crate) fn copy_id_of(op_id: Uuid) -> Uuid {
     Uuid::new_v5(&op_id, b"silentsilo-conflict-copy")
 }
 
@@ -2070,6 +2070,32 @@ fn rescue_entry(
     Ok(())
 }
 
+/// The record whose name claim an entry holds now.
+fn claimed_by(conn: &Connection, entry_id: Uuid) -> CoreResult<Option<String>> {
+    conn.query_row(
+        "SELECT op_id FROM name_claims WHERE entry_id = ?1",
+        [entry_id.to_string()],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|e| CoreError::Database(e.to_string()))
+}
+
+/// Whether a purge that sorts after `record` named `id`.
+fn purged_after(conn: &Connection, id: Uuid, record: &OpRecord) -> CoreResult<bool> {
+    let purges: Vec<(i64, String, String)> = conn
+        .prepare_cached("SELECT lamport, device_id, op_id FROM purges WHERE id = ?1")
+        .map_err(|e| CoreError::Database(e.to_string()))?
+        .query_map([id.to_string()], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .map_err(|e| CoreError::Database(e.to_string()))?
+        .collect::<rusqlite::Result<_>>()
+        .map_err(|e| CoreError::Database(e.to_string()))?;
+    let incoming = order_of(record);
+    Ok(purges.into_iter().any(|purge| purge > incoming))
+}
+
 pub(crate) fn was_purged(conn: &Connection, id: Uuid) -> CoreResult<bool> {
     conn.query_row(
         "SELECT 1 FROM purged_ids WHERE id = ?1",
@@ -2889,10 +2915,17 @@ fn apply_inner(conn: &Connection, record: &OpRecord) -> CoreResult<ApplyOutcome>
             let Some(parent_path) = folder_path(conn, *parent_id)? else {
                 return Ok(ApplyOutcome::Obsolete);
             };
-            // Two records creating one id only comes from a corrupted or
-            // hostile bucket, but failing on it would wedge sync for good.
-            // The folder is already there, so there is nothing to do.
-            if folder_path(conn, *id)?.is_some() || was_purged(conn, *id)? {
+            // Two records creating one id: two devices importing the same
+            // item into the same new folder, or a corrupted bucket. Failing
+            // would wedge sync for good; the folder is there already.
+            if folder_path(conn, *id)?.is_some() {
+                return Ok(ApplyOutcome::Obsolete);
+            }
+            // Purged by a record after this one in the order: its author
+            // named it, so it stays gone. One made again after the purge, by
+            // a device whose base hides the purge, is a new folder: a purge
+            // never deletes what its author did not name.
+            if purged_after(conn, *id, record)? {
                 return Ok(ApplyOutcome::Obsolete);
             }
             let final_name = claim_name(conn, *id, true, *parent_id, &sanitize(name), record)?;
@@ -2926,10 +2959,55 @@ fn apply_inner(conn: &Connection, record: &OpRecord) -> CoreResult<ApplyOutcome>
             if folder_path(conn, *folder_id)?.is_none() {
                 return Ok(ApplyOutcome::Obsolete);
             }
-            // Two records creating one id only comes from a corrupted or
-            // hostile bucket, but failing on it would wedge sync for good;
-            // like the folder arm, the file being there means nothing to do.
-            if read_content_state(conn, *id)?.is_some() {
+            // Two records creating one id: two devices importing the same
+            // inbox item, or a corrupted bucket. Two imports can name two
+            // folders, and each device kept the one that reached it first.
+            // The creation first in the order places it, on every device:
+            // while nothing has renamed it since, an earlier one moves it.
+            if let Some(current) = read_content_state(conn, *id)? {
+                let (lamport, device, op) = current.written_by;
+                let current_order = (lamport as i64, device.to_string(), op.to_string());
+                if current.blob_id == *blob_id
+                    && current.folder_id != *folder_id
+                    && order_of(record) < current_order
+                    && claimed_by(conn, *id)?.as_deref() == Some(op.to_string().as_str())
+                {
+                    // A placeholder first: the folder may hold the name.
+                    conn.execute(
+                        "UPDATE files SET folder_id = ?2, name = ?3 WHERE id = ?1",
+                        params![id.to_string(), folder_id.to_string(), format!("\u{1}{id}")],
+                    )
+                    .map_err(db)?;
+                    let final_name =
+                        claim_name(conn, *id, false, *folder_id, &sanitize(name), record)?;
+                    conn.execute(
+                        "UPDATE files SET content_op_id = ?2, content_lamport = ?3,
+                                          content_device_id = ?4
+                          WHERE id = ?1",
+                        params![
+                            id.to_string(),
+                            record.op_id.to_string(),
+                            record.lamport as i64,
+                            record.device_id.to_string()
+                        ],
+                    )
+                    .map_err(db)?;
+                    insert_version(
+                        conn,
+                        &record.op_id.to_string(),
+                        *id,
+                        (record.lamport, record.device_id),
+                        *blob_id,
+                        None,
+                        true,
+                        *size_bytes,
+                        content_hash,
+                        mime_type,
+                        blob_key,
+                        at,
+                    )?;
+                    return Ok(renamed_or_applied(name, &final_name));
+                }
                 return Ok(ApplyOutcome::Obsolete);
             }
             if !purges_of(conn, *id)?.is_empty() {
@@ -3963,6 +4041,33 @@ pub fn pending_ops(conn: &Connection) -> CoreResult<Vec<OpRecord>> {
         out.push(OpRecord::from_bytes(payload.as_bytes())?);
     }
     Ok(out)
+}
+
+/// What this device wrote and no copy has taken: what a rebuild writes
+/// again. `pushed` alone is not the test. It stays unset until every copy
+/// has a record, so beside a copy that is unplugged or left under a
+/// replaced key it is unset on everything, other devices' records included,
+/// and a rebuild wrote all of that again as new changes on top.
+pub fn undelivered_own_ops(conn: &Connection) -> CoreResult<Vec<OpRecord>> {
+    let me = device_id(conn)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT o.payload FROM oplog o
+             WHERE o.pushed = 0 AND o.device_id = ?1
+               AND NOT EXISTS (SELECT 1 FROM op_delivery d WHERE d.op_id = o.op_id)
+             ORDER BY o.lamport, o.device_id, o.op_id",
+        )
+        .map_err(|e| CoreError::Database(e.to_string()))?;
+    let payloads = stmt
+        .query_map([me.to_string()], |row| row.get::<_, String>(0))
+        .map_err(|e| CoreError::Database(e.to_string()))?
+        .collect::<rusqlite::Result<Vec<String>>>()
+        .map_err(|e| CoreError::Database(e.to_string()))?;
+    drop(stmt);
+    payloads
+        .iter()
+        .map(|payload| OpRecord::from_bytes(payload.as_bytes()))
+        .collect()
 }
 
 /// Marks records as being in the bucket.
@@ -5712,6 +5817,114 @@ pub(crate) mod tests {
         .unwrap();
 
         assert_eq!(d.snapshot(), vec!["folder / deleted=false"]);
+    }
+
+    #[test]
+    fn one_item_imported_by_two_devices_lands_in_the_same_folder_on_both() {
+        // Two devices import the same inbox item into two folders before
+        // either has the other's record. Each kept the one it saw first; the
+        // creation first in the order now places it everywhere.
+        let vault_id = Uuid::new_v4();
+        let (a, b) = (Device::joining(vault_id), Device::joining(vault_id));
+        let root = a.root();
+        let (first, second, file, blob) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let import = |folder| VaultOp::AddFile {
+            id: file,
+            folder_id: folder,
+            name: "IMG_0001.jpg".into(),
+            blob_id: blob,
+            size_bytes: 10,
+            content_hash: "hash".into(),
+            mime_type: None,
+            blob_key: String::new(),
+        };
+        let records = [
+            a.make(1, new_folder(first, root, "Phone")),
+            b.make(1, new_folder(second, root, "Phone")),
+            a.make(2, import(first)),
+            b.make(3, import(second)),
+        ];
+        for r in &records {
+            apply_op(a.conn(), r).unwrap();
+        }
+        for i in [1, 0, 3, 2] {
+            apply_op(b.conn(), &records[i]).unwrap();
+        }
+        assert_eq!(a.snapshot(), b.snapshot());
+        let folder: String = b
+            .conn()
+            .query_row(
+                "SELECT folder_id FROM files WHERE id = ?1",
+                [file.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(folder, first.to_string());
+    }
+
+    /// The delivery rows survive being written inside one transaction:
+    /// `mark_delivered` nests a savepoint, and the pass wraps every target's
+    /// marking in one commit.
+    #[test]
+    fn one_transaction_around_mark_delivered_still_commits_the_rows() {
+        let d = Device::new();
+        let root = d.root();
+        crate::emit(d.conn(), new_folder(Uuid::new_v4(), root, "a")).unwrap();
+        crate::emit(d.conn(), new_folder(Uuid::new_v4(), root, "b")).unwrap();
+        let target = Uuid::new_v4();
+        let owed = pending_ops_for(d.conn(), target).unwrap();
+        assert!(owed.len() >= 2);
+
+        let delivery = d.conn().unchecked_transaction().unwrap();
+        mark_delivered(d.conn(), target, &owed).unwrap();
+        delivery.commit().unwrap();
+        assert!(pending_ops_for(d.conn(), target).unwrap().is_empty());
+    }
+
+    /// And rolled back, which is why dropping it on the way out is the safe
+    /// failure: the records stay owed and the next pass marks them.
+    #[test]
+    fn a_delivery_transaction_dropped_part_way_marks_nothing() {
+        let d = Device::new();
+        crate::emit(d.conn(), new_folder(Uuid::new_v4(), d.root(), "a")).unwrap();
+        let target = Uuid::new_v4();
+        let owed = pending_ops_for(d.conn(), target).unwrap();
+        {
+            let delivery = d.conn().unchecked_transaction().unwrap();
+            mark_delivered(d.conn(), target, &owed).unwrap();
+            drop(delivery);
+        }
+        assert_eq!(pending_ops_for(d.conn(), target).unwrap().len(), owed.len());
+    }
+
+    #[test]
+    fn a_folder_made_again_after_its_purge_is_kept_and_one_before_it_is_not() {
+        // A device whose base hides a purge makes the folder again under the
+        // same derived id. Dropping that record left the folder on that
+        // device alone. A creation the purge sorts after stays purged.
+        let d = Device::new();
+        let root = d.root();
+        let folder = Uuid::new_v4();
+        apply_op(d.conn(), &d.make(1, new_folder(folder, root, "Phone"))).unwrap();
+        let purge = VaultOp::Purge {
+            folder_ids: vec![folder],
+            file_ids: Vec::new(),
+        };
+        apply_op(d.conn(), &d.make(5, purge)).unwrap();
+
+        apply_op(d.conn(), &d.make(3, new_folder(folder, root, "Phone"))).unwrap();
+        assert_eq!(d.snapshot(), vec!["folder / deleted=false"]);
+
+        apply_op(d.conn(), &d.make(9, new_folder(folder, root, "Phone"))).unwrap();
+        assert_eq!(
+            d.snapshot(),
+            vec!["folder / deleted=false", "folder /Phone deleted=false"]
+        );
     }
 
     #[test]

@@ -61,6 +61,22 @@ pub fn work_base() -> PathBuf {
     std::env::temp_dir().join("silentsilo-work")
 }
 
+/// The base for one silo. In a debug build a silo in the system's temp
+/// folder, which is where tests make theirs, keeps its scratch there too:
+/// a suite without `SILENTSILO_TEST_WORK_BASE` (desktop, mobile) left
+/// thousands of working copies under the real one. No real silo lives in
+/// the temp folder, and a release build always takes `work_base`.
+fn base_for(silo_root: &Path) -> PathBuf {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("SILENTSILO_TEST_WORK_BASE").is_none()
+        && silo_root.starts_with(std::env::temp_dir())
+    {
+        return std::env::temp_dir().join("silentsilo-test-work");
+    }
+    let _ = silo_root;
+    work_base()
+}
+
 /// The scratch directory for the silo stored at `silo_root`.
 ///
 /// Derived from the path rather than from the silo's id, so it can be
@@ -69,7 +85,7 @@ pub fn work_base() -> PathBuf {
 /// new scratch directory; nothing here is more than `vault.db.enc` rebuilds.
 pub fn work_dir_for(silo_root: &Path) -> PathBuf {
     let key = silo_root.to_string_lossy().to_lowercase();
-    work_base()
+    base_for(silo_root)
         .join("open")
         .join(Uuid::new_v5(&WORK_NAMESPACE, key.as_bytes()).to_string())
 }
@@ -161,7 +177,7 @@ pub fn seal_readonly(path: &Path) {
 /// bucket. That record is expensive to rebuild and harmless to keep.
 pub fn cache_dir_for(silo_root: &Path) -> PathBuf {
     let key = silo_root.to_string_lossy().to_lowercase();
-    work_base()
+    base_for(silo_root)
         .join("cache")
         .join(Uuid::new_v5(&WORK_NAMESPACE, key.as_bytes()).to_string())
 }

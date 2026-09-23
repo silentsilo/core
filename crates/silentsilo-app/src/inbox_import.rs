@@ -165,7 +165,7 @@ pub async fn import_inbox(
             };
             let mut added = false;
             let recorded = silo.with_vfs(&mut |vfs| {
-                let folder = vfs.ensure_folder_path(&item.folder)?;
+                let folder = vfs.ensure_folder_path(&item.folder, item.item_id)?;
                 added = vfs
                     .record_imported_file(
                         item.item_id,
@@ -252,7 +252,7 @@ impl OpenSilo for Session<'_> {
         let sessions = self.state.sessions.lock().map_err(|e| e.to_string())?;
         let session = sessions
             .get(&self.id)
-            .ok_or_else(|| "The silo was locked".to_string())?;
+            .ok_or_else(|| "The silo was locked.".to_string())?;
         f(&Vfs::new(session)).map_err(|e| e.to_string())
     }
 }

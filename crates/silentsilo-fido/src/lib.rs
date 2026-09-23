@@ -3,6 +3,11 @@
 //! - **Windows**: OS WebAuthn API (`webauthn.dll`) — no administrator rights.
 //! - **Linux / macOS**: CTAP2 over USB HID.
 
+// A constant in place of a security key, for end-to-end tests. Never in a
+// release build.
+#[cfg(all(feature = "test-authenticator", not(debug_assertions)))]
+compile_error!("the test authenticator is for debug builds only");
+
 mod backend;
 #[cfg(feature = "ctap2")]
 pub mod ctap2;
@@ -12,7 +17,7 @@ pub mod enclave;
 pub mod passkey;
 // Only the hardware backends build client data; its deps are optional and
 // follow the same feature.
-#[cfg(feature = "hardware")]
+#[cfg(all(feature = "hardware", not(feature = "test-authenticator")))]
 mod client_data;
 mod error;
 mod types;
@@ -22,7 +27,7 @@ pub use types::{
     Authenticator, CredentialInfo, Enrollment, EnrollmentChallenge, FidoStatus, UnlockMaterial,
 };
 
-#[cfg(feature = "hardware")]
+#[cfg(all(feature = "hardware", not(feature = "test-authenticator")))]
 const RP_ID: &str = "silentsilo.com";
 
 /// On Windows, bind the main app window HWND so WebAuthn can show its security-key UI.

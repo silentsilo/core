@@ -478,9 +478,10 @@ pub async fn fetch_rebuild_reporting(
 /// to say so, and recovery is the one path where there is nothing left to
 /// compare the result against.
 pub enum JoinPlan {
-    /// Compacted: the state as captured, plus everything since.
+    /// Compacted: the state as captured, plus everything since. Boxed: a
+    /// snapshot with its purge memory dwarfs the other variant.
     FromSnapshot {
-        snapshot: Snapshot,
+        snapshot: Box<Snapshot>,
         incoming: Vec<OpRecord>,
     },
     /// Never compacted: the log still starts at the beginning.
@@ -522,7 +523,10 @@ pub async fn fetch_join_plan_reporting(
     progress: &mut (dyn FnMut(usize, usize) + Send),
 ) -> Result<JoinPlan, SyncError> {
     match fetch_rebuild_reporting(client, dek, progress).await? {
-        Some((snapshot, incoming)) => Ok(JoinPlan::FromSnapshot { snapshot, incoming }),
+        Some((snapshot, incoming)) => Ok(JoinPlan::FromSnapshot {
+            snapshot: Box::new(snapshot),
+            incoming,
+        }),
         // Horizon zero fetches the whole log: no record carries Lamport 0.
         None => Ok(JoinPlan::WholeLog(
             fetch_all_ops_above_reporting(client, dek, 0, progress).await?,
@@ -538,8 +542,10 @@ pub fn apply_rebuild(
 ) -> Result<RebootstrapOutcome, SyncError> {
     let fetched = incoming.len();
     // What this device wrote and no copy has yet. A rebuild used to drop it:
-    // work done offline, gone because the others compacted meanwhile.
-    let unpushed = silentsilo_vfs::pending_ops(conn)?;
+    // work done offline, gone because the others compacted meanwhile. Only
+    // that: a record some copy holds is in the snapshot or comes back with
+    // the fetch, and writing it again replayed old history as new changes.
+    let unpushed = silentsilo_vfs::undelivered_own_ops(conn)?;
     let device_id = silentsilo_vfs::snapshot::rebootstrap(conn, snapshot)?;
     let replay_report = replay(conn, incoming)?;
 

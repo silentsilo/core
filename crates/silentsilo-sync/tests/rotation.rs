@@ -41,6 +41,7 @@ fn snapshot_at(vault_id: Uuid, horizon: u64) -> Snapshot {
         passwords: Vec::new(),
         name_claims: Vec::new(),
         device_labels: Vec::new(),
+        purged: Default::default(),
     }
 }
 

@@ -298,14 +298,40 @@ async fn rotated_pair() -> (
     let old = generate_dek();
     let new = generate_dek();
 
-    populate(&stale as &dyn ObjectStore, &old, Uuid::new_v4()).await;
+    let vault_id = Uuid::new_v4();
+    populate(&stale as &dyn ObjectStore, &old, vault_id).await;
+    // A snapshot and the content key's envelope as well: sealed like the
+    // records, and just as wrong to copy back over a rotated copy.
+    let snapshot = silentsilo_vfs::Snapshot {
+        version: silentsilo_vfs::SNAPSHOT_VERSION,
+        vault_id,
+        horizon: 2,
+        captured_at: 0,
+        folders: Vec::new(),
+        files: Vec::new(),
+        passwords: Vec::new(),
+        name_claims: Vec::new(),
+        device_labels: Vec::new(),
+        purged: Default::default(),
+    };
+    silentsilo_sync::put_snapshot(&stale, &old, &snapshot)
+        .await
+        .unwrap();
+    let kek = silentsilo_crypto::generate_content_kek();
+    stale
+        .put(
+            silentsilo_sync::CONTENT_KEK_KEY,
+            silentsilo_vault::wrap_kek_bytes(&kek, &old).unwrap(),
+        )
+        .await
+        .unwrap();
     seed_target(&stale, &rotated, &mut |_| {}, &|| false)
         .await
         .unwrap();
     let outcome = reseal_under_new_key(&rotated, &old, &new, &mut |_, _| {})
         .await
         .unwrap();
-    assert_eq!(outcome.resealed, 4);
+    assert_eq!(outcome.resealed, 6);
     (stale_dir, rotated_dir, stale, rotated, new)
 }
 
@@ -317,7 +343,7 @@ async fn a_checked_seed_does_not_undo_a_rotation() {
         .await
         .unwrap();
 
-    assert_eq!(outcome.stale, 4, "{outcome:?}");
+    assert_eq!(outcome.stale, 6, "{outcome:?}");
     assert!(outcome.failed.is_empty());
     let records = fetch_all_ops_above(&rotated, &new, 0).await.unwrap();
     assert_eq!(

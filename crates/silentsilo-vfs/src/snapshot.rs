@@ -125,6 +125,72 @@ pub struct Snapshot {
     pub passwords: Vec<PasswordRow>,
     pub name_claims: Vec<NameClaimRow>,
     pub device_labels: Vec<DeviceLabelRow>,
+    /// What purges left behind, for records that arrive after one, and the
+    /// edit history a later purge is judged against. Without it a device
+    /// rebuilt from this snapshot has forgotten every purge below the
+    /// horizon: a file added offline to a purged folder, or an edit to a
+    /// purged file, was kept at the top by the devices that remembered and
+    /// dropped by the one that did not. Without the history, a purge above
+    /// the horizon of a file edited below it kept an edit its author had not
+    /// seen on the devices that replayed the edit, and nowhere else. Left
+    /// out when empty, so a snapshot of a silo nobody edited or purged in is
+    /// the bytes it always was, and ignored by 1.6.1 and earlier, which read
+    /// none of it.
+    #[serde(default, skip_serializing_if = "PurgeMemory::is_empty")]
+    pub purged: PurgeMemory,
+}
+
+/// The purge bookkeeping a replay reads, as `oplog` keeps it. Versions and
+/// copy origins only for files that were edited or purged: a file never
+/// edited has one version, which the snapshot's row already says. So it grows with edits and purges, not
+/// with the number of files.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PurgeMemory {
+    pub purged_ids: Vec<String>,
+    /// `purges`: id, op_id, lamport, device_id.
+    pub purges: Vec<(String, String, i64, String)>,
+    /// `purged_names`: file_id, desired, lamport, device_id, op_id.
+    pub purged_names: Vec<(String, String, i64, String, String)>,
+    /// `kept_edits`: copy_id, file_id, claim_op, at.
+    pub kept_edits: Vec<(String, String, String, i64)>,
+    /// `copy_origins`: copy_id, file_id, op_id, at. A later purge of the
+    /// file takes these copies with it.
+    pub copy_origins: Vec<(String, String, String, i64)>,
+    /// `content_versions` of files edited or purged.
+    pub versions: Vec<VersionRow>,
+    /// `conflict_copies`: copy_id, file_id, claim_op, at. A later purge
+    /// lists them as seen, and a later edit can retire one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflict_copies: Vec<(String, String, String, i64)>,
+}
+
+impl PurgeMemory {
+    pub fn is_empty(&self) -> bool {
+        self.purged_ids.is_empty()
+            && self.purges.is_empty()
+            && self.purged_names.is_empty()
+            && self.kept_edits.is_empty()
+            && self.copy_origins.is_empty()
+            && self.versions.is_empty()
+            && self.conflict_copies.is_empty()
+    }
+}
+
+/// A row of `content_versions`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VersionRow {
+    pub op_id: String,
+    pub file_id: String,
+    pub lamport: i64,
+    pub device_id: String,
+    pub blob_id: String,
+    pub replaces: Option<String>,
+    pub has_base: bool,
+    pub size_bytes: i64,
+    pub content_hash: String,
+    pub mime_type: Option<String>,
+    pub blob_key: String,
+    pub at: i64,
 }
 
 impl Snapshot {
@@ -234,6 +300,12 @@ pub fn choose_horizon(
         horizon
     };
 
+    // At or below this device's base there is nothing new to fold in. Only
+    // records kept back from an earlier prune can point there.
+    if read_base(conn)?.is_some_and(|base| horizon <= base.horizon) {
+        return Ok(None);
+    }
+
     // Nothing above it means nothing to compact to.
     let highest = records.last().map(|(lamport, _)| *lamport).unwrap_or(0);
     if horizon >= highest {
@@ -262,9 +334,76 @@ pub fn capture_at(conn: &Connection, vault_id: Uuid, horizon: u64) -> CoreResult
         )));
     }
 
+    replay_to(conn, vault_id, horizon, &records)
+}
+
+/// What this device's log says the silo held at `horizon`, to hold against
+/// a snapshot another device published there. Unlike [`capture_at`] it may
+/// reach the end of the log: nothing is compacted from it.
+pub fn state_at(conn: &Connection, vault_id: Uuid, horizon: u64) -> CoreResult<Snapshot> {
+    replay_to(conn, vault_id, horizon, &all_ops(conn)?)
+}
+
+/// Whether `theirs` holds something `mine`, taken at the same horizon, does
+/// not: an entry missing here, or one here that differs in where it is,
+/// what it is called, what it holds or whether it is trashed. Entries only
+/// `mine` holds do not count, so a snapshot short of state, as 1.6.1
+/// published after a rebuild, does not send this device to rebuild from it.
+pub fn holds_more(theirs: &Snapshot, mine: &Snapshot) -> bool {
+    use std::collections::HashMap;
+    let folders: HashMap<Uuid, &FolderRow> = mine.folders.iter().map(|f| (f.id, f)).collect();
+    let files: HashMap<Uuid, &FileRow> = mine.files.iter().map(|f| (f.id, f)).collect();
+    let passwords: HashMap<Uuid, &PasswordRow> = mine.passwords.iter().map(|p| (p.id, p)).collect();
+    theirs.folders.iter().any(|t| {
+        folders.get(&t.id).is_none_or(|m| {
+            (m.parent_id, &m.name, m.deleted_at.is_some())
+                != (t.parent_id, &t.name, t.deleted_at.is_some())
+        })
+    }) || theirs.files.iter().any(|t| {
+        files.get(&t.id).is_none_or(|m| {
+            (
+                m.folder_id,
+                &m.name,
+                m.blob_id,
+                &m.content_hash,
+                m.deleted_at.is_some(),
+            ) != (
+                t.folder_id,
+                &t.name,
+                t.blob_id,
+                &t.content_hash,
+                t.deleted_at.is_some(),
+            )
+        })
+    }) || theirs
+        .passwords
+        .iter()
+        .any(|t| passwords.get(&t.id).is_none_or(|m| m.data != t.data))
+}
+
+fn replay_to(
+    conn: &Connection,
+    vault_id: Uuid,
+    horizon: u64,
+    records: &[crate::OpRecord],
+) -> CoreResult<Snapshot> {
     silentsilo_vault::init_openssl();
     let scratch = Connection::open_in_memory().map_err(db)?;
     init_schema(&scratch, vault_id)?;
+    // From this device's base, not from nothing. A device rebuilt from a
+    // snapshot, or one that compacted before, holds no records below its
+    // base: replayed from an empty tree, its log alone published a snapshot
+    // missing everything the base held, and a rebuild from that lost it.
+    // The same start as `oplog::rebuild_derived`.
+    if let Some(base) = read_base(conn)? {
+        if horizon <= base.horizon {
+            return Err(CoreError::Invalid(format!(
+                "refusing to snapshot at {horizon}: this device's base is already at {}",
+                base.horizon
+            )));
+        }
+        restore(&scratch, &base)?;
+    }
     for record in records.iter().filter(|r| r.lamport <= horizon) {
         // Records this build cannot act on are stored and forwarded, never
         // applied. Snapshotting one would mean writing down a change nobody
@@ -290,7 +429,150 @@ fn dump(conn: &Connection, vault_id: Uuid, horizon: u64) -> CoreResult<Snapshot>
         passwords: read_passwords(conn)?,
         name_claims: read_name_claims(conn)?,
         device_labels: read_device_labels(conn)?,
+        purged: read_purge_memory(conn)?,
     })
+}
+
+fn read_purge_memory(conn: &Connection) -> CoreResult<PurgeMemory> {
+    fn rows<T>(
+        conn: &Connection,
+        sql: &str,
+        f: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    ) -> CoreResult<Vec<T>> {
+        let mut stmt = conn.prepare(sql).map_err(db)?;
+        let out = stmt
+            .query_map([], f)
+            .map_err(db)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db)?;
+        Ok(out)
+    }
+    const PURGED: &str = "SELECT id FROM purged_ids";
+    const EDITED: &str =
+        "SELECT file_id FROM content_versions WHERE replaces IS NOT NULL OR has_base = 0";
+    Ok(PurgeMemory {
+        purged_ids: rows(conn, "SELECT id FROM purged_ids ORDER BY id", |r| r.get(0))?,
+        purges: rows(
+            conn,
+            "SELECT id, op_id, lamport, device_id FROM purges ORDER BY id, op_id",
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?,
+        purged_names: rows(
+            conn,
+            "SELECT file_id, desired, lamport, device_id, op_id FROM purged_names ORDER BY file_id",
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )?,
+        kept_edits: rows(
+            conn,
+            "SELECT copy_id, file_id, claim_op, at FROM kept_edits ORDER BY copy_id",
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?,
+        copy_origins: rows(
+            conn,
+            &format!(
+                "SELECT copy_id, file_id, op_id, at FROM copy_origins
+                  WHERE file_id IN ({PURGED}) OR file_id IN ({EDITED}) ORDER BY copy_id"
+            ),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?,
+        conflict_copies: rows(
+            conn,
+            "SELECT copy_id, file_id, claim_op, at FROM conflict_copies ORDER BY copy_id",
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?,
+        versions: rows(
+            conn,
+            &format!(
+                "SELECT op_id, file_id, lamport, device_id, blob_id, replaces, has_base,
+                        size_bytes, content_hash, mime_type, blob_key, at
+                   FROM content_versions
+                  WHERE file_id IN ({PURGED}) OR file_id IN ({EDITED})
+                  ORDER BY op_id"
+            ),
+            |r| {
+                Ok(VersionRow {
+                    op_id: r.get(0)?,
+                    file_id: r.get(1)?,
+                    lamport: r.get(2)?,
+                    device_id: r.get(3)?,
+                    blob_id: r.get(4)?,
+                    replaces: r.get(5)?,
+                    has_base: r.get::<_, i64>(6)? != 0,
+                    size_bytes: r.get(7)?,
+                    content_hash: r.get(8)?,
+                    mime_type: r.get(9)?,
+                    blob_key: r.get(10)?,
+                    at: r.get(11)?,
+                })
+            },
+        )?,
+    })
+}
+
+fn restore_purge_memory(conn: &Connection, memory: &PurgeMemory) -> CoreResult<()> {
+    for id in &memory.purged_ids {
+        conn.execute("INSERT OR IGNORE INTO purged_ids(id) VALUES (?1)", [id])
+            .map_err(db)?;
+    }
+    for (id, op_id, lamport, device_id) in &memory.purges {
+        conn.execute(
+            "INSERT OR IGNORE INTO purges(id, op_id, lamport, device_id) VALUES (?1, ?2, ?3, ?4)",
+            params![id, op_id, lamport, device_id],
+        )
+        .map_err(db)?;
+    }
+    for (file_id, desired, lamport, device_id, op_id) in &memory.purged_names {
+        conn.execute(
+            "INSERT OR IGNORE INTO purged_names(file_id, desired, lamport, device_id, op_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![file_id, desired, lamport, device_id, op_id],
+        )
+        .map_err(db)?;
+    }
+    for (copy_id, file_id, claim_op, at) in &memory.kept_edits {
+        conn.execute(
+            "INSERT OR IGNORE INTO kept_edits(copy_id, file_id, claim_op, at) VALUES (?1, ?2, ?3, ?4)",
+            params![copy_id, file_id, claim_op, at],
+        )
+        .map_err(db)?;
+    }
+    for (copy_id, file_id, claim_op, at) in &memory.conflict_copies {
+        conn.execute(
+            "INSERT OR IGNORE INTO conflict_copies(copy_id, file_id, claim_op, at) VALUES (?1, ?2, ?3, ?4)",
+            params![copy_id, file_id, claim_op, at],
+        )
+        .map_err(db)?;
+    }
+    for (copy_id, file_id, op_id, at) in &memory.copy_origins {
+        conn.execute(
+            "INSERT OR IGNORE INTO copy_origins(copy_id, file_id, op_id, at) VALUES (?1, ?2, ?3, ?4)",
+            params![copy_id, file_id, op_id, at],
+        )
+        .map_err(db)?;
+    }
+    for v in &memory.versions {
+        conn.execute(
+            "INSERT OR IGNORE INTO content_versions(op_id, file_id, lamport, device_id, blob_id,
+                 replaces, has_base, size_bytes, content_hash, mime_type, blob_key, at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                v.op_id,
+                v.file_id,
+                v.lamport,
+                v.device_id,
+                v.blob_id,
+                v.replaces,
+                v.has_base as i64,
+                v.size_bytes,
+                v.content_hash,
+                v.mime_type,
+                v.blob_key,
+                v.at,
+            ],
+        )
+        .map_err(db)?;
+    }
+    Ok(())
 }
 
 /// Writes a snapshot's rows into the derived tables of `conn`. Only onto
@@ -433,7 +715,7 @@ pub fn restore(conn: &Connection, snapshot: &Snapshot) -> CoreResult<()> {
         .map_err(db)?;
     }
 
-    Ok(())
+    restore_purge_memory(conn, &snapshot.purged)
 }
 
 fn uuid_at(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Uuid> {
@@ -1245,6 +1527,163 @@ mod tests {
         rebuild_from_scratch(&conn, vault_id);
 
         assert_eq!(snapshot_of(&conn), before);
+    }
+
+    #[test]
+    fn a_device_rebuilt_from_a_snapshot_remembers_what_a_purge_took() {
+        // A folder purged below the horizon, then a file another device put
+        // in it offline. The device that saw the purge keeps the file at
+        // the top; one rebuilt from the snapshot had forgotten the purge,
+        // took the folder for one it had never heard of and dropped it.
+        let vault_id = Uuid::new_v4();
+        let seen = bare_device(vault_id);
+        let root = root_folder_id_for(vault_id);
+        let old = Uuid::new_v4();
+        let mut author = Author::new();
+        let records = vec![
+            author.make(
+                1,
+                VaultOp::CreateFolder {
+                    id: old,
+                    parent_id: root,
+                    name: "Old".into(),
+                },
+            ),
+            author.make(2, VaultOp::TrashFolder { id: old }),
+            author.make(
+                3,
+                VaultOp::Purge {
+                    folder_ids: vec![old],
+                    file_ids: Vec::new(),
+                },
+            ),
+            author.make(4, add_file(root, "after.txt")),
+        ];
+        replay(&seen, records.clone()).unwrap();
+        let snapshot = capture_at(&seen, vault_id, 3).unwrap();
+        assert!(!snapshot.purged.is_empty());
+
+        let mut rebuilt = bare_device(vault_id);
+        rebootstrap(&mut rebuilt, &snapshot).unwrap();
+        replay(&rebuilt, records[3..].to_vec()).unwrap();
+
+        let late = Author::new().make(5, add_file(old, "offline.txt"));
+        replay(&seen, vec![late.clone()]).unwrap();
+        replay(&rebuilt, vec![late]).unwrap();
+        assert_eq!(snapshot_of(&rebuilt), snapshot_of(&seen));
+        assert!(
+            snapshot_of(&seen)
+                .iter()
+                .any(|row| row.contains("offline.txt")),
+            "{:?}",
+            snapshot_of(&seen)
+        );
+    }
+
+    #[test]
+    fn a_device_rebuilt_from_a_snapshot_judges_a_later_purge_like_the_others() {
+        // A file edited below the horizon and purged above it by a device
+        // that had not received the edit. The devices that replayed the
+        // edit keep it as a copy; one rebuilt from the snapshot had no record
+        // of the edit and dropped it.
+        let vault_id = Uuid::new_v4();
+        let seen = bare_device(vault_id);
+        let root = root_folder_id_for(vault_id);
+        let mut author = Author::new();
+        let created = author.make(1, add_file(root, "x.txt"));
+        let file = file_id(&created);
+        let OpBody::Known(VaultOp::AddFile { blob_id: first, .. }) = created.op.clone() else {
+            unreachable!()
+        };
+        let edited = Uuid::new_v4();
+        let edit = Author::new().make(
+            2,
+            VaultOp::ReplaceFileContent {
+                id: file,
+                blob_id: edited,
+                size_bytes: 20,
+                content_hash: "edited".into(),
+                mime_type: None,
+                blob_key: String::new(),
+                replaces: Some(first),
+            },
+        );
+        let mut listed = vec![file, crate::oplog::copy_id_of(created.op_id)];
+        listed.extend(
+            listed
+                .clone()
+                .into_iter()
+                .map(crate::oplog::purge_marker)
+                .collect::<Vec<_>>(),
+        );
+        let purge = author.make(
+            3,
+            VaultOp::Purge {
+                folder_ids: Vec::new(),
+                file_ids: listed,
+            },
+        );
+        replay(&seen, vec![created, edit, purge.clone()]).unwrap();
+        let snapshot = capture_at(&seen, vault_id, 2).unwrap();
+        assert!(
+            snapshot_of(&seen)
+                .iter()
+                .any(|row| row.contains("conflicted copy")),
+            "{:?}",
+            snapshot_of(&seen)
+        );
+
+        let mut rebuilt = bare_device(vault_id);
+        rebootstrap(&mut rebuilt, &snapshot).unwrap();
+        replay(&rebuilt, vec![purge]).unwrap();
+        assert_eq!(snapshot_of(&rebuilt), snapshot_of(&seen));
+    }
+
+    #[test]
+    fn a_snapshot_with_nothing_edited_or_purged_is_the_bytes_it_always_was() {
+        let (conn, vault_id, _) = populated();
+        let bytes = capture_at(&conn, vault_id, 2).unwrap().to_bytes().unwrap();
+        assert!(!String::from_utf8(bytes).unwrap().contains("purged"));
+    }
+
+    #[test]
+    fn a_second_compaction_keeps_what_the_first_folded_in() {
+        // After one compaction the log starts at the base. A second snapshot
+        // replayed from the log alone left out everything below it, and a
+        // device rebuilt from that snapshot lost it.
+        let (mut conn, vault_id, _) = populated();
+        compact(&mut conn, vault_id, 3);
+
+        let root = root_folder_id_for(vault_id);
+        let mut author = Author::new();
+        replay(
+            &conn,
+            vec![
+                author.make(6, add_file(root, "six.txt")),
+                author.make(7, add_file(root, "seven.txt")),
+            ],
+        )
+        .unwrap();
+        conn.execute("UPDATE oplog SET pushed = 1", []).unwrap();
+        let before = snapshot_of(&conn);
+
+        let second = capture_at(&conn, vault_id, 6).unwrap();
+        assert!(
+            second.files.iter().any(|f| f.name == "march.pdf"),
+            "{:?}",
+            second.files
+        );
+        compact_local(&mut conn, &second).unwrap();
+        rebuild_from_scratch(&conn, vault_id);
+
+        assert_eq!(snapshot_of(&conn), before);
+    }
+
+    #[test]
+    fn a_horizon_at_or_below_the_base_is_refused() {
+        let (mut conn, vault_id, _) = populated();
+        compact(&mut conn, vault_id, 3);
+        assert!(capture_at(&conn, vault_id, 3).is_err());
     }
 
     #[test]

@@ -526,6 +526,20 @@ real format, versioned, and it is why `snapshot::prune_to` never drops a
 record the bucket has not confirmed: until a record is pushed, the log row is
 its only copy.
 
+Since core 1.7.0 a snapshot also carries `purged`: the purge bookkeeping a
+replay reads (`purged_ids`, `purges`, `purged_names`, `kept_edits`,
+`conflict_copies`, and `copy_origins` and `content_versions` of files edited
+or purged). Without it a device rebuilt from the snapshot forgot every purge
+below the horizon, and dropped a file added offline to a purged folder that
+every other device kept at the top. Without the edit history, a later purge
+of a file edited below the horizon kept an edit its author had not seen on
+every device but the rebuilt one. The field is left out when empty, so a
+snapshot of a silo with no edit and no purge is byte for byte what 1.6.1
+wrote, and `SNAPSHOT_VERSION` stays 1: 1.0.0
+and 1.6.1 read the snapshot and ignore the field, which
+`silentsilo-fixture/tests/snapshot_purge_memory.rs` checks with their own
+code. What they lose by ignoring it is what they already lacked.
+
 Two consequences worth stating:
 
 - Adding a `VaultOp` variant must bump `SCHEMA_VERSION`. The rebuild is what

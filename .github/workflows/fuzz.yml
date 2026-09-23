@@ -1,0 +1,41 @@
+name: Fuzz
+
+# Every night and on demand, never on push: each target runs for a quarter of
+# an hour, and a finding is something to look at, not a red commit.
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Linux only: cargo-fuzz needs a sanitizer, and on Windows the address
+  # sanitizer does not build with the OpenSSL that SQLCipher vendors.
+  fuzz:
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [sealed, blob, op_record, snapshot, silo_files, manifest, inbox, signature]
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: nightly
+      - run: cargo install cargo-fuzz --version 0.13.2 --locked
+      # The corpus carries over between nights, so each run starts where the
+      # last one got to.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      - run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=900 -rss_limit_mb=4096
+      - if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: fuzz-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}

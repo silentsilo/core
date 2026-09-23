@@ -747,6 +747,16 @@ fn map_webauthn_err_impl(err: windows::core::Error, enroll: bool) -> FidoError {
             FidoError::UnlockFailed(t)
         };
     }
+    // ERROR_TIMEOUT as an HRESULT: the prompt was left to run out. Said as
+    // such, so the app neither retries it nor blames the storage.
+    if code == 0x800705B4 || lower.contains("timeout") || lower.contains("timed out") {
+        let t = "Security key prompt timed out".to_string();
+        return if enroll {
+            FidoError::EnrollmentFailed(t)
+        } else {
+            FidoError::UnlockFailed(t)
+        };
+    }
     if enroll {
         FidoError::EnrollmentFailed(text)
     } else {

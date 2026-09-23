@@ -373,9 +373,14 @@ impl VaultSession {
     /// Seals the current state into `vault.db.enc` and its shadow copy.
     /// Fails inside an open transaction: the export attaches a database.
     pub fn backup_locally(&self) -> Result<(), VaultError> {
-        // A rotation committed since this session opened: the snapshot on
-        // disk is under the new key, and sealing over it under this one
-        // would leave the silo opening under nothing.
+        self.refuse_if_key_changed()?;
+        self.write_snapshot().map(|_| ())
+    }
+
+    /// A rotation committed since this session opened: the snapshot on disk
+    /// is under the new key, and sealing over it under this one would leave
+    /// the silo opening under nothing.
+    fn refuse_if_key_changed(&self) -> Result<(), VaultError> {
         if let Ok(sealed) = std::fs::read(crate::kek_store::kek_path(&self.paths.root))
             && crate::kek_store::unwrap_kek_bytes(&sealed, &self.dek).is_err()
         {
@@ -383,7 +388,7 @@ impl VaultSession {
                 "the silo's key changed since this session opened".into(),
             ));
         }
-        self.write_snapshot().map(|_| ())
+        Ok(())
     }
 
     /// Seals the snapshot, then records its fingerprint in the working copy.
@@ -408,6 +413,9 @@ impl VaultSession {
     /// [`wipe_plaintext_working_copy`]. On an error the copy stays unmarked,
     /// and the next unlock treats it as a session that never locked.
     pub fn seal_for_lock(&self) -> Result<(), VaultError> {
+        // The same guard as `backup_locally`: a lock right after a rotation
+        // must not write the old key's snapshot over the new one.
+        self.refuse_if_key_changed()?;
         let sealed = self.write_snapshot()?;
         record_fingerprint(&self.conn, STATE_LOCKED, &sealed)?;
         self.flush_wal()
@@ -2039,6 +2047,39 @@ mod tests {
         std::fs::copy(paths.db_enc_path(), paths.db_enc_backup_path()).unwrap();
         let session = VaultSession::open_with_dek(root, new_dek).unwrap();
         assert_eq!(marker(&session.conn), "rotated");
+    }
+
+    /// A session still open when a rotation commits holds the retired key.
+    /// Locking it must not seal its snapshot over the one under the new key,
+    /// even when it wrote after the rotation.
+    #[test]
+    fn a_lock_after_a_rotation_does_not_seal_under_the_retired_key() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let session = silo_with_marker(&root, "secret", "before");
+        let old = session.dek.clone();
+        let paths = session.paths.clone();
+
+        let new_dek = generate_dek();
+        let kek = crate::kek_store::load_kek(&root, &old).unwrap();
+        crate::rotation::stage_rotation(&root, &new_dek, &kek, &old).unwrap();
+        session
+            .stage_local_backup(&new_dek, &paths.db_enc_staged_path())
+            .unwrap();
+        crate::rotation::commit_rotation(&root).unwrap();
+        silentsilo_core::rename_with_retry(&paths.db_enc_staged_path(), &paths.db_enc_path())
+            .unwrap();
+
+        set_marker(&session, "written after the rotation");
+        assert!(session.seal_for_lock().is_err());
+        assert!(session.backup_locally().is_err());
+        drop(session);
+        wipe_plaintext_working_copy(&paths);
+
+        // Opens under the new key, and the write is not lost: the working
+        // copy's page key moved to the new key with the rotation.
+        let reopened = VaultSession::open_with_dek(root, new_dek).unwrap();
+        assert_eq!(marker(&reopened.conn), "written after the rotation");
     }
 
     /// A damaged snapshot is not a replaced one: the copy still stands for

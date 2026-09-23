@@ -53,6 +53,9 @@ hardware = [
     "dep:ciborium",
     "dep:ctap-hid-fido2",
 ]
+# A security key made of a constant, for end-to-end tests of the real app.
+# Debug builds only: `lib.rs` refuses to compile it otherwise.
+test-authenticator = ["hardware", "dep:blake3"]
 # The Secure Enclave path. Its key agreement and derivation are pure Rust
 # and build everywhere, which is what makes them testable on every platform;
 # only the two macOS crates below reach the chip itself. Separate from

@@ -1,0 +1,20 @@
+[package]
+name = "silentsilo-soak"
+description = "Runs devices on one silo for days, killing them at random and checking what survives. Development only, never shipped."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+silentsilo-app = { workspace = true }
+silentsilo-store = { workspace = true }
+silentsilo-sync = { workspace = true }
+silentsilo-vault = { workspace = true }
+silentsilo-vfs = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }

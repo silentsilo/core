@@ -509,19 +509,30 @@ impl<'a> Vfs<'a> {
     /// two devices importing the same item before either has synced make the
     /// same folder. Random ids made two folders, one renamed "(2)", and each
     /// device kept the files in its own.
-    pub fn ensure_folder_path(&self, segments: &[String]) -> CoreResult<FolderEntry> {
+    ///
+    /// Where that id is taken, by a trashed folder or one purged, the id is
+    /// derived from `seed` as well, the item being imported: the same on
+    /// every device importing it. A fresh id put the item in a different
+    /// folder on each.
+    pub fn ensure_folder_path(&self, segments: &[String], seed: Uuid) -> CoreResult<FolderEntry> {
         let mut folder = self.get_folder(self.root_folder_id()?)?;
         for segment in segments {
             let name = crate::names::sanitize(segment);
             let derived = Uuid::new_v5(&folder.id, crate::names::fold(&name).as_bytes());
-            // A row with that id already, trashed most likely, or one purged:
-            // a record for it would be dropped, so a fresh id.
-            let id = if self.folder_row_exists(derived)?
-                || crate::oplog::was_purged(self.conn(), derived)?
-            {
-                Uuid::now_v7()
-            } else {
+            let taken = |id: Uuid| -> CoreResult<bool> {
+                Ok(self.folder_row_exists(id)? || crate::oplog::was_purged(self.conn(), id)?)
+            };
+            let id = if !taken(derived)? {
                 derived
+            } else {
+                let seeded = Uuid::new_v5(&derived, seed.as_bytes());
+                let mut id = seeded;
+                let mut generation = 0u32;
+                while taken(id)? {
+                    generation += 1;
+                    id = Uuid::new_v5(&seeded, format!("generation {generation}").as_bytes());
+                }
+                id
             };
             folder = match self.create_folder_as(id, folder.id, &name) {
                 Err(CoreError::NameConflict(_)) => self.create_or_get_folder(folder.id, &name)?,
@@ -2040,10 +2051,13 @@ mod tests {
     use tempfile::tempdir;
 
     fn new_session() -> (tempfile::TempDir, VaultSession) {
+        session_for(Uuid::new_v4())
+    }
+
+    fn session_for(vault_id: Uuid) -> (tempfile::TempDir, VaultSession) {
         let dir = tempdir().unwrap();
         let session =
-            VaultSession::provision(dir.path().to_path_buf(), Uuid::new_v4(), "test-secret")
-                .unwrap();
+            VaultSession::provision(dir.path().to_path_buf(), vault_id, "test-secret").unwrap();
         let vfs = Vfs::new(&session);
         vfs.ensure_initialized().unwrap();
         (dir, session)
@@ -2445,11 +2459,11 @@ mod tests {
         let (_dir, session) = new_session();
         let vfs = Vfs::new(&session);
         let folder = vfs
-            .ensure_folder_path(&["Phone".into(), "Photos".into()])
+            .ensure_folder_path(&["Phone".into(), "Photos".into()], Uuid::new_v4())
             .unwrap();
         assert_eq!(folder.path, "/Phone/Photos");
         assert_eq!(
-            vfs.ensure_folder_path(&["Phone".into(), "Photos".into()])
+            vfs.ensure_folder_path(&["Phone".into(), "Photos".into()], Uuid::new_v4())
                 .unwrap()
                 .id,
             folder.id,
@@ -2491,11 +2505,31 @@ mod tests {
     }
 
     #[test]
+    fn two_devices_recreating_a_trashed_import_folder_pick_the_same_one() {
+        // Two devices import the same item before either has the other's
+        // record. With the import folder trashed, each used to make a new one
+        // under a fresh id, and the item landed in a different folder on each.
+        let item = Uuid::new_v4();
+        let recreated = |session: &VaultSession| {
+            let vfs = Vfs::new(session);
+            let phone = vfs
+                .ensure_folder_path(&["Phone".into()], Uuid::new_v4())
+                .unwrap();
+            vfs.trash_folder(phone.id).unwrap();
+            vfs.ensure_folder_path(&["Phone".into()], item).unwrap().id
+        };
+        let vault_id = Uuid::new_v4();
+        let (_a, first) = session_for(vault_id);
+        let (_b, second) = session_for(vault_id);
+        assert_eq!(recreated(&first), recreated(&second));
+    }
+
+    #[test]
     fn imported_names_are_repaired_rather_than_refused() {
         let (_dir, session) = new_session();
         let vfs = Vfs::new(&session);
         let folder = vfs
-            .ensure_folder_path(&["..".into(), "a/b".into()])
+            .ensure_folder_path(&["..".into(), "a/b".into()], Uuid::new_v4())
             .unwrap();
         assert!(!folder.path.contains("/../"), "{}", folder.path);
         let file = vfs

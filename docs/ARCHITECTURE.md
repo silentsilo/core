@@ -158,6 +158,18 @@ sent a whole fleet round a loop with no way out. With nothing readable to
 compare against the answer stays `Rotated`. The join flows say the same two
 things (`flows::kek_refusal`).
 
+With several copies, every copy that answers is asked and the gravest answer
+decides (rotated, then replaced, then current): a copy that missed a rotation
+still says current, and letting the first answer decide pushed its stale
+envelope over the rotated one. Never-delete copies vote only on a silo that
+has no working copy: a rotation leaves them on the old key, so a device on
+the new key reads them as rotated, and letting them decide sent it to rejoin
+in a loop, or whenever the working copy was unplugged. Such a copy, one that
+reads as rotated beside working copies, is retired: the pass leaves it out
+with `RETIRED_COPY` as its status and does not count it as a copy to reach.
+Counting it held the inbox, the sweep and compaction for as long as it stayed
+configured, since it can never be reached under the new key.
+
 ## Data at rest
 
 Three distinct places, and the boundary between them is a security
@@ -253,7 +265,10 @@ snapshot to every target, read it back and refuse to prune unless the bytes
 in storage are the bytes written (it is about to become the only copy of
 everything below the horizon), delete covered ops from targets that allow
 it, prune locally (unpushed records are never dropped and are reported as
-stranded). A device that falls below the horizon gets `needs_rebuild` and
+stranded). A snapshot is captured from this device's base plus its log,
+never from the log alone: after a rebuild or an earlier compaction the log
+starts at the base, and a snapshot of the log alone left out everything
+below it. A device that falls below the horizon gets `needs_rebuild` and
 comes back via the snapshot with a fresh device id, because its old chain
 positions died with the log. Append-only targets keep their whole log and
 still receive the snapshot, which is what a joining device replays from.
@@ -263,8 +278,22 @@ targets that answer. A target below the highest horizon counts only when its
 records reach that horizon: a drive left in a drawer since before the others
 were compacted has a low horizon because it is stale, and it does not hold
 what they pruned. A folder target whose root is gone (an unplugged drive)
-lists as `Unreachable`, never as empty; a missing prefix under an existing
-root is still an empty listing. When no target answers, the pass marks each
+is `Unreachable` for every call, never an empty listing and never a write
+that recreates the root and fills it as a new copy; a missing prefix under
+an existing root is still an empty listing. Only `check`, which runs while
+the user adds or tests the place, creates the root.
+
+The received mark alone cannot see one case. A device that wrote offline for
+a month sends records whose Lamport values the others passed long ago; they
+are older than the policy's month by their own clock, so the first
+compaction folds them in and prunes them, possibly in the same pass that
+sent them. A device whose mark is above the horizon then never fetches them
+and never counts as behind. So once per new horizon each device replays its
+own log to that horizon (`vfs::state_at`) and holds it against the snapshot
+(`vfs::holds_more`): anything the snapshot has that it lacks, or has
+differently, sends it to rebuild. Only that direction counts, so a snapshot
+short of state, as 1.6.1 published after a rebuild, is not rebuilt from. The
+horizon that agreed is kept as `snapshot_checked_through`. When no target answers, the pass marks each
 one failed and backs off instead of stopping with an error.
 
 ## Blob lifecycle
@@ -286,8 +315,11 @@ The referenced set is `files.blob_id` (trash included, a restore needs the
 bytes) plus password attachment blobs parsed out of the decrypted entries,
 because attachments have no row anywhere; the sealed entry is their only
 reference (`Vfs::referenced_blobs_with_attachments`). Purge and attachment
-removal clean the local cache only; the bucket copy is always the sweep's
-to delete, because the sweep re-asks after the ops have converged, and a
+removal clean the local cache only, and a purge leaves content no copy holds
+yet until a push has sent it (`files::release_purged_blobs`): a device that
+has not seen the purge may keep an edit pointing at it. The pass drops such
+content once every copy has it (`drop_delivered_unreferenced`). The bucket
+copy is always the sweep's to delete, because the sweep re-asks after the ops have converged, and a
 row written concurrently on another device may still need the bytes. All
 transfers stream through disk (`put_from_file`/`get_to_file`); nothing
 holds a whole blob in memory.
@@ -344,7 +376,15 @@ that. What keeps them agreeing:
 - the file id is the item id, and the folders the import creates take ids
   derived from parent and name (`Vfs::ensure_folder_path`), so both devices
   write the same file into the same folder. Random folder ids made a
-  "(2)" folder, and each device kept the files in its own;
+  "(2)" folder, and each device kept the files in its own. Where that id is
+  taken (a trashed or purged folder of that name) the id is derived from the
+  item as well, the same on both devices; a fresh id split the items again.
+  A device whose base hides the purge reuses the plain id, and replay keeps
+  that folder: a creation is dropped only when a purge of its id sorts
+  after it (`purged_after`), since a purge never deletes what its author
+  did not name. Two imports of one item that still name two folders are
+  settled by order: the creation first in the order places the file on
+  every device, while no rename has claimed it since;
 - content already in `blobs/` at the signed size is not copied again;
 - an item another device finished between the listing and the read is
   skipped, not an error that stops the scan;
@@ -420,8 +460,12 @@ Read this before "fixing" any of it.
   orders; `silentsilo-app/tests/fleet.rs` runs three devices on one storage.
 - **A purge never deletes what its author did not name.** Entries another
   device put in a purged folder meanwhile move to the top of the silo, as do
-  entries a later record creates there (`purged_ids`). A rebuild writes this
-  device's unpushed records again on top (`sync::apply_rebuild`).
+  entries a later record creates there (`purged_ids`). A rebuild writes
+  again, on top, only what this device wrote and no copy took
+  (`vfs::undelivered_own_ops`, `sync::apply_rebuild`). Not `pushed = 0`: that
+  flag waits for every copy, so beside an unplugged drive or a never-delete
+  copy under a replaced key it is unset on everything, and a rebuild that
+  took it wrote old history again as new changes, purged folders included.
 - **A purge keeps the edits its author could not have seen.** An edit to a
   purged file made on a device that had not received the purge becomes a
   file of its own at the top of the silo, named as a conflict copy of the
@@ -444,8 +488,10 @@ Read this before "fixing" any of it.
   it named in `purges`; the kept file's id derives from the file id and the
   edit's op id (`kept_edit_id`), and its name follows the purged file's last
   name (`purged_names`), so every arrival order and a rebuild give the same
-  file. Like `purged_ids`, none of this is in a snapshot: an edit arriving
-  after the purge was compacted goes with the file. A 1.0.0 device ignores
+  file. A snapshot carries all of it (`Snapshot::purged`), with the
+  versions and copies of every edited file: a device rebuilt from one judges
+  a later purge against the same edits as a device that replayed them. A
+  1.0.0 device ignores
   the markers and drops the edit; the kept file references the content, so
   the sweep here keeps it and `restore_missing_blobs` puts back what a 1.0.0
   sweep deleted.

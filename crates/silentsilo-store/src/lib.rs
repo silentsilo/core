@@ -233,19 +233,25 @@ pub trait ObjectStore: Send + Sync {
     /// Round-trips a probe object, so a misconfiguration is found while the
     /// user is still looking at the settings that caused it.
     async fn check(&self) -> Result<(), StoreError> {
-        const PROBE: &str = ".silentsilo-write-test";
-        self.put(PROBE, b"ok".to_vec()).await?;
-        let read = self.get(PROBE).await?;
-        // Deleted whether or not the contents matched: leaving a probe
-        // behind on a failed check is litter in the user's own storage.
-        let removed = self.delete(PROBE).await;
-        if read != b"ok" {
-            return Err(StoreError::Other(
-                "storage returned different bytes than were written".into(),
-            ));
-        }
-        removed
+        probe(self).await
     }
+}
+
+/// The round trip behind [`ObjectStore::check`], for a backend that
+/// prepares something first.
+pub(crate) async fn probe(store: &(impl ObjectStore + ?Sized)) -> Result<(), StoreError> {
+    const PROBE: &str = ".silentsilo-write-test";
+    store.put(PROBE, b"ok".to_vec()).await?;
+    let read = store.get(PROBE).await?;
+    // Deleted whether or not the contents matched: leaving a probe behind on
+    // a failed check is litter in the user's own storage.
+    let removed = store.delete(PROBE).await;
+    if read != b"ok" {
+        return Err(StoreError::Other(
+            "storage returned different bytes than were written".into(),
+        ));
+    }
+    removed
 }
 
 /// Everything needed to reach one backend.

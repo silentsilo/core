@@ -126,14 +126,30 @@ async fn a_wrong_code_leaves_nothing_behind() {
         .await
         .err()
         .unwrap();
-    assert_eq!(err, "That recovery code doesn't match this silo.");
+    assert_eq!(err, "That recovery code does not match this silo.");
 
     let empty = tempfile::tempdir().unwrap();
     let err = recovery_join_begin(&FolderStore::new(empty.path().to_path_buf()), &origin.code)
         .await
         .err()
         .unwrap();
-    assert_eq!(err, "That bucket doesn't hold a silo.");
+    assert_eq!(err, "That backup storage does not hold a silo.");
+}
+
+#[tokio::test]
+async fn a_code_from_a_newer_version_says_update_rather_than_wrong_code() {
+    let origin = origin().await;
+    let path = origin.storage.join("recovery.env");
+    let mut envelope: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    envelope["version"] = (envelope["version"].as_u64().unwrap() + 1).into();
+    std::fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+
+    let err = recovery_join_begin(&FolderStore::new(origin.storage.clone()), &origin.code)
+        .await
+        .err()
+        .unwrap();
+    assert!(err.contains("newer version"), "{err}");
 }
 
 #[tokio::test]
@@ -172,7 +188,7 @@ async fn the_code_opens_the_joined_silo_and_a_wrong_one_does_not() {
     )
     .err()
     .unwrap();
-    assert_eq!(err, "That recovery code doesn't match this silo.");
+    assert_eq!(err, "That recovery code does not match this silo.");
 
     let (session, meta) =
         open_with_recovery(root.clone(), &envelope, &origin.code, origin.vault_id).unwrap();
