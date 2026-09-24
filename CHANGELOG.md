@@ -11,6 +11,8 @@ release notes should say.
 
 ## [Unreleased]
 
+## [1.7.1] - Touched copies stay
+
 ### Fixed
 
 - A conflict copy someone trashed, renamed, edited or starred no longer
