@@ -534,6 +534,19 @@ pub fn init_oplog_derived(conn: &Connection) -> rusqlite::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_copy_origins_file ON copy_origins(file_id);
 
+        -- Records aimed at a file this device does not have yet: a conflict
+        -- copy another device made and did something with, before the
+        -- records that make or retire it here. Applied when the file
+        -- appears (`apply_pending_touches`).
+        CREATE TABLE IF NOT EXISTS pending_touches (
+            op_id     TEXT PRIMARY KEY,
+            target    TEXT NOT NULL,
+            lamport   INTEGER NOT NULL,
+            device_id TEXT NOT NULL,
+            payload   TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_pending_touches_target ON pending_touches(target);
+
         CREATE TABLE IF NOT EXISTS password_order (
             id        TEXT PRIMARY KEY,
             lamport   INTEGER NOT NULL,
@@ -589,6 +602,7 @@ pub fn drop_oplog_derived(conn: &Connection) -> rusqlite::Result<()> {
         DROP TABLE IF EXISTS kept_edits;
         DROP TABLE IF EXISTS copy_origins;
         DROP TABLE IF EXISTS content_versions;
+        DROP TABLE IF EXISTS pending_touches;
         ",
     )
 }
@@ -951,7 +965,7 @@ fn conflict_copy(
         &losing.blob_key,
         at,
     )?;
-    Ok(())
+    apply_pending_touches(conn, copy_id)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1002,6 +1016,83 @@ fn insert_version(
         .map_err(db)?;
     }
     Ok(())
+}
+
+/// Keeps a record aimed at a file that is not here, for when it appears.
+/// A conflict copy is the case that matters: another device made it and
+/// did something with it, and here the edit that retires it came first, or
+/// the edits that make it have not all arrived. A touched copy is never
+/// retired (`settle_content`), so asking the file's content to settle again
+/// makes it here too, and the record applies to it. Returns whether the
+/// file now exists.
+fn defer_touch(conn: &Connection, record: &OpRecord, id: Uuid) -> CoreResult<bool> {
+    if was_purged(conn, id)? {
+        return Ok(false);
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO pending_touches(op_id, target, lamport, device_id, payload)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            record.op_id.to_string(),
+            id.to_string(),
+            record.lamport as i64,
+            record.device_id.to_string(),
+            String::from_utf8_lossy(&record.to_bytes()?).into_owned(),
+        ],
+    )
+    .map_err(db)?;
+    let origin: Option<String> = conn
+        .query_row(
+            "SELECT file_id FROM copy_origins WHERE copy_id = ?1",
+            [id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(db)?;
+    if let Some(origin) = origin {
+        settle_content(conn, parse_uuid(&origin)?)?;
+    }
+    Ok(read_content_state(conn, id)?.is_some())
+}
+
+/// Applies, in the order records sort, what was kept for `id` while it was
+/// missing. Called once the file exists.
+fn apply_pending_touches(conn: &Connection, id: Uuid) -> CoreResult<()> {
+    let payloads: Vec<String> = conn
+        .prepare_cached(
+            "SELECT payload FROM pending_touches WHERE target = ?1
+             ORDER BY lamport, device_id, op_id",
+        )
+        .map_err(db)?
+        .query_map([id.to_string()], |row| row.get(0))
+        .map_err(db)?
+        .collect::<rusqlite::Result<_>>()
+        .map_err(db)?;
+    if payloads.is_empty() {
+        return Ok(());
+    }
+    conn.execute(
+        "DELETE FROM pending_touches WHERE target = ?1",
+        [id.to_string()],
+    )
+    .map_err(db)?;
+    for payload in payloads {
+        let record = OpRecord::from_bytes(payload.as_bytes())?;
+        apply_inner(conn, &record)?;
+    }
+    Ok(())
+}
+
+/// Whether a record other than the one that made it has been aimed at copy
+/// `copy_id`, here or while it was missing.
+fn copy_touched(conn: &Connection, copy_id: Uuid) -> CoreResult<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pending_touches WHERE target = ?1)
+             OR EXISTS(SELECT 1 FROM trash_events WHERE target = ?1)",
+        [copy_id.to_string()],
+        |row| row.get(0),
+    )
+    .map_err(db)
 }
 
 /// The id of the conflict copy a content record makes.
@@ -1143,6 +1234,19 @@ fn settle_content(conn: &Connection, file_id: Uuid) -> CoreResult<()> {
     for leaf in leaves[..leaves.len() - 1].iter().rev() {
         if leaf.blob_id != winner.blob_id && !wanted.iter().any(|w| w.blob_id == leaf.blob_id) {
             wanted.push(leaf);
+        }
+    }
+    // A copy some record was aimed at stands even once superseded: the
+    // device that sent it had the copy, whatever order the edits came in
+    // here.
+    for version in &versions {
+        if version.blob_id == winner.blob_id || wanted.iter().any(|w| w.op_id == version.op_id) {
+            continue;
+        }
+        if let Ok(op) = Uuid::parse_str(&version.op_id)
+            && copy_touched(conn, copy_id_of(op))?
+        {
+            wanted.push(version);
         }
     }
     for leaf in &wanted {
@@ -1713,6 +1817,7 @@ fn keep_edit(conn: &Connection, file_id: Uuid, op_id: Uuid, version: &Version) -
         &version.blob_key,
         at,
     )?;
+    apply_pending_touches(conn, copy_id)?;
     Ok(true)
 }
 
@@ -3058,6 +3163,7 @@ fn apply_inner(conn: &Connection, record: &OpRecord) -> CoreResult<ApplyOutcome>
                 blob_key,
                 at,
             )?;
+            apply_pending_touches(conn, *id)?;
             Ok(renamed_or_applied(name, &final_name))
         }
 
@@ -3072,7 +3178,11 @@ fn apply_inner(conn: &Connection, record: &OpRecord) -> CoreResult<ApplyOutcome>
         } => {
             let here = read_content_state(conn, *id)?.is_some();
             if !here && purges_of(conn, *id)?.is_empty() {
-                return Ok(ApplyOutcome::Obsolete);
+                return Ok(if defer_touch(conn, record, *id)? {
+                    ApplyOutcome::Applied
+                } else {
+                    ApplyOutcome::Obsolete
+                });
             }
             // Every edit is kept, and what the file holds and which copies
             // stand beside it are worked out from all of them.
@@ -3113,12 +3223,17 @@ fn apply_inner(conn: &Connection, record: &OpRecord) -> CoreResult<ApplyOutcome>
                 .map_err(db)?;
             let Some((folder_id, _current)) = existing else {
                 // What was kept of a purged file is named after it.
-                if !purges_of(conn, *id)?.is_empty()
-                    && remember_purged_name(conn, *id, &sanitize(name), order_of(record))?
-                {
-                    follow_purged_name(conn, *id, at)?;
+                if !purges_of(conn, *id)?.is_empty() {
+                    if remember_purged_name(conn, *id, &sanitize(name), order_of(record))? {
+                        follow_purged_name(conn, *id, at)?;
+                    }
+                    return Ok(ApplyOutcome::Obsolete);
                 }
-                return Ok(ApplyOutcome::Obsolete);
+                return Ok(if defer_touch(conn, record, *id)? {
+                    ApplyOutcome::Applied
+                } else {
+                    ApplyOutcome::Obsolete
+                });
             };
             // No shortcut when the name already reads the same: that can be
             // a rank suffix, and the claim still has to record what was asked
@@ -3165,6 +3280,13 @@ fn apply_inner(conn: &Connection, record: &OpRecord) -> CoreResult<ApplyOutcome>
         VaultOp::TrashFile { id } | VaultOp::RestoreFile { id } => {
             let trash = matches!(op, VaultOp::TrashFile { .. });
             record_trash_event(conn, record, *id, false, trash)?;
+            if read_content_state(conn, *id)?.is_none() {
+                return Ok(if defer_touch(conn, record, *id)? {
+                    ApplyOutcome::Applied
+                } else {
+                    ApplyOutcome::Obsolete
+                });
+            }
             Ok(if settle_file_trash(conn, *id)? {
                 ApplyOutcome::Applied
             } else {
@@ -3434,6 +3556,13 @@ fn apply_inner(conn: &Connection, record: &OpRecord) -> CoreResult<ApplyOutcome>
         // the user files an entry, not about the entry changing, and letting
         // it bump the timestamp would reorder the explorer under them.
         VaultOp::SetFileFavorite { id, favorite } => {
+            if read_content_state(conn, *id)?.is_none() {
+                return Ok(if defer_touch(conn, record, *id)? {
+                    ApplyOutcome::Applied
+                } else {
+                    ApplyOutcome::Obsolete
+                });
+            }
             Ok(set_favorite(conn, "files", *id, *favorite)?)
         }
 
@@ -6172,6 +6301,55 @@ pub(crate) mod tests {
                 kept_row(s.file, &edit, "x (conflicted copy 2023-11-14).txt", blob),
                 format!("folder / {} deleted=false", s.root),
             ]
+        );
+    }
+
+    /// X edits, Y edits the same content, and X builds on its own edit,
+    /// which retires the copy of it. Z trashes that copy, having not seen
+    /// X's second edit. A device that retired the copy first used to drop
+    /// the trash as aimed at nothing, while one that saw the trash first
+    /// kept the copy: touched copies are not retired.
+    #[test]
+    fn a_copy_touched_after_it_was_retired_comes_back_in_every_order() {
+        let vault = Uuid::new_v4();
+        let root = crate::schema::root_folder_id_for(vault);
+        let (x, y, z) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let file = Uuid::new_v4();
+        let [b0, b1, b2, b3] = [0; 4].map(|_| Uuid::new_v4());
+        let base = by(x, 1, added(file, root, "x.txt", b0));
+        let first = by(x, 2, edited(file, b1, b0));
+        let other = by(y, 3, edited(file, b2, b0));
+        let on_first = by(x, 4, edited(file, b3, b1));
+        let copy = copy_id_of(first.op_id);
+        let trash = by(z, 5, VaultOp::TrashFile { id: copy });
+        let tree = same_in_every_order(vault, &[base, first], &[other, on_first, trash]);
+        assert!(
+            tree.iter()
+                .any(|row| row.contains(&copy.to_string()) && row.ends_with("deleted=true")),
+            "{tree:#?}"
+        );
+    }
+
+    /// The same with an edit to the copy: lost on every device that retired
+    /// the copy before the edit reached it, a fresh one included.
+    #[test]
+    fn an_edit_to_a_retired_copy_is_kept_in_every_order() {
+        let vault = Uuid::new_v4();
+        let root = crate::schema::root_folder_id_for(vault);
+        let (x, y, z) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let file = Uuid::new_v4();
+        let [b0, b1, b2, b3, b4] = [0; 5].map(|_| Uuid::new_v4());
+        let base = by(x, 1, added(file, root, "x.txt", b0));
+        let first = by(x, 2, edited(file, b1, b0));
+        let other = by(y, 3, edited(file, b2, b0));
+        let on_first = by(x, 4, edited(file, b3, b1));
+        let copy = copy_id_of(first.op_id);
+        let on_copy = by(z, 5, edited(copy, b4, b1));
+        let tree = same_in_every_order(vault, &[base, first], &[other, on_first, on_copy]);
+        assert!(
+            tree.iter()
+                .any(|row| row.contains(&format!("{copy} blob={b4}"))),
+            "{tree:#?}"
         );
     }
 

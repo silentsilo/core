@@ -455,7 +455,12 @@ Read this before "fixing" any of it.
   file's content and conflict copies from every edit (`content_versions`),
   password edits and renames guarded by total order (`password_order`, the
   claim's own order), purged ids remembered (`purged_ids`), and each purge
-  with its place in the order (`purges`).
+  with its place in the order (`purges`). A conflict copy an edit has built
+  on is retired unless a record touched it (trash, rename, edit, star); a
+  record aimed at a file not here yet waits in `pending_touches` and applies
+  when the file appears, and a copy with such a record stands even once
+  superseded. Before this a device that retired the copy first dropped the
+  record, and a device rebuilt from the log did too.
   `tests/arrival_order.rs` applies records one at a time in random causal
   orders; `silentsilo-app/tests/fleet.rs` runs three devices on one storage.
 - **A purge never deletes what its author did not name.** Entries another

@@ -11,6 +11,17 @@ release notes should say.
 
 ## [Unreleased]
 
+### Fixed
+
+- A conflict copy someone trashed, renamed, edited or starred no longer
+  vanishes on the devices where the edit that retires it arrived first. The
+  record aimed at it was dropped as pointing at nothing, and a device
+  rebuilt from the log dropped it too, so an edit to such a copy was lost
+  everywhere but on the device that made it. A record aimed at a file not
+  here yet now waits (`pending_touches`) and applies when the file appears,
+  and a touched copy is never retired. `SCHEMA_VERSION` is 4, so every
+  device rebuilds its index once. Found by the soak test.
+
 ## [1.7.0] - The same silo on every device
 
 ### Fixed

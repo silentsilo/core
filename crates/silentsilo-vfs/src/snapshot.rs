@@ -162,6 +162,10 @@ pub struct PurgeMemory {
     /// lists them as seen, and a later edit can retire one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conflict_copies: Vec<(String, String, String, i64)>,
+    /// `pending_touches`: op_id, target, lamport, device_id, payload.
+    /// Records aimed at a copy not made here yet, applied when it is.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_touches: Vec<(String, String, i64, String, String)>,
 }
 
 impl PurgeMemory {
@@ -173,6 +177,7 @@ impl PurgeMemory {
             && self.copy_origins.is_empty()
             && self.versions.is_empty()
             && self.conflict_copies.is_empty()
+            && self.pending_touches.is_empty()
     }
 }
 
@@ -480,6 +485,12 @@ fn read_purge_memory(conn: &Connection) -> CoreResult<PurgeMemory> {
             "SELECT copy_id, file_id, claim_op, at FROM conflict_copies ORDER BY copy_id",
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?,
+        pending_touches: rows(
+            conn,
+            "SELECT op_id, target, lamport, device_id, payload FROM pending_touches
+              ORDER BY op_id",
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )?,
         versions: rows(
             conn,
             &format!(
@@ -533,6 +544,14 @@ fn restore_purge_memory(conn: &Connection, memory: &PurgeMemory) -> CoreResult<(
         conn.execute(
             "INSERT OR IGNORE INTO kept_edits(copy_id, file_id, claim_op, at) VALUES (?1, ?2, ?3, ?4)",
             params![copy_id, file_id, claim_op, at],
+        )
+        .map_err(db)?;
+    }
+    for (op_id, target, lamport, device_id, payload) in &memory.pending_touches {
+        conn.execute(
+            "INSERT OR IGNORE INTO pending_touches(op_id, target, lamport, device_id, payload)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![op_id, target, lamport, device_id, payload],
         )
         .map_err(db)?;
     }

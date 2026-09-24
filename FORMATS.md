@@ -110,7 +110,7 @@ in this list; that lives on the machine instead, in the table after this one.
 | Which silo this is | `silo.json` | `MARKER_VERSION = 1`, `silentsilo-vault/registry.rs` | Refuses a newer one; unlock uses it to tell a leftover working copy from this silo's |
 | Enrolled keys | `keys/fido.json` | `SILO_FILE_VERSION`, plus a `kind` per key | |
 | Recovery envelope | `keys/recovery.json` | Its own, as above | Its version means the shape of one wrapped key, not the file |
-| Index | `vault.db.enc` | `SCHEMA_VERSION = 3`, `silentsilo-vfs/schema.rs` | Not a format: see below |
+| Index | `vault.db.enc` | `SCHEMA_VERSION = 4`, `silentsilo-vfs/schema.rs` | Not a format: see below |
 | Index, mid-rotation | `vault.db.enc.next` | Same envelope as `vault.db.enc` | Transient; unlock adopts it, see below |
 | Keys, mid-rotation | `keys/fido.json.next`, `keys/recovery.json.next` | Same as the files they replace | Transient, from core 1.7.0; see below |
 | Base snapshot | `vault_base` table in `vault.db` | `SNAPSHOT_VERSION = 1`, `silentsilo-vfs/snapshot.rs` | Refuses, naming the version |
@@ -528,7 +528,7 @@ its only copy.
 
 Since core 1.7.0 a snapshot also carries `purged`: the purge bookkeeping a
 replay reads (`purged_ids`, `purges`, `purged_names`, `kept_edits`,
-`conflict_copies`, and `copy_origins` and `content_versions` of files edited
+`conflict_copies`, `pending_touches` since 1.7.1, and `copy_origins` and `content_versions` of files edited
 or purged). Without it a device rebuilt from the snapshot forgot every purge
 below the horizon, and dropped a file added offline to a purged folder that
 every other device kept at the top. Without the edit history, a later purge
