@@ -25,6 +25,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: nightly
+      - name: System libraries the workspace links against
+        run: |
+          for attempt in 1 2 3; do
+            sudo timeout 180 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && break
+            echo "apt-get update stalled or failed (attempt $attempt)"
+            sleep 5
+          done
+          sudo apt-get install -y libdbus-1-dev libudev-dev pkg-config
       - run: cargo install cargo-fuzz --version 0.13.2 --locked
       # The corpus carries over between nights, so each run starts where the
       # last one got to.

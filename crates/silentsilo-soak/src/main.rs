@@ -7,6 +7,7 @@
 //! ```text
 //! silentsilo-soak run --work D:\soak [--storage storage.json] [--devices 3]
 //!                     [--hours 48] [--kill-every 300] [--check-every 3600]
+//!                     [--min-free-gb 20]
 //! ```
 //!
 //! Without `--storage` the silo backs up to a folder under `--work`. With it,
@@ -18,6 +19,10 @@
 //! it comes back behind the horizon and rebuilds with its offline work.
 //! A failed check writes `FAILED` in `report.log` and stops, leaving the work
 //! folder as it was for a look.
+//!
+//! Storage keeps everything uploaded (the sweep's grace is 30 days), so the
+//! work disk fills at roughly 1.5 GB an hour. Below `--min-free-gb` the run
+//! stops early, says so, and still runs the final check.
 //!
 //! The device key is a fixed wrap key, the way the tests open a silo, so no
 //! security key or Windows Hello is needed.
@@ -49,6 +54,7 @@ struct Args {
     hours: f64,
     kill_every: u64,
     check_every: u64,
+    min_free_gb: u64,
     n: usize,
     out: bool,
     name: String,
@@ -64,6 +70,7 @@ fn args() -> Args {
         hours: 48.0,
         kill_every: 300,
         check_every: 3600,
+        min_free_gb: 20,
         n: 0,
         out: false,
         name: String::new(),
@@ -77,6 +84,7 @@ fn args() -> Args {
             "--hours" => args.hours = value().parse().expect("a number"),
             "--kill-every" => args.kill_every = value().parse().expect("seconds"),
             "--check-every" => args.check_every = value().parse().expect("seconds"),
+            "--min-free-gb" => args.min_free_gb = value().parse().expect("a number"),
             "--n" => args.n = value().parse().expect("a number"),
             "--compact" => args.out = true,
             "--name" => args.name = value(),
@@ -219,8 +227,25 @@ fn supervise(args: &Args) {
     let mut next_check = Instant::now() + Duration::from_secs(args.check_every);
     let mut checks = 0;
     let mut kills = 0;
+    let mut next_space = Instant::now();
 
     while started.elapsed() < end {
+        if Instant::now() >= next_space {
+            if let Some(free) = free_bytes(work)
+                && free < args.min_free_gb * 1_000_000_000
+            {
+                report(
+                    work,
+                    &format!(
+                        "stopped early: {:.1} GB free on the work disk, under {} GB",
+                        free as f64 / 1e9,
+                        args.min_free_gb
+                    ),
+                );
+                break;
+            }
+            next_space = Instant::now() + Duration::from_secs(60);
+        }
         for (n, child) in children.iter_mut().enumerate() {
             if child.is_none() && Instant::now() >= asleep_until[n] {
                 *child = Some(spawn(work, "device", n, &[]));
@@ -269,6 +294,7 @@ fn supervise(args: &Args) {
     }
     for child in children.iter_mut().flatten() {
         let _ = child.kill();
+        let _ = child.wait();
     }
     match check(work, args.devices, None) {
         Ok(summary) => report(
@@ -280,6 +306,40 @@ fn supervise(args: &Args) {
             std::process::exit(1);
         }
     }
+}
+
+/// Bytes free to this user on the disk holding `path`. `None` when it cannot
+/// be read, which never stops a run.
+#[cfg(windows)]
+fn free_bytes(path: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    let mut free = 0u64;
+    // SAFETY: `wide` is NUL-terminated and outlives the call; the out
+    // pointer is a live u64, and the two totals are optional.
+    let ok = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    (ok != 0).then_some(free)
+}
+
+#[cfg(unix)]
+// The field types differ between Linux and macOS.
+#[allow(clippy::unnecessary_cast)]
+fn free_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` is a valid C string and `stat` a live, writable struct.
+    if unsafe { libc::statvfs(c.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    Some(stat.f_bavail as u64 * stat.f_frsize as u64)
 }
 
 /// Syncs every device until a round moves nothing, compacting first when

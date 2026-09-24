@@ -4178,6 +4178,7 @@ dependencies = [
 name = "silentsilo-soak"
 version = "1.7.0"
 dependencies = [
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
@@ -4188,6 +4189,7 @@ dependencies = [
  "silentsilo-vfs 1.7.0",
  "tokio",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
