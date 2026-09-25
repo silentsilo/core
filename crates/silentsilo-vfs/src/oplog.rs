@@ -1051,8 +1051,35 @@ fn defer_touch(conn: &Connection, record: &OpRecord, id: Uuid) -> CoreResult<boo
         .map_err(db)?;
     if let Some(origin) = origin {
         settle_content(conn, parse_uuid(&origin)?)?;
+    } else if let Some(file) = kept_edit_origin(conn, id)? {
+        settle_kept_edits(conn, file)?;
     }
     Ok(read_content_state(conn, id)?.is_some())
+}
+
+/// The purged file `id` would be an edit of, kept as a file of its own. Its
+/// id derives from the file and the edit (`kept_edit_id`), so the edits of
+/// purged files are tried in turn: only for a record aimed at a missing
+/// file, which is rare.
+fn kept_edit_origin(conn: &Connection, id: Uuid) -> CoreResult<Option<Uuid>> {
+    let rows: Vec<(String, String)> = conn
+        .prepare_cached(
+            "SELECT file_id, op_id FROM content_versions
+              WHERE file_id IN (SELECT id FROM purged_ids)",
+        )
+        .map_err(db)?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(db)?
+        .collect::<rusqlite::Result<_>>()
+        .map_err(db)?;
+    for (file, op) in rows {
+        if let (Ok(file), Ok(op)) = (Uuid::parse_str(&file), Uuid::parse_str(&op))
+            && kept_edit_id(file, op) == id
+        {
+            return Ok(Some(file));
+        }
+    }
+    Ok(None)
 }
 
 /// Applies, in the order records sort, what was kept for `id` while it was
@@ -1723,11 +1750,56 @@ fn settle_kept_edits(conn: &Connection, file_id: Uuid) -> CoreResult<bool> {
                 break;
             }
         }
-        if unseen {
+        // What a purge saw can only grow as its records arrive: the edit it
+        // listed, or one another was written under. So an edit kept while
+        // those were missing is taken back once they are here, unless
+        // something touched the file it became, as for a conflict copy.
+        if unseen || copy_touched(conn, kept_edit_id(file_id, op_id))? {
             made |= keep_edit(conn, file_id, op_id, version)?;
+        } else {
+            made |= retire_kept_edit(conn, file_id, op_id, version.at)?;
         }
     }
     Ok(made)
+}
+
+/// Removes the file an edit was kept as, when nothing but its own record
+/// ever touched it. True when it went.
+fn retire_kept_edit(conn: &Connection, file_id: Uuid, op_id: Uuid, at: i64) -> CoreResult<bool> {
+    let copy_id = kept_edit_id(file_id, op_id);
+    let untouched: bool = conn
+        .query_row(
+            "SELECT
+                EXISTS(SELECT 1 FROM files WHERE id = ?1)
+                AND EXISTS(SELECT 1 FROM name_claims WHERE entry_id = ?1 AND op_id = ?2)
+                AND NOT EXISTS(SELECT 1 FROM trash_events WHERE target = ?1)
+                AND NOT EXISTS(SELECT 1 FROM pending_touches WHERE target = ?1)
+                AND NOT EXISTS(SELECT 1 FROM content_versions WHERE file_id = ?1 AND op_id != ?2 || ':kept')
+                AND NOT EXISTS(SELECT 1 FROM files WHERE id = ?1 AND favorite = 1)",
+            params![copy_id.to_string(), op_id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(db)?;
+    if !untouched {
+        return Ok(false);
+    }
+    let group = current_group(conn, copy_id)?;
+    for sql in [
+        "DELETE FROM files WHERE id = ?1",
+        "DELETE FROM content_versions WHERE file_id = ?1",
+        "DELETE FROM kept_edits WHERE copy_id = ?1",
+    ] {
+        conn.execute(sql, [copy_id.to_string()]).map_err(db)?;
+    }
+    release_claim(conn, copy_id)?;
+    if let Some(group) = group {
+        let mut groups = vec![group.clone()];
+        if let Some(base) = suffix_base(&group.key) {
+            groups.push(ClaimGroupKey { key: base, ..group });
+        }
+        settle_groups(conn, &groups, at)?;
+    }
+    Ok(true)
 }
 
 fn keep_edit(conn: &Connection, file_id: Uuid, op_id: Uuid, version: &Version) -> CoreResult<bool> {
@@ -6535,6 +6607,180 @@ pub(crate) mod tests {
                 ),
                 format!("folder / {} deleted=false", s.root),
             ]
+        );
+    }
+
+    /// An edit from a build that did not say what it was written on.
+    fn edited_without_base(id: Uuid, blob: Uuid) -> VaultOp {
+        VaultOp::ReplaceFileContent {
+            id,
+            blob_id: blob,
+            size_bytes: 20,
+            content_hash: format!("hash-{blob}"),
+            mime_type: None,
+            blob_key: format!("key-{blob}"),
+            replaces: None,
+        }
+    }
+
+    fn no_kept_copy(tree: &[String]) -> bool {
+        !tree.iter().any(|row| row.contains("conflicted copy"))
+    }
+
+    #[test]
+    fn an_edit_the_purging_device_wrote_after_its_purge_is_not_kept() {
+        // Its own record, later in its own order: it knew of the purge.
+        let s = emptied();
+        let purge = listing_purge(&s, 4, &[&s.records[1]]);
+        let later = by(s.purger, 5, edited(s.file, Uuid::new_v4(), s.original));
+        let tree = same_in_every_order(s.vault, &s.records, &[purge, later]);
+        assert!(no_kept_copy(&tree), "{tree:#?}");
+    }
+
+    #[test]
+    fn an_old_style_edit_older_than_one_the_purge_listed_was_seen() {
+        // It names no base, so the order decides: something the purge's
+        // author held came after it.
+        let s = emptied();
+        let listed = by(s.purger, 6, edited(s.file, Uuid::new_v4(), s.original));
+        let old = by(
+            Uuid::new_v4(),
+            5,
+            edited_without_base(s.file, Uuid::new_v4()),
+        );
+        let purge = listing_purge(&s, 10, &[&s.records[1], &listed]);
+        let tree = same_in_every_order(s.vault, &s.records, &[listed, old, purge]);
+        assert!(no_kept_copy(&tree), "{tree:#?}");
+    }
+
+    #[test]
+    fn a_kept_edit_someone_trashed_stays_even_once_it_proves_seen() {
+        // A device that got the purge before the edit it listed kept the
+        // older edit as a file, and someone trashed that file. The trash is
+        // aimed at it, so every device ends with it, in the trash.
+        let s = emptied();
+        let listed = by(s.purger, 6, edited(s.file, Uuid::new_v4(), s.original));
+        let old = by(
+            Uuid::new_v4(),
+            5,
+            edited_without_base(s.file, Uuid::new_v4()),
+        );
+        let purge = listing_purge(&s, 10, &[&s.records[1], &listed]);
+        let kept = kept_edit_id(s.file, old.op_id);
+        let trash = by(Uuid::new_v4(), 11, VaultOp::TrashFile { id: kept });
+        let tree = same_in_every_order(s.vault, &s.records, &[listed, old, purge, trash]);
+        assert!(
+            tree.iter()
+                .any(|row| row.contains(&kept.to_string()) && row.ends_with("deleted=true")),
+            "{tree:#?}"
+        );
+    }
+
+    #[test]
+    fn an_old_style_edit_newer_than_all_the_purge_listed_is_kept() {
+        let s = emptied();
+        let blob = Uuid::new_v4();
+        let listed = by(s.purger, 6, edited(s.file, Uuid::new_v4(), s.original));
+        let old = by(Uuid::new_v4(), 7, edited_without_base(s.file, blob));
+        let purge = listing_purge(&s, 10, &[&s.records[1], &listed]);
+        let tree = same_in_every_order(s.vault, &s.records, &[listed, old.clone(), purge]);
+        assert!(
+            tree.contains(&kept_row(
+                s.file,
+                &old,
+                "x (conflicted copy 2023-11-14).txt",
+                blob
+            )),
+            "{tree:#?}"
+        );
+    }
+
+    #[test]
+    fn a_conflict_copy_keeps_the_size_and_type_of_the_edit_it_preserves() {
+        let vault = Uuid::new_v4();
+        let root = crate::schema::root_folder_id_for(vault);
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let (file, b0, b1, b2) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let base = by(a, 1, added(file, root, "x.txt", b0));
+        let losing = by(
+            a,
+            2,
+            VaultOp::ReplaceFileContent {
+                id: file,
+                blob_id: b1,
+                size_bytes: 33,
+                content_hash: format!("hash-{b1}"),
+                mime_type: Some("text/plain".into()),
+                blob_key: format!("key-{b1}"),
+                replaces: Some(b0),
+            },
+        );
+        let winning = by(b, 3, edited(file, b2, b0));
+        for order in [[&losing, &winning], [&winning, &losing]] {
+            let conn = bare_device(vault);
+            apply_op(&conn, &base).unwrap();
+            for record in order {
+                apply_op(&conn, record).unwrap();
+            }
+            let (blob, size, mime): (String, i64, Option<String>) = conn
+                .query_row(
+                    "SELECT blob_id, size_bytes, mime_type FROM files WHERE id = ?1",
+                    [copy_id_of(losing.op_id).to_string()],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(blob, b1.to_string());
+            assert_eq!(size, 33);
+            assert_eq!(mime.as_deref(), Some("text/plain"));
+        }
+    }
+
+    #[test]
+    fn a_rebuild_stops_at_a_record_it_does_not_know_and_may_not_skip() {
+        // Reachable only after a downgrade: a newer build stored a record
+        // this one cannot apply. Carrying on without it would build an index
+        // that silently lacks something.
+        let vault = Uuid::new_v4();
+        let conn = bare_device(vault);
+        let store = |skippable: bool, lamport: u64| {
+            let record = OpRecord {
+                op_id: Uuid::new_v4(),
+                lamport,
+                device_id: Uuid::new_v4(),
+                at: DAY_ONE,
+                skippable,
+                seq: 0,
+                prev: None,
+                op: OpBody::Unknown {
+                    op: "SomethingLater".into(),
+                    fields: serde_json::Map::new(),
+                },
+            };
+            conn.execute(
+                "INSERT INTO oplog(op_id, lamport, device_id, at, payload, pushed, applied)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1, 0)",
+                params![
+                    record.op_id.to_string(),
+                    record.lamport as i64,
+                    record.device_id.to_string(),
+                    record.at,
+                    String::from_utf8(record.to_bytes().unwrap()).unwrap(),
+                ],
+            )
+            .unwrap();
+        };
+        store(true, 1);
+        assert!(rebuild_derived(&conn).is_ok(), "a skippable one waits");
+        store(false, 2);
+        let refused = rebuild_derived(&conn).unwrap_err();
+        assert!(
+            matches!(&refused, CoreError::UnsupportedOperation(op) if op == "SomethingLater"),
+            "{refused:?}"
         );
     }
 

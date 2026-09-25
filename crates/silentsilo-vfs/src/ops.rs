@@ -2048,6 +2048,193 @@ mod tests {
             seen_folder |= !folder_ids.is_empty();
         }
     }
+    /// The purge records written since the log held `before` rows, as
+    /// (folder ids, file ids).
+    fn purges_since(session: &VaultSession, before: i64) -> Vec<(Vec<Uuid>, Vec<Uuid>)> {
+        let mut stmt = session
+            .conn
+            .prepare("SELECT payload FROM oplog ORDER BY lamport, device_id, op_id")
+            .unwrap();
+        let payloads: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        payloads[before as usize..]
+            .iter()
+            .filter_map(|text| {
+                match crate::oplog::OpRecord::from_bytes(text.as_bytes())
+                    .unwrap()
+                    .op
+                {
+                    crate::oplog::OpBody::Known(crate::oplog::VaultOp::Purge {
+                        folder_ids,
+                        file_ids,
+                    }) => Some((folder_ids, file_ids)),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    fn log_len(session: &VaultSession) -> i64 {
+        session
+            .conn
+            .query_row("SELECT COUNT(*) FROM oplog", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_purge_of_files_alone_is_split_into_full_records() {
+        // Files only, no folder: the path that decides whether one record is
+        // enough counts files and folders together.
+        let (_dir, session) = new_session();
+        let vfs = Vfs::new(&session);
+        let root = vfs.root_folder_id().unwrap();
+        let mut ids = Vec::new();
+        for i in 0..30 {
+            let file = vfs
+                .add_file(root, &format!("{i}.txt"), Uuid::new_v4(), 1, "h", None, "")
+                .unwrap();
+            vfs.trash_file(file.id).unwrap();
+            ids.push(file.id);
+        }
+        let before = log_len(&session);
+        vfs.empty_trash().unwrap();
+
+        let records = purges_since(&session, before);
+        let sizes: Vec<usize> = records.iter().map(|(f, d)| f.len() + d.len()).collect();
+        assert!(
+            sizes.iter().all(|&n| n <= PURGE_IDS_PER_RECORD),
+            "{sizes:?}"
+        );
+        // Each file's group is four ids (the file, the copy its record could
+        // make, and a marker for each), so every record but the last is
+        // filled to within one group of the ceiling: no record per file.
+        let (last, full) = sizes.split_last().unwrap();
+        assert!(*last > 0);
+        assert!(
+            full.iter().all(|&n| n > PURGE_IDS_PER_RECORD - 4),
+            "{sizes:?}"
+        );
+        let named: std::collections::HashSet<Uuid> = records
+            .iter()
+            .flat_map(|(_, d)| d.iter().copied())
+            .collect();
+        assert!(ids.iter().all(|id| named.contains(id)));
+        assert!(vfs.list_trash().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_file_with_too_many_versions_for_one_record_goes_without_its_markers() {
+        // Its ids and their markers do not fit one record, and a marker in a
+        // record that does not hold the whole list would claim a list it
+        // does not have. The ids go, the markers do not.
+        let (_dir, session) = new_session();
+        let vfs = Vfs::new(&session);
+        let root = vfs.root_folder_id().unwrap();
+        let mut file = vfs
+            .add_file(root, "busy.txt", Uuid::new_v4(), 1, "h", None, "")
+            .unwrap();
+        for _ in 0..25 {
+            file = vfs
+                .add_file(root, "busy.txt", Uuid::new_v4(), 1, "h", None, "")
+                .unwrap();
+        }
+        vfs.trash_file(file.id).unwrap();
+        let before = log_len(&session);
+        vfs.empty_trash().unwrap();
+
+        let records = purges_since(&session, before);
+        let named: Vec<Uuid> = records
+            .iter()
+            .flat_map(|(_, d)| d.iter().copied())
+            .collect();
+        assert!(named.contains(&file.id), "{records:?}");
+        assert!(!named.contains(&crate::oplog::purge_marker(file.id)));
+        assert!(
+            records
+                .iter()
+                .all(|(f, d)| f.len() + d.len() <= PURGE_IDS_PER_RECORD),
+            "{records:?}"
+        );
+        assert!(vfs.get_file(file.id).is_err(), "purged");
+    }
+
+    #[test]
+    fn an_import_folder_takes_its_derived_id_while_that_is_free() {
+        // The id 1.6.1 gives it, so a phone's photos land in one folder on
+        // every device. Only when that id is taken does the item's seed come
+        // in, and after that a generation.
+        let (_dir, session) = new_session();
+        let vfs = Vfs::new(&session);
+        let root = vfs.root_folder_id().unwrap();
+        let seed = Uuid::new_v4();
+        let path = vec!["Phone".to_string()];
+        let derived = Uuid::new_v5(&root, crate::names::fold("Phone").as_bytes());
+
+        let first = vfs.ensure_folder_path(&path, seed).unwrap();
+        assert_eq!(first.id, derived);
+
+        vfs.rename_folder(first.id, "Old phone").unwrap();
+        let second = vfs.ensure_folder_path(&path, seed).unwrap();
+        let seeded = Uuid::new_v5(&derived, seed.as_bytes());
+        assert_eq!(second.id, seeded);
+
+        vfs.rename_folder(second.id, "Older phone").unwrap();
+        let third = vfs.ensure_folder_path(&path, seed).unwrap();
+        assert_eq!(third.id, Uuid::new_v5(&seeded, b"generation 1"));
+    }
+
+    #[test]
+    fn every_listing_says_what_is_starred() {
+        let (_dir, session) = new_session();
+        let vfs = Vfs::new(&session);
+        let root = vfs.root_folder_id().unwrap();
+        let folder = vfs.create_folder(root, "Starred folder").unwrap();
+        let plain = vfs.create_folder(root, "Plain folder").unwrap();
+        let file = vfs
+            .add_file(root, "starred.txt", Uuid::new_v4(), 1, "h", None, "")
+            .unwrap();
+        vfs.set_folder_favorite(folder.id, true).unwrap();
+        vfs.set_file_favorite(file.id, true).unwrap();
+        let starred = |entry: &VaultEntry| match entry {
+            VaultEntry::Folder(f) => (f.id, f.favorite),
+            VaultEntry::File(f) => (f.id, f.favorite),
+        };
+
+        let listed: Vec<(Uuid, bool)> =
+            vfs.list_folder(root).unwrap().iter().map(starred).collect();
+        assert!(listed.contains(&(folder.id, true)));
+        assert!(listed.contains(&(plain.id, false)));
+        assert!(listed.contains(&(file.id, true)));
+        assert!(vfs.get_file(file.id).unwrap().favorite);
+        assert!(vfs.get_folder(folder.id).unwrap().favorite);
+        assert!(!vfs.get_folder(plain.id).unwrap().favorite);
+        assert!(vfs.folder_by_path("/Starred folder").unwrap().favorite);
+        let all = vfs.list_all_folders().unwrap();
+        assert!(all.iter().any(|f| f.id == folder.id && f.favorite));
+        assert!(all.iter().any(|f| f.id == plain.id && !f.favorite));
+        let favourites: Vec<(Uuid, bool)> = vfs
+            .list_favorites()
+            .unwrap()
+            .iter()
+            .map(|h| starred(&h.entry))
+            .collect();
+        assert!(favourites.contains(&(folder.id, true)));
+        assert!(favourites.contains(&(file.id, true)));
+        let found: Vec<(Uuid, bool)> = vfs
+            .search_entries("starred", 10)
+            .unwrap()
+            .iter()
+            .map(|h| starred(&h.entry))
+            .collect();
+        assert!(found.contains(&(folder.id, true)));
+        assert!(found.contains(&(file.id, true)));
+        // The root is never starred.
+        assert!(vfs.set_folder_favorite(root, true).is_err());
+    }
+
     use tempfile::tempdir;
 
     fn new_session() -> (tempfile::TempDir, VaultSession) {

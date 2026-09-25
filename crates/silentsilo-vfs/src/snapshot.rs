@@ -1659,6 +1659,148 @@ mod tests {
     }
 
     #[test]
+    fn what_a_purge_left_behind_survives_the_bytes_a_snapshot_is_stored_as() {
+        // The other tests hand the snapshot over in memory. Stored, it goes
+        // through its bytes, where a field left out when empty, or a flag
+        // read back the wrong way round, loses what the purge left behind.
+        let vault_id = Uuid::new_v4();
+        let conn = bare_device(vault_id);
+        let root = root_folder_id_for(vault_id);
+        let mut author = Author::new();
+        let created = author.make(1, add_file(root, "x.txt"));
+        let file = file_id(&created);
+        let OpBody::Known(VaultOp::AddFile { blob_id: first, .. }) = created.op.clone() else {
+            unreachable!()
+        };
+        let edit = Author::new().make(
+            2,
+            VaultOp::ReplaceFileContent {
+                id: file,
+                blob_id: Uuid::new_v4(),
+                size_bytes: 20,
+                content_hash: "edited".into(),
+                mime_type: None,
+                blob_key: String::new(),
+                replaces: Some(first),
+            },
+        );
+        let purge = author.make(
+            3,
+            VaultOp::Purge {
+                folder_ids: Vec::new(),
+                file_ids: vec![file],
+            },
+        );
+        let after = author.make(4, add_file(root, "after.txt"));
+        replay(&conn, vec![created, edit.clone(), purge, after]).unwrap();
+        let snapshot = capture_at(&conn, vault_id, 3).unwrap();
+        let memory = &snapshot.purged;
+        assert!(!memory.purges.is_empty() && !memory.versions.is_empty());
+        assert!(memory.conflict_copies.is_empty() || memory.pending_touches.is_empty());
+        let stored = memory
+            .versions
+            .iter()
+            .find(|v| v.op_id == edit.op_id.to_string())
+            .expect("the edit's version is kept");
+        assert!(stored.has_base, "the edit named what it replaced");
+
+        let back = Snapshot::from_bytes(&snapshot.to_bytes().unwrap()).unwrap();
+        assert_eq!(back.purged, snapshot.purged);
+        let mut rebuilt = bare_device(vault_id);
+        rebootstrap(&mut rebuilt, &back).unwrap();
+        assert_eq!(read_purge_memory(&rebuilt).unwrap(), snapshot.purged);
+    }
+
+    #[test]
+    fn an_edit_history_survives_the_bytes_when_nothing_was_purged() {
+        // Nothing purged, one file edited: the history is the only thing in
+        // `purged`, and a snapshot that dropped it would judge a later purge
+        // of that file differently from the devices that replayed the edit.
+        let vault_id = Uuid::new_v4();
+        let conn = bare_device(vault_id);
+        let root = root_folder_id_for(vault_id);
+        let mut author = Author::new();
+        let created = author.make(1, add_file(root, "x.txt"));
+        let file = file_id(&created);
+        let OpBody::Known(VaultOp::AddFile { blob_id: first, .. }) = created.op.clone() else {
+            unreachable!()
+        };
+        let edit = author.make(
+            2,
+            VaultOp::ReplaceFileContent {
+                id: file,
+                blob_id: Uuid::new_v4(),
+                size_bytes: 20,
+                content_hash: "edited".into(),
+                mime_type: None,
+                blob_key: String::new(),
+                replaces: Some(first),
+            },
+        );
+        let after = author.make(3, add_file(root, "after.txt"));
+        replay(&conn, vec![created, edit, after]).unwrap();
+        let snapshot = capture_at(&conn, vault_id, 2).unwrap();
+        assert!(snapshot.purged.purged_ids.is_empty());
+        assert!(!snapshot.purged.versions.is_empty());
+        let back = Snapshot::from_bytes(&snapshot.to_bytes().unwrap()).unwrap();
+        assert_eq!(back.purged, snapshot.purged);
+    }
+
+    #[test]
+    fn a_password_only_the_snapshot_has_counts_as_more() {
+        let (conn, vault_id, _) = populated();
+        let with_password = capture_at(&conn, vault_id, 4).unwrap();
+        let without = capture_at(&conn, vault_id, 3).unwrap();
+        assert!(!with_password.passwords.is_empty());
+        assert!(holds_more(&with_password, &without));
+        assert!(!holds_more(&with_password, &with_password));
+        let mut changed = with_password.clone();
+        changed.passwords[0].data = "edited elsewhere".into();
+        assert!(holds_more(&changed, &with_password));
+    }
+
+    #[test]
+    fn a_snapshot_is_never_restored_over_an_index_that_has_anything() {
+        let vault_id = Uuid::new_v4();
+        let root = root_folder_id_for(vault_id);
+        let snapshot = {
+            let (conn, vault, _) = populated();
+            let mut s = capture_at(&conn, vault, 2).unwrap();
+            s.vault_id = vault_id;
+            s
+        };
+
+        let with_a_file = bare_device(vault_id);
+        replay(
+            &with_a_file,
+            vec![Author::new().make(1, add_file(root, "a.txt"))],
+        )
+        .unwrap();
+        assert!(
+            restore(&with_a_file, &snapshot).is_err(),
+            "a file in the root"
+        );
+
+        let with_a_folder = bare_device(vault_id);
+        replay(
+            &with_a_folder,
+            vec![Author::new().make(
+                1,
+                VaultOp::CreateFolder {
+                    id: Uuid::new_v4(),
+                    parent_id: root,
+                    name: "Old".into(),
+                },
+            )],
+        )
+        .unwrap();
+        assert!(
+            restore(&with_a_folder, &snapshot).is_err(),
+            "a folder besides the root"
+        );
+    }
+
+    #[test]
     fn a_snapshot_with_nothing_edited_or_purged_is_the_bytes_it_always_was() {
         let (conn, vault_id, _) = populated();
         let bytes = capture_at(&conn, vault_id, 2).unwrap().to_bytes().unwrap();

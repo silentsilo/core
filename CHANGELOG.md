@@ -11,6 +11,22 @@ release notes should say.
 
 ## [Unreleased]
 
+### Fixed
+
+- An edit kept as a file of its own after a purge no longer stays on the
+  devices that got the purge before the edit it had listed. Once that edit
+  arrives, the kept file is taken back, as it never appeared on the others,
+  unless someone trashed, renamed, edited or starred it; then it stays on
+  every device. `SCHEMA_VERSION` is 5, so every device rebuilds its index
+  once. Found by a test written for a missed mutant.
+
+### Added
+
+- Tests for what mutation testing of `silentsilo-vfs` found unchecked:
+  snapshots through their bytes, splitting large purges, the derived id of
+  an import folder, a rebuild meeting a record it may not skip, conflict
+  copy metadata, and the star in every listing.
+
 ## [1.7.1] - Touched copies stay
 
 ### Fixed

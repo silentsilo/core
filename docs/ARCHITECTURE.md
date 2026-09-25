@@ -488,7 +488,12 @@ Read this before "fixing" any of it.
   Every unseen edit is kept, not only the newest, and one purge that missed
   it is enough: the newest edit and the set of purges both change with
   arrival, and a kept file that went away again would take later work on it
-  along. A conflict copy counts as purged with its file (`copy_origins`).
+  along. What a purge saw only grows as its records arrive, so an edit kept
+  while the edit the purge listed (or one written on it) was missing is taken
+  back when that arrives, unless a record touched the file it became: trash,
+  rename, edit or star (`retire_kept_edit`). A record aimed at a kept file
+  not made here yet waits in `pending_touches` and keeps it. A conflict copy
+  counts as purged with its file (`copy_origins`).
   The purge leaves the file's `content_versions` in place and records what
   it named in `purges`; the kept file's id derives from the file id and the
   edit's op id (`kept_edit_id`), and its name follows the purged file's last
