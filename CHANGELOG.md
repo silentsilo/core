@@ -11,6 +11,8 @@ release notes should say.
 
 ## [Unreleased]
 
+## [1.7.2] - Kept edits settle
+
 ### Fixed
 
 - An edit kept as a file of its own after a purge no longer stays on the
