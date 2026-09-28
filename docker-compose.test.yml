@@ -1,20 +1,9 @@
-# The storage backends the app really talks to, for running the suites that
-# skip themselves without one. CI starts the same three; this file is so the
-# same tests can run here before a push rather than only after it.
+# The WebDAV and SFTP backends the app really talks to, for running the
+# suites that skip themselves without one. CI starts the same two; this file
+# is so the same tests can run here before a push rather than only after it.
+# MinIO has no image any more: scripts/test-local.ps1 builds it from source
+# and runs it next to these.
 services:
-  minio:
-    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
-    command: server /data
-    ports: ["127.0.0.1:9000:9000"]
-    environment:
-      MINIO_ROOT_USER: silentsilo
-      MINIO_ROOT_PASSWORD: silentsilo123
-    healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
-      interval: 2s
-      timeout: 3s
-      retries: 30
-
   webdav:
     image: bytemark/webdav
     ports: ["127.0.0.1:8088:80"]

@@ -65,8 +65,8 @@ cargo test --all
 ### Integration tests
 
 The sync and storage tests run against real servers, and skip themselves
-unless one is configured. `scripts/test-local.ps1` brings up MinIO, WebDAV
-and SFTP in containers, points the tests at them, and runs the whole CI
+unless one is configured. `scripts/test-local.ps1` brings up MinIO (built
+from source, which needs Go), WebDAV and SFTP (in containers), points the tests at them, and runs the whole CI
 sequence:
 
 ```bash

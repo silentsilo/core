@@ -241,6 +241,7 @@ jobs:
       SILENTSILO_TEST_WEBDAV_URL: http://127.0.0.1:8088
       SILENTSILO_TEST_SFTP_HOST: 127.0.0.1
       SILENTSILO_TEST_SFTP_PORT: "2222"
+      MINIO_RELEASE: RELEASE.2025-09-07T16-13-09Z
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
@@ -255,28 +256,41 @@ jobs:
             sleep 5
           done
           sudo apt-get install -y libdbus-1-dev pkg-config
-      # Started as steps rather than service containers: two of the three
-      # images need a command, and services cannot give one.
-      # MinIO left Docker Hub in September 2026; its images are pinned on
-      # quay.io so a tag that disappears fails here by name.
+      # MinIO no longer publishes images: Docker Hub dropped them and quay.io
+      # answers 401 since late September 2026. The server is built from its
+      # source at the release these tests always ran against, and cached.
+      - name: Cache the MinIO build
+        id: minio
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/minio-bin
+          key: minio-${{ env.MINIO_RELEASE }}
+      - if: steps.minio.outputs.cache-hit != 'true'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.24"
+          cache: false
+      - name: Build MinIO
+        if: steps.minio.outputs.cache-hit != 'true'
+        run: GOBIN="$HOME/minio-bin" go install "github.com/minio/minio@$MINIO_RELEASE"
+      # Started as steps rather than service containers: both images need a
+      # command, and services cannot give one.
       - name: Start the storage backends
         run: |
           # Registries time out now and then (quay.io answered 504 twice in
           # one day), which failed the job before any test ran. Pulled first,
           # with a few tries, so a slow registry is not a red build.
-          for image in quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z \
-                       quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z \
-                       bytemark/webdav atmoz/sftp:alpine; do
+          for image in bytemark/webdav atmoz/sftp:alpine; do
             for attempt in 1 2 3 4; do
               if docker pull "$image"; then break; fi
               if [ "$attempt" = 4 ]; then exit 1; fi
               sleep $((attempt * 15))
             done
           done
-          docker run -d --name minio -p 9000:9000 \
-            -e MINIO_ROOT_USER=silentsilo \
-            -e MINIO_ROOT_PASSWORD=silentsilo123 \
-            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+          MINIO_ROOT_USER=silentsilo MINIO_ROOT_PASSWORD=silentsilo123 \
+            nohup "$HOME/minio-bin/minio" server /tmp/minio-data \
+            --address 127.0.0.1:9000 --console-address 127.0.0.1:9001 \
+            > /tmp/minio.log 2>&1 &
           docker run -d --name webdav -p 8088:80 \
             -e USERNAME=silentsilo -e PASSWORD=silentsilo123 \
             bytemark/webdav
@@ -288,13 +302,9 @@ jobs:
             if curl -fsS http://127.0.0.1:9000/minio/health/live; then break; fi
             sleep 1
           done
-          # MC_HOST_<alias> rather than `mc alias set`: the alias would be
-          # written inside a --rm container and gone before the next command,
-          # which fails as "Access Denied" and looks like a credentials
-          # problem rather than a missing alias.
-          docker run --rm --network host \
-            -e MC_HOST_local=http://silentsilo:silentsilo123@127.0.0.1:9000 \
-            quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z mb --ignore-existing local/vault-test
+          # A signed PUT on the bucket name creates it; no mc client needed.
+          curl -fsS --aws-sigv4 "aws:amz:us-east-1:s3" \
+            --user silentsilo:silentsilo123 -X PUT http://127.0.0.1:9000/vault-test
       - run: cargo test -p silentsilo-s3 --locked --test live_roundtrip
       - run: cargo test -p silentsilo-store --locked --test contract
       - run: cargo test -p silentsilo-sync --locked
@@ -311,4 +321,4 @@ jobs:
           fi
       - name: Container logs on failure
         if: failure()
-        run: docker logs minio; docker logs webdav; docker logs sftp
+        run: cat /tmp/minio.log; docker logs webdav; docker logs sftp

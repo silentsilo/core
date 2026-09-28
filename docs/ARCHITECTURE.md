@@ -664,8 +664,8 @@ The checklist, in order:
    whose decoded output changes is a break, not a fixture to update.
 
    Anything touching a storage backend goes through
-   `scripts/test-local.ps1`, which brings up MinIO, WebDAV and SFTP in
-   containers and runs the same sequence with the endpoints set. Those
+   `scripts/test-local.ps1`, which brings up MinIO (built from source),
+   WebDAV and SFTP (in containers) and runs the same sequence with the endpoints set. Those
    suites skip themselves without an endpoint, so on a developer machine
    they otherwise never run at all. That script sets
    `SILENTSILO_TEST_REQUIRE_BACKENDS`, which turns
