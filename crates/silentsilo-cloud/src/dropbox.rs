@@ -275,6 +275,96 @@ impl DropboxStore {
     }
 }
 
+impl DropboxStore {
+    /// An RPC call that takes no argument: no body, as Dropbox asks.
+    async fn rpc_bare(&self, endpoint: &str) -> Result<serde_json::Value, StoreError> {
+        let response = self
+            .http
+            .send(Method::POST, &format!("{}/{endpoint}", self.api), &[], None)
+            .await?;
+        if !response.status().is_success() {
+            return Err(self.failure(response, endpoint).await);
+        }
+        self.http.json(response).await
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::Probe for DropboxStore {
+    async fn account(&self) -> Result<crate::Account, StoreError> {
+        let account = self.rpc_bare("users/get_current_account").await?;
+        let id = account
+            .get("account_id")
+            .and_then(|i| i.as_str())
+            .filter(|i| !i.is_empty())
+            .ok_or_else(|| StoreError::Other("Dropbox did not say which account".into()))?;
+        let label = ["/email", "/name/display_name"]
+            .iter()
+            .find_map(|at| account.pointer(at)?.as_str().filter(|s| !s.is_empty()))
+            .unwrap_or("Dropbox");
+        let space = self.rpc_bare("users/get_space_usage").await?;
+        let used = space.get("used").and_then(|u| u.as_u64());
+        let total = space
+            .pointer("/allocation/allocated")
+            .and_then(|a| a.as_u64());
+        Ok(crate::Account {
+            id: id.to_string(),
+            label: label.to_string(),
+            free_bytes: used
+                .zip(total)
+                .map(|(used, total)| total.saturating_sub(used)),
+            total_bytes: total,
+        })
+    }
+
+    async fn silo_folders(&self) -> Result<Vec<String>, StoreError> {
+        let mut names = Vec::new();
+        // The app folder is the root this app sees.
+        let mut response = self
+            .rpc(
+                "files/list_folder",
+                serde_json::json!({ "path": "", "recursive": false, "limit": 2000 }),
+            )
+            .await?;
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..MAX_PAGES {
+            if !response.status().is_success() {
+                return match self.failure(response, "the app folder").await {
+                    StoreError::NotFound(_) => Ok(Vec::new()),
+                    other => Err(other),
+                };
+            }
+            let page = self.http.json(response).await?;
+            names.extend(
+                page.get("entries")
+                    .and_then(|e| e.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter(|e| e.get(".tag").and_then(|t| t.as_str()) == Some("folder"))
+                    .filter_map(|e| e.get("name")?.as_str().map(str::to_string)),
+            );
+            let more = page.get("has_more").and_then(|m| m.as_bool()) == Some(true);
+            let cursor = page.get("cursor").and_then(|c| c.as_str()).unwrap_or("");
+            if !more {
+                names.sort();
+                return Ok(names);
+            }
+            if !seen.insert(cursor.to_string()) {
+                break;
+            }
+            response = self
+                .rpc(
+                    "files/list_folder/continue",
+                    serde_json::json!({ "cursor": cursor }),
+                )
+                .await?;
+        }
+        Err(StoreError::Other(
+            "Dropbox sent a listing that does not end".into(),
+        ))
+    }
+}
+
 #[async_trait::async_trait]
 impl ObjectStore for DropboxStore {
     async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), StoreError> {
@@ -523,6 +613,30 @@ mod tests {
     fn assert_clean(state: &Arc<Mutex<DropboxState>>) {
         let violations = state.lock().unwrap().violations.clone();
         assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[tokio::test]
+    async fn the_account_space_and_silo_folders_are_read() {
+        use crate::Probe;
+        let (store, state) = store_in("Silo").await;
+        store.put("vault.json", vec![1]).await.unwrap();
+
+        let account = store.account().await.unwrap();
+        assert_eq!(account.id, "dbid:1");
+        assert_eq!(account.label, "ana@example.com");
+        assert_eq!(
+            (account.free_bytes, account.total_bytes),
+            (Some(1700), Some(2000))
+        );
+        assert_eq!(store.silo_folders().await.unwrap(), vec!["Silo"]);
+        assert_clean(&state);
+    }
+
+    #[tokio::test]
+    async fn removing_the_target_ends_the_sign_in_at_dropbox() {
+        let (store, state) = store_in("Silo").await;
+        store.http.tokens.revoke().await.unwrap();
+        assert_eq!(state.lock().unwrap().revoked, vec!["at-1"]);
     }
 
     #[tokio::test]

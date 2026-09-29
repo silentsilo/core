@@ -144,6 +144,8 @@ pub struct GraphState {
     pub foreign_next_link: bool,
     pub violations: Vec<String>,
     pub api_calls: usize,
+    /// What `/me/drive` says the drive is; `personal` when unset.
+    pub drive_type: Option<String>,
 }
 
 pub struct FakeGraph {
@@ -265,6 +267,40 @@ fn handle(state: &mut GraphState, base: &str, request: Request) -> Reply {
             202,
             serde_json::json!({ "nextExpectedRanges": [format!("{so_far}-")] }),
         );
+    }
+
+    if path == "/v1.0/me/drive" {
+        if !request.headers.contains_key("authorization") {
+            return Reply::status(401);
+        }
+        return Reply::json(
+            200,
+            serde_json::json!({
+                "id": "drive-1",
+                "driveType": state.drive_type.clone().unwrap_or_else(|| "personal".into()),
+                "owner": { "user": { "displayName": "Ana Pop" } },
+                "quota": { "total": 1000, "remaining": 400 },
+            }),
+        );
+    }
+    if path == "/v1.0/me/drive/special/approot/children" {
+        if !request.headers.contains_key("authorization") {
+            return Reply::status(401);
+        }
+        let mut folders: Vec<String> = state
+            .files
+            .keys()
+            .filter_map(|k| Some(k.split_once('/')?.0.to_string()))
+            .collect();
+        folders.dedup();
+        let value: Vec<serde_json::Value> = folders
+            .iter()
+            .map(|name| serde_json::json!({ "name": name, "folder": {} }))
+            .chain(std::iter::once(
+                serde_json::json!({ "name": "stray.txt", "file": {} }),
+            ))
+            .collect();
+        return Reply::json(200, serde_json::json!({ "value": value }));
     }
 
     let Some(item) = path.strip_prefix("/v1.0/me/drive/special/approot:/") else {

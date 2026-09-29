@@ -37,7 +37,10 @@ pub use cache_store::{
     remove_blob_from_cache, set_cache_limit_bytes, set_keep_full_copy, settle_blob_delivery,
     touch_blob_access,
 };
-pub use cloud_token::{forget_cloud_token, install_cloud, save_cloud_token};
+pub use cloud_token::{
+    CloudSignIn, adopt_cloud_sign_in, cloud_sign_in, cloud_silo_folders, end_cloud_sign_in,
+    forget_cloud_token, install_cloud, save_cloud_token,
+};
 pub use dek_store::{
     dek_path, load_dek, save_dek, save_wrapped_dek_bytes, unwrap_dek_hex, wrap_dek_bytes,
 };
@@ -74,6 +77,7 @@ pub use s3_store::{
 };
 pub use s3_store::{clear_s3_config, load_s3_config, save_s3_config};
 pub use session::{VaultPaths, VaultSession, wipe_plaintext_working_copy};
+pub use silentsilo_cloud::{Account as CloudAccount, Provider as CloudProvider};
 pub use workdir::{
     KEPT_ACROSS_LOCKS, create_private_dir, detect_sync_provider, seal_readonly, set_work_base,
     wipe_cache_dir, wipe_machine_state, wipe_plaintext, wipe_work_dir, wipe_work_dirs_except,

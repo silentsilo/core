@@ -376,6 +376,15 @@ pub fn load_unreadable_targets(silo_id: Uuid) -> Vec<UnreadableTarget> {
 /// `targets.more.config.json` with its position. Targets a newer release
 /// wrote, which `targets` cannot contain, go back where they were.
 pub fn save_targets(silo_id: Uuid, targets: &[BackupTarget]) -> Result<(), VaultError> {
+    // A cloud target taken off the list takes its sign-in with it.
+    let kept: std::collections::HashSet<Uuid> =
+        targets.iter().map(|t| t.config.target_id()).collect();
+    let dropped: Vec<Uuid> = load_targets(silo_id)
+        .into_iter()
+        .filter(|t| t.config.cloud().is_some() && !kept.contains(&t.config.target_id()))
+        .map(|t| t.config.target_id())
+        .collect();
+
     let mut all: Vec<Stored> = targets.iter().cloned().map(Stored::Known).collect();
     for (place, value) in unknown_with_places(silo_id) {
         let at = place.min(all.len());
@@ -397,7 +406,11 @@ pub fn save_targets(silo_id: Uuid, targets: &[BackupTarget]) -> Result<(), Vault
     }
 
     write_list(silo_id, &list)?;
-    write_more(silo_id, &more)
+    write_more(silo_id, &more)?;
+    for target_id in dropped {
+        crate::cloud_token::forget_cloud_token(target_id);
+    }
+    Ok(())
 }
 
 /// The list and the single slot, which older releases read: only kinds they
@@ -731,6 +744,32 @@ mod target_list_tests {
             recovered[1].config.target_id(),
             folder("E:/Offsite").target_id()
         );
+    }
+
+    #[test]
+    fn a_cloud_target_taken_off_the_list_takes_its_sign_in() {
+        let scratch = Scratch::new();
+        let cloud = StoreConfig::Dropbox(silentsilo_store::CloudConfig {
+            account_id: "dbid:1".into(),
+            account_label: "ana@example.com".into(),
+            folder: format!("Silo {}", scratch.id()),
+        });
+        let disk = BackupTarget {
+            config: folder("D:/Backups"),
+            label: "Disk".into(),
+            role: TargetRole::Working,
+        };
+        let dropbox = BackupTarget {
+            config: cloud.clone(),
+            label: String::new(),
+            role: TargetRole::Working,
+        };
+        save_targets(scratch.id(), &[disk.clone(), dropbox]).unwrap();
+        crate::cloud_token::save_cloud_token(cloud.target_id(), "rt-1").unwrap();
+
+        save_targets(scratch.id(), &[disk]).unwrap();
+
+        assert!(crate::cloud_token::load_cloud_token(cloud.target_id()).is_none());
     }
 
     #[test]

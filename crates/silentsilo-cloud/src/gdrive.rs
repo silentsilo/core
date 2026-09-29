@@ -585,6 +585,60 @@ impl GoogleDriveStore {
 }
 
 #[async_trait::async_trait]
+impl crate::Probe for GoogleDriveStore {
+    async fn account(&self) -> Result<crate::Account, StoreError> {
+        let url = format!(
+            "{}/about?fields=user(permissionId,emailAddress,displayName),storageQuota(limit,usage)",
+            self.api
+        );
+        let response = self
+            .call(Method::GET, &url, &[], None, "the account")
+            .await?;
+        if !response.status().is_success() {
+            return Err(self.http.status_error(response.status(), "the account"));
+        }
+        let about = self.http.json(response).await?;
+        let id = about
+            .pointer("/user/permissionId")
+            .and_then(|i| i.as_str())
+            .filter(|i| !i.is_empty())
+            .ok_or_else(|| StoreError::Other("Google Drive did not say which account".into()))?;
+        let label = ["/user/emailAddress", "/user/displayName"]
+            .iter()
+            .find_map(|at| about.pointer(at)?.as_str().filter(|s| !s.is_empty()))
+            .unwrap_or("Google Drive");
+        // Drive gives the numbers as strings; no limit means unlimited.
+        let number = |at: &str| about.pointer(at)?.as_str()?.parse::<u64>().ok();
+        let total = number("/storageQuota/limit");
+        let used = number("/storageQuota/usage");
+        Ok(crate::Account {
+            id: id.to_string(),
+            label: label.to_string(),
+            free_bytes: total
+                .zip(used)
+                .map(|(total, used)| total.saturating_sub(used)),
+            total_bytes: total,
+        })
+    }
+
+    async fn silo_folders(&self) -> Result<Vec<String>, StoreError> {
+        let mut names = Vec::new();
+        for root in self.children("root", Some(ROOT_NAME), Some(true)).await? {
+            names.extend(
+                self.children(&root.id, None, Some(true))
+                    .await?
+                    .into_iter()
+                    .map(|item| item.name),
+            );
+        }
+        // Twin folders from two devices are one silo.
+        names.sort();
+        names.dedup();
+        Ok(names)
+    }
+}
+
+#[async_trait::async_trait]
 impl ObjectStore for GoogleDriveStore {
     async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), StoreError> {
         let total = bytes.len() as u64;
@@ -786,6 +840,40 @@ mod tests {
     fn assert_clean(state: &Arc<Mutex<DriveState>>) {
         let violations = state.lock().unwrap().violations.clone();
         assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[tokio::test]
+    async fn the_account_and_the_silo_folders_are_read() {
+        use crate::Probe;
+        let (store, state) = store_in("Silo").await;
+        store.put("vault.json", vec![1]).await.unwrap();
+        // A twin of the silo folder, made by another device.
+        {
+            let mut state = state.lock().unwrap();
+            let root = state.folder_id("SilentSilo").unwrap();
+            let twin = state.add_file("Silo", &root, Vec::new());
+            state
+                .items
+                .iter_mut()
+                .find(|i| i.id == twin)
+                .unwrap()
+                .folder = true;
+        }
+
+        let account = store.account().await.unwrap();
+        assert_eq!(account.id, "perm-1");
+        assert_eq!(account.label, "ana@gmail.com");
+        assert_eq!(account.total_bytes, Some(16106127360));
+        assert_eq!(account.free_bytes, Some(16000000000));
+        assert_eq!(store.silo_folders().await.unwrap(), vec!["Silo"]);
+    }
+
+    #[tokio::test]
+    async fn google_is_never_asked_to_end_the_grant() {
+        // Google's revocation ends every sign-in of the app to that account,
+        // other computers' included.
+        let (store, _) = store_in("Silo").await;
+        store.http.tokens.revoke().await.unwrap();
     }
 
     #[tokio::test]

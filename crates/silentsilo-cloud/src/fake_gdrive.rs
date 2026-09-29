@@ -319,6 +319,15 @@ fn handle(state: &mut DriveState, base: &str, request: Request) -> Reply {
     }
 
     let method = request.method.as_str();
+    if path == "/drive/v3/about" {
+        return Reply::json(
+            200,
+            serde_json::json!({
+                "user": { "permissionId": "perm-1", "emailAddress": "ana@gmail.com" },
+                "storageQuota": { "limit": "16106127360", "usage": "106127360" },
+            }),
+        );
+    }
     if path == "/drive/v3/files" && method == "GET" {
         let q = query_param(&query, "q").unwrap_or_default();
         let skip: usize = query_param(&query, "pageToken")

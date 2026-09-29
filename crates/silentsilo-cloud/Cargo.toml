@@ -19,7 +19,7 @@ sha2 = "0.10"
 silentsilo-s3 = { workspace = true }
 silentsilo-store = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync", "time", "fs", "io-util"] }
+tokio = { workspace = true, features = ["sync", "time", "fs", "io-util", "net", "macros", "rt"] }
 url = "2"
 zeroize = { workspace = true }
 

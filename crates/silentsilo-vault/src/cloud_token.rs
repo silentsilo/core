@@ -10,9 +10,10 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use keyring::Entry;
-use silentsilo_cloud::{OAuth, PersistToken, Provider, TokenSource};
+use silentsilo_cloud::{Account, CloudError, OAuth, PersistToken, Provider, TokenSource};
 use silentsilo_store::{ObjectStore, StoreConfig, StoreError};
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -90,7 +91,7 @@ fn write_token(target_id: Uuid, refresh_token: &str) -> Result<(), VaultError> {
     Ok(())
 }
 
-fn load_cloud_token(target_id: Uuid) -> Option<Zeroizing<String>> {
+pub(crate) fn load_cloud_token(target_id: Uuid) -> Option<Zeroizing<String>> {
     if let Ok(entry) = keyring_entry(target_id)
         && let Ok(token) = entry.get_password()
     {
@@ -159,6 +160,145 @@ fn token_source(provider: Provider, target_id: Uuid) -> Result<Arc<TokenSource>,
     Ok(source)
 }
 
+/// A sign-in not yet given to a target is dropped after this.
+const PENDING_FOR: Duration = Duration::from_secs(30 * 60);
+
+/// A finished sign-in waiting for the target it is for. The frontend holds
+/// only its id: the tokens never leave this process.
+struct Pending {
+    provider: Provider,
+    account: Account,
+    tokens: Arc<TokenSource>,
+    at: Instant,
+}
+
+fn pending() -> &'static Mutex<HashMap<Uuid, Pending>> {
+    static PENDING: OnceLock<Mutex<HashMap<Uuid, Pending>>> = OnceLock::new();
+    PENDING.get_or_init(Default::default)
+}
+
+/// What the app shows of a sign-in.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudSignIn {
+    pub id: Uuid,
+    pub provider: Provider,
+    pub account: Account,
+}
+
+/// A rotated token of a sign-in with no target yet has nowhere to go: it
+/// stays in memory and moves with the rest when the sign-in is adopted.
+struct NotYet;
+
+impl PersistToken for NotYet {
+    fn save(&self, _: &str) -> Result<(), String> {
+        Err("not stored yet".into())
+    }
+}
+
+fn store_error(error: CloudError) -> StoreError {
+    match error {
+        CloudError::Revoked => StoreError::Denied("the sign-in is no longer valid".into()),
+        CloudError::Unreachable(what) => StoreError::Unreachable(format!("could not reach {what}")),
+        CloudError::Refused(message) => StoreError::Denied(message),
+        CloudError::Other(message) => StoreError::Other(message),
+    }
+}
+
+/// Signs in to `provider` in the user's browser (`open` gets the page) and
+/// keeps the result until a target adopts it.
+pub async fn cloud_sign_in(
+    provider: Provider,
+    open: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<CloudSignIn, StoreError> {
+    let signed_in = silentsilo_cloud::sign_in(provider, Arc::new(NotYet), open)
+        .await
+        .map_err(store_error)?;
+    let id = Uuid::new_v4();
+    let shown = CloudSignIn {
+        id,
+        provider,
+        account: signed_in.account.clone(),
+    };
+    let mut pending = pending()
+        .lock()
+        .map_err(|_| StoreError::Other("sign-in list poisoned".into()))?;
+    pending.retain(|_, p| p.at.elapsed() < PENDING_FOR);
+    pending.insert(
+        id,
+        Pending {
+            provider,
+            account: signed_in.account,
+            tokens: signed_in.tokens,
+            at: Instant::now(),
+        },
+    );
+    Ok(shown)
+}
+
+fn pending_tokens(sign_in: Uuid) -> Result<(Provider, Arc<TokenSource>), StoreError> {
+    let pending = pending()
+        .lock()
+        .map_err(|_| StoreError::Other("sign-in list poisoned".into()))?;
+    pending
+        .get(&sign_in)
+        .filter(|p| p.at.elapsed() < PENDING_FOR)
+        .map(|p| (p.provider, p.tokens.clone()))
+        .ok_or_else(|| StoreError::Denied("the sign-in expired; sign in again".into()))
+}
+
+/// The silo folders a pending sign-in can see: what a second computer
+/// offers to join, before any target exists.
+pub async fn cloud_silo_folders(sign_in: Uuid) -> Result<Vec<String>, StoreError> {
+    let (provider, tokens) = pending_tokens(sign_in)?;
+    silentsilo_cloud::silo_folders(provider, tokens).await
+}
+
+/// Gives a pending sign-in to the target it was for, new or reconnected.
+/// Refused when the target names another account: a reconnect to a
+/// different account would point the target at an empty folder.
+pub async fn adopt_cloud_sign_in(sign_in: Uuid, config: &StoreConfig) -> Result<(), StoreError> {
+    let (provider, tokens) = pending_tokens(sign_in)?;
+    let account_id = pending()
+        .lock()
+        .ok()
+        .and_then(|p| p.get(&sign_in).map(|p| p.account.id.clone()))
+        .unwrap_or_default();
+    let Some(cloud) = config.cloud() else {
+        return Err(StoreError::Other("not a cloud storage".into()));
+    };
+    if provider_of(config) != Some(provider) {
+        return Err(StoreError::Other(
+            "the sign-in is for another provider".into(),
+        ));
+    }
+    if cloud.account_id != account_id {
+        return Err(StoreError::Denied(format!(
+            "That is a different {} account. Sign in with the one this storage uses.",
+            provider.name()
+        )));
+    }
+    save_cloud_token(config.target_id(), &tokens.refresh_token().await)
+        .map_err(|e| StoreError::Other(e.to_string()))?;
+    if let Ok(mut pending) = pending().lock() {
+        pending.remove(&sign_in);
+    }
+    Ok(())
+}
+
+/// Ends a target's sign-in: at the provider where that touches no other
+/// sign-in (Dropbox), then here. Best effort at the provider: the local
+/// token goes either way.
+pub async fn end_cloud_sign_in(config: &StoreConfig) {
+    let target_id = config.target_id();
+    if let Some(provider) = provider_of(config)
+        && let Ok(tokens) = token_source(provider, target_id)
+    {
+        let _ = tokens.revoke().await;
+    }
+    forget_cloud_token(target_id);
+}
+
 /// Writes a refresh token the provider rotated.
 struct Keep(Uuid);
 
@@ -206,6 +346,78 @@ mod tests {
             load_cloud_token(target.0).as_deref().map(|t| t.len()),
             Some(long.len())
         );
+    }
+
+    fn onedrive(account: &str, folder: &str) -> StoreConfig {
+        StoreConfig::OneDrive(silentsilo_store::CloudConfig {
+            account_id: account.into(),
+            account_label: "ana@outlook.com".into(),
+            folder: folder.into(),
+        })
+    }
+
+    /// A sign-in as `cloud_sign_in` leaves it, without the browser.
+    fn pending_for(account: &str) -> Uuid {
+        let oauth = OAuth::new(Provider::OneDrive).unwrap();
+        let tokens = Arc::new(TokenSource::new(oauth, "rt-new".into(), Arc::new(NotYet)));
+        let id = Uuid::new_v4();
+        pending().lock().unwrap().insert(
+            id,
+            Pending {
+                provider: Provider::OneDrive,
+                account: Account {
+                    id: account.into(),
+                    label: "ana@outlook.com".into(),
+                    free_bytes: None,
+                    total_bytes: None,
+                },
+                tokens,
+                at: Instant::now(),
+            },
+        );
+        id
+    }
+
+    #[test]
+    fn a_sign_in_is_adopted_only_by_a_target_of_its_account() {
+        let _serial = keyring_lock();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(adopt_only_by_its_account());
+    }
+
+    async fn adopt_only_by_its_account() {
+        let config = onedrive("drive-1", "Silo");
+        let target = Scratch(config.target_id());
+
+        let wrong = pending_for("drive-2");
+        match adopt_cloud_sign_in(wrong, &config).await {
+            Err(StoreError::Denied(message)) => assert!(message.contains("different")),
+            other => panic!("another account must be refused, got {other:?}"),
+        }
+        assert!(load_cloud_token(target.0).is_none());
+
+        let right = pending_for("drive-1");
+        adopt_cloud_sign_in(right, &config).await.unwrap();
+        assert_eq!(
+            load_cloud_token(target.0).as_deref().map(|t| t.as_str()),
+            Some("rt-new")
+        );
+        // Used up: the frontend cannot replay the id.
+        assert!(adopt_cloud_sign_in(right, &config).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn an_old_sign_in_is_not_handed_out() {
+        let id = pending_for("drive-1");
+        let Some(long_ago) = Instant::now().checked_sub(PENDING_FOR + Duration::from_secs(1))
+        else {
+            return;
+        };
+        pending().lock().unwrap().get_mut(&id).unwrap().at = long_ago;
+        assert!(matches!(
+            cloud_silo_folders(id).await,
+            Err(StoreError::Denied(_))
+        ));
     }
 
     #[test]

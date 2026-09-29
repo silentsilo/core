@@ -66,11 +66,24 @@ impl Provider {
         }
     }
 
+    /// Where a sign-in is ended at the provider. Only Dropbox: Microsoft
+    /// has no revocation for a personal account's token, and Google's ends
+    /// the whole grant, which would sign out every other computer on the
+    /// same account.
+    pub(crate) fn revoke_url(self) -> Option<&'static str> {
+        match self {
+            Provider::Dropbox => Some("https://api.dropboxapi.com/2/auth/token/revoke"),
+            _ => None,
+        }
+    }
+
     /// Only the app's own folder, at each of them. Dropbox takes the scopes
     /// set on the app itself.
     pub(crate) fn scope(self) -> Option<&'static str> {
         match self {
-            Provider::OneDrive => Some("Files.ReadWrite.AppFolder offline_access"),
+            // `openid email` only for the address shown as the account:
+            // Graph gives a personal drive's owner as a display name.
+            Provider::OneDrive => Some("Files.ReadWrite.AppFolder offline_access openid email"),
             Provider::Dropbox => None,
             Provider::GoogleDrive => Some("https://www.googleapis.com/auth/drive.file"),
         }

@@ -265,6 +265,79 @@ impl OneDriveStore {
 }
 
 #[async_trait::async_trait]
+impl crate::Probe for OneDriveStore {
+    async fn account(&self) -> Result<crate::Account, StoreError> {
+        let url = format!("{}/me/drive?$select=id,driveType,owner,quota", self.api);
+        let response = self.http.send(Method::GET, &url, &[], None).await?;
+        if !response.status().is_success() {
+            return Err(self.http.status_error(response.status(), "the drive"));
+        }
+        let drive = self.http.json(response).await?;
+        // The sign-in only admits personal accounts; a work drive here
+        // would mean the app folder rule does not hold.
+        if drive.get("driveType").and_then(|t| t.as_str()) != Some("personal") {
+            return Err(StoreError::Denied(
+                "OneDrive for work or school accounts is not supported yet".into(),
+            ));
+        }
+        let id = drive
+            .get("id")
+            .and_then(|i| i.as_str())
+            .filter(|i| !i.is_empty())
+            .ok_or_else(|| StoreError::Other("OneDrive did not say which drive".into()))?;
+        let label = ["/owner/user/email", "/owner/user/displayName"]
+            .iter()
+            .find_map(|at| drive.pointer(at)?.as_str().filter(|s| !s.is_empty()))
+            .unwrap_or("OneDrive");
+        Ok(crate::Account {
+            id: id.to_string(),
+            label: label.to_string(),
+            free_bytes: drive.pointer("/quota/remaining").and_then(|q| q.as_u64()),
+            total_bytes: drive.pointer("/quota/total").and_then(|q| q.as_u64()),
+        })
+    }
+
+    async fn silo_folders(&self) -> Result<Vec<String>, StoreError> {
+        let mut names = Vec::new();
+        let mut next = Some(format!(
+            "{}/me/drive/special/approot/children?$top=1000&$select=name,folder",
+            self.api
+        ));
+        let mut seen = std::collections::HashSet::new();
+        while let Some(url) = next.take() {
+            // The next page must be Graph's own address: it carries the token.
+            if seen.len() > MAX_PAGES || !url.starts_with(&self.api) || !seen.insert(url.clone()) {
+                return Err(StoreError::Other(
+                    "OneDrive sent a listing that does not end".into(),
+                ));
+            }
+            let response = self.http.send(Method::GET, &url, &[], None).await?;
+            if response.status() == StatusCode::NOT_FOUND {
+                break;
+            }
+            if !response.status().is_success() {
+                return Err(self.http.status_error(response.status(), "the app folder"));
+            }
+            let page = self.http.json(response).await?;
+            names.extend(
+                page.get("value")
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter(|item| item.get("folder").is_some())
+                    .filter_map(|item| item.get("name")?.as_str().map(str::to_string)),
+            );
+            next = page
+                .get("@odata.nextLink")
+                .and_then(|n| n.as_str())
+                .map(str::to_string);
+        }
+        names.sort();
+        Ok(names)
+    }
+}
+
+#[async_trait::async_trait]
 impl ObjectStore for OneDriveStore {
     async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), StoreError> {
         let total = bytes.len() as u64;
@@ -458,6 +531,40 @@ mod tests {
         (0..(CHUNK as usize + 2 * 1024 * 1024 + 13))
             .map(|i| (i % 251) as u8)
             .collect()
+    }
+
+    #[tokio::test]
+    async fn the_account_is_the_drive_and_the_silos_are_its_folders() {
+        use crate::Probe;
+        let (store, state) = store_in("Silo").await;
+        store.put("vault.json", vec![1]).await.unwrap();
+        let other = OneDriveStore::with_api(
+            &store.api,
+            CloudConfig {
+                account_id: String::new(),
+                account_label: String::new(),
+                folder: "Silo 2".into(),
+            },
+            store.http.tokens.clone(),
+        )
+        .unwrap();
+        other.put("ops/1.op", vec![2]).await.unwrap();
+
+        let account = store.account().await.unwrap();
+        assert_eq!(account.id, "drive-1");
+        assert_eq!(account.label, "Ana Pop");
+        assert_eq!(
+            (account.free_bytes, account.total_bytes),
+            (Some(400), Some(1000))
+        );
+        assert_eq!(store.silo_folders().await.unwrap(), vec!["Silo", "Silo 2"]);
+
+        state.lock().unwrap().drive_type = Some("business".into());
+        match store.account().await {
+            Err(StoreError::Denied(message)) => assert!(message.contains("work or school")),
+            other => panic!("a work drive must be refused, got {other:?}"),
+        }
+        assert_clean(&state);
     }
 
     #[tokio::test]

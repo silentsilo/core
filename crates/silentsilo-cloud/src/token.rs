@@ -56,8 +56,52 @@ impl TokenSource {
         }
     }
 
+    /// Straight after a sign-in: the access token that came with it is
+    /// used until it runs out.
+    pub fn signed_in(
+        oauth: OAuth,
+        tokens: crate::Tokens,
+        persist: Arc<dyn PersistToken>,
+    ) -> Result<Self, CloudError> {
+        let refresh = tokens.refresh.ok_or_else(|| {
+            CloudError::Refused(format!(
+                "{} did not grant lasting access; sign in again",
+                oauth.provider().name()
+            ))
+        })?;
+        Ok(Self {
+            state: tokio::sync::Mutex::new(State {
+                refresh,
+                unsaved: false,
+                access: Some((tokens.access, Instant::now() + tokens.expires_in)),
+            }),
+            oauth,
+            persist,
+        })
+    }
+
     pub fn provider(&self) -> crate::Provider {
         self.oauth.provider()
+    }
+
+    /// The refresh token held now, to store a fresh sign-in under the
+    /// target it ends up belonging to.
+    pub async fn refresh_token(&self) -> Zeroizing<String> {
+        self.state.lock().await.refresh.clone()
+    }
+
+    /// Ends the sign-in at the provider where it can be ended on its own.
+    pub async fn revoke(&self) -> Result<(), CloudError> {
+        if self.oauth.provider().revoke_url().is_none() {
+            return Ok(());
+        }
+        let access = match self.bearer().await {
+            Ok(access) => access,
+            // Nothing left to end.
+            Err(CloudError::Revoked) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        self.oauth.revoke(&access).await
     }
 
     /// A valid access token, refreshed first when it is missing or about to

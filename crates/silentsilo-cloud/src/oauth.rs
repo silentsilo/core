@@ -65,6 +65,13 @@ impl AuthRequest {
         self.provider
     }
 
+    /// Whether a redirect carries this sign-in's `state`. Anything else
+    /// reaching the listener is not an answer to it.
+    pub(crate) fn state_matches(&self, query: &str) -> bool {
+        url::form_urlencoded::parse(query.as_bytes())
+            .any(|(key, value)| key == "state" && value == self.state.as_str())
+    }
+
     /// The code from the query string the browser brought back. Refused
     /// unless the `state` is this sign-in's, so a redirect something else
     /// started cannot sign this app in to someone else's account.
@@ -117,6 +124,8 @@ pub struct Tokens {
     /// first sign-in, Dropbox on refresh).
     pub refresh: Option<Zeroizing<String>>,
     pub expires_in: Duration,
+    /// The address in the ID token, when one came (Microsoft, asked for it).
+    pub email: Option<String>,
 }
 
 impl std::fmt::Debug for Tokens {
@@ -132,6 +141,7 @@ impl std::fmt::Debug for Tokens {
 pub struct OAuth {
     provider: Provider,
     token_url: String,
+    revoke_url: Option<String>,
     http: reqwest::Client,
 }
 
@@ -153,9 +163,18 @@ impl OAuth {
             .timeout(Duration::from_secs(60))
             .build()
             .map_err(|e| CloudError::Other(e.to_string()))?;
+        // The tests' fake answers revocations beside its token endpoint.
+        let revoke_url = provider.revoke_url().map(|real| {
+            if token_url == provider.token_url() {
+                real.to_string()
+            } else {
+                format!("{token_url}/revoke")
+            }
+        });
         Ok(Self {
             provider,
             token_url: token_url.to_string(),
+            revoke_url,
             http,
         })
     }
@@ -247,8 +266,62 @@ impl OAuth {
             access: Zeroizing::new(access.to_string()),
             refresh: refresh.map(|t| Zeroizing::new(t.to_string())),
             expires_in: Duration::from_secs(expires_in),
+            email: json
+                .get("id_token")
+                .and_then(|t| t.as_str())
+                .and_then(email_in),
         })
     }
+
+    /// Ends a sign-in at the provider, where that is possible without
+    /// touching other sign-ins (see [`Provider::revoke_url`]). Dropbox
+    /// revokes by the access token, which takes its refresh token along.
+    pub async fn revoke(&self, access_token: &str) -> Result<(), CloudError> {
+        let Some(url) = self.revoke_url.as_deref() else {
+            return Ok(());
+        };
+        let name = self.provider.name();
+        let response = self
+            .http
+            .post(url)
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(|_| CloudError::Unreachable(name.into()))?;
+        match response.status() {
+            status if status.is_success() => Ok(()),
+            // Already ended: what was asked for.
+            reqwest::StatusCode::UNAUTHORIZED => Ok(()),
+            status if status.is_server_error() => Err(CloudError::Unreachable(name.into())),
+            status => Err(CloudError::Refused(format!(
+                "{name} did not end the sign-in ({})",
+                status.as_u16()
+            ))),
+        }
+    }
+}
+
+/// The `email` (or `preferred_username`) claim of an ID token. It came
+/// straight from the token endpoint over TLS, so the signature is not what
+/// vouches for it (OpenID Connect Core 3.1.3.7). Only ever shown as a label.
+fn email_in(id_token: &str) -> Option<String> {
+    use base64::Engine;
+    let payload = id_token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('='))
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    ["email", "preferred_username"]
+        .iter()
+        .filter_map(|claim| claims.get(*claim)?.as_str())
+        .find(|value| value.contains('@'))
+        .map(|value| {
+            value
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(200)
+                .collect()
+        })
 }
 
 #[cfg(test)]
@@ -450,11 +523,34 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_address_comes_from_the_id_token_and_nothing_else_does() {
+        use base64::Engine;
+        let token = |claims: serde_json::Value| {
+            let body = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string());
+            format!("eyJhbGciOiJub25lIn0.{body}.sig")
+        };
+        assert_eq!(
+            email_in(&token(serde_json::json!({ "email": "ana@outlook.com" }))).as_deref(),
+            Some("ana@outlook.com")
+        );
+        assert_eq!(
+            email_in(&token(
+                serde_json::json!({ "preferred_username": "ana@live.com" })
+            ))
+            .as_deref(),
+            Some("ana@live.com")
+        );
+        assert_eq!(email_in(&token(serde_json::json!({ "name": "Ana" }))), None);
+        assert_eq!(email_in("not a token"), None);
+    }
+
+    #[test]
     fn the_debug_form_holds_no_token() {
         let tokens = Tokens {
             access: Zeroizing::new("at-secret".into()),
             refresh: Some(Zeroizing::new("rt-secret".into())),
             expires_in: Duration::from_secs(60),
+            email: None,
         };
         let shown = format!("{tokens:?}");
         assert!(!shown.contains("secret"));

@@ -20,6 +20,8 @@ pub struct DropboxState {
     pub page_size: usize,
     pub violations: Vec<String>,
     pub api_calls: usize,
+    /// Access tokens ended through `/token/revoke`.
+    pub revoked: Vec<String>,
 }
 
 pub struct FakeDropbox {
@@ -71,6 +73,16 @@ fn is_folder(files: &BTreeMap<String, (String, Vec<u8>)>, path: &str) -> bool {
 
 fn handle(state: &mut DropboxState, request: Request) -> Reply {
     let path = request.target.split('?').next().unwrap_or("").to_string();
+    if path == "/token/revoke" {
+        let token = request
+            .headers
+            .get("authorization")
+            .and_then(|a| a.strip_prefix("Bearer "))
+            .unwrap_or("")
+            .to_string();
+        state.revoked.push(token);
+        return Reply::json(200, serde_json::json!(null));
+    }
     if path == "/token" {
         state.tokens_issued += 1;
         let n = state.tokens_issued;
@@ -107,6 +119,52 @@ fn handle(state: &mut DropboxState, request: Request) -> Reply {
     };
 
     match path.as_str() {
+        "/api/2/users/get_current_account" | "/api/2/users/get_space_usage"
+            if !request.body.is_empty() =>
+        {
+            state.violations.push(format!("a body sent to {path}"));
+            Reply::status(400)
+        }
+        "/api/2/users/get_current_account" => Reply::json(
+            200,
+            serde_json::json!({
+                "account_id": "dbid:1",
+                "email": "ana@example.com",
+                "name": { "display_name": "Ana Pop" },
+            }),
+        ),
+        "/api/2/users/get_space_usage" => Reply::json(
+            200,
+            serde_json::json!({
+                "used": 300,
+                "allocation": { ".tag": "individual", "allocated": 2000 },
+            }),
+        ),
+        "/api/2/files/list_folder" if arg.get("recursive") == Some(&serde_json::json!(false)) => {
+            let mut folders: Vec<String> = state
+                .files
+                .values()
+                .filter_map(|(display, _)| {
+                    Some(
+                        display
+                            .trim_start_matches('/')
+                            .split_once('/')?
+                            .0
+                            .to_string(),
+                    )
+                })
+                .collect();
+            folders.sort();
+            folders.dedup();
+            let entries: Vec<serde_json::Value> = folders
+                .iter()
+                .map(|name| serde_json::json!({ ".tag": "folder", "name": name }))
+                .collect();
+            Reply::json(
+                200,
+                serde_json::json!({ "entries": entries, "has_more": false, "cursor": "c" }),
+            )
+        }
         "/content/2/files/upload" => {
             let p = text(&arg, "path");
             state.files.insert(p.to_lowercase(), (p, request.body));

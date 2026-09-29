@@ -48,3 +48,4 @@ windows = { version = "0.61", features = [
 [dev-dependencies]
 silentsilo-testkit = { workspace = true }
 tempfile = { workspace = true }
+tokio = { workspace = true }
