@@ -13,6 +13,9 @@ pub mod dropbox;
 mod fake;
 #[cfg(test)]
 mod fake_dropbox;
+#[cfg(test)]
+mod fake_gdrive;
+pub mod gdrive;
 mod http;
 mod oauth;
 pub mod onedrive;
@@ -37,10 +40,7 @@ pub fn open(
     match provider {
         Provider::OneDrive => Ok(Box::new(onedrive::OneDriveStore::new(config, tokens)?)),
         Provider::Dropbox => Ok(Box::new(dropbox::DropboxStore::new(config, tokens)?)),
-        other => Err(StoreError::Other(format!(
-            "{} is not available in this build yet",
-            other.name()
-        ))),
+        Provider::GoogleDrive => Ok(Box::new(gdrive::GoogleDriveStore::new(config, tokens)?)),
     }
 }
 
