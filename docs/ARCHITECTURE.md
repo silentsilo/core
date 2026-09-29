@@ -413,7 +413,7 @@ bucket):
 | Local index corrupt beyond both snapshots | `vault_repair_from_storage`, offered by the unlock screen, in place, blobs kept |
 | Device below the compaction horizon | `vault_rebuild_from_snapshot` (any copy that holds one), fresh device id |
 | Device rotated away | `needs_rejoin`: remove and rejoin with a current credential |
-| Bit rot in a copy | `vault_verify` deep read; a damaged object re-uploads from another copy or the local cache on later passes |
+| Bit rot in a copy | `vault_verify` deep read finds and names it; nothing replaces it yet. `restore_missing_blobs` puts back only objects that are gone: a damaged one has the right key and size, so every pass takes it as present |
 
 ## Looks wrong, is deliberate
 
