@@ -110,9 +110,13 @@ mod tests {
         let _cleanup = Cleanup(&user);
 
         // What an earlier build left: keyring's own write, which roams.
-        entry.set_password("from 1.5.0").unwrap();
-        assert_eq!(persistence(&user), CRED_PERSIST_ENTERPRISE);
-        assert_eq!(entry.get_password().unwrap(), "from 1.5.0");
+        // Opt-in: a roaming entry comes back from the profile after the
+        // delete, and those filled the user's store once already.
+        if std::env::var_os("SILENTSILO_TEST_ROAMING").is_some() {
+            entry.set_password("from 1.5.0").unwrap();
+            assert_eq!(persistence(&user), CRED_PERSIST_ENTERPRISE);
+            assert_eq!(entry.get_password().unwrap(), "from 1.5.0");
+        }
 
         super::set_password(SERVICE, &user, "{\"secret\":\"ünïcödé ✓\"}").unwrap();
         assert_eq!(persistence(&user), CRED_PERSIST_LOCAL_MACHINE);
