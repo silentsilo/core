@@ -189,6 +189,10 @@ property:
   else in files. On Windows those files are DPAPI-wrapped; elsewhere a client
   may register a `LocalProtector` (Android: a Keystore key), and without one
   they are plaintext, private to the user or app.
+  Backup targets of a kind core 1.7.2 does not know live in
+  `targets.more.config.json`, never in the list or the single slot an older
+  release reads (FORMATS.md). Test runs use the keyring service
+  `com.silentsilo.test`, never the app's (`keychain::service`).
 - **The machine workdir** (keyed by silo path, outside the folder): the
   working copy `vault.sqlcipher` with its WAL, ciphered by SQLCipher under a
   random page key, that key sealed under the DEK as `vault.key` (and

@@ -6,6 +6,20 @@
 //! written here with `CRED_PERSIST_LOCAL_MACHINE`, in the layout `keyring`
 //! reads. An entry written by an earlier build is rewritten on its next save.
 
+/// The keyring service every entry is stored under.
+///
+/// Test runs get one of their own, by the same switch that moves their files
+/// to `target/test-work` (debug builds only, see `workdir::work_base`): they
+/// wrote into the app's entries, left hundreds behind on a developer machine,
+/// and a full roaming store made Credential Manager refuse writes.
+pub(crate) fn service() -> &'static str {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("SILENTSILO_TEST_WORK_BASE").is_some_and(|d| !d.is_empty()) {
+        return "com.silentsilo.test";
+    }
+    "com.silentsilo.desktop"
+}
+
 /// Stores `password` under the entry `keyring::Entry::new(service, user)`
 /// names.
 pub(crate) fn set_password(service: &str, user: &str, password: &str) -> Result<(), String> {

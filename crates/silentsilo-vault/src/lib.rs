@@ -67,7 +67,9 @@ pub use registry::{
     SiloEntry, SiloMarker, SiloRegistry, available_path, folder_name_for, load_registry,
     marker_path, read_marker, registry_path, save_registry, write_marker,
 };
-pub use s3_store::{BackupTarget, TargetRole, load_targets, save_targets};
+pub use s3_store::{
+    BackupTarget, TargetRole, UnreadableTarget, load_targets, load_unreadable_targets, save_targets,
+};
 pub use s3_store::{clear_s3_config, load_s3_config, save_s3_config};
 pub use session::{VaultPaths, VaultSession, wipe_plaintext_working_copy};
 pub use workdir::{

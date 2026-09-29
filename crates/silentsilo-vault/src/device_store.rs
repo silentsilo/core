@@ -7,7 +7,6 @@ use uuid::Uuid;
 use crate::dpapi;
 use crate::error::VaultError;
 
-const KEYRING_SERVICE: &str = "com.silentsilo.desktop";
 const KEYRING_USER: &str = "vault-credentials";
 /// Prefix marking the fallback file's contents as DPAPI-protected rather
 /// than plain JSON. Anything not starting with this is treated as a
@@ -67,7 +66,9 @@ fn read_fallback_file(silo_id: Uuid) -> Option<LocalVaultAuth> {
 /// `is_provisioned`/`load_credentials` unable to find credentials that were
 /// supposedly just saved.
 fn keyring_roundtrips(silo_id: Uuid, json: &str) -> bool {
-    if crate::keychain::set_password(KEYRING_SERVICE, &keyring_user(silo_id), json).is_err() {
+    if crate::keychain::set_password(crate::keychain::service(), &keyring_user(silo_id), json)
+        .is_err()
+    {
         return false;
     }
     let Ok(verify_entry) = keyring_entry(silo_id) else {
@@ -191,7 +192,7 @@ fn unwrap_protected(raw: &[u8]) -> Option<Vec<u8>> {
 /// other's secret in the keyring — which is what a fixed entry name would
 /// do, silently, leaving every silo but the last one unopenable.
 fn keyring_entry(silo_id: Uuid) -> Result<Entry, keyring::Error> {
-    Entry::new(KEYRING_SERVICE, &keyring_user(silo_id))
+    Entry::new(crate::keychain::service(), &keyring_user(silo_id))
 }
 
 fn keyring_user(silo_id: Uuid) -> String {
