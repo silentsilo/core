@@ -107,6 +107,7 @@ mod tests {
     fn a_write_stays_on_this_machine_and_keyring_reads_it() {
         let user = format!("roundtrip:{}", uuid::Uuid::new_v4());
         let entry = Entry::new(SERVICE, &user).unwrap();
+        let _cleanup = Cleanup(&user);
 
         // What an earlier build left: keyring's own write, which roams.
         entry.set_password("from 1.5.0").unwrap();
@@ -119,7 +120,25 @@ mod tests {
             Entry::new(SERVICE, &user).unwrap().get_password().unwrap(),
             "{\"secret\":\"ünïcödé ✓\"}"
         );
+    }
 
-        entry.delete_credential().unwrap();
+    /// Deletes the test entry even when an assertion fails, and retries:
+    /// Credential Manager now and then drops a delete, and what is left
+    /// piles up in the user's own store.
+    struct Cleanup<'a>(&'a str);
+
+    impl Drop for Cleanup<'_> {
+        fn drop(&mut self) {
+            for _ in 0..5 {
+                let Ok(entry) = Entry::new(SERVICE, self.0) else {
+                    return;
+                };
+                let _ = entry.delete_credential();
+                if matches!(entry.get_password(), Err(keyring::Error::NoEntry)) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+        }
     }
 }

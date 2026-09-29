@@ -47,6 +47,22 @@ pub enum StoreConfigInput {
         /// one already confirmed, so editing the path doesn't ask again.
         host_fingerprint: Option<String>,
     },
+    /// The account comes from the sign-in the app holds (`sign_in`, its
+    /// id), never from the UI. Without one, only the stored target of the
+    /// same kind and folder is kept.
+    #[serde(rename = "onedrive")]
+    OneDrive {
+        sign_in: Option<String>,
+        folder: String,
+    },
+    Dropbox {
+        sign_in: Option<String>,
+        folder: String,
+    },
+    GoogleDrive {
+        sign_in: Option<String>,
+        folder: String,
+    },
 }
 
 /// How to prove who we are to an SSH server.
@@ -90,9 +106,111 @@ fn or_stored(given: Option<String>, stored: Option<String>) -> Option<String> {
         .or(stored)
 }
 
+/// A folder name every provider takes as it is, and that reads the same on
+/// Windows once downloaded: one segment, none of the characters OneDrive
+/// refuses, no leading or trailing space or dot.
+fn cloud_folder(folder: &str) -> Result<String, String> {
+    let folder = folder.trim();
+    let refused = |c: char| c.is_control() || "\"*:<>?/\\|".contains(c);
+    if folder.is_empty() {
+        return Err("Give the folder a name.".into());
+    }
+    if folder.chars().count() > 100
+        || folder.chars().any(refused)
+        || folder.starts_with('.')
+        || folder.ends_with('.')
+    {
+        return Err(
+            "Use a plain folder name: no slashes, none of \" * : < > ? |, no dot at either end."
+                .into(),
+        );
+    }
+    Ok(folder.to_string())
+}
+
+fn cloud_kind(config: &StoreConfig) -> Option<silentsilo_vault::CloudProvider> {
+    match config {
+        StoreConfig::OneDrive(_) => Some(silentsilo_vault::CloudProvider::OneDrive),
+        StoreConfig::Dropbox(_) => Some(silentsilo_vault::CloudProvider::Dropbox),
+        StoreConfig::GoogleDrive(_) => Some(silentsilo_vault::CloudProvider::GoogleDrive),
+        _ => None,
+    }
+}
+
+fn cloud_config(
+    kind: silentsilo_vault::CloudProvider,
+    sign_in: Option<String>,
+    folder: String,
+    existing: Option<StoreConfig>,
+) -> Result<StoreConfig, String> {
+    let folder = cloud_folder(&folder)?;
+    let wrap = |c: silentsilo_store::CloudConfig| match kind {
+        silentsilo_vault::CloudProvider::OneDrive => StoreConfig::OneDrive(c),
+        silentsilo_vault::CloudProvider::Dropbox => StoreConfig::Dropbox(c),
+        silentsilo_vault::CloudProvider::GoogleDrive => StoreConfig::GoogleDrive(c),
+    };
+    match sign_in.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(id) => {
+            let id = uuid::Uuid::parse_str(id).map_err(|_| "Sign in again.".to_string())?;
+            let (provider, account) = silentsilo_vault::cloud_sign_in_account(id)
+                .ok_or_else(|| "The sign-in expired. Sign in again.".to_string())?;
+            if provider != kind {
+                return Err(format!("Sign in to {} first.", kind.name()));
+            }
+            Ok(wrap(silentsilo_store::CloudConfig {
+                account_id: account.id,
+                account_label: account.label,
+                folder,
+            }))
+        }
+        // An edit that keeps the target: its sign-in is stored under it,
+        // so another folder would be a target with none.
+        None => match existing {
+            Some(stored)
+                if cloud_kind(&stored) == Some(kind)
+                    && stored.cloud().is_some_and(|c| c.folder == folder) =>
+            {
+                Ok(stored)
+            }
+            _ => Err(format!("Sign in to {} first.", kind.name())),
+        },
+    }
+}
+
 impl StoreConfigInput {
+    /// The sign-in a cloud target is being saved with, if any: its tokens
+    /// open the store until the target is saved and adopts them.
+    pub fn sign_in(&self) -> Option<uuid::Uuid> {
+        match self {
+            Self::OneDrive { sign_in, .. }
+            | Self::Dropbox { sign_in, .. }
+            | Self::GoogleDrive { sign_in, .. } => sign_in
+                .as_deref()
+                .and_then(|id| uuid::Uuid::parse_str(id.trim()).ok()),
+            _ => None,
+        }
+    }
+
     pub fn into_config(self, existing: Option<StoreConfig>) -> Result<StoreConfig, String> {
         match self {
+            Self::OneDrive { sign_in, folder } => cloud_config(
+                silentsilo_vault::CloudProvider::OneDrive,
+                sign_in,
+                folder,
+                existing,
+            ),
+            Self::Dropbox { sign_in, folder } => cloud_config(
+                silentsilo_vault::CloudProvider::Dropbox,
+                sign_in,
+                folder,
+                existing,
+            ),
+            Self::GoogleDrive { sign_in, folder } => cloud_config(
+                silentsilo_vault::CloudProvider::GoogleDrive,
+                sign_in,
+                folder,
+                existing,
+            ),
             Self::S3 {
                 endpoint,
                 region,
@@ -391,6 +509,13 @@ mod deserialisation_tests {
                 },
                 "hostFingerprint": "SHA256:abc"
             }),
+            serde_json::json!({
+                "kind": "onedrive",
+                "signIn": "6f1c2c7e-3a0b-4d7e-9a53-3b1f2d9c0e11",
+                "folder": "Silo"
+            }),
+            serde_json::json!({ "kind": "dropbox", "signIn": null, "folder": "Silo" }),
+            serde_json::json!({ "kind": "google-drive", "signIn": null, "folder": "Silo 2" }),
         ];
 
         for payload in payloads {
@@ -398,6 +523,76 @@ mod deserialisation_tests {
             serde_json::from_value::<StoreConfigInput>(payload)
                 .unwrap_or_else(|e| panic!("the UI payload for {kind} must deserialise: {e}"));
         }
+    }
+
+    fn stored_dropbox(folder: &str) -> StoreConfig {
+        StoreConfig::Dropbox(silentsilo_store::CloudConfig {
+            account_id: "dbid:1".into(),
+            account_label: "ana@example.com".into(),
+            folder: folder.into(),
+        })
+    }
+
+    fn dropbox_input(sign_in: Option<&str>, folder: &str) -> StoreConfigInput {
+        serde_json::from_value(serde_json::json!({
+            "kind": "dropbox",
+            "signIn": sign_in,
+            "folder": folder,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_cloud_target_without_a_sign_in_keeps_only_itself() {
+        let stored = stored_dropbox("Silo");
+        let kept = dropbox_input(None, "Silo")
+            .into_config(Some(stored.clone()))
+            .unwrap();
+        assert_eq!(kept.target_id(), stored.target_id());
+
+        // Another folder, another kind, or nothing stored: sign in first.
+        assert!(
+            dropbox_input(None, "Silo 2")
+                .into_config(Some(stored.clone()))
+                .is_err()
+        );
+        let google: StoreConfigInput = serde_json::from_value(
+            serde_json::json!({ "kind": "google-drive", "signIn": null, "folder": "Silo" }),
+        )
+        .unwrap();
+        assert!(google.into_config(Some(stored)).is_err());
+        assert!(dropbox_input(None, "Silo").into_config(None).is_err());
+    }
+
+    #[test]
+    fn an_unknown_sign_in_is_refused_rather_than_trusted() {
+        let input = dropbox_input(Some("6f1c2c7e-3a0b-4d7e-9a53-3b1f2d9c0e11"), "Silo");
+        assert!(input.sign_in().is_some());
+        let Err(err) = input.into_config(None) else {
+            panic!("an id the app never issued must not name an account");
+        };
+        assert!(err.contains("Sign in again"), "got: {err}");
+    }
+
+    #[test]
+    fn a_folder_name_with_a_path_in_it_is_refused() {
+        for bad in [
+            "",
+            "  ",
+            "a/b",
+            "a\\b",
+            "..",
+            ".hidden",
+            "trailing.",
+            "a:b",
+            "a|b",
+        ] {
+            assert!(cloud_folder(bad).is_err(), "{bad:?} must be refused");
+        }
+        assert_eq!(
+            cloud_folder(" Siloz personal \u{103} ").unwrap(),
+            "Siloz personal \u{103}"
+        );
     }
 
     #[test]

@@ -92,10 +92,16 @@ fn write_token(target_id: Uuid, refresh_token: &str) -> Result<(), VaultError> {
 }
 
 pub(crate) fn load_cloud_token(target_id: Uuid) -> Option<Zeroizing<String>> {
-    if let Ok(entry) = keyring_entry(target_id)
-        && let Ok(token) = entry.get_password()
-    {
-        return Some(Zeroizing::new(token));
+    // Credential Manager now and then fails a read of an entry it holds.
+    // Only "no entry" sends the read to the file: a missing token asks the
+    // user to sign in again, which a glitch should not.
+    for attempt in 0..3 {
+        match keyring_entry(target_id).map(|entry| entry.get_password()) {
+            Ok(Ok(token)) => return Some(Zeroizing::new(token)),
+            Ok(Err(keyring::Error::NoEntry)) => break,
+            _ if attempt < 2 => std::thread::sleep(std::time::Duration::from_millis(30)),
+            _ => break,
+        }
     }
     let raw = std::fs::read(token_path(target_id)).ok()?;
     let bytes = match raw.strip_prefix(DPAPI_MAGIC) {
@@ -245,6 +251,37 @@ fn pending_tokens(sign_in: Uuid) -> Result<(Provider, Arc<TokenSource>), StoreEr
         .filter(|p| p.at.elapsed() < PENDING_FOR)
         .map(|p| (p.provider, p.tokens.clone()))
         .ok_or_else(|| StoreError::Denied("the sign-in expired; sign in again".into()))
+}
+
+/// The provider and account of a pending sign-in, to build the target.
+pub fn cloud_sign_in_account(sign_in: Uuid) -> Option<(Provider, Account)> {
+    let pending = pending().lock().ok()?;
+    pending
+        .get(&sign_in)
+        .filter(|p| p.at.elapsed() < PENDING_FOR)
+        .map(|p| (p.provider, p.account.clone()))
+}
+
+/// Opens a target not saved yet with a pending sign-in's tokens, to check
+/// it before anything is stored.
+pub fn open_with_sign_in(
+    sign_in: Uuid,
+    config: &StoreConfig,
+) -> Result<Box<dyn ObjectStore>, StoreError> {
+    let (provider, tokens) = pending_tokens(sign_in)?;
+    let (Some(cloud), Some(kind)) = (config.cloud(), provider_of(config)) else {
+        return Err(StoreError::Other("not a cloud storage".into()));
+    };
+    let account_id = cloud_sign_in_account(sign_in)
+        .map(|(_, account)| account.id)
+        .unwrap_or_default();
+    if kind != provider || cloud.account_id != account_id {
+        return Err(StoreError::Denied(format!(
+            "That is a different {} account.",
+            provider.name()
+        )));
+    }
+    silentsilo_cloud::open(provider, cloud.clone(), tokens)
 }
 
 /// The silo folders a pending sign-in can see: what a second computer

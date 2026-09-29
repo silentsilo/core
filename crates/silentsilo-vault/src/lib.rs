@@ -38,8 +38,8 @@ pub use cache_store::{
     touch_blob_access,
 };
 pub use cloud_token::{
-    CloudSignIn, adopt_cloud_sign_in, cloud_sign_in, cloud_silo_folders, end_cloud_sign_in,
-    forget_cloud_token, install_cloud, save_cloud_token,
+    CloudSignIn, adopt_cloud_sign_in, cloud_sign_in, cloud_sign_in_account, cloud_silo_folders,
+    end_cloud_sign_in, forget_cloud_token, install_cloud, open_with_sign_in, save_cloud_token,
 };
 pub use dek_store::{
     dek_path, load_dek, save_dek, save_wrapped_dek_bytes, unwrap_dek_hex, wrap_dek_bytes,
