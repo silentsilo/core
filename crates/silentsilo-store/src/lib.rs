@@ -36,6 +36,10 @@ pub struct StoredObject {
     pub size: i64,
 }
 
+/// The shared contract suite, for this crate's tests and other crates'.
+#[doc(hidden)]
+pub mod contract;
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("{0} is not there")]

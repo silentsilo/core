@@ -8,7 +8,9 @@ license.workspace = true
 
 [dependencies]
 # All already in the tree (crypto, fido, vfs, store): no new compilation.
+async-trait = "0.1"
 base64 = "0.22"
+percent-encoding = "2"
 rand = { workspace = true }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 serde = { workspace = true }
@@ -17,9 +19,10 @@ sha2 = "0.10"
 silentsilo-s3 = { workspace = true }
 silentsilo-store = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync", "time"] }
+tokio = { workspace = true, features = ["sync", "time", "fs", "io-util"] }
 url = "2"
 zeroize = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util"] }

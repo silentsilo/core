@@ -8,7 +8,11 @@
 //! the user's own browser, so the password and second factor never reach the
 //! app.
 
+#[cfg(test)]
+mod fake;
+mod http;
 mod oauth;
+pub mod onedrive;
 mod pkce;
 mod provider;
 mod token;
@@ -27,11 +31,13 @@ pub fn open(
     config: CloudConfig,
     tokens: Arc<TokenSource>,
 ) -> Result<Box<dyn ObjectStore>, StoreError> {
-    let _ = (config, tokens);
-    Err(StoreError::Other(format!(
-        "{} is not available in this build yet",
-        provider.name()
-    )))
+    match provider {
+        Provider::OneDrive => Ok(Box::new(onedrive::OneDriveStore::new(config, tokens)?)),
+        other => Err(StoreError::Other(format!(
+            "{} is not available in this build yet",
+            other.name()
+        ))),
+    }
 }
 
 /// What can go wrong talking to a provider's sign-in service. The messages

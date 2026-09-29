@@ -3967,7 +3967,9 @@ dependencies = [
 name = "silentsilo-cloud"
 version = "1.7.2"
 dependencies = [
+ "async-trait",
  "base64",
+ "percent-encoding",
  "rand 0.9.5",
  "reqwest",
  "serde",
@@ -3975,6 +3977,7 @@ dependencies = [
  "sha2 0.10.9",
  "silentsilo-s3 1.7.2",
  "silentsilo-store 1.7.2",
+ "tempfile",
  "thiserror",
  "tokio",
  "url",
