@@ -23,6 +23,30 @@ impl Provider {
         }
     }
 
+    /// Whether this build can sign in there. Google's token endpoint wants
+    /// the client secret, so a build made without it leaves Google Drive out.
+    pub fn available(self) -> bool {
+        match self {
+            Provider::GoogleDrive => self.client_secret().is_some(),
+            _ => true,
+        }
+    }
+
+    /// The storage kind this provider's targets carry (`StoreConfig`'s tag).
+    pub fn kind(self) -> &'static str {
+        match self {
+            Provider::OneDrive => "onedrive",
+            Provider::Dropbox => "dropbox",
+            Provider::GoogleDrive => "google-drive",
+        }
+    }
+
+    pub fn from_kind(kind: &str) -> Option<Self> {
+        [Provider::OneDrive, Provider::Dropbox, Provider::GoogleDrive]
+            .into_iter()
+            .find(|p| p.kind() == kind)
+    }
+
     pub(crate) fn client_id(self) -> &'static str {
         match self {
             // Microsoft Entra, tenant softwarehive.onmicrosoft.com.
@@ -122,5 +146,41 @@ impl Provider {
             Provider::Dropbox => &[53682, 53683, 53684],
             _ => &[],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_kind_names_match_the_storage_config_tags() {
+        for provider in [Provider::OneDrive, Provider::Dropbox, Provider::GoogleDrive] {
+            assert_eq!(Provider::from_kind(provider.kind()), Some(provider));
+        }
+        let tag = |config: silentsilo_store::StoreConfig| {
+            serde_json::to_value(config).unwrap()["kind"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let cloud = silentsilo_store::CloudConfig {
+            account_id: "a".into(),
+            account_label: String::new(),
+            folder: "f".into(),
+        };
+        assert_eq!(
+            tag(silentsilo_store::StoreConfig::OneDrive(cloud.clone())),
+            "onedrive"
+        );
+        assert_eq!(
+            tag(silentsilo_store::StoreConfig::Dropbox(cloud.clone())),
+            "dropbox"
+        );
+        assert_eq!(
+            tag(silentsilo_store::StoreConfig::GoogleDrive(cloud)),
+            "google-drive"
+        );
+        assert_eq!(Provider::from_kind("s3"), None);
     }
 }
