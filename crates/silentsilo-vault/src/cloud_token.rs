@@ -118,9 +118,7 @@ pub fn forget_cloud_token(target_id: Uuid) {
     if let Ok(mut sources) = sources().lock() {
         sources.remove(&target_id);
     }
-    if let Ok(entry) = keyring_entry(target_id) {
-        let _ = entry.delete_credential();
-    }
+    crate::s3_store::forget_keyring_entry(|| keyring_entry(target_id));
     let _ = std::fs::remove_file(token_path(target_id));
 }
 

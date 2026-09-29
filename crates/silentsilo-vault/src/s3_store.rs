@@ -157,7 +157,7 @@ fn clear_slot_and_list(silo_id: Uuid) {
 /// stays readable, the mirror of the write problem `save_s3_config` guards
 /// against. Here that would leave storage credentials on a machine told to
 /// forget the silo, so the delete is retried rather than assumed.
-fn forget_keyring_entry(open: impl Fn() -> Result<Entry, keyring::Error>) {
+pub(crate) fn forget_keyring_entry(open: impl Fn() -> Result<Entry, keyring::Error>) {
     for _ in 0..5 {
         match open() {
             Ok(entry) => {
