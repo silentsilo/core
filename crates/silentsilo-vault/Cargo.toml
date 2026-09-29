@@ -35,6 +35,7 @@ zeroize = { workspace = true }
 thiserror = { workspace = true }
 silentsilo-core = { workspace = true }
 silentsilo-store = { workspace = true }
+silentsilo-cloud = { workspace = true }
 silentsilo-crypto = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]

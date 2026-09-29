@@ -135,6 +135,11 @@ fn write_slot(silo_id: Uuid, config: &StoreConfig) -> Result<(), VaultError> {
 /// Disconnects sync and forgets every target. Best-effort: a missing entry
 /// isn't an error. All of them hold the same secrets, so all of them go.
 pub fn clear_s3_config(silo_id: Uuid) {
+    for target in load_targets(silo_id) {
+        if target.config.cloud().is_some() {
+            crate::cloud_token::forget_cloud_token(target.config.target_id());
+        }
+    }
     clear_slot_and_list(silo_id);
     let _ = std::fs::remove_file(more_path(silo_id));
 }
@@ -1001,8 +1006,8 @@ mod older_release_tests {
     /// would write it.
     fn newer_kind() -> serde_json::Value {
         serde_json::json!({
-            "config": { "kind": "onedrive", "account": "ana@example.com", "folder": "Silo" },
-            "label": "OneDrive",
+            "config": { "kind": "box", "account": "ana@example.com", "folder": "Silo" },
+            "label": "Box",
             "role": "working"
         })
     }
@@ -1053,8 +1058,8 @@ mod older_release_tests {
         assert_eq!(load_targets(scratch.id()).len(), 2);
         let unreadable = load_unreadable_targets(scratch.id());
         assert_eq!(unreadable.len(), 1);
-        assert_eq!(unreadable[0].kind, "onedrive");
-        assert_eq!(unreadable[0].label, "OneDrive");
+        assert_eq!(unreadable[0].kind, "box");
+        assert_eq!(unreadable[0].label, "Box");
         assert!(matches!(load_stored(scratch.id())[0], Stored::Unknown(_)));
 
         clear_s3_config(scratch.id());
@@ -1156,6 +1161,67 @@ mod older_release_tests {
         assert!(matches!(stored[1], Stored::Unknown(_)));
 
         clear_s3_config(scratch.id());
+    }
+
+    fn onedrive(folder: &str) -> BackupTarget {
+        BackupTarget {
+            config: StoreConfig::OneDrive(silentsilo_store::CloudConfig {
+                account_id: "a1b2c3".into(),
+                account_label: "ana@example.com".into(),
+                folder: folder.into(),
+            }),
+            label: "OneDrive".into(),
+            role: TargetRole::Working,
+        }
+    }
+
+    #[test]
+    fn onedrive_goes_where_an_older_release_does_not_look() {
+        let _serial = keyring_lock();
+        let scratch = Scratch::new();
+
+        save_targets(
+            scratch.id(),
+            &[
+                onedrive("Silo"),
+                folder("D:/Backups", "Disk", TargetRole::Working),
+            ],
+        )
+        .unwrap();
+
+        // 1.2 sees the folder, whole, and as its first target.
+        let old = read_as_1_2(scratch.id());
+        assert_eq!(old.len(), 1);
+        assert_eq!(path_of(&old[0]), std::path::Path::new("D:/Backups"));
+        assert!(matches!(
+            slot_as_1_2(scratch.id()),
+            Some(as_of_1_2::StoreConfig::Folder { .. })
+        ));
+
+        // This build sees both, OneDrive first.
+        let back = load_targets(scratch.id());
+        assert_eq!(back.len(), 2);
+        assert!(matches!(back[0].config, StoreConfig::OneDrive(_)));
+        assert_eq!(back[0].label, "OneDrive");
+        assert!(matches!(
+            load_s3_config(scratch.id()),
+            Some(StoreConfig::OneDrive(_))
+        ));
+    }
+
+    #[test]
+    fn a_silo_joined_through_onedrive_writes_nothing_an_older_release_reads() {
+        let _serial = keyring_lock();
+        let scratch = Scratch::new();
+
+        save_s3_config(scratch.id(), &onedrive("Silo").config).unwrap();
+
+        assert!(read_as_1_2(scratch.id()).is_empty());
+        assert!(slot_as_1_2(scratch.id()).is_none());
+        assert!(matches!(
+            load_s3_config(scratch.id()),
+            Some(StoreConfig::OneDrive(_))
+        ));
     }
 
     #[test]

@@ -3964,6 +3964,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "silentsilo-cloud"
+version = "1.7.2"
+dependencies = [
+ "base64",
+ "rand 0.9.5",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "silentsilo-s3 1.7.2",
+ "silentsilo-store 1.7.2",
+ "thiserror",
+ "tokio",
+ "url",
+ "zeroize",
+]
+
+[[package]]
 name = "silentsilo-core"
 version = "1.0.0"
 source = "git+https://github.com/silentsilo/core?tag=v1.0.0#c6694cc193e3210638a2f8cf9562884993a9c1c5"
@@ -4246,6 +4264,7 @@ dependencies = [
  "russh",
  "russh-sftp",
  "serde",
+ "serde_json",
  "silentsilo-core 1.7.2",
  "silentsilo-s3 1.7.2",
  "silentsilo-testkit",
@@ -4382,6 +4401,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "silentsilo-cloud",
  "silentsilo-core 1.7.2",
  "silentsilo-crypto 1.7.2",
  "silentsilo-store 1.7.2",

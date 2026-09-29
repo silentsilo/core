@@ -1,0 +1,25 @@
+[package]
+name = "silentsilo-cloud"
+description = "Sign-in and storage for OneDrive, Dropbox and Google Drive."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+# All already in the tree (crypto, fido, vfs, store): no new compilation.
+base64 = "0.22"
+rand = { workspace = true }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+silentsilo-s3 = { workspace = true }
+silentsilo-store = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time"] }
+url = "2"
+zeroize = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util"] }

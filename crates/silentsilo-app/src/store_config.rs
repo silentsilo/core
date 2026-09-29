@@ -279,6 +279,19 @@ pub enum StoreConfigView {
         /// user can compare it against what their server reports.
         host_fingerprint: Option<String>,
     },
+    #[serde(rename = "onedrive")]
+    OneDrive {
+        account: String,
+        folder: String,
+    },
+    Dropbox {
+        account: String,
+        folder: String,
+    },
+    GoogleDrive {
+        account: String,
+        folder: String,
+    },
 }
 
 impl From<&StoreConfig> for StoreConfigView {
@@ -309,6 +322,18 @@ impl From<&StoreConfig> for StoreConfigView {
                     SftpAuth::Key { .. } => "key".into(),
                 },
                 host_fingerprint: c.host_fingerprint.clone(),
+            },
+            StoreConfig::OneDrive(c) => Self::OneDrive {
+                account: c.account_label.clone(),
+                folder: c.folder.clone(),
+            },
+            StoreConfig::Dropbox(c) => Self::Dropbox {
+                account: c.account_label.clone(),
+                folder: c.folder.clone(),
+            },
+            StoreConfig::GoogleDrive(c) => Self::GoogleDrive {
+                account: c.account_label.clone(),
+                folder: c.folder.clone(),
             },
         }
     }

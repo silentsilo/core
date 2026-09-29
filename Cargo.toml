@@ -8,6 +8,7 @@ members = [
     "crates/silentsilo-fido",
     "crates/silentsilo-s3",
     "crates/silentsilo-store",
+    "crates/silentsilo-cloud",
     "crates/silentsilo-fixture",
     "crates/silentsilo-testkit",
     "crates/silentsilo-sync",
@@ -47,6 +48,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "blo
 silentsilo-fido = { path = "crates/silentsilo-fido" }
 silentsilo-s3 = { path = "crates/silentsilo-s3" }
 silentsilo-store = { path = "crates/silentsilo-store" }
+silentsilo-cloud = { path = "crates/silentsilo-cloud" }
 silentsilo-sync = { path = "crates/silentsilo-sync" }
 silentsilo-app = { path = "crates/silentsilo-app" }
 # default-https-client, not the legacy "rustls" feature: that one drags in

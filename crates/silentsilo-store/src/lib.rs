@@ -254,6 +254,34 @@ pub(crate) async fn probe(store: &(impl ObjectStore + ?Sized)) -> Result<(), Sto
     removed
 }
 
+/// A OneDrive, Dropbox or Google Drive account and the silo's folder inside
+/// the app's own folder there. No secret: the refresh token is kept in the
+/// keyring by the vault, under [`StoreConfig::target_id`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CloudConfig {
+    /// The provider's own id for the account. It never changes, so a
+    /// reconnect that signs in to another account is caught by it.
+    pub account_id: String,
+    /// What the user sees: an address or a name.
+    #[serde(default)]
+    pub account_label: String,
+    /// The silo's folder, inside the app folder. The provider sees this
+    /// name, so it is neutral by default rather than the silo's.
+    pub folder: String,
+}
+
+/// Opens the cloud kinds. Installed by the vault at startup, because their
+/// token is in the keyring and their backends are in `silentsilo-cloud`,
+/// which is built on this crate.
+pub type CloudOpener = fn(&StoreConfig) -> Result<Box<dyn ObjectStore>, StoreError>;
+
+static CLOUD_OPENER: std::sync::OnceLock<CloudOpener> = std::sync::OnceLock::new();
+
+/// Called once; later calls change nothing.
+pub fn set_cloud_opener(opener: CloudOpener) {
+    let _ = CLOUD_OPENER.set(opener);
+}
+
 /// Everything needed to reach one backend.
 ///
 /// An enum rather than a trait object at the config layer, because this is
@@ -264,12 +292,29 @@ pub(crate) async fn probe(store: &(impl ObjectStore + ?Sized)) -> Result<(), Sto
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum StoreConfig {
     S3(silentsilo_core::S3Config),
-    Folder { path: PathBuf },
+    Folder {
+        path: PathBuf,
+    },
     WebDav(WebDavConfig),
     Sftp(SftpConfig),
+    // The kinds below are newer than core 1.7.2 and never go in the list it
+    // reads: see `LEGACY_KINDS` in the vault.
+    #[serde(rename = "onedrive")]
+    OneDrive(CloudConfig),
+    Dropbox(CloudConfig),
+    GoogleDrive(CloudConfig),
 }
 
 impl StoreConfig {
+    /// OneDrive, Dropbox or Google Drive: signed in through the browser,
+    /// with a token rather than a password in the settings.
+    pub fn cloud(&self) -> Option<&CloudConfig> {
+        match self {
+            Self::OneDrive(c) | Self::Dropbox(c) | Self::GoogleDrive(c) => Some(c),
+            _ => None,
+        }
+    }
+
     /// A stable name for the place this config points at, keying the
     /// per-target bookkeeping. Derived from where the target is, so
     /// changing the bucket or path makes a different target, correctly.
@@ -295,6 +340,17 @@ impl StoreConfig {
                 config.port,
                 config.path.trim_end_matches('/')
             ),
+            Self::OneDrive(c) => {
+                format!("onedrive|{}|{}", c.account_id, c.folder.trim_matches('/'))
+            }
+            Self::Dropbox(c) => format!("dropbox|{}|{}", c.account_id, c.folder.trim_matches('/')),
+            Self::GoogleDrive(c) => {
+                format!(
+                    "google-drive|{}|{}",
+                    c.account_id,
+                    c.folder.trim_matches('/')
+                )
+            }
         };
         Uuid::new_v5(&TARGET_NAMESPACE, location.as_bytes())
     }
@@ -308,6 +364,61 @@ impl StoreConfig {
             Self::Folder { path } => Ok(Box::new(FolderStore::new(path.clone()))),
             Self::WebDav(config) => Ok(Box::new(WebDavStore::new(config.clone())?)),
             Self::Sftp(config) => Ok(Box::new(SftpStore::new(config.clone())?)),
+            Self::OneDrive(_) | Self::Dropbox(_) | Self::GoogleDrive(_) => {
+                match CLOUD_OPENER.get() {
+                    Some(open) => open(self),
+                    None => Err(StoreError::Other(
+                        "this build cannot open OneDrive, Dropbox or Google Drive".into(),
+                    )),
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod cloud_config_tests {
+    use super::*;
+
+    fn cloud() -> CloudConfig {
+        CloudConfig {
+            account_id: "a1b2c3".into(),
+            account_label: "ana@example.com".into(),
+            folder: "Silo".into(),
+        }
+    }
+
+    #[test]
+    fn the_kinds_are_named_as_stored() {
+        let kind = |config: StoreConfig| {
+            serde_json::to_value(config).unwrap()["kind"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(kind(StoreConfig::OneDrive(cloud())), "onedrive");
+        assert_eq!(kind(StoreConfig::Dropbox(cloud())), "dropbox");
+        assert_eq!(kind(StoreConfig::GoogleDrive(cloud())), "google-drive");
+    }
+
+    #[test]
+    fn the_same_folder_at_two_providers_is_two_targets() {
+        let one = StoreConfig::OneDrive(cloud()).target_id();
+        assert_ne!(one, StoreConfig::Dropbox(cloud()).target_id());
+        assert_ne!(one, StoreConfig::GoogleDrive(cloud()).target_id());
+        // The label is shown, not where the target is.
+        let relabelled = CloudConfig {
+            account_label: "Ana".into(),
+            ..cloud()
+        };
+        assert_eq!(one, StoreConfig::OneDrive(relabelled).target_id());
+    }
+
+    #[test]
+    fn a_build_without_the_opener_refuses_rather_than_panics() {
+        // The vault installs it; this crate alone cannot open these kinds.
+        if CLOUD_OPENER.get().is_none() {
+            assert!(StoreConfig::Dropbox(cloud()).open().is_err());
         }
     }
 }

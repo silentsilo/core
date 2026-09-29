@@ -9,6 +9,7 @@
 pub const FIXTURE_SUPPORT: bool = cfg!(feature = "fixture-support");
 
 pub mod cache_store;
+mod cloud_token;
 pub mod dek_store;
 mod device_store;
 mod dpapi;
@@ -36,6 +37,7 @@ pub use cache_store::{
     remove_blob_from_cache, set_cache_limit_bytes, set_keep_full_copy, settle_blob_delivery,
     touch_blob_access,
 };
+pub use cloud_token::{forget_cloud_token, install_cloud, save_cloud_token};
 pub use dek_store::{
     dek_path, load_dek, save_dek, save_wrapped_dek_bytes, unwrap_dek_hex, wrap_dek_bytes,
 };
