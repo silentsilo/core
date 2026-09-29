@@ -171,6 +171,7 @@ impl PersistToken for Keep {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::s3_store::tests::keyring_lock;
 
     struct Scratch(Uuid);
 
@@ -182,6 +183,7 @@ mod tests {
 
     #[test]
     fn a_token_round_trips_and_is_forgotten() {
+        let _serial = keyring_lock();
         let target = Scratch(Uuid::new_v4());
         save_cloud_token(target.0, "rt-short").unwrap();
         assert_eq!(
@@ -196,6 +198,7 @@ mod tests {
     #[test]
     fn a_token_credential_manager_refuses_is_kept_in_the_file() {
         // Longer than the 1280 characters Credential Manager takes.
+        let _serial = keyring_lock();
         let target = Scratch(Uuid::new_v4());
         let long = "M.C5_BAY.".to_string() + &"a".repeat(2000);
         save_cloud_token(target.0, &long).unwrap();

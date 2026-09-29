@@ -166,9 +166,10 @@ fn forget_keyring_entry(open: impl Fn() -> Result<Entry, keyring::Error>) {
             Err(_) => return,
         }
         match open() {
+            // Only "no entry" proves the delete; any other error is retried.
             Ok(entry) => match entry.get_password() {
-                Ok(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
-                Err(_) => return,
+                Err(keyring::Error::NoEntry) => return,
+                _ => std::thread::sleep(std::time::Duration::from_millis(20)),
             },
             Err(_) => return,
         }
@@ -515,7 +516,7 @@ fn write_fallback_targets(silo_id: Uuid, json: &[u8]) -> Result<(), VaultError> 
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn sample() -> StoreConfig {
@@ -549,11 +550,19 @@ mod tests {
     /// Same reasoning as `device_store`: this file now lives under
     /// `work_base()`, a real directory on the machine running the tests, so
     /// each test takes a random id and cleans up after itself.
-    pub(super) struct Scratch(Uuid);
+    /// Holds the keyring lock until its cleanup is done.
+    pub(super) struct Scratch(
+        Uuid,
+        #[allow(dead_code)] Option<std::sync::MutexGuard<'static, ()>>,
+    );
 
     impl Scratch {
         pub(super) fn new() -> Self {
-            Scratch(Uuid::new_v4())
+            Scratch(Uuid::new_v4(), Some(keyring_lock()))
+        }
+        /// A second silo in a test that already holds the lock.
+        pub(super) fn another(&self) -> Self {
+            Scratch(Uuid::new_v4(), None)
         }
         pub(super) fn id(&self) -> Uuid {
             self.0
@@ -573,7 +582,7 @@ mod tests {
     /// Held by the tests that read back what the keyring stored. Credential
     /// Manager under many parallel writers now and then loses one, which is
     /// the machine's behaviour rather than this module's.
-    pub(super) fn keyring_lock() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn keyring_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -604,7 +613,7 @@ mod tests {
         // configured last, which is how a family silo ends up replaying a
         // work silo's operation log.
         let first = Scratch::new();
-        let second = Scratch::new();
+        let second = first.another();
 
         let StoreConfig::S3(mut inner) = sample() else {
             unreachable!()
@@ -880,7 +889,7 @@ mod target_list_tests {
     #[test]
     fn two_silos_keep_separate_lists() {
         let first = Scratch::new();
-        let second = Scratch::new();
+        let second = first.another();
 
         write_fallback_targets(
             first.id(),
@@ -902,7 +911,7 @@ mod target_list_tests {
 /// here rather than in somebody's backup list after a downgrade.
 #[cfg(test)]
 mod older_release_tests {
-    use super::tests::{Scratch, keyring_lock};
+    use super::tests::Scratch;
     use super::*;
 
     /// The target shapes as desktop 1.2 has them. Decoded, never read.
@@ -1021,7 +1030,6 @@ mod older_release_tests {
 
     #[test]
     fn an_older_release_reads_every_target_it_knows_and_nothing_else() {
-        let _serial = keyring_lock();
         let scratch = Scratch::new();
         write_more(
             scratch.id(),
@@ -1069,7 +1077,6 @@ mod older_release_tests {
     fn a_save_by_an_older_release_leaves_the_newer_targets_alone() {
         // 1.2 rewrites the list and the single slot and never opens the
         // other file, so whatever it saves, the newer target survives.
-        let _serial = keyring_lock();
         let scratch = Scratch::new();
         write_more(
             scratch.id(),
@@ -1105,7 +1112,6 @@ mod older_release_tests {
     fn a_target_this_build_cannot_read_never_takes_the_others_with_it() {
         // Before 1.3 one unknown entry made the whole list unreadable, the
         // slot answered "one target" and the next save wrote that back.
-        let _serial = keyring_lock();
         let scratch = Scratch::new();
         let written = vec![
             serde_json::to_value(folder("D:/Backups", "Disk", TargetRole::Working)).unwrap(),
@@ -1130,7 +1136,6 @@ mod older_release_tests {
 
     #[test]
     fn a_newer_target_keeps_its_place_when_others_are_removed() {
-        let _serial = keyring_lock();
         let scratch = Scratch::new();
         write_more(
             scratch.id(),
@@ -1177,7 +1182,6 @@ mod older_release_tests {
 
     #[test]
     fn onedrive_goes_where_an_older_release_does_not_look() {
-        let _serial = keyring_lock();
         let scratch = Scratch::new();
 
         save_targets(
@@ -1211,7 +1215,6 @@ mod older_release_tests {
 
     #[test]
     fn a_silo_joined_through_onedrive_writes_nothing_an_older_release_reads() {
-        let _serial = keyring_lock();
         let scratch = Scratch::new();
 
         save_s3_config(scratch.id(), &onedrive("Silo").config).unwrap();
@@ -1226,7 +1229,6 @@ mod older_release_tests {
 
     #[test]
     fn forgetting_a_silo_takes_the_newer_targets_too() {
-        let _serial = keyring_lock();
         let scratch = Scratch::new();
         write_more(
             scratch.id(),
