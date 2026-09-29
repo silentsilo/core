@@ -8,8 +8,11 @@
 //! the user's own browser, so the password and second factor never reach the
 //! app.
 
+pub mod dropbox;
 #[cfg(test)]
 mod fake;
+#[cfg(test)]
+mod fake_dropbox;
 mod http;
 mod oauth;
 pub mod onedrive;
@@ -33,6 +36,7 @@ pub fn open(
 ) -> Result<Box<dyn ObjectStore>, StoreError> {
     match provider {
         Provider::OneDrive => Ok(Box::new(onedrive::OneDriveStore::new(config, tokens)?)),
+        Provider::Dropbox => Ok(Box::new(dropbox::DropboxStore::new(config, tokens)?)),
         other => Err(StoreError::Other(format!(
             "{} is not available in this build yet",
             other.name()

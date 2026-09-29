@@ -11,10 +11,9 @@ use std::sync::Arc;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::{Method, StatusCode};
 use silentsilo_store::{CloudConfig, ObjectStore, Progress, StoreError, StoredObject};
-use tokio::io::AsyncWriteExt;
 
 use crate::TokenSource;
-use crate::http::{Http, transport, trusted_address};
+use crate::http::{Http, read_at, stream_to_file, transport, trusted_address};
 
 const GRAPH: &str = "https://graph.microsoft.com/v1.0";
 /// At or under this, one PUT; over it, an upload session.
@@ -350,39 +349,8 @@ impl ObjectStore for OneDriveStore {
         dest: &Path,
         progress: Progress<'_>,
     ) -> Result<(), StoreError> {
-        let mut response = self.download(key, None).await?;
-        let partial = dest.with_extension("part");
-        let result = async {
-            let mut file = tokio::fs::File::create(&partial)
-                .await
-                .map_err(|e| StoreError::Other(format!("{}: {e}", partial.display())))?;
-            while let Some(chunk) = response
-                .chunk()
-                .await
-                .map_err(|e| transport("OneDrive", &e))?
-            {
-                file.write_all(&chunk)
-                    .await
-                    .map_err(|e| StoreError::Other(e.to_string()))?;
-                if progress(chunk.len() as u64).is_break() {
-                    return Err(StoreError::Cancelled);
-                }
-            }
-            file.sync_all()
-                .await
-                .map_err(|e| StoreError::Other(e.to_string()))?;
-            Ok(())
-        }
-        .await;
-        match result {
-            Ok(()) => tokio::fs::rename(&partial, dest)
-                .await
-                .map_err(|e| StoreError::Other(format!("{}: {e}", dest.display()))),
-            Err(e) => {
-                let _ = tokio::fs::remove_file(&partial).await;
-                Err(e)
-            }
-        }
+        let response = self.download(key, None).await?;
+        stream_to_file(response, dest, progress, "OneDrive").await
     }
 
     async fn head(&self, key: &str) -> Result<Option<i64>, StoreError> {
@@ -443,26 +411,6 @@ impl ObjectStore for OneDriveStore {
             format!("OneDrive ({})", self.account)
         }
     }
-}
-
-#[cfg(windows)]
-fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
-    use std::os::windows::fs::FileExt;
-    let mut done = 0;
-    while done < buf.len() {
-        let n = file.seek_read(&mut buf[done..], offset + done as u64)?;
-        if n == 0 {
-            return Err(std::io::ErrorKind::UnexpectedEof.into());
-        }
-        done += n;
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
-    use std::os::unix::fs::FileExt;
-    file.read_exact_at(buf, offset)
 }
 
 #[cfg(test)]

@@ -215,3 +215,64 @@ pub(crate) fn trusted_address(url: &str, api: &str) -> bool {
         _ => false,
     }
 }
+
+/// Writes a download to `dest` through a `.part` file, reporting each chunk.
+/// A stop or a failure removes the partial file: a caller renames what it
+/// fetched into the blob cache, and a short file there is a file that will
+/// not open.
+pub(crate) async fn stream_to_file(
+    mut response: Response,
+    dest: &std::path::Path,
+    progress: silentsilo_store::Progress<'_>,
+    name: &str,
+) -> Result<(), StoreError> {
+    use tokio::io::AsyncWriteExt;
+    let partial = dest.with_extension("part");
+    let result = async {
+        let mut file = tokio::fs::File::create(&partial)
+            .await
+            .map_err(|e| StoreError::Other(format!("{}: {e}", partial.display())))?;
+        while let Some(chunk) = response.chunk().await.map_err(|e| transport(name, &e))? {
+            file.write_all(&chunk)
+                .await
+                .map_err(|e| StoreError::Other(e.to_string()))?;
+            if progress(chunk.len() as u64).is_break() {
+                return Err(StoreError::Cancelled);
+            }
+        }
+        file.sync_all()
+            .await
+            .map_err(|e| StoreError::Other(e.to_string()))?;
+        Ok(())
+    }
+    .await;
+    match result {
+        Ok(()) => tokio::fs::rename(&partial, dest)
+            .await
+            .map_err(|e| StoreError::Other(format!("{}: {e}", dest.display()))),
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&partial).await;
+            Err(e)
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    let mut done = 0;
+    while done < buf.len() {
+        let n = file.seek_read(&mut buf[done..], offset + done as u64)?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        done += n;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(buf, offset)
+}
