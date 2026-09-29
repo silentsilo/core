@@ -11,6 +11,27 @@ release notes should say.
 
 ## [Unreleased]
 
+### Added
+
+- OneDrive, Dropbox and Google Drive backends (`silentsilo-cloud`), each in
+  the app's own folder at the provider, and all three held to the same
+  `ObjectStore` contract suite as the others, against fake servers in CI.
+- Signing in to them: PKCE and a loopback redirect, the account and space a
+  sign-in reached, refresh tokens kept per target in the keyring (in a
+  file when too long for it, DPAPI-sealed on Windows), and one refresh at a
+  time per target.
+- The account of a cloud target comes from a sign-in the app holds, never
+  from the UI. A reconnect must be the same account.
+- Backup targets of a kind 1.7 does not know are kept in
+  `targets.more.config.json`, so an older release reads the list it knows
+  unharmed and its saves leave the new targets alone. A kind this release
+  does not know is kept as it is, in its place.
+
+### Fixed
+
+- A token read that Credential Manager fails now and then is retried before
+  it asks for a new sign-in, and deletes of keyring entries are checked.
+
 ## [1.7.2] - Kept edits settle
 
 ### Fixed

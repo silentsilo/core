@@ -24,7 +24,7 @@ confidence and it answers wrong.
 SilentSilo is a local-first encrypted vault. There is no server. Every
 change to the tree is an immutable, encrypted operation record appended to a
 log; devices converge by exchanging records through dumb storage the user
-owns (S3, WebDAV, SFTP, a folder). File content lives beside the log as
+owns (S3, WebDAV, SFTP, a folder, OneDrive, Dropbox, Google Drive). File content lives beside the log as
 encrypted blobs, each under a key of its own. Everything a device shows is a
 disposable cache rebuilt from the log; the log and the blobs are the only
 things that matter, and the whole design bends around never losing either.
@@ -41,6 +41,7 @@ flowchart TD
     end
     subgraph edge["edge crates"]
         STORE["silentsilo-store<br/>ObjectStore: folder, S3, WebDAV, SFTP"]
+        CLOUD["silentsilo-cloud<br/>OneDrive, Dropbox, Google Drive:<br/>sign-in, tokens, stores"]
         S3C["silentsilo-s3"]
         FIDO["silentsilo-fido"]
         CORE["silentsilo-core<br/>shared types"]
@@ -55,7 +56,8 @@ flowchart TD
     APP --> SYNC & VFS & VAULT & STORE
     SYNC --> VFS & VAULT & CRYPTO & STORE
     VFS --> VAULT & CRYPTO & CORE
-    VAULT --> CRYPTO
+    VAULT --> CRYPTO & CLOUD
+    CLOUD --> STORE & S3C
     STORE --> S3C
     EXTRACT --> SYNC & VFS & VAULT & CRYPTO & STORE
     FIXTURE --> SYNC & VFS & VAULT
@@ -193,6 +195,9 @@ property:
   `targets.more.config.json`, never in the list or the single slot an older
   release reads (FORMATS.md). Test runs use the keyring service
   `com.silentsilo.test`, never the app's (`keychain::service`).
+  The refresh token of each OneDrive, Dropbox or Google Drive target is kept
+  the same way, under `cloud-token:<target id>` (FORMATS.md). The access
+  token is never stored.
 - **The machine workdir** (keyed by silo path, outside the folder): the
   working copy `vault.sqlcipher` with its WAL, ciphered by SQLCipher under a
   random page key, that key sealed under the DEK as `vault.key` (and
@@ -637,6 +642,43 @@ Read this before "fixing" any of it.
   cookie, noted in a TEMP table of the same connection when the snapshot is
   written, exported or adopted. Never a timestamp or the revision, which
   sync writes do not bump; the note dies with the connection it counts.
+- **Cloud targets open through a hook the vault installs.**
+  `StoreConfig::open` lives in `silentsilo-store`, which cannot reach the
+  keyring, so the three cloud kinds open through `set_cloud_opener`, set by
+  `silentsilo_vault::install_cloud()` at startup. A client that never calls
+  it refuses those targets with a message instead of opening them without a
+  token. One `TokenSource` per target for the life of the process, so a pass
+  that opens a store again does not refresh again, and one refresh at a time:
+  two transfers must not both spend a refresh token Microsoft rotates.
+- **A sign-in's tokens wait in memory until a target adopts them.** The UI
+  gets the account to show and an id. The target is built from the account
+  that sign-in reached, never from what the UI sent, checked with the pending
+  tokens, and only stored under the target id once the list is saved: a
+  failed check leaves no token behind. A reconnect must reach the same
+  account, or the target would point at an empty folder.
+- **Only Dropbox sign-ins are revoked on removal.** Google's revocation ends
+  the whole grant, every other computer's sign-in to that account included,
+  and Microsoft has none for a personal account's token. Removing a target
+  forgets its token here either way.
+- **Tokens never follow a redirect.** None of the HTTP clients follow one;
+  the OneDrive download's 302 is followed by hand with the plain client, and
+  upload session addresses (OneDrive, Google) and OneDrive's `nextLink` are
+  checked before use. Graph refuses a token on an upload URL anyway.
+- **OneDrive is personal accounts only (`consumers`).** `Files.ReadWrite.AppFolder`
+  exists only there; a work account would have to grant every file it holds.
+  A drive that answers as anything but `personal` is refused.
+- **Google Drive may hold two files with one name.** Drive addresses by id,
+  and two devices can create the same key or the same folder at once. The
+  newest file by (modifiedTime, id) is the object; a writer removes only the
+  older copies, a delete removes them all, and a listing names each key once.
+  Twin folders are read as one: a read that misses asks Drive again rather
+  than trusting the folder cache, because the twin another device made after
+  the cache was filled holds files a read must see. The layout is real
+  folders, so a folder downloaded from drive.google.com opens with
+  `silentsilo-extract` like a local copy.
+- **`probe` is a folder nobody writes.** Asking a provider for the account or
+  the silo folders goes through a store built with that placeholder name,
+  which keeps one HTTP path per provider instead of two.
 - **Recovery codes map O→0, I/L→1, U→V on input.** Crockford's alphabet
   excludes those on output precisely because handwriting confuses them;
   strict parsing would reject correct codes.
