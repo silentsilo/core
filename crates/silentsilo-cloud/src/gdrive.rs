@@ -112,6 +112,10 @@ pub struct GoogleDriveStore {
     /// listing; a duplicate it causes is one the rules above settle.
     absent_dirs: Mutex<HashSet<String>>,
     absent_keys: Mutex<HashSet<String>>,
+    /// Folder paths looked up fresh since this store was opened, twins and
+    /// all: a miss there needs no search for a twin, which on an account with
+    /// several silos finds their `vault.json` and `recovery.env` every time.
+    fresh_dirs: Mutex<HashSet<String>>,
 }
 
 impl GoogleDriveStore {
@@ -141,6 +145,7 @@ impl GoogleDriveStore {
             folders: Mutex::new(HashMap::new()),
             absent_dirs: Mutex::new(HashSet::new()),
             absent_keys: Mutex::new(HashSet::new()),
+            fresh_dirs: Mutex::new(HashSet::new()),
         })
     }
 
@@ -354,6 +359,21 @@ impl GoogleDriveStore {
         if let Ok(mut absent) = self.absent_keys.lock() {
             absent.clear();
         }
+        if let Ok(mut fresh) = self.fresh_dirs.lock() {
+            fresh.clear();
+        }
+    }
+
+    fn walked_fresh(&self, dir: &str) -> bool {
+        self.fresh_dirs
+            .lock()
+            .is_ok_and(|fresh| fresh.contains(dir))
+    }
+
+    fn mark_walked(&self, dir: &str) {
+        if let Ok(mut fresh) = self.fresh_dirs.lock() {
+            fresh.insert(dir.to_string());
+        }
     }
 
     fn known_absent(&self, key: &str) -> bool {
@@ -417,6 +437,10 @@ impl GoogleDriveStore {
         if !copies.is_empty() {
             return Ok(copies);
         }
+        if self.walked_fresh(dir) {
+            self.mark_absent(key, true);
+            return Ok(Vec::new());
+        }
         let query = format!(
             "name = {} and trashed = false and mimeType != {}",
             quoted(name),
@@ -426,7 +450,12 @@ impl GoogleDriveStore {
             self.mark_absent(key, true);
             return Ok(Vec::new());
         }
-        self.copies_in(key, true).await
+        let copies = self.copies_in(key, true).await?;
+        self.mark_walked(dir);
+        if copies.is_empty() {
+            self.mark_absent(key, true);
+        }
+        Ok(copies)
     }
 
     async fn copies_under(&self, parents: &[String], name: &str) -> Result<Vec<Item>, StoreError> {
@@ -829,12 +858,10 @@ impl ObjectStore for GoogleDriveStore {
         };
         // Key to its object: the copy that sorts last.
         let mut found: HashMap<String, Item> = HashMap::new();
-        let mut folders: Vec<(String, String)> = self
-            .resolve(dir, false, true)
-            .await?
-            .into_iter()
-            .map(|id| (base.clone(), id))
-            .collect();
+        let resolved = self.resolve(dir, false, true).await?;
+        self.mark_walked(dir);
+        let mut folders: Vec<(String, String)> =
+            resolved.into_iter().map(|id| (base.clone(), id)).collect();
         while let Some((path, id)) = folders.pop() {
             for item in self.children(&id, None, None).await? {
                 let key = format!("{path}{}", item.name);
@@ -1109,6 +1136,33 @@ mod tests {
             second, 0,
             "the second miss in a missing folder asks nothing"
         );
+    }
+
+    #[tokio::test]
+    async fn other_silos_files_of_the_same_name_cost_one_search_a_pass() {
+        let (store, state) = store_in("Silo").await;
+        store.put("ops/1.op", vec![1]).await.unwrap();
+        // Another silo in the same account, with the fixed names every silo has.
+        {
+            let mut state = state.lock().unwrap();
+            let root = state.folder_id("SilentSilo").unwrap();
+            let other = state.add_file("Other", &root, Vec::new());
+            state
+                .items
+                .iter_mut()
+                .find(|i| i.id == other)
+                .unwrap()
+                .folder = true;
+            state.add_file("vault.json", &other, vec![9]);
+            state.add_file("recovery.env", &other, vec![9]);
+        }
+        state.lock().unwrap().api_calls = 0;
+        assert_eq!(store.head("vault.json").await.unwrap(), None);
+        let first = std::mem::take(&mut state.lock().unwrap().api_calls);
+        assert_eq!(store.head("recovery.env").await.unwrap(), None);
+        let second = state.lock().unwrap().api_calls;
+        assert!(first <= 6, "the first miss took {first} calls");
+        assert_eq!(second, 1, "a folder walked fresh needs no second search");
     }
 
     #[tokio::test]
