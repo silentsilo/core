@@ -92,15 +92,16 @@ fn write_token(target_id: Uuid, refresh_token: &str) -> Result<(), VaultError> {
 }
 
 pub(crate) fn load_cloud_token(target_id: Uuid) -> Option<Zeroizing<String>> {
-    // Credential Manager now and then fails a read of an entry it holds.
-    // Only "no entry" sends the read to the file: a missing token asks the
-    // user to sign in again, which a glitch should not.
+    // Credential Manager now and then fails a read of an entry it holds, or
+    // answers "no entry" just after a write it confirmed. A missing token
+    // asks the user to sign in again, which a glitch should not, so every
+    // answer but the token is asked twice more before the file is tried.
     for attempt in 0..3 {
-        match keyring_entry(target_id).map(|entry| entry.get_password()) {
-            Ok(Ok(token)) => return Some(Zeroizing::new(token)),
-            Ok(Err(keyring::Error::NoEntry)) => break,
-            _ if attempt < 2 => std::thread::sleep(std::time::Duration::from_millis(30)),
-            _ => break,
+        if let Ok(Ok(token)) = keyring_entry(target_id).map(|entry| entry.get_password()) {
+            return Some(Zeroizing::new(token));
+        }
+        if attempt < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(30));
         }
     }
     let raw = std::fs::read(token_path(target_id)).ok()?;
