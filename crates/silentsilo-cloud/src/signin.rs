@@ -111,10 +111,11 @@ impl Loopback {
         respond(
             &mut browser,
             "200 OK",
-            &page(&format!(
-                "Signed in to {}. Go back to SilentSilo to finish.",
-                provider.name()
-            )),
+            &page(
+                &format!("Signed in to {}", provider.name()),
+                "Go back to SilentSilo to finish. This tab is no longer needed, you can close it.",
+                true,
+            ),
         )
         .await;
         drop(browser);
@@ -158,7 +159,7 @@ impl Loopback {
                 Some((target, mut stream)) = received.recv() => {
                     let (path, query) = target.split_once('?').unwrap_or((&target, ""));
                     if path != "/" || !self.request.state_matches(query) {
-                        respond(&mut stream, "404 Not Found", &page("Nothing here.")).await;
+                        respond(&mut stream, "404 Not Found", &page("Nothing here", "", false)).await;
                         continue;
                     }
                     match self.request.code_from(query) {
@@ -167,7 +168,11 @@ impl Loopback {
                             respond(
                                 &mut stream,
                                 "200 OK",
-                                &page("The sign-in did not finish. Go back to SilentSilo to see why."),
+                                &page(
+                                    "The sign-in did not finish",
+                                    "Go back to SilentSilo to see why and try again. You can close this tab.",
+                                    false,
+                                ),
                             )
                             .await;
                             return Err(e);
@@ -244,11 +249,27 @@ async fn read_target(mut stream: TcpStream) -> Option<(String, TcpStream)> {
     Some((target, stream))
 }
 
-/// A page of fixed text: nothing from the request is echoed back.
-fn page(message: &str) -> String {
+/// A page of fixed text: nothing from the request is echoed back. Styled
+/// inline, since the policy it is sent with lets nothing else load.
+fn page(title: &str, message: &str, done: bool) -> String {
+    let (mark, tint) = if done {
+        ("&#10003;", "#16a34a")
+    } else {
+        ("!", "#dc2626")
+    };
     format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>SilentSilo</title></head>\
-         <body style=\"font-family:system-ui,sans-serif;margin:3rem\"><p>{message}</p></body></html>"
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title} - SilentSilo</title><style>
+:root{{color-scheme:light dark}}
+body{{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:#f4f5fb;color:#161a2e}}
+main{{max-width:26rem;margin:1.5rem;padding:2rem 1.75rem;border-radius:16px;background:#fff;box-shadow:0 8px 30px rgba(20,24,60,.10);text-align:center}}
+.mark{{width:3rem;height:3rem;margin:0 auto 1rem;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:1.5rem;font-weight:700;color:#fff;background:{tint}}}
+h1{{margin:0 0 .6rem;font-size:1.35rem}}
+p{{margin:0;line-height:1.5;color:#4a5068}}
+.brand{{margin-top:1.5rem;font-size:.85rem;color:#8a90a8}}
+@media (prefers-color-scheme:dark){{body{{background:#0f1220;color:#e8eaf4}}main{{background:#181c2e;box-shadow:none}}p{{color:#aeb3c8}}}}
+</style></head><body><main><div class="mark">{mark}</div><h1>{title}</h1><p>{message}</p><div class="brand">SilentSilo</div></main></body></html>"#
     )
 }
 
