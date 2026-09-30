@@ -269,17 +269,22 @@ fn handle(state: &mut GraphState, base: &str, request: Request) -> Reply {
         );
     }
 
+    // As Graph answers a token that holds only the app folder permission.
     if path == "/v1.0/me/drive" {
+        return Reply::status(403);
+    }
+    if path == "/v1.0/me/drive/special/approot" {
         if !request.headers.contains_key("authorization") {
             return Reply::status(401);
         }
         return Reply::json(
             200,
             serde_json::json!({
-                "id": "drive-1",
-                "driveType": state.drive_type.clone().unwrap_or_else(|| "personal".into()),
-                "owner": { "user": { "displayName": "Ana Pop" } },
-                "quota": { "total": 1000, "remaining": 400 },
+                "id": "approot-1",
+                "parentReference": {
+                    "driveId": "drive-1",
+                    "driveType": state.drive_type.clone().unwrap_or_else(|| "personal".into()),
+                },
             }),
         );
     }

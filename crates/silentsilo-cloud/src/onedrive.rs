@@ -266,34 +266,42 @@ impl OneDriveStore {
 
 #[async_trait::async_trait]
 impl crate::Probe for OneDriveStore {
+    /// Asked of the app folder, not of `/me/drive`: the app folder
+    /// permission reaches that folder only, and Graph refuses the drive
+    /// itself with 403. The folder's parent names the drive and its kind;
+    /// the space left is not something this permission can read. The
+    /// address shown comes from the sign-in's ID token instead.
     async fn account(&self) -> Result<crate::Account, StoreError> {
-        let url = format!("{}/me/drive?$select=id,driveType,owner,quota", self.api);
+        let url = format!(
+            "{}/me/drive/special/approot?$select=id,parentReference",
+            self.api
+        );
         let response = self.http.send(Method::GET, &url, &[], None).await?;
         if !response.status().is_success() {
-            return Err(self.http.status_error(response.status(), "the drive"));
+            return Err(self.http.status_error(response.status(), "the app folder"));
         }
-        let drive = self.http.json(response).await?;
+        let folder = self.http.json(response).await?;
         // The sign-in only admits personal accounts; a work drive here
         // would mean the app folder rule does not hold.
-        if drive.get("driveType").and_then(|t| t.as_str()) != Some("personal") {
+        if let Some(kind) = folder
+            .pointer("/parentReference/driveType")
+            .and_then(|t| t.as_str())
+            && kind != "personal"
+        {
             return Err(StoreError::Denied(
                 "OneDrive for work or school accounts is not supported yet".into(),
             ));
         }
-        let id = drive
-            .get("id")
+        let id = folder
+            .pointer("/parentReference/driveId")
             .and_then(|i| i.as_str())
             .filter(|i| !i.is_empty())
             .ok_or_else(|| StoreError::Other("OneDrive did not say which drive".into()))?;
-        let label = ["/owner/user/email", "/owner/user/displayName"]
-            .iter()
-            .find_map(|at| drive.pointer(at)?.as_str().filter(|s| !s.is_empty()))
-            .unwrap_or("OneDrive");
         Ok(crate::Account {
             id: id.to_string(),
-            label: label.to_string(),
-            free_bytes: drive.pointer("/quota/remaining").and_then(|q| q.as_u64()),
-            total_bytes: drive.pointer("/quota/total").and_then(|q| q.as_u64()),
+            label: "OneDrive".into(),
+            free_bytes: None,
+            total_bytes: None,
         })
     }
 
@@ -552,11 +560,9 @@ mod tests {
 
         let account = store.account().await.unwrap();
         assert_eq!(account.id, "drive-1");
-        assert_eq!(account.label, "Ana Pop");
-        assert_eq!(
-            (account.free_bytes, account.total_bytes),
-            (Some(400), Some(1000))
-        );
+        // The address comes from the sign-in; the space is not readable.
+        assert_eq!(account.label, "OneDrive");
+        assert_eq!((account.free_bytes, account.total_bytes), (None, None));
         assert_eq!(store.silo_folders().await.unwrap(), vec!["Silo", "Silo 2"]);
 
         state.lock().unwrap().drive_type = Some("business".into());

@@ -106,12 +106,18 @@ impl Loopback {
         let (code, mut browser) = self.wait_for_code().await?;
         let result = async {
             let tokens = oauth.exchange(&self.request, &code).await?;
+            let email = tokens.email.clone();
             let tokens = Arc::new(TokenSource::signed_in(oauth, tokens, persist)?);
-            let account = account_of(tokens.clone()).await.map_err(|e| match e {
+            let mut account = account_of(tokens.clone()).await.map_err(|e| match e {
                 silentsilo_store::StoreError::Denied(message) => CloudError::Refused(message),
                 silentsilo_store::StoreError::Unreachable(what) => CloudError::Unreachable(what),
                 other => CloudError::Other(other.to_string()),
             })?;
+            // The ID token's address, where the provider sent one: Graph
+            // gives the app folder permission no way to read it.
+            if let Some(email) = email {
+                account.label = email;
+            }
             Ok(SignedIn { account, tokens })
         }
         .await;
@@ -343,6 +349,37 @@ mod tests {
         assert_eq!(endpoint.hits.load(std::sync::atomic::Ordering::SeqCst), 1);
         let sent = endpoint.bodies.lock().unwrap()[0].clone();
         assert!(sent.contains("code=c-1") && sent.contains("code_verifier="));
+    }
+
+    #[tokio::test]
+    async fn the_address_in_the_id_token_names_the_account() {
+        use base64::Engine;
+        let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"email":"ana@outlook.com"}"#);
+        let body = format!(
+            r#"{{"access_token":"at-1","refresh_token":"rt-1","expires_in":3600,"id_token":"x.{claims}.y"}}"#
+        );
+        let endpoint = FakeTokenEndpoint::start(move |_| (200, body.clone())).await;
+        let loopback = Loopback::bind(Provider::OneDrive).await.unwrap();
+        let state = param(loopback.url(), "state");
+        let port: u16 = param(loopback.url(), "redirect_uri")
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let oauth = OAuth::with_token_url(Provider::OneDrive, &endpoint.url).unwrap();
+        let finishing = tokio::spawn(loopback.finish(oauth, Arc::new(Forget), |_| async {
+            Ok(Account {
+                id: "drive-1".into(),
+                label: "OneDrive".into(),
+                free_bytes: None,
+                total_bytes: None,
+            })
+        }));
+        visit(port, &format!("/?code=c-1&state={state}")).await;
+        let signed_in = finishing.await.unwrap().unwrap();
+        assert_eq!(signed_in.account.label, "ana@outlook.com");
     }
 
     #[tokio::test]
