@@ -351,11 +351,23 @@ impl GoogleDriveStore {
     }
 
     /// Every copy of `key`'s file, the object last. Found nowhere through
-    /// the cached folders, asked again with fresh ones before saying so.
+    /// the cached folders, the name is searched for once across what the app
+    /// can see, and only a hit somewhere is worth fresh folders: a twin
+    /// another device made may hold it. A plain miss, the common case for
+    /// every new record and blob, stays two calls.
     async fn copies(&self, key: &str) -> Result<Vec<Item>, StoreError> {
         let copies = self.copies_in(key, false).await?;
         if !copies.is_empty() {
             return Ok(copies);
+        }
+        let (_, name) = Self::split(key);
+        let query = format!(
+            "name = {} and trashed = false and mimeType != {}",
+            quoted(name),
+            quoted(FOLDER)
+        );
+        if self.search(&query).await?.is_empty() {
+            return Ok(Vec::new());
         }
         self.copies_in(key, true).await
     }
@@ -1003,6 +1015,24 @@ mod tests {
         }
         store.delete("vault.json").await.unwrap();
         assert_eq!(store.head("vault.json").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_new_small_object_costs_a_few_calls_not_a_folder_walk() {
+        let (store, state) = store_in("Silo").await;
+        // Folders made and cached, as they are after the first writes.
+        store.put("ops/a.op", vec![1]).await.unwrap();
+        state.lock().unwrap().api_calls = 0;
+
+        assert_eq!(store.head("ops/b.op").await.unwrap(), None);
+        let for_head = std::mem::take(&mut state.lock().unwrap().api_calls);
+        store.put("ops/b.op", vec![2]).await.unwrap();
+        let for_put = state.lock().unwrap().api_calls;
+
+        // A folder lookup and a name search; then those two, the upload
+        // and the check for an older copy.
+        assert!(for_head <= 2, "a missing key took {for_head} calls");
+        assert!(for_put <= 4, "a new small object took {for_put} calls");
     }
 
     #[tokio::test]

@@ -32,6 +32,8 @@ pub struct DriveState {
     pub throttle: usize,
     pub page_size: usize,
     pub violations: Vec<String>,
+    /// Requests other than the token endpoint, to hold the cost of a write.
+    pub api_calls: usize,
 }
 
 impl DriveState {
@@ -236,6 +238,8 @@ fn handle(state: &mut DriveState, base: &str, request: Request) -> Reply {
             serde_json::json!({ "access_token": format!("at-{n}"), "expires_in": 3600 }),
         );
     }
+
+    state.api_calls += 1;
 
     // The resumable session address: no token expected.
     if path == "/upload/drive/v3/files" && query_param(&query, "upload_id").is_some() {
