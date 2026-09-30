@@ -301,7 +301,9 @@ fn load_stored(silo_id: Uuid) -> Vec<Stored> {
             })
             .unwrap_or_default(),
     };
-    let mut more = read_more(silo_id);
+    // Shown as far as it can be read; a save refuses instead (see
+    // `unknown_with_places`).
+    let mut more = read_more(silo_id).unwrap_or_default();
     more.sort_by_key(|entry| entry.position);
     for entry in more {
         let at = entry.position.min(all.len());
@@ -313,7 +315,7 @@ fn load_stored(silo_id: Uuid) -> Vec<Stored> {
 /// The targets this build cannot read, each with the place it was saved at
 /// rather than where it lands in a shorter list today, so a save here puts
 /// it back where it was.
-fn unknown_with_places(silo_id: Uuid) -> Vec<(usize, serde_json::Value)> {
+fn unknown_with_places(silo_id: Uuid) -> Result<Vec<(usize, serde_json::Value)>, VaultError> {
     let mut out = Vec::new();
     for (place, value) in read_list(silo_id)
         .unwrap_or_default()
@@ -324,13 +326,15 @@ fn unknown_with_places(silo_id: Uuid) -> Vec<(usize, serde_json::Value)> {
             out.push((place, value));
         }
     }
-    for entry in read_more(silo_id) {
+    // An unreadable file refuses the save: read as empty, it was rewritten
+    // without every cloud copy it held, which were then gone for good.
+    for entry in read_more(silo_id)? {
         if let Stored::Unknown(value) = Stored::from_value(entry.target) {
             out.push((entry.position, value));
         }
     }
     out.sort_by_key(|(place, _)| *place);
-    out
+    Ok(out)
 }
 
 /// Every target this silo backs up to, in the order they were added.
@@ -389,7 +393,7 @@ pub fn save_targets(silo_id: Uuid, targets: &[BackupTarget]) -> Result<(), Vault
         .collect();
 
     let mut all: Vec<Stored> = targets.iter().cloned().map(Stored::Known).collect();
-    for (place, value) in unknown_with_places(silo_id) {
+    for (place, value) in unknown_with_places(silo_id)? {
         let at = place.min(all.len());
         all.insert(at, Stored::Unknown(value));
     }
@@ -486,18 +490,25 @@ fn read_list(silo_id: Uuid) -> Option<Vec<serde_json::Value>> {
 
 /// A file only, no keyring entry: nothing in it is a secret (the tokens of
 /// these kinds are stored apart), and one copy cannot disagree with another.
-fn read_more(silo_id: Uuid) -> Vec<MoreEntry> {
-    let Ok(raw) = std::fs::read(more_path(silo_id)) else {
-        return Vec::new();
+///
+/// Absent is an empty list; present and unreadable (protected under another
+/// Windows account, damaged, or from a newer release) is an error.
+fn read_more(silo_id: Uuid) -> Result<Vec<MoreEntry>, VaultError> {
+    let raw = match std::fs::read(more_path(silo_id)) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
     };
     let json_bytes = match raw.strip_prefix(DPAPI_MAGIC) {
-        Some(protected) => match dpapi::unprotect(protected) {
-            Some(json) => json,
-            None => return Vec::new(),
-        },
+        Some(protected) => dpapi::unprotect(protected).ok_or_else(|| {
+            VaultError::Corrupted(
+                "the list of cloud copies could not be read on this computer, so it was left as it is"
+                    .into(),
+            )
+        })?,
         None => raw,
     };
-    crate::format::decode("the backup targets", &json_bytes).unwrap_or_default()
+    crate::format::decode("the list of cloud copies", &json_bytes)
 }
 
 fn write_more(silo_id: Uuid, more: &[MoreEntry]) -> Result<(), VaultError> {
@@ -1113,6 +1124,32 @@ mod older_release_tests {
         assert!(matches!(load_stored(scratch.id())[0], Stored::Unknown(_)));
 
         clear_s3_config(scratch.id());
+    }
+
+    #[test]
+    fn a_list_of_cloud_copies_this_computer_cannot_read_is_never_overwritten() {
+        // Read as empty, the next save rewrote it without them: every cloud
+        // copy of the silo gone from this computer for good.
+        for unreadable in [
+            b"not json at all".to_vec(),
+            br#"{"version":99,"data":[]}"#.to_vec(),
+            [DPAPI_MAGIC, b"not a protected blob"].concat(),
+        ] {
+            let scratch = Scratch::new();
+            std::fs::create_dir_all(more_path(scratch.id()).parent().unwrap()).unwrap();
+            std::fs::write(more_path(scratch.id()), &unreadable).unwrap();
+
+            let refused = save_targets(
+                scratch.id(),
+                &[folder("D:/Backups", "Disk", TargetRole::Working)],
+            );
+            assert!(refused.is_err(), "the save must refuse, not drop the list");
+            assert_eq!(std::fs::read(more_path(scratch.id())).unwrap(), unreadable);
+            // Still shown, as far as it can be.
+            assert!(load_targets(scratch.id()).is_empty());
+
+            clear_s3_config(scratch.id());
+        }
     }
 
     #[test]
