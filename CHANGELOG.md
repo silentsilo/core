@@ -11,6 +11,8 @@ release notes should say.
 
 ## [Unreleased]
 
+## [1.8.0] - OneDrive, Dropbox and Google Drive
+
 ### Added
 
 - OneDrive, Dropbox and Google Drive backends (`silentsilo-cloud`), each in
