@@ -47,7 +47,7 @@ pub async fn a_prefix_read_returns_the_first_bytes_only(store: Box<dyn ObjectSto
 pub async fn listing_is_ordered_by_key(store: Box<dyn ObjectStore>) {
     // Operation keys are the Lamport counter zero-padded, so
     // lexicographic order is logical order. Written out of order on
-    // purpose — a backend that echoed insertion order would pass a
+    // purpose: a backend that echoed insertion order would pass a
     // weaker test than this.
     for n in [7u32, 1, 30, 2] {
         store
@@ -110,7 +110,7 @@ pub async fn reading_something_absent_reports_not_found(store: Box<dyn ObjectSto
     );
 }
 
-/// Not needed by the operation log, which never rewrites — but the
+/// Not needed by the operation log, which never rewrites, but the
 /// manifest and the key envelopes do.
 pub async fn rewriting_a_key_replaces_it(store: Box<dyn ObjectStore>) {
     store.put("vault.json", b"first".to_vec()).await.unwrap();
