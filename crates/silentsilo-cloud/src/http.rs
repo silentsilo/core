@@ -81,7 +81,10 @@ impl Http {
             if let Some(body) = body {
                 request = request.body(body.to_vec());
             }
-            match request.send().await {
+            let started = std::time::Instant::now();
+            let sent = request.send().await;
+            trace(self.name, &method, url, &sent, started);
+            match sent {
                 Err(e) if attempt < ATTEMPTS && retryable(&e) => {
                     tokio::time::sleep(backoff(attempt)).await;
                 }
@@ -117,7 +120,10 @@ impl Http {
             if let Some(body) = body {
                 request = request.body(body.to_vec());
             }
-            match request.send().await {
+            let started = std::time::Instant::now();
+            let sent = request.send().await;
+            trace(self.name, &method, url, &sent, started);
+            match sent {
                 Err(e) if attempt < ATTEMPTS && retryable(&e) => {
                     tokio::time::sleep(backoff(attempt)).await;
                 }
@@ -163,6 +169,38 @@ impl Http {
         serde_json::from_slice(&bytes)
             .map_err(|_| StoreError::Other(format!("{} answered something unreadable", self.name)))
     }
+}
+
+/// With `SILENTSILO_TRACE_CLOUD` set, one line per request on stderr: the
+/// provider, the method, the path without its query, the answer and the
+/// time taken. For finding where a slow pass spends it; never a token, a
+/// query or a body.
+fn trace(
+    name: &str,
+    method: &Method,
+    url: &str,
+    sent: &Result<Response, reqwest::Error>,
+    started: std::time::Instant,
+) {
+    if std::env::var_os("SILENTSILO_TRACE_CLOUD").is_none() {
+        return;
+    }
+    let path = url::Url::parse(url)
+        .map(|u| u.path().to_string())
+        .unwrap_or_default();
+    let answer = match sent {
+        Ok(response) => response.status().as_u16().to_string(),
+        Err(_) => "failed".into(),
+    };
+    let _ = std::io::Write::write_all(
+        &mut std::io::stderr(),
+        format!(
+            "[cloud] {name} {method} {path} {answer} {}ms
+",
+            started.elapsed().as_millis()
+        )
+        .as_bytes(),
+    );
 }
 
 fn throttled(status: StatusCode) -> bool {
