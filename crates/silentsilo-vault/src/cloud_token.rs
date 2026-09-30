@@ -345,7 +345,7 @@ impl PersistToken for Keep {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::s3_store::tests::keyring_lock;
 
@@ -368,7 +368,19 @@ mod tests {
         );
 
         forget_cloud_token(target.0);
-        assert!(load_cloud_token(target.0).is_none());
+        assert!(gone(target.0), "a forgotten token must not come back");
+    }
+
+    /// Credential Manager can still answer with an entry for a moment after
+    /// a delete it confirmed; what matters is that it stops.
+    pub(crate) fn gone(target_id: Uuid) -> bool {
+        (0..20).any(|_| {
+            let none = load_cloud_token(target_id).is_none();
+            if !none {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            none
+        })
     }
 
     #[test]

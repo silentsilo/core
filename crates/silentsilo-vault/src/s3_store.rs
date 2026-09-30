@@ -769,7 +769,7 @@ mod target_list_tests {
 
         save_targets(scratch.id(), &[disk]).unwrap();
 
-        assert!(crate::cloud_token::load_cloud_token(cloud.target_id()).is_none());
+        assert!(crate::cloud_token::tests::gone(cloud.target_id()));
     }
 
     #[test]

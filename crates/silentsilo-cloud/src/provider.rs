@@ -64,7 +64,10 @@ impl Provider {
     /// build without it simply sends none.
     pub(crate) fn client_secret(self) -> Option<&'static str> {
         match self {
-            Provider::GoogleDrive => option_env!("SILENTSILO_GOOGLE_CLIENT_SECRET"),
+            // Empty is absent: a CI secret nobody configured arrives as "".
+            Provider::GoogleDrive => {
+                option_env!("SILENTSILO_GOOGLE_CLIENT_SECRET").filter(|s| !s.trim().is_empty())
+            }
             _ => None,
         }
     }
