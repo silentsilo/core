@@ -175,7 +175,7 @@ impl Http {
 /// provider, the method, the path without its query, the answer and the
 /// time taken. For finding where a slow pass spends it; never a token, a
 /// query or a body.
-fn trace(
+pub(crate) fn trace(
     name: &str,
     method: &Method,
     url: &str,
@@ -190,7 +190,7 @@ fn trace(
         .unwrap_or_default();
     let answer = match sent {
         Ok(response) => response.status().as_u16().to_string(),
-        Err(_) => "failed".into(),
+        Err(e) => format!("failed ({})", cause(e)),
     };
     let _ = std::io::Write::write_all(
         &mut std::io::stderr(),

@@ -14,7 +14,7 @@
 //! go to the one that sorts first by (created time, id), whichever device
 //! asks.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -104,6 +104,14 @@ pub struct GoogleDriveStore {
     /// Folder path (relative to My Drive, `SilentSilo/<silo>/ops`) to the
     /// ids that hold that name, sorted: the first is where writes go.
     folders: Mutex<HashMap<String, Vec<String>>>,
+    /// Folder paths found missing, and keys found nowhere, since this store
+    /// was opened. A sync pass asks about each new record and blob before it
+    /// writes it, and the write asks again: without these, every one cost a
+    /// walk and a search on a folder already known not to be there. Another
+    /// device's write in the meantime is seen by the next pass, as with a
+    /// listing; a duplicate it causes is one the rules above settle.
+    absent_dirs: Mutex<HashSet<String>>,
+    absent_keys: Mutex<HashSet<String>>,
 }
 
 impl GoogleDriveStore {
@@ -131,6 +139,8 @@ impl GoogleDriveStore {
             folder,
             account: config.account_label,
             folders: Mutex::new(HashMap::new()),
+            absent_dirs: Mutex::new(HashSet::new()),
+            absent_keys: Mutex::new(HashSet::new()),
         })
     }
 
@@ -289,15 +299,30 @@ impl GoogleDriveStore {
                 parents = ids;
                 continue;
             }
+            if !fresh
+                && !create
+                && self
+                    .absent_dirs
+                    .lock()
+                    .is_ok_and(|absent| absent.contains(&path))
+            {
+                return Ok(Vec::new());
+            }
             let mut found = Vec::new();
             for parent in &parents {
                 found.extend(self.children(parent, Some(&segment), Some(true)).await?);
             }
             if found.is_empty() {
                 if !create {
+                    if let Ok(mut absent) = self.absent_dirs.lock() {
+                        absent.insert(path);
+                    }
                     return Ok(Vec::new());
                 }
                 self.create_folder(&segment, &parents[0]).await?;
+                if let Ok(mut absent) = self.absent_dirs.lock() {
+                    absent.clear();
+                }
                 // Read back rather than trusted: another device may have
                 // made the same folder at the same moment.
                 for parent in &parents {
@@ -322,6 +347,28 @@ impl GoogleDriveStore {
     fn forget_folders(&self) {
         if let Ok(mut folders) = self.folders.lock() {
             folders.clear();
+        }
+        if let Ok(mut absent) = self.absent_dirs.lock() {
+            absent.clear();
+        }
+        if let Ok(mut absent) = self.absent_keys.lock() {
+            absent.clear();
+        }
+    }
+
+    fn known_absent(&self, key: &str) -> bool {
+        self.absent_keys
+            .lock()
+            .is_ok_and(|absent| absent.contains(key))
+    }
+
+    fn mark_absent(&self, key: &str, absent: bool) {
+        if let Ok(mut keys) = self.absent_keys.lock() {
+            if absent {
+                keys.insert(key.to_string());
+            } else {
+                keys.remove(key);
+            }
         }
     }
 
@@ -356,30 +403,45 @@ impl GoogleDriveStore {
     /// another device made may hold it. A plain miss, the common case for
     /// every new record and blob, stays two calls.
     async fn copies(&self, key: &str) -> Result<Vec<Item>, StoreError> {
-        let copies = self.copies_in(key, false).await?;
+        if self.known_absent(key) {
+            return Ok(Vec::new());
+        }
+        let (dir, name) = Self::split(key);
+        let parents = self.resolve(dir, false, false).await?;
+        // No folder, no file: nothing to search for.
+        if parents.is_empty() {
+            self.mark_absent(key, true);
+            return Ok(Vec::new());
+        }
+        let copies = self.copies_under(&parents, name).await?;
         if !copies.is_empty() {
             return Ok(copies);
         }
-        let (_, name) = Self::split(key);
         let query = format!(
             "name = {} and trashed = false and mimeType != {}",
             quoted(name),
             quoted(FOLDER)
         );
         if self.search(&query).await?.is_empty() {
+            self.mark_absent(key, true);
             return Ok(Vec::new());
         }
         self.copies_in(key, true).await
     }
 
-    async fn copies_in(&self, key: &str, fresh: bool) -> Result<Vec<Item>, StoreError> {
-        let (dir, name) = Self::split(key);
+    async fn copies_under(&self, parents: &[String], name: &str) -> Result<Vec<Item>, StoreError> {
         let mut copies = Vec::new();
-        for parent in self.resolve(dir, false, fresh).await? {
-            copies.extend(self.children(&parent, Some(name), Some(false)).await?);
+        for parent in parents {
+            copies.extend(self.children(parent, Some(name), Some(false)).await?);
         }
         copies.sort_by(|a, b| a.file_order().cmp(&b.file_order()));
         Ok(copies)
+    }
+
+    async fn copies_in(&self, key: &str, fresh: bool) -> Result<Vec<Item>, StoreError> {
+        let (dir, name) = Self::split(key);
+        let parents = self.resolve(dir, false, fresh).await?;
+        self.copies_under(&parents, name).await
     }
 
     async fn current(&self, key: &str) -> Result<Option<Item>, StoreError> {
@@ -472,6 +534,7 @@ impl GoogleDriveStore {
             .and_then(|i| i.as_str())
             .map(str::to_string)
             .unwrap_or_default();
+        self.mark_absent(key, false);
         self.tidy(key, &id).await
     }
 
@@ -564,6 +627,7 @@ impl GoogleDriveStore {
                 return Err(StoreError::Cancelled);
             }
         }
+        self.mark_absent(key, false);
         self.tidy(key, &id).await
     }
 
@@ -1029,10 +1093,22 @@ mod tests {
         store.put("ops/b.op", vec![2]).await.unwrap();
         let for_put = state.lock().unwrap().api_calls;
 
-        // A folder lookup and a name search; then those two, the upload
-        // and the check for an older copy.
+        // A folder lookup and a name search; then only the upload and the
+        // check for an older copy, the miss being known.
         assert!(for_head <= 2, "a missing key took {for_head} calls");
-        assert!(for_put <= 4, "a new small object took {for_put} calls");
+        assert!(for_put <= 2, "a new small object took {for_put} calls");
+
+        // A folder known missing is not asked about again.
+        state.lock().unwrap().api_calls = 0;
+        assert_eq!(store.head("blobs/x.sslo").await.unwrap(), None);
+        let first = std::mem::take(&mut state.lock().unwrap().api_calls);
+        assert_eq!(store.head("blobs/y.sslo").await.unwrap(), None);
+        let second = state.lock().unwrap().api_calls;
+        assert!(first >= 1, "the first miss asks");
+        assert_eq!(
+            second, 0,
+            "the second miss in a missing folder asks nothing"
+        );
     }
 
     #[tokio::test]

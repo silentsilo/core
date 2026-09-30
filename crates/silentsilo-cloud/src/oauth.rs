@@ -229,6 +229,7 @@ impl OAuth {
         let deadline = std::time::Instant::now() + UNREACHABLE_FOR;
         let mut pause = Duration::from_millis(500);
         let response = loop {
+            let started = std::time::Instant::now();
             let sent = self
                 .http
                 .post(&self.token_url)
@@ -237,6 +238,13 @@ impl OAuth {
                 .body(body.to_string())
                 .send()
                 .await;
+            crate::http::trace(
+                name,
+                &reqwest::Method::POST,
+                &self.token_url,
+                &sent,
+                started,
+            );
             match sent {
                 Ok(response) => break response,
                 Err(e) if e.is_connect() && std::time::Instant::now() + pause < deadline => {
