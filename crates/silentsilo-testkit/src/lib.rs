@@ -25,11 +25,24 @@ pub fn skip_or_fail(what: &str) {
 pub struct HeldOpen(#[allow(dead_code)] std::fs::File);
 
 impl HeldOpen {
-    /// Opens `path` for reading and keeps the handle until dropped. The
-    /// share mode is the ordinary one: readers do not stop a plain write,
-    /// only a rename onto the file.
+    /// Opens `path` for reading and keeps the handle until dropped. Shared
+    /// for reading and writing but not for delete, as a scanner opens it:
+    /// a plain write goes through, a rename onto the file does not. Rust's
+    /// own default shares delete too, and a POSIX-style rename then succeeds.
     pub fn reading(path: &Path) -> Self {
-        Self(std::fs::File::open(path).expect("the file to hold open must exist"))
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // FILE_SHARE_READ | FILE_SHARE_WRITE
+            options.share_mode(0x1 | 0x2);
+        }
+        Self(
+            options
+                .open(path)
+                .expect("the file to hold open must exist"),
+        )
     }
 }
 

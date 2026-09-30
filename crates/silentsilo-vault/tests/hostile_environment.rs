@@ -201,3 +201,45 @@ fn a_silo_provisions_while_its_folder_is_being_watched() {
     assert!(root.join("master.dek.enc").is_file());
     assert!(root.join("content.kek.enc").is_file());
 }
+
+#[test]
+fn a_key_change_commits_while_something_holds_the_key_files() {
+    // Past the point of no return the old recovery code no longer works, so
+    // a held file must not turn the commit into an error that hides the new
+    // one.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let old = generate_dek();
+    let kek = generate_content_kek();
+    silentsilo_vault::save_dek(root, &old, &[3u8; 32]).unwrap();
+    silentsilo_vault::save_kek(root, &kek, &old).unwrap();
+    let keys_before = StoredFidoKeys {
+        keys: vec![credential("aa11", "old")],
+    };
+    save_fido_keys(root, &keys_before, silentsilo_vault::Authority::Machine).unwrap();
+    let (_, first) = create_recovery_envelope(&old, &kek).unwrap();
+    save_recovery_envelope(root, &first).unwrap();
+
+    let new = generate_dek();
+    silentsilo_vault::rotation::stage_rotation(root, &new, &kek, &old).unwrap();
+    let (code, envelope) = create_recovery_envelope(&new, &kek).unwrap();
+
+    let keys_file = HeldOpen::reading(&root.join("keys").join("fido.json"));
+    let recovery_file = HeldOpen::reading(&root.join("keys").join("recovery.json"));
+    silentsilo_vault::rotation::commit_rotation_with(
+        root,
+        &StoredFidoKeys {
+            keys: vec![credential("aa11", "new")],
+        },
+        silentsilo_vault::Authority::Machine,
+        Some(&envelope),
+    )
+    .expect("a held key file must not fail a commit past its point of no return");
+    drop(keys_file);
+    drop(recovery_file);
+
+    assert_eq!(load_fido_keys(root).unwrap().keys[0].wrapped_dek, "new");
+    let stored = load_recovery_envelope(root).unwrap();
+    assert!(silentsilo_vault::unwrap_with_code(&stored, &code).is_ok());
+    assert!(!silentsilo_vault::rotation::rotation_pending(root));
+}

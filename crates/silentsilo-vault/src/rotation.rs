@@ -86,9 +86,13 @@ pub fn commit_rotation_with(
             let _ = std::fs::remove_file(staged_recovery_path(root));
         }
     }
-    // The point of no return.
+    // The point of no return. Past it the change is in force whatever
+    // happens, so it is reported as done: an error from here on hid the new
+    // recovery code while the old one had already stopped working. Whatever
+    // a held file stops below is finished by the next read of the keys.
     silentsilo_core::rename_with_retry(&staged_kek_path(root), &kek_path(root))?;
-    finish_committed(root)
+    let _ = finish_committed(root);
+    Ok(())
 }
 
 /// Finishes a commit that got past moving the KEK. The staged key is still
@@ -116,7 +120,7 @@ fn finish_committed(root: &Path) -> Result<(), VaultError> {
         ),
     ] {
         if staged.is_file() {
-            silentsilo_core::rename_with_retry(&staged, &target)?;
+            move_into_place(&staged, &target)?;
         }
     }
     // Last, because its absence is what says the rotation is over.
@@ -168,6 +172,17 @@ pub fn load_staged_dek(root: &Path, old_dek: &MasterDek) -> Result<MasterDek, Va
         .try_into()
         .map_err(|_| VaultError::InvalidCredentials)?;
     Ok(MasterDek::from_bytes(key))
+}
+
+/// A rename, or, when something holds the target open, its bytes written
+/// over it in place, as every other key file is saved.
+fn move_into_place(staged: &Path, target: &Path) -> Result<(), VaultError> {
+    if silentsilo_core::rename_with_retry(staged, target).is_ok() {
+        return Ok(());
+    }
+    crate::workdir::write_private(target, &std::fs::read(staged)?)?;
+    let _ = std::fs::remove_file(staged);
+    Ok(())
 }
 
 /// Puts the staged KEK in force and clears the pending marker, and nothing
