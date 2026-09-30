@@ -11,6 +11,31 @@ release notes should say.
 
 ## [Unreleased]
 
+### Fixed
+
+- Signing in to OneDrive, Dropbox or Google Drive from a phone. The browser
+  is answered at once; the code is traded only once the app is back on
+  screen, and a request the phone kept off the network is tried again for
+  up to a minute. Before, Android's certificate check answered "revoked"
+  for about half a minute after the app came back, and OneDrive's account
+  was read from a place the app folder permission cannot reach.
+- Google Drive on an account with several silos: a check for a file no
+  longer searches the whole Drive each time and finds the other silos'
+  files of the same name. A new small file costs about four requests, not
+  ten.
+- Keyring deletes are confirmed twice: Credential Manager has been seen to
+  hand back an entry it had confirmed deleted.
+
+### Changed
+
+- `ObjectStore::get_small` reads a small object in one request where the
+  backend can, refusing it unread when it is too large. Sync uses it for the
+  manifest, the key envelopes and `recovery.env`; on the cloud providers it
+  saves a request each time.
+- The sign-in page says plainly what to do next.
+- The cloud request trace (`SILENTSILO_TRACE_CLOUD`) exists in debug builds
+  only.
+
 ## [1.8.0] - OneDrive, Dropbox and Google Drive
 
 ### Added

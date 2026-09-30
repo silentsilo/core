@@ -656,6 +656,15 @@ Read this before "fixing" any of it.
   tokens, and only stored under the target id once the list is saved: a
   failed check leaves no token behind. A reconnect must reach the same
   account, or the target would point at an empty folder.
+- **On a phone the code is traded after the app is back.** The browser is
+  answered as soon as the redirect arrives, and the exchange waits for the
+  `ready` a client passes (`sign_in_when`, `cloud_sign_in_when`); the phone
+  passes "the app is on screen again". Android keeps an app off the network
+  while another app is in front, and a request made then fails its
+  certificate revocation check, after which the platform verifier answers
+  "revoked" for that host for about half a minute. The exchange also retries
+  a request that never got out, for up to a minute: never one that did,
+  since the code may be spent.
 - **Only Dropbox sign-ins are revoked on removal.** Google's revocation ends
   the whole grant, every other computer's sign-in to that account included,
   and Microsoft has none for a personal account's token. Removing a target
@@ -676,6 +685,18 @@ Read this before "fixing" any of it.
   the cache was filled holds files a read must see. The layout is real
   folders, so a folder downloaded from drive.google.com opens with
   `silentsilo-extract` like a local copy.
+- **A Google Drive store remembers what it found missing.** Folder paths
+  and keys found absent, and folders looked up fresh, are kept for the life
+  of the store, which is one sync pass: every new record and blob is asked
+  about before it is written, and on an account with several silos the twin
+  search found the others' `vault.json` and `recovery.env` every time.
+  Another device's write in the meantime is seen by the next pass, as with a
+  listing, and a duplicate it leaves is one the rule above settles.
+- **Small objects are read in one request where the backend can.**
+  `get_small` returns the bytes or says the object is absent, and refuses
+  one over the limit unread: the default asks for the size first; OneDrive
+  and Dropbox read the download and stop past the limit, Google Drive knows
+  the size from its lookup.
 - **`probe` is a folder nobody writes.** Asking a provider for the account or
   the silo folders goes through a store built with that placeholder name,
   which keeps one HTTP path per provider instead of two.
