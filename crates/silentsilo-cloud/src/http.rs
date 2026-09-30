@@ -171,10 +171,10 @@ impl Http {
     }
 }
 
-/// With `SILENTSILO_TRACE_CLOUD` set, one line per request on stderr: the
-/// provider, the method, the path without its query, the answer and the
-/// time taken. For finding where a slow pass spends it; never a token, a
-/// query or a body.
+/// Debug builds only, with `SILENTSILO_TRACE_CLOUD` set: one line per
+/// request on stderr, with the provider, the method, the path, a Drive
+/// search's query, the answer and the time taken. For finding where a slow
+/// pass spends it; never a token or a body. A release build has none of it.
 pub(crate) fn trace(
     name: &str,
     method: &Method,
@@ -182,7 +182,7 @@ pub(crate) fn trace(
     sent: &Result<Response, reqwest::Error>,
     started: std::time::Instant,
 ) {
-    if std::env::var_os("SILENTSILO_TRACE_CLOUD").is_none() {
+    if !cfg!(debug_assertions) || std::env::var_os("SILENTSILO_TRACE_CLOUD").is_none() {
         return;
     }
     let path = url::Url::parse(url)

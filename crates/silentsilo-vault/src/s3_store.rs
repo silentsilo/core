@@ -158,21 +158,24 @@ fn clear_slot_and_list(silo_id: Uuid) {
 /// against. Here that would leave storage credentials on a machine told to
 /// forget the silo, so the delete is retried rather than assumed.
 pub(crate) fn forget_keyring_entry(open: impl Fn() -> Result<Entry, keyring::Error>) {
-    for _ in 0..5 {
-        match open() {
-            Ok(entry) => {
+    // Two "no entry" answers in a row before it counts: a confirmed delete
+    // has been seen to come back a moment later.
+    let mut gone_in_a_row = 0;
+    for _ in 0..10 {
+        let Ok(entry) = open() else { return };
+        match entry.get_password() {
+            Err(keyring::Error::NoEntry) => {
+                gone_in_a_row += 1;
+                if gone_in_a_row == 2 {
+                    return;
+                }
+            }
+            _ => {
+                gone_in_a_row = 0;
                 let _ = entry.delete_credential();
             }
-            Err(_) => return,
         }
-        match open() {
-            // Only "no entry" proves the delete; any other error is retried.
-            Ok(entry) => match entry.get_password() {
-                Err(keyring::Error::NoEntry) => return,
-                _ => std::thread::sleep(std::time::Duration::from_millis(20)),
-            },
-            Err(_) => return,
-        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
 

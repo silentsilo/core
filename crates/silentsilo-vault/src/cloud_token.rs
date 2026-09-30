@@ -384,7 +384,7 @@ pub(crate) mod tests {
     /// Credential Manager can still answer with an entry for a moment after
     /// a delete it confirmed; what matters is that it stops.
     pub(crate) fn gone(target_id: Uuid) -> bool {
-        (0..20).any(|_| {
+        (0..40).any(|_| {
             let none = load_cloud_token(target_id).is_none();
             if !none {
                 std::thread::sleep(std::time::Duration::from_millis(50));
