@@ -31,6 +31,26 @@ const UPLOAD: &str = "https://www.googleapis.com/upload/drive/v3";
 const FOLDER: &str = "application/vnd.google-apps.folder";
 /// The app's own folder in My Drive.
 const ROOT_NAME: &str = "SilentSilo";
+/// Answers in a row that take no byte further before an upload gives up.
+const STALLS: u32 = 3;
+
+/// An upload Drive answered without the finished file.
+fn unfinished(key: &str) -> StoreError {
+    StoreError::Other(format!("Google Drive did not finish storing {key}"))
+}
+
+/// How many bytes a 308 says Drive holds: its `Range` is `bytes=0-<last>`,
+/// and no `Range` means none.
+fn kept(response: &Response) -> u64 {
+    response
+        .headers()
+        .get("Range")
+        .and_then(|r| r.to_str().ok())
+        .and_then(|r| r.strip_prefix("bytes=0-"))
+        .and_then(|last| last.parse::<u64>().ok())
+        .map_or(0, |last| last + 1)
+}
+
 /// At or under this, one multipart call; over it, a resumable upload.
 const SMALL: u64 = 5 * 1024 * 1024;
 /// A multiple of 256 KiB, as Drive requires.
@@ -619,9 +639,17 @@ impl GoogleDriveStore {
                 StoreError::Other("Google Drive gave no usable upload address".into())
             })?;
 
+        // Done only when Drive answers with the file. A 308 says how much it
+        // kept, which can be less than was sent: the next chunk starts there.
+        // Taking the upload as done without the file made the blob look
+        // delivered, and evictable, while Drive had no copy of it.
         let mut offset = 0u64;
-        let mut id = String::new();
-        while offset < total {
+        let mut stalls = 0;
+        let id = loop {
+            if offset >= total || stalls >= STALLS {
+                let _ = self.http.plain.delete(&session).send().await;
+                return Err(unfinished(key));
+            }
             let chunk = read(offset, CHUNK.min(total - offset) as usize)?;
             let end = offset + chunk.len() as u64 - 1;
             // The session address stands for the upload: no token with it.
@@ -635,27 +663,37 @@ impl GoogleDriveStore {
                 )
                 .await?;
             let status = response.status();
-            offset += chunk.len() as u64;
+            let before = offset;
             if status.is_success() {
-                id = self
+                let id = self
                     .http
                     .json(response)
                     .await?
                     .get("id")
                     .and_then(|i| i.as_str())
                     .map(str::to_string)
-                    .unwrap_or_default();
-            } else if status.as_u16() != 308 {
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| unfinished(key))?;
+                if progress(total - before).is_break() {
+                    return Err(StoreError::Cancelled);
+                }
+                break id;
+            }
+            if status.as_u16() != 308 {
                 let _ = self.http.plain.delete(&session).send().await;
                 return Err(self.http.status_error(status, key));
             }
-            if progress(chunk.len() as u64).is_break() {
-                if offset < total {
+            offset = kept(&response).min(total);
+            if offset > before {
+                stalls = 0;
+                if progress(offset - before).is_break() {
                     let _ = self.http.plain.delete(&session).send().await;
+                    return Err(StoreError::Cancelled);
                 }
-                return Err(StoreError::Cancelled);
+            } else {
+                stalls += 1;
             }
-        }
+        };
         self.mark_absent(key, false);
         self.tidy(key, &id).await
     }
@@ -690,7 +728,7 @@ impl GoogleDriveStore {
         let status = response.status();
         if status.is_success() {
             Ok(response)
-        } else if status == StatusCode::RANGE_NOT_SATISFIABLE {
+        } else if status == StatusCode::RANGE_NOT_SATISFIABLE && range.is_some() {
             Box::pin(self.download_item(key, item, None)).await
         } else {
             Err(self.http.status_error(status, key))
@@ -884,11 +922,16 @@ impl ObjectStore for GoogleDriveStore {
         self.mark_walked(dir);
         let mut folders: Vec<(String, String)> =
             resolved.into_iter().map(|id| (base.clone(), id)).collect();
+        // A folder can have several parents on Drive, so a walk that did not
+        // remember where it had been could go round forever.
+        let mut seen: HashSet<String> = folders.iter().map(|(_, id)| id.clone()).collect();
         while let Some((path, id)) = folders.pop() {
             for item in self.children(&id, None, None).await? {
                 let key = format!("{path}{}", item.name);
                 if item.folder {
-                    folders.push((format!("{key}/"), item.id));
+                    if seen.insert(item.id.clone()) {
+                        folders.push((format!("{key}/"), item.id));
+                    }
                     continue;
                 }
                 if !key.starts_with(prefix) {
@@ -965,6 +1008,67 @@ mod tests {
     fn assert_clean(state: &Arc<Mutex<DriveState>>) {
         let violations = state.lock().unwrap().violations.clone();
         assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    /// One resumable chunk, so the chunk Drive keeps short is the last.
+    fn one_chunk() -> Vec<u8> {
+        (0..(SMALL as usize + 1024 * 1024 + 7))
+            .map(|i| (i % 249) as u8)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_last_chunk_drive_kept_only_part_of_is_not_taken_as_stored() {
+        // Taken as done, the blob counted as delivered and could be evicted
+        // here while Drive had no file.
+        let (store, state) = store_in("Silo").await;
+        state.lock().unwrap().keep_half = 1;
+        let bytes = one_chunk();
+        store.put("blobs/b1", bytes.clone()).await.unwrap();
+        assert_eq!(store.get("blobs/b1").await.unwrap(), bytes);
+        assert_clean(&state);
+    }
+
+    #[tokio::test]
+    async fn chunks_drive_kept_only_part_of_go_again_from_where_it_stopped() {
+        let (store, state) = store_in("Silo").await;
+        state.lock().unwrap().keep_half = 3;
+        let bytes = big();
+        let mut reported = 0u64;
+        store
+            .put_from_file_reporting(
+                "blobs/b2",
+                &{
+                    let dir = tempfile::tempdir().unwrap().keep();
+                    let path = dir.join("b2");
+                    std::fs::write(&path, &bytes).unwrap();
+                    path
+                },
+                &mut |step| {
+                    reported += step;
+                    ControlFlow::Continue(())
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.get("blobs/b2").await.unwrap(), bytes);
+        assert_eq!(
+            reported,
+            bytes.len() as u64,
+            "progress counts each byte once"
+        );
+        assert_clean(&state);
+    }
+
+    #[tokio::test]
+    async fn an_upload_drive_never_takes_further_gives_up() {
+        let (store, state) = store_in("Silo").await;
+        state.lock().unwrap().keep_half = 1000;
+        match store.put("blobs/b3", one_chunk()).await {
+            Err(StoreError::Other(message)) => assert!(message.contains("did not finish")),
+            other => panic!("expected an unfinished upload, got {other:?}"),
+        }
+        assert_eq!(store.head("blobs/b3").await.unwrap(), None);
     }
 
     #[tokio::test]

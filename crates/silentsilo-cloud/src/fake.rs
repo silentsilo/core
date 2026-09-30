@@ -146,6 +146,9 @@ pub struct GraphState {
     pub api_calls: usize,
     /// What `/me/drive` says the drive is; `personal` when unset.
     pub drive_type: Option<String>,
+    /// The next this many upload fragments keep only their first half and
+    /// ask for the rest in `nextExpectedRanges`.
+    pub keep_half: usize,
 }
 
 pub struct FakeGraph {
@@ -231,6 +234,12 @@ fn handle(state: &mut GraphState, base: &str, request: Request) -> Reply {
             state.sessions.remove(&id);
             return Reply::status(204);
         }
+        let keep = if state.keep_half > 0 && state.sessions.contains_key(&id) {
+            state.keep_half -= 1;
+            request.body.len() / 2
+        } else {
+            request.body.len()
+        };
         let Some((_, total, received)) = state.sessions.get_mut(&id) else {
             return Reply::status(404);
         };
@@ -255,7 +264,7 @@ fn handle(state: &mut GraphState, base: &str, request: Request) -> Reply {
         if start != received.len() as u64 || whole != *total {
             return Reply::status(416);
         }
-        received.extend_from_slice(&request.body);
+        received.extend_from_slice(&request.body[..keep]);
         let done = received.len() as u64 == *total;
         let so_far = received.len();
         if done {

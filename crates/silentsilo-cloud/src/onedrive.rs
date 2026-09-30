@@ -20,6 +20,23 @@ const GRAPH: &str = "https://graph.microsoft.com/v1.0";
 const SMALL: u64 = 4 * 1024 * 1024;
 /// 32 times 320 KiB: Graph wants multiples of 320 KiB, and advises 5 to 10.
 const CHUNK: u64 = 32 * 320 * 1024;
+
+/// Answers in a row that take no byte further before an upload gives up.
+const STALLS: u32 = 3;
+
+/// Where a 202 asks the upload to go on from: the start of the first of its
+/// `nextExpectedRanges`, each written `<start>-` or `<start>-<end>`.
+fn next_expected(answer: &serde_json::Value) -> Option<u64> {
+    answer
+        .get("nextExpectedRanges")?
+        .as_array()?
+        .first()?
+        .as_str()?
+        .split('-')
+        .next()?
+        .parse()
+        .ok()
+}
 /// A listing that pages on for ever is a broken answer, not a big silo.
 const MAX_PAGES: usize = 100_000;
 
@@ -125,8 +142,20 @@ impl OneDriveStore {
             .ok_or_else(|| StoreError::Other("OneDrive gave no usable upload address".into()))?
             .to_string();
 
+        // Done only on 200 or 201, which Graph gives with the finished item.
+        // A 202 means more is wanted, and `nextExpectedRanges` says from
+        // where, which is not always after the bytes just sent. Taking a 202
+        // on the last fragment as done made the blob look delivered, and
+        // evictable, while OneDrive had not put the file together.
         let mut offset = 0u64;
-        while offset < total {
+        let mut stalls = 0;
+        loop {
+            if offset >= total || stalls >= STALLS {
+                let _ = self.http.plain.delete(&upload_url).send().await;
+                return Err(StoreError::Other(format!(
+                    "OneDrive did not finish storing {key}"
+                )));
+            }
             let length = CHUNK.min(total - offset) as usize;
             let chunk = read(offset, length)?;
             let end = offset + chunk.len() as u64 - 1;
@@ -146,15 +175,25 @@ impl OneDriveStore {
                 let _ = self.http.plain.delete(&upload_url).send().await;
                 return Err(self.http.status_error(status, key));
             }
-            offset += chunk.len() as u64;
-            if progress(chunk.len() as u64).is_break() {
-                if offset < total {
-                    let _ = self.http.plain.delete(&upload_url).send().await;
+            let before = offset;
+            if status != StatusCode::ACCEPTED {
+                if progress(total - before).is_break() {
+                    return Err(StoreError::Cancelled);
                 }
-                return Err(StoreError::Cancelled);
+                return Ok(());
+            }
+            let wanted = self.http.json(response).await?;
+            offset = next_expected(&wanted).unwrap_or(end + 1).min(total);
+            if offset > before {
+                stalls = 0;
+                if progress(offset - before).is_break() {
+                    let _ = self.http.plain.delete(&upload_url).send().await;
+                    return Err(StoreError::Cancelled);
+                }
+            } else {
+                stalls += 1;
             }
         }
-        Ok(())
     }
 
     /// Where to fetch `key`'s bytes: Graph answers `/content` with a
@@ -196,8 +235,9 @@ impl OneDriveStore {
         let status = response.status();
         if status.is_success() {
             Ok(response)
-        } else if status == StatusCode::RANGE_NOT_SATISFIABLE {
+        } else if status == StatusCode::RANGE_NOT_SATISFIABLE && range.is_some() {
             // Asked for more than there is: the whole object is the answer.
+            // Only once: a 416 to a request with no range is an error.
             Box::pin(self.download(key, None)).await
         } else {
             Err(self.http.status_error(status, key))
@@ -542,6 +582,46 @@ mod tests {
     fn assert_clean(state: &Arc<Mutex<GraphState>>) {
         let violations = state.lock().unwrap().violations.clone();
         assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    /// One session fragment, so the fragment OneDrive keeps short is the last.
+    fn one_chunk() -> Vec<u8> {
+        (0..(SMALL as usize + 1024 * 1024 + 7))
+            .map(|i| (i % 249) as u8)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_last_fragment_answered_202_is_not_taken_as_stored() {
+        // Taken as done, the blob counted as delivered and could be evicted
+        // here while OneDrive had not put the file together.
+        let (store, state) = store_in("Silo").await;
+        state.lock().unwrap().keep_half = 1;
+        let bytes = one_chunk();
+        store.put("blobs/b1", bytes.clone()).await.unwrap();
+        assert_eq!(store.get("blobs/b1").await.unwrap(), bytes);
+        assert_clean(&state);
+    }
+
+    #[tokio::test]
+    async fn fragments_go_again_from_where_onedrive_asks() {
+        let (store, state) = store_in("Silo").await;
+        state.lock().unwrap().keep_half = 2;
+        let bytes = big();
+        store.put("blobs/b2", bytes.clone()).await.unwrap();
+        assert_eq!(store.get("blobs/b2").await.unwrap(), bytes);
+        assert_clean(&state);
+    }
+
+    #[tokio::test]
+    async fn an_upload_onedrive_never_takes_further_gives_up() {
+        let (store, state) = store_in("Silo").await;
+        state.lock().unwrap().keep_half = 1000;
+        match store.put("blobs/b3", one_chunk()).await {
+            Err(StoreError::Other(message)) => assert!(message.contains("did not finish")),
+            other => panic!("expected an unfinished upload, got {other:?}"),
+        }
+        assert_eq!(store.head("blobs/b3").await.unwrap(), None);
     }
 
     /// Bigger than one upload session chunk, and not a multiple of it.

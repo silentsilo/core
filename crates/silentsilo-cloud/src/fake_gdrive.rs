@@ -34,6 +34,9 @@ pub struct DriveState {
     pub violations: Vec<String>,
     /// Requests other than the token endpoint, to hold the cost of a write.
     pub api_calls: usize,
+    /// The next this many upload chunks keep only their first half, as Drive
+    /// may, and say so in the `Range` of the 308.
+    pub keep_half: usize,
 }
 
 impl DriveState {
@@ -253,6 +256,12 @@ fn handle(state: &mut DriveState, base: &str, request: Request) -> Reply {
             state.sessions.remove(&id);
             return Reply::status(499);
         }
+        let keep = if state.keep_half > 0 && state.sessions.contains_key(&id) {
+            state.keep_half -= 1;
+            request.body.len() / 2
+        } else {
+            request.body.len()
+        };
         let Some((_, _, total, received)) = state.sessions.get_mut(&id) else {
             return Reply::status(404);
         };
@@ -269,10 +278,16 @@ fn handle(state: &mut DriveState, base: &str, request: Request) -> Reply {
         if start != received.len() as u64 {
             return Reply::status(400);
         }
-        received.extend_from_slice(&request.body);
+        received.extend_from_slice(&request.body[..keep]);
         let done = received.len() as u64 == *total;
         if !done {
-            return Reply::status(308);
+            let mut reply = Reply::status(308);
+            if !received.is_empty() {
+                reply
+                    .headers
+                    .push(("Range".into(), format!("bytes=0-{}", received.len() - 1)));
+            }
+            return reply;
         }
         let (existing, metadata, _, bytes) = state.sessions.remove(&id).unwrap();
         let now = state.tick();

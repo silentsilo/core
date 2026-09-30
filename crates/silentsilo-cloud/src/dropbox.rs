@@ -257,21 +257,21 @@ impl DropboxStore {
         let status = response.status();
         if status.is_success() {
             Ok(response)
-        } else if status == StatusCode::RANGE_NOT_SATISFIABLE {
+        } else if status == StatusCode::RANGE_NOT_SATISFIABLE && range.is_some() {
             Box::pin(self.download(key, None)).await
         } else {
             Err(self.failure(response, key).await)
         }
     }
 
-    /// The silo folder's prefix in `path_display`, compared without case.
+    /// The silo folder's prefix in `path_display`, compared without case, as
+    /// Dropbox compares names. Split on characters: a byte count could land
+    /// inside a non-ASCII letter, and slicing there panicked.
     fn relative(&self, display: &str) -> Option<String> {
         let root = format!("/{}/", self.folder);
-        if display.len() > root.len() && display[..root.len()].eq_ignore_ascii_case(&root) {
-            Some(display[root.len()..].to_string())
-        } else {
-            None
-        }
+        let (at, _) = display.char_indices().nth(root.chars().count())?;
+        let (head, rest) = display.split_at(at);
+        (head.to_lowercase() == root.to_lowercase()).then(|| rest.to_string())
     }
 }
 
@@ -613,6 +613,19 @@ mod tests {
 
     // Every rule the other backends pass, against the fake Dropbox.
     silentsilo_store::contract_tests!(fake_store());
+
+    #[tokio::test]
+    async fn a_path_is_read_by_letters_whatever_their_bytes() {
+        // Cut by bytes, "/aéé/" split inside the second é and panicked.
+        let (store, _) = store_in("abc").await;
+        assert_eq!(store.relative("/aéé/ops/1.op"), None);
+        let (store, _) = store_in("Siloț").await;
+        assert_eq!(
+            store.relative("/SILOȚ/ops/1.op").as_deref(),
+            Some("ops/1.op")
+        );
+        assert_eq!(store.relative("/Siloț/"), None);
+    }
 
     fn big() -> Vec<u8> {
         (0..(2 * CHUNK as usize + 1024 * 1024 + 17))

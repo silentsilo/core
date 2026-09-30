@@ -120,6 +120,10 @@ fn refusal(provider: Provider, error: &str) -> CloudError {
 /// How long a token request that cannot get out is tried again.
 const UNREACHABLE_FOR: Duration = Duration::from_secs(60);
 
+/// The longest access token lifetime believed: a day, far over any the three
+/// providers give.
+const MAX_LIFETIME_SECS: u64 = 24 * 3600;
+
 /// What the token endpoint hands back.
 pub struct Tokens {
     pub access: Zeroizing<String>,
@@ -301,7 +305,8 @@ impl OAuth {
         Ok(Tokens {
             access: Zeroizing::new(access.to_string()),
             refresh: refresh.map(|t| Zeroizing::new(t.to_string())),
-            expires_in: Duration::from_secs(expires_in),
+            // Capped: a huge value made `Instant + expires_in` panic.
+            expires_in: Duration::from_secs(expires_in.min(MAX_LIFETIME_SECS)),
             email: json
                 .get("id_token")
                 .and_then(|t| t.as_str())
@@ -496,6 +501,23 @@ pub(crate) mod tests {
         let message = request.code_from(&query).unwrap_err().to_string();
         assert!(!message.contains('<'));
         assert!(!message.contains("anything"));
+    }
+
+    #[tokio::test]
+    async fn a_token_lifetime_too_long_for_a_clock_is_capped() {
+        // Added to `Instant::now()`, u64::MAX seconds panicked.
+        let endpoint = FakeTokenEndpoint::start(|_| {
+            (
+                200,
+                r#"{"access_token":"at-1","expires_in":18446744073709551615}"#.into(),
+            )
+        })
+        .await;
+        let request = AuthRequest::new(Provider::OneDrive, 49152).unwrap();
+        let oauth = OAuth::with_token_url(Provider::OneDrive, &endpoint.url).unwrap();
+        let tokens = oauth.exchange(&request, "the-code").await.unwrap();
+        assert_eq!(tokens.expires_in, Duration::from_secs(MAX_LIFETIME_SECS));
+        let _ = std::time::Instant::now() + tokens.expires_in;
     }
 
     #[tokio::test]
