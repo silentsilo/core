@@ -96,6 +96,18 @@ $env:SILENTSILO_TEST_SFTP_PORT = '2222'
 # fail instead of printing a line nobody reads.
 $env:SILENTSILO_TEST_REQUIRE_BACKENDS = '1'
 
+# The real OneDrive, Dropbox and Google Drive test accounts, when this
+# machine has them: refresh tokens written by the sign-in example, kept
+# outside every repository. A provider not in the file is skipped.
+$cloudEnv = Join-Path $env:USERPROFILE '.silentsilo-test\cloud.env'
+if (Test-Path $cloudEnv) {
+    foreach ($line in Get-Content $cloudEnv) {
+        if ($line -match '^\s*(SILENTSILO_TEST_[A-Z_]+)=(.+)$') {
+            Set-Item -Path "env:$($Matches[1])" -Value $Matches[2].Trim()
+        }
+    }
+}
+
 function Invoke-Step {
     param([string]$Name, [scriptblock]$Body)
     Write-Host "`n=== $Name ===" -ForegroundColor Cyan
