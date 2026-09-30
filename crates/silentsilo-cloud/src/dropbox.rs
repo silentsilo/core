@@ -367,6 +367,16 @@ impl crate::Probe for DropboxStore {
 
 #[async_trait::async_trait]
 impl ObjectStore for DropboxStore {
+    async fn get_small(&self, key: &str, max: u64) -> Result<Option<Vec<u8>>, StoreError> {
+        match self.download(key, None).await {
+            Ok(response) => crate::http::read_capped(response, key, max, "Dropbox")
+                .await
+                .map(Some),
+            Err(StoreError::NotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), StoreError> {
         let total = bytes.len() as u64;
         if total <= SMALL {

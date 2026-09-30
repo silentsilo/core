@@ -293,6 +293,29 @@ pub(crate) fn trusted_address(url: &str, api: &str) -> bool {
     }
 }
 
+/// A download read into memory, refused as soon as it passes `max` bytes:
+/// by its announced length when there is one, else while it streams.
+pub(crate) async fn read_capped(
+    mut response: Response,
+    key: &str,
+    max: u64,
+    name: &str,
+) -> Result<Vec<u8>, StoreError> {
+    if let Some(length) = response.content_length()
+        && length > max
+    {
+        return Err(silentsilo_store::too_large(key, length));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| transport(name, &e))? {
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() as u64 > max {
+            return Err(silentsilo_store::too_large(key, bytes.len() as u64));
+        }
+    }
+    Ok(bytes)
+}
+
 /// Writes a download to `dest` through a `.part` file, reporting each chunk.
 /// A stop or a failure removes the partial file: a caller renames what it
 /// fetched into the blob cache, and a short file there is a file that will

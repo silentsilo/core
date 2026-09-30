@@ -665,6 +665,15 @@ impl GoogleDriveStore {
             .current(key)
             .await?
             .ok_or_else(|| StoreError::NotFound(key.to_string()))?;
+        self.download_item(key, &item, range).await
+    }
+
+    async fn download_item(
+        &self,
+        key: &str,
+        item: &Item,
+        range: Option<u64>,
+    ) -> Result<Response, StoreError> {
         let headers: Vec<(&str, String)> = match range {
             Some(len) => vec![("Range", format!("bytes=0-{}", len - 1))],
             None => Vec::new(),
@@ -682,7 +691,7 @@ impl GoogleDriveStore {
         if status.is_success() {
             Ok(response)
         } else if status == StatusCode::RANGE_NOT_SATISFIABLE {
-            Box::pin(self.download(key, None)).await
+            Box::pin(self.download_item(key, item, None)).await
         } else {
             Err(self.http.status_error(status, key))
         }
@@ -745,6 +754,19 @@ impl crate::Probe for GoogleDriveStore {
 
 #[async_trait::async_trait]
 impl ObjectStore for GoogleDriveStore {
+    async fn get_small(&self, key: &str, max: u64) -> Result<Option<Vec<u8>>, StoreError> {
+        let Some(item) = self.current(key).await? else {
+            return Ok(None);
+        };
+        if item.size < 0 || item.size as u64 > max {
+            return Err(silentsilo_store::too_large(key, item.size as u64));
+        }
+        let response = self.download_item(key, &item, None).await?;
+        crate::http::read_capped(response, key, max, "Google Drive")
+            .await
+            .map(Some)
+    }
+
     async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), StoreError> {
         let total = bytes.len() as u64;
         if total <= SMALL {

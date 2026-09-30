@@ -335,6 +335,11 @@ async fn a_stopped_transfer_says_so_and_leaves_nothing_half_written() {
 }
 
 #[tokio::test]
+async fn a_small_read_says_absent_or_refuses_what_is_too_large() {
+    for_each_store(contract::a_small_read_says_absent_or_refuses_what_is_too_large).await;
+}
+
+#[tokio::test]
 async fn every_backend_answers_the_stale_upload_sweep() {
     for_each_store(contract::every_backend_answers_the_stale_upload_sweep).await;
 }

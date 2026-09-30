@@ -86,6 +86,7 @@ async fn whole_contract(provider: Provider) {
         what_a_transfer_reports_adds_up_to_the_file,
         a_stopped_transfer_says_so_and_leaves_nothing_half_written,
         every_backend_answers_the_stale_upload_sweep,
+        a_small_read_says_absent_or_refuses_what_is_too_large,
     );
 
     // A file large enough for an upload session at every provider, and the

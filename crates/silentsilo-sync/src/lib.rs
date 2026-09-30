@@ -302,30 +302,13 @@ pub(crate) fn too_large(size: i64) -> bool {
     size > MAX_SMALL_OBJECT_BYTES
 }
 
-/// A small object whose size storage reported, refused unread when no real
-/// one is that large.
-pub(crate) async fn get_small(
-    client: &dyn ObjectStore,
-    key: &str,
-    size: i64,
-) -> Result<Vec<u8>, SyncError> {
-    if too_large(size) {
-        return Err(SyncError::Storage(format!(
-            "{key} is {size} bytes, far larger than it can be"
-        )));
-    }
-    Ok(client.get(key).await?)
-}
-
-/// [`get_small`] after a HEAD. `None` when the object is absent.
+/// A small object in one request where the backend can: `None` when absent,
+/// refused unread when larger than [`MAX_SMALL_OBJECT_BYTES`].
 pub(crate) async fn fetch_small(
     client: &dyn ObjectStore,
     key: &str,
 ) -> Result<Option<Vec<u8>>, SyncError> {
-    match client.head(key).await? {
-        Some(size) => get_small(client, key, size).await.map(Some),
-        None => Ok(None),
-    }
+    Ok(client.get_small(key, MAX_SMALL_OBJECT_BYTES as u64).await?)
 }
 
 /// One full pass: push what is local-only, pull what is new, replay it.

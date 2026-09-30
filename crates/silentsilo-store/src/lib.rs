@@ -199,6 +199,23 @@ pub trait ObjectStore: Send + Sync {
     /// "is it already up there", and answering it should not move bytes.
     async fn head(&self, key: &str) -> Result<Option<i64>, StoreError>;
 
+    /// A small object whole: `None` when it is not there, an error when it
+    /// is larger than `max` bytes, so storage that answers with something
+    /// huge is refused unread. The default asks for the size first; a
+    /// backend whose download says both at once saves that request, which
+    /// on a cloud provider is a third of a second each time.
+    async fn get_small(&self, key: &str, max: u64) -> Result<Option<Vec<u8>>, StoreError> {
+        match self.head(key).await? {
+            None => Ok(None),
+            Some(size) if size < 0 || size as u64 > max => Err(too_large(key, size as u64)),
+            Some(_) => match self.get(key).await {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(StoreError::NotFound(_)) => Ok(None),
+                Err(e) => Err(e),
+            },
+        }
+    }
+
     async fn delete(&self, key: &str) -> Result<(), StoreError>;
 
     /// Every object under `prefix`, in lexicographic order by key.
@@ -243,6 +260,11 @@ pub trait ObjectStore: Send + Sync {
 
 /// The round trip behind [`ObjectStore::check`], for a backend that
 /// prepares something first.
+/// What [`ObjectStore::get_small`] answers for an object over its limit.
+pub fn too_large(key: &str, size: u64) -> StoreError {
+    StoreError::Other(format!("{key} is {size} bytes, far larger than it can be"))
+}
+
 pub(crate) async fn probe(store: &(impl ObjectStore + ?Sized)) -> Result<(), StoreError> {
     const PROBE: &str = ".silentsilo-write-test";
     store.put(PROBE, b"ok".to_vec()).await?;

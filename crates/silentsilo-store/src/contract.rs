@@ -394,6 +394,20 @@ pub async fn a_stopped_transfer_says_so_and_leaves_nothing_half_written(
 
 /// Every backend answers the stale-upload sweep, with nothing to do on an
 /// empty prefix. Only S3 has unfinished uploads at all.
+/// A small read answers in one go: absent is none, and an object over the
+/// limit is refused rather than read.
+pub async fn a_small_read_says_absent_or_refuses_what_is_too_large(store: Box<dyn ObjectStore>) {
+    assert_eq!(store.get_small("small/absent", 64).await.unwrap(), None);
+    store.put("small/one", b"hello".to_vec()).await.unwrap();
+    assert_eq!(
+        store.get_small("small/one", 64).await.unwrap().as_deref(),
+        Some(&b"hello"[..])
+    );
+    store.put("small/big", vec![7u8; 1000]).await.unwrap();
+    let refused = store.get_small("small/big", 64).await.unwrap_err();
+    assert!(refused.to_string().contains("far larger"), "got: {refused}");
+}
+
 pub async fn every_backend_answers_the_stale_upload_sweep(store: Box<dyn ObjectStore>) {
     let day = std::time::Duration::from_secs(24 * 60 * 60);
     assert_eq!(store.abort_stale_uploads("blobs/", day).await.unwrap(), 0);
@@ -483,6 +497,11 @@ macro_rules! contract_tests {
                 $make.await,
             )
             .await;
+        }
+        #[tokio::test]
+        async fn a_small_read_says_absent_or_refuses_what_is_too_large() {
+            $crate::contract::a_small_read_says_absent_or_refuses_what_is_too_large($make.await)
+                .await;
         }
         #[tokio::test]
         async fn every_backend_answers_the_stale_upload_sweep() {
