@@ -130,7 +130,10 @@ moves the KEK. Moving the KEK is the point of no return; everything after is
 renames, and `finish_interrupted_commit` (called by `load_fido_keys` and
 `rotation_pending`) finishes them with no key. Writing the keys after the
 commit, as the app used to, left a window where the new key was in force and
-nothing on disk opened it.
+nothing on disk opened it. Past the KEK the commit reports success whatever
+the renames do: an error there hid the new recovery code while the old one
+no longer worked. A rename refused because something holds the file falls
+back to writing it in place, as every other key file does.
 
 A rotation reaches every target or does not start: a target whose settings
 will not open stops it before the first touch, since one skipped keeps the

@@ -20,10 +20,13 @@ tested against.
 ## Scope
 
 This repository is the engine: the cryptography, the persisted formats, the
-operation log, sync against storage the user controls, and the standalone
+operation log, sync against storage the user chooses, and the standalone
 extraction tool. It has no user interface and opens no network connection of
-its own except to the backup storage a client configures, which carries only
-ciphertext plus one small manifest naming a random vault id.
+its own except to the backup storage a client configures: the storage itself,
+and for OneDrive, Dropbox and Google Drive the provider's sign-in and token
+endpoints. What storage carries is the ciphertext described in
+[`docs/CRYPTO.md`](docs/CRYPTO.md), which also lists what a provider can
+read without a key.
 
 The desktop application is in
 [silentsilo/desktop](https://github.com/silentsilo/desktop) and has its own

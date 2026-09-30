@@ -11,6 +11,28 @@ release notes should say.
 
 ## [Unreleased]
 
+### Fixed
+
+- A key change could leave a silo with no working recovery code. Past the
+  point of no return, a key file held open by a sync client or an antivirus
+  turned the commit into an error, the app never showed the new code, and
+  the old one had already stopped working. The commit now reports success
+  from there on and writes a held file in place.
+- An upload Google Drive or OneDrive had not finished could be taken as
+  done, and the blob then counted as delivered and could be evicted from
+  this computer. Drive may keep only part of a chunk, and OneDrive can
+  answer 202 to the last fragment; the upload now goes on from where the
+  provider says, and is done only when it returns the file.
+- `targets.more.config.json` that could not be read (protected under another
+  Windows account, damaged, or from a newer release) was taken as empty, and
+  the next save deleted it with every cloud copy in it. The save now refuses.
+- Answers a provider should never give no longer panic or loop: a Dropbox
+  path with non-ASCII letters, a token lifetime too large for a clock, a 416
+  to a request with no range, a Google Drive folder that is its own
+  ancestor.
+- The test helper that holds a file open now holds it as a scanner does, so
+  the tests for held files test what they say.
+
 ## [1.8.1] - Cloud sign-in on a phone
 
 ### Fixed

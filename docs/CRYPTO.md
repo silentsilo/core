@@ -3,8 +3,10 @@
 Public reference for auditors and contributors. Describes what the desktop
 app does. Everything below happens on the user's machine: there is no server
 component and no account. The only network calls are the optional backup and
-sync against storage the user configures (an S3-compatible bucket, WebDAV,
-SFTP or a folder), which carry the same ciphertext described here. The
+sync against storage the user configures (OneDrive, Dropbox or Google Drive,
+an S3-compatible bucket, WebDAV, SFTP or a folder), which carry the same
+ciphertext described here, plus the sign-in and token calls of the three
+account providers. The
 storage provider sees opaque blobs, encrypted operation records, per-key
 envelopes whose wrapped DEK is ciphertext but whose surrounding fields are
 not, and one small manifest naming a random vault id. "What the storage
@@ -624,6 +626,7 @@ obtains a copy of the bucket, reads all of the following without any key:
 
 | Object | What it reveals |
 |--------|-----------------|
+| The silo folder | Its name, which the user types (`Silo` unless changed), in the clear at OneDrive, Dropbox and Google Drive; an S3 prefix or a folder path the same way. The account provider also knows the account uses SilentSilo, since the app signs in to it |
 | `vault.json` | The vault id, which is random and says nothing else |
 | `ops/<lamport>-<device_id>-<op_id>.op` | How many operations exist, their order, when they were made, and how many devices the vault has, from the device ids in the key names |
 | An operation body | Its length, which bounds the size of the file name inside and hints at the kind of operation |
