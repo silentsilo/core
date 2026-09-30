@@ -11,6 +11,8 @@ release notes should say.
 
 ## [Unreleased]
 
+## [1.8.1] - Cloud sign-in on a phone
+
 ### Fixed
 
 - Signing in to OneDrive, Dropbox or Google Drive from a phone. The browser
