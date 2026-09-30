@@ -117,6 +117,9 @@ fn refusal(provider: Provider, error: &str) -> CloudError {
     }
 }
 
+/// How long a token request that cannot get out is tried again.
+const UNREACHABLE_FOR: Duration = Duration::from_secs(60);
+
 /// What the token endpoint hands back.
 pub struct Tokens {
     pub access: Zeroizing<String>,
@@ -219,22 +222,44 @@ impl OAuth {
         };
 
         let name = self.provider.name();
-        let response = self
-            .http
-            .post(&self.token_url)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .header("Accept", "application/json")
-            .body(body.to_string())
-            .send()
-            .await
-            // The error text names the host, never the body.
-            .map_err(|_| CloudError::Unreachable(name.into()))?;
+        // A phone keeps the app off the network while the browser is in
+        // front, and the code arrives exactly then: a request that never got
+        // out is tried again until the app is back, for up to a minute. One
+        // that got out is not, since the code may be spent.
+        let deadline = std::time::Instant::now() + UNREACHABLE_FOR;
+        let mut pause = Duration::from_millis(500);
+        let response = loop {
+            let sent = self
+                .http
+                .post(&self.token_url)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .header("Accept", "application/json")
+                .body(body.to_string())
+                .send()
+                .await;
+            match sent {
+                Ok(response) => break response,
+                Err(e) if e.is_connect() && std::time::Instant::now() + pause < deadline => {
+                    tokio::time::sleep(pause).await;
+                    pause = (pause * 2).min(Duration::from_secs(4));
+                }
+                // The error text names the host, never the body.
+                Err(e) => {
+                    return Err(CloudError::Unreachable(format!(
+                        "{name} ({})",
+                        crate::http::cause(&e)
+                    )));
+                }
+            }
+        };
         let status = response.status();
         let bytes = Zeroizing::new(
             response
                 .bytes()
                 .await
-                .map_err(|_| CloudError::Unreachable(name.into()))?
+                .map_err(|e| {
+                    CloudError::Unreachable(format!("{name} ({})", crate::http::cause(&e)))
+                })?
                 .to_vec(),
         );
         let json: serde_json::Value = serde_json::from_slice(&bytes)
@@ -242,7 +267,10 @@ impl OAuth {
 
         if !status.is_success() {
             if status.is_server_error() {
-                return Err(CloudError::Unreachable(name.into()));
+                return Err(CloudError::Unreachable(format!(
+                    "{name} (answered {})",
+                    status.as_u16()
+                )));
             }
             let error = json.get("error").and_then(|e| e.as_str()).unwrap_or("");
             return Err(refusal(self.provider, error));
@@ -287,12 +315,15 @@ impl OAuth {
             .bearer_auth(access_token)
             .send()
             .await
-            .map_err(|_| CloudError::Unreachable(name.into()))?;
+            .map_err(|e| CloudError::Unreachable(format!("{name} ({})", crate::http::cause(&e))))?;
         match response.status() {
             status if status.is_success() => Ok(()),
             // Already ended: what was asked for.
             reqwest::StatusCode::UNAUTHORIZED => Ok(()),
-            status if status.is_server_error() => Err(CloudError::Unreachable(name.into())),
+            status if status.is_server_error() => Err(CloudError::Unreachable(format!(
+                "{name} (answered {})",
+                status.as_u16()
+            ))),
             status => Err(CloudError::Refused(format!(
                 "{name} did not end the sign-in ({})",
                 status.as_u16()

@@ -104,7 +104,21 @@ impl Loopback {
     {
         let provider = self.request.provider();
         let (code, mut browser) = self.wait_for_code().await?;
-        let result = async {
+        // Answered before the code is traded: on a phone the app may have no
+        // network until the person switches back to it, and a tab spinning
+        // meanwhile would not tell them to. Whatever fails after this, the
+        // app says.
+        respond(
+            &mut browser,
+            "200 OK",
+            &page(&format!(
+                "Signed in to {}. Go back to SilentSilo to finish.",
+                provider.name()
+            )),
+        )
+        .await;
+        drop(browser);
+        async {
             let tokens = oauth.exchange(&self.request, &code).await?;
             let email = tokens.email.clone();
             let tokens = Arc::new(TokenSource::signed_in(oauth, tokens, persist)?);
@@ -120,16 +134,7 @@ impl Loopback {
             }
             Ok(SignedIn { account, tokens })
         }
-        .await;
-        let page = match &result {
-            Ok(_) => page(&format!(
-                "Connected to {}. You can close this tab and go back to SilentSilo.",
-                provider.name()
-            )),
-            Err(_) => page("The sign-in did not finish. Go back to SilentSilo to see why."),
-        };
-        respond(&mut browser, "200 OK", &page).await;
-        result
+        .await
     }
 
     /// The code from the first request that carries this sign-in's state.
@@ -338,7 +343,7 @@ mod tests {
 
         let (status, page) = visit(port, &format!("/?code=c-1&state={state}")).await;
         assert!(status.contains("200"));
-        assert!(page.contains("Connected to OneDrive"));
+        assert!(page.contains("Signed in to OneDrive"));
         assert!(!page.contains("c-1"), "the page echoes nothing");
 
         let signed_in = finishing.await.unwrap().unwrap();
@@ -428,8 +433,7 @@ mod tests {
             ))
         }));
 
-        let (_, page) = visit(port, &format!("/?code=c-1&state={state}")).await;
-        assert!(page.contains("did not finish"));
+        visit(port, &format!("/?code=c-1&state={state}")).await;
         match finishing.await.unwrap() {
             Err(CloudError::Refused(message)) => assert!(message.contains("work or school")),
             other => panic!("expected a refusal, got {other:?}"),

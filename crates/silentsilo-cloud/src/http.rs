@@ -235,10 +235,40 @@ fn wait_for(response: &Response, attempt: u32) -> Duration {
 
 pub(crate) fn transport(name: &str, error: &reqwest::Error) -> StoreError {
     if error.is_connect() || error.is_timeout() {
-        StoreError::Unreachable(format!("could not reach {name}"))
+        StoreError::Unreachable(format!("could not reach {name} ({})", cause(error)))
     } else {
-        StoreError::Other(format!("{name}: the connection failed"))
+        StoreError::Other(format!("{name}: the connection failed ({})", cause(error)))
     }
+}
+
+/// Why a request failed, in words that carry no token and no body: its kind
+/// and the innermost cause, such as a refused connection or a certificate
+/// the platform does not trust. Without it a phone that cannot reach a
+/// provider says nothing anyone can act on.
+pub(crate) fn cause(error: &reqwest::Error) -> String {
+    let kind = if error.is_timeout() {
+        "timed out"
+    } else if error.is_connect() {
+        "no connection"
+    } else if error.is_body() || error.is_decode() {
+        "the answer broke off"
+    } else {
+        "the request failed"
+    };
+    let mut inner: &dyn std::error::Error = error;
+    while let Some(next) = inner.source() {
+        inner = next;
+    }
+    if std::ptr::addr_eq(inner, error as &dyn std::error::Error) {
+        return kind.to_string();
+    }
+    let detail: String = inner
+        .to_string()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(160)
+        .collect();
+    format!("{kind}: {detail}")
 }
 
 /// Whether a URL the provider handed back may be used: `https`, or, when
