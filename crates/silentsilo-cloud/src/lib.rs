@@ -26,7 +26,7 @@ mod token;
 
 pub use oauth::{AuthRequest, OAuth, Tokens};
 pub use provider::Provider;
-pub use signin::{Loopback, SIGN_IN_TIMEOUT, SignedIn, sign_in};
+pub use signin::{Loopback, SIGN_IN_TIMEOUT, SignedIn, sign_in, sign_in_when};
 pub use token::{PersistToken, TokenSource};
 
 use std::sync::Arc;

@@ -186,7 +186,16 @@ pub(crate) fn trace(
         return;
     }
     let path = url::Url::parse(url)
-        .map(|u| u.path().to_string())
+        .map(|u| {
+            // A Drive search says what it looked for: names and folder ids,
+            // never a token.
+            let query: String = u
+                .query_pairs()
+                .find(|(k, _)| k == "q")
+                .map(|(_, v)| format!(" q=[{}]", v.chars().take(160).collect::<String>()))
+                .unwrap_or_default();
+            format!("{}{query}", u.path())
+        })
         .unwrap_or_default();
     let answer = match sent {
         Ok(response) => response.status().as_u16().to_string(),

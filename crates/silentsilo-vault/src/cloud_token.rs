@@ -216,7 +216,17 @@ pub async fn cloud_sign_in(
     provider: Provider,
     open: impl FnOnce(&str) -> Result<(), String>,
 ) -> Result<CloudSignIn, StoreError> {
-    let signed_in = silentsilo_cloud::sign_in(provider, Arc::new(NotYet), open)
+    cloud_sign_in_when(provider, open, std::future::ready(())).await
+}
+
+/// [`cloud_sign_in`] that trades the code only once `ready` is done. A phone
+/// passes "the app is on screen again"; see `silentsilo_cloud::Loopback::finish`.
+pub async fn cloud_sign_in_when(
+    provider: Provider,
+    open: impl FnOnce(&str) -> Result<(), String>,
+    ready: impl std::future::Future<Output = ()>,
+) -> Result<CloudSignIn, StoreError> {
+    let signed_in = silentsilo_cloud::sign_in_when(provider, Arc::new(NotYet), open, ready)
         .await
         .map_err(store_error)?;
     let id = Uuid::new_v4();

@@ -92,15 +92,23 @@ impl Loopback {
 
     /// Waits for the redirect, trades its code and asks who signed in.
     /// `account_of` is [`crate::account`] outside the tests.
-    pub async fn finish<F, Fut>(
+    ///
+    /// `ready` is awaited between the redirect and the first request: a
+    /// phone passes "the app is on screen again". A request made while
+    /// Android keeps the app off the network also fails its certificate
+    /// revocation check, and Android then answers "revoked" for that host
+    /// for about half a minute after the app is back.
+    pub async fn finish<F, Fut, R>(
         self,
         oauth: OAuth,
         persist: Arc<dyn PersistToken>,
         account_of: F,
+        ready: R,
     ) -> Result<SignedIn, CloudError>
     where
         F: FnOnce(Arc<TokenSource>) -> Fut,
         Fut: std::future::Future<Output = Result<Account, silentsilo_store::StoreError>>,
+        R: std::future::Future<Output = ()>,
     {
         let provider = self.request.provider();
         let (code, mut browser) = self.wait_for_code().await?;
@@ -119,6 +127,7 @@ impl Loopback {
         )
         .await;
         drop(browser);
+        ready.await;
         async {
             let tokens = oauth.exchange(&self.request, &code).await?;
             let email = tokens.email.clone();
@@ -192,13 +201,29 @@ pub async fn sign_in(
     persist: Arc<dyn PersistToken>,
     open: impl FnOnce(&str) -> Result<(), String>,
 ) -> Result<SignedIn, CloudError> {
+    sign_in_when(provider, persist, open, std::future::ready(())).await
+}
+
+/// [`sign_in`], trading the code only once `ready` is done: see
+/// [`Loopback::finish`].
+pub async fn sign_in_when(
+    provider: Provider,
+    persist: Arc<dyn PersistToken>,
+    open: impl FnOnce(&str) -> Result<(), String>,
+    ready: impl std::future::Future<Output = ()>,
+) -> Result<SignedIn, CloudError> {
     let loopback = Loopback::bind(provider).await?;
     open(loopback.url())
         .map_err(|e| CloudError::Other(format!("could not open the browser: {e}")))?;
     let oauth = OAuth::new(provider)?;
     tokio::time::timeout(
         SIGN_IN_TIMEOUT,
-        loopback.finish(oauth, persist, |tokens| crate::account(provider, tokens)),
+        loopback.finish(
+            oauth,
+            persist,
+            |tokens| crate::account(provider, tokens),
+            ready,
+        ),
     )
     .await
     .map_err(|_| CloudError::Refused("the sign-in took too long; try again".into()))?
@@ -291,6 +316,22 @@ mod tests {
     use super::*;
     use crate::oauth::tests::FakeTokenEndpoint;
 
+    impl Loopback {
+        async fn finish_now<F, Fut>(
+            self,
+            oauth: OAuth,
+            persist: Arc<dyn PersistToken>,
+            account_of: F,
+        ) -> Result<SignedIn, CloudError>
+        where
+            F: FnOnce(Arc<TokenSource>) -> Fut,
+            Fut: std::future::Future<Output = Result<Account, silentsilo_store::StoreError>>,
+        {
+            self.finish(oauth, persist, account_of, std::future::ready(()))
+                .await
+        }
+    }
+
     struct Forget;
 
     impl PersistToken for Forget {
@@ -354,7 +395,7 @@ mod tests {
             .unwrap();
         let oauth = OAuth::with_token_url(Provider::OneDrive, &endpoint.url).unwrap();
         let finishing =
-            tokio::spawn(loopback.finish(oauth, Arc::new(Forget), |_| async { Ok(account()) }));
+            tokio::spawn(loopback.finish_now(oauth, Arc::new(Forget), |_| async { Ok(account()) }));
 
         // A stray request and one with another state change nothing.
         let (status, _) = visit(port, "/favicon.ico").await;
@@ -395,7 +436,7 @@ mod tests {
             .parse()
             .unwrap();
         let oauth = OAuth::with_token_url(Provider::OneDrive, &endpoint.url).unwrap();
-        let finishing = tokio::spawn(loopback.finish(oauth, Arc::new(Forget), |_| async {
+        let finishing = tokio::spawn(loopback.finish_now(oauth, Arc::new(Forget), |_| async {
             Ok(Account {
                 id: "drive-1".into(),
                 label: "OneDrive".into(),
@@ -406,6 +447,39 @@ mod tests {
         visit(port, &format!("/?code=c-1&state={state}")).await;
         let signed_in = finishing.await.unwrap().unwrap();
         assert_eq!(signed_in.account.label, "ana@outlook.com");
+    }
+
+    #[tokio::test]
+    async fn the_code_is_traded_only_once_the_app_is_ready() {
+        let endpoint = endpoint().await;
+        let loopback = Loopback::bind(Provider::GoogleDrive).await.unwrap();
+        let state = param(loopback.url(), "state");
+        let port: u16 = param(loopback.url(), "redirect_uri")
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let oauth = OAuth::with_token_url(Provider::GoogleDrive, &endpoint.url).unwrap();
+        let (on_screen, ready) = tokio::sync::oneshot::channel::<()>();
+        let finishing = tokio::spawn(loopback.finish(
+            oauth,
+            Arc::new(Forget),
+            |_| async { Ok(account()) },
+            async {
+                let _ = ready.await;
+            },
+        ));
+
+        // The browser is answered at once; the token endpoint is not asked.
+        let (_, page) = visit(port, &format!("/?code=c-1&state={state}")).await;
+        assert!(page.contains("Signed in to Google Drive"));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(endpoint.hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        on_screen.send(()).unwrap();
+        assert!(finishing.await.unwrap().is_ok());
+        assert_eq!(endpoint.hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -421,7 +495,7 @@ mod tests {
             .unwrap();
         let oauth = OAuth::with_token_url(Provider::GoogleDrive, &endpoint.url).unwrap();
         let finishing =
-            tokio::spawn(loopback.finish(oauth, Arc::new(Forget), |_| async { Ok(account()) }));
+            tokio::spawn(loopback.finish_now(oauth, Arc::new(Forget), |_| async { Ok(account()) }));
 
         let (_, page) = visit(
             port,
@@ -448,7 +522,7 @@ mod tests {
             .parse()
             .unwrap();
         let oauth = OAuth::with_token_url(Provider::OneDrive, &endpoint.url).unwrap();
-        let finishing = tokio::spawn(loopback.finish(oauth, Arc::new(Forget), |_| async {
+        let finishing = tokio::spawn(loopback.finish_now(oauth, Arc::new(Forget), |_| async {
             Err(silentsilo_store::StoreError::Denied(
                 "OneDrive for work or school accounts is not supported yet".into(),
             ))
