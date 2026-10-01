@@ -11,6 +11,8 @@ release notes should say.
 
 ## [Unreleased]
 
+## [1.8.2] - Audit fixes before the cloud releases
+
 ### Fixed
 
 - A key change could leave a silo with no working recovery code. Past the
