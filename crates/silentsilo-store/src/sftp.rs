@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use russh::client;
-use russh::keys::PublicKey;
+use russh::keys::PublicKeyOrCertificate;
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::OpenFlags;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -64,6 +64,18 @@ pub struct SftpConfig {
     pub host_fingerprint: Option<String>,
 }
 
+/// A server key's `SHA256:` fingerprint. A host certificate has none here:
+/// silos pin a key, and a certificate is refused rather than pinned by the
+/// key inside it.
+fn fingerprint(key: &PublicKeyOrCertificate) -> Option<String> {
+    match key {
+        PublicKeyOrCertificate::PublicKey { key, .. } => {
+            Some(key.fingerprint(Default::default()).to_string())
+        }
+        PublicKeyOrCertificate::Certificate(_) => None,
+    }
+}
+
 /// Accepts whatever the server offers and reports it, without transferring
 /// anything.
 ///
@@ -77,9 +89,15 @@ struct LearningHandler {
 impl client::Handler for LearningHandler {
     type Error = russh::Error;
 
-    async fn check_server_key(&mut self, key: &PublicKey) -> Result<bool, Self::Error> {
+    async fn check_server_key(
+        &mut self,
+        key: &PublicKeyOrCertificate,
+    ) -> Result<bool, Self::Error> {
+        let Some(fingerprint) = fingerprint(key) else {
+            return Ok(false);
+        };
         if let Ok(mut seen) = self.seen.lock() {
-            *seen = Some(key.fingerprint(Default::default()).to_string());
+            *seen = Some(fingerprint);
         }
         Ok(true)
     }
@@ -95,8 +113,13 @@ struct PinnedHandler {
 impl client::Handler for PinnedHandler {
     type Error = russh::Error;
 
-    async fn check_server_key(&mut self, key: &PublicKey) -> Result<bool, Self::Error> {
-        let fingerprint = key.fingerprint(Default::default()).to_string();
+    async fn check_server_key(
+        &mut self,
+        key: &PublicKeyOrCertificate,
+    ) -> Result<bool, Self::Error> {
+        let Some(fingerprint) = fingerprint(key) else {
+            return Ok(false);
+        };
         let matches = fingerprint == self.expected;
         if let Ok(mut offered) = self.offered.lock() {
             *offered = Some(fingerprint);

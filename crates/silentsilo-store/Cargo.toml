@@ -19,7 +19,7 @@ url = "2"
 serde = { workspace = true, features = ["derive"] }
 # Only to name a target stably; already in the tree everywhere else.
 uuid = { workspace = true }
-russh = "0.62"
+russh = "0.63"
 russh-sftp = "2.3"
 tokio = { workspace = true, features = ["rt", "net", "time", "fs", "sync", "macros"] }
 # Turns a tokio file into the byte stream reqwest's streaming body wants.

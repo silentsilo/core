@@ -1295,7 +1295,7 @@ dependencies = [
  "asn1-rs",
  "displaydoc",
  "nom",
- "num-bigint",
+ "num-bigint 0.4.8",
  "num-traits",
  "rusticata-macros",
 ]
@@ -1486,7 +1486,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2573,7 +2573,7 @@ version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "35bd024e8b2ff75562e5f34e7f4905839deb4b22955ef5e73d2fea1b9813cb23"
 dependencies = [
- "num-bigint",
+ "num-bigint 0.4.8",
  "num-complex",
  "num-integer",
  "num-iter",
@@ -2589,6 +2589,18 @@ checksum = "c89e69e7e0f03bea5ef08013795c25018e101932225a656383bd384495ecc367"
 dependencies = [
  "num-integer",
  "num-traits",
+]
+
+[[package]]
+name = "num-bigint"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93e7820bc0a80a0238e650327316f929ba18d5be054b647490a3a6a339f3e7c0"
+dependencies = [
+ "num-integer",
+ "num-traits",
+ "rand 0.10.2",
+ "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -2631,7 +2643,7 @@ version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f83d14da390562dca69fc84082e73e548e1ad308d24accdedd2720017cb37824"
 dependencies = [
- "num-bigint",
+ "num-bigint 0.4.8",
  "num-integer",
  "num-traits",
 ]
@@ -3161,7 +3173,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3393,9 +3405,9 @@ dependencies = [
 
 [[package]]
 name = "russh"
-version = "0.62.4"
+version = "0.62.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8b67b5a0d8068c89dcbe9d95df986af7a851d1f3c604525274c37468e60464f"
+checksum = "9decb68e4e44e1079700e54f17c8f23806ec53d7e0db73ab1c71d9dabc666812"
 dependencies = [
  "aes 0.9.1",
  "aws-lc-rs",
@@ -3430,7 +3442,78 @@ dependencies = [
  "md5",
  "ml-kem",
  "module-lattice",
- "num-bigint",
+ "num-bigint 0.4.8",
+ "p256",
+ "p384",
+ "p521",
+ "pageant",
+ "pbkdf2",
+ "pkcs1",
+ "pkcs5",
+ "pkcs8",
+ "polyval 0.7.3",
+ "rand 0.10.2",
+ "rand_core 0.10.1",
+ "rsa",
+ "russh-cryptovec",
+ "russh-util",
+ "salsa20",
+ "scrypt",
+ "sec1",
+ "sha1 0.11.0",
+ "sha2 0.11.0",
+ "sha3 0.12.0",
+ "signature",
+ "spki",
+ "ssh-encoding",
+ "ssh-key",
+ "subtle",
+ "thiserror",
+ "tokio",
+ "typenum",
+ "universal-hash 0.6.1",
+ "zeroize",
+]
+
+[[package]]
+name = "russh"
+version = "0.63.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "036204edbd199552a5b3832f63c60dcdf395dc44c7f06b4af1c0e8139cc11bce"
+dependencies = [
+ "aes 0.9.1",
+ "aws-lc-rs",
+ "bitflags",
+ "block-padding 0.4.2",
+ "byteorder",
+ "bytes",
+ "cbc 0.2.1",
+ "cipher 0.5.2",
+ "crypto-bigint",
+ "ctr 0.10.1",
+ "curve25519-dalek",
+ "data-encoding",
+ "delegate",
+ "der",
+ "digest 0.11.3",
+ "ecdsa",
+ "ed25519-dalek",
+ "elliptic-curve",
+ "enum_dispatch",
+ "flate2",
+ "futures",
+ "generic-array 1.4.4",
+ "getrandom 0.4.3",
+ "ghash 0.6.0",
+ "hex-literal",
+ "hmac 0.13.0",
+ "inout 0.2.2",
+ "keccak",
+ "log",
+ "md5",
+ "ml-kem",
+ "module-lattice",
+ "num-bigint 0.5.1",
  "p256",
  "p384",
  "p521",
@@ -3541,7 +3624,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3598,7 +3681,7 @@ dependencies = [
  "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3943,20 +4026,20 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-app"
-version = "1.8.2"
+version = "1.8.3"
 dependencies = [
  "async-trait",
  "hex",
  "rusqlite",
  "serde",
  "serde_json",
- "silentsilo-core 1.8.2",
- "silentsilo-crypto 1.8.2",
- "silentsilo-store 1.8.2",
- "silentsilo-sync 1.8.2",
+ "silentsilo-core 1.8.3",
+ "silentsilo-crypto 1.8.3",
+ "silentsilo-store 1.8.3",
+ "silentsilo-sync 1.8.3",
  "silentsilo-testkit",
- "silentsilo-vault 1.8.2",
- "silentsilo-vfs 1.8.2",
+ "silentsilo-vault 1.8.3",
+ "silentsilo-vfs 1.8.3",
  "tempfile",
  "tokio",
  "uuid",
@@ -3965,7 +4048,7 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-cloud"
-version = "1.8.2"
+version = "1.8.3"
 dependencies = [
  "async-trait",
  "base64",
@@ -3975,8 +4058,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "silentsilo-s3 1.8.2",
- "silentsilo-store 1.8.2",
+ "silentsilo-s3 1.8.3",
+ "silentsilo-store 1.8.3",
  "tempfile",
  "thiserror",
  "tokio",
@@ -4006,7 +4089,7 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-core"
-version = "1.8.2"
+version = "1.8.3"
 dependencies = [
  "serde",
  "tempfile",
@@ -4049,7 +4132,7 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-crypto"
-version = "1.8.2"
+version = "1.8.3"
 dependencies = [
  "aes-gcm 0.10.3",
  "blake3",
@@ -4058,7 +4141,7 @@ dependencies = [
  "p256",
  "rand 0.9.5",
  "sha2 0.10.9",
- "silentsilo-core 1.8.2",
+ "silentsilo-core 1.8.3",
  "tempfile",
  "thiserror",
  "uuid",
@@ -4067,18 +4150,18 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-extract"
-version = "1.8.2"
+version = "1.8.3"
 dependencies = [
  "base64",
  "hex",
  "rusqlite",
  "serde_json",
- "silentsilo-core 1.8.2",
- "silentsilo-crypto 1.8.2",
- "silentsilo-store 1.8.2",
- "silentsilo-sync 1.8.2",
- "silentsilo-vault 1.8.2",
- "silentsilo-vfs 1.8.2",
+ "silentsilo-core 1.8.3",
+ "silentsilo-crypto 1.8.3",
+ "silentsilo-store 1.8.3",
+ "silentsilo-sync 1.8.3",
+ "silentsilo-vault 1.8.3",
+ "silentsilo-vfs 1.8.3",
  "tempfile",
  "tokio",
  "uuid",
@@ -4086,7 +4169,7 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-fido"
-version = "1.8.2"
+version = "1.8.3"
 dependencies = [
  "aes 0.8.4",
  "base64",
@@ -4113,30 +4196,30 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-fixture"
-version = "1.8.2"
+version = "1.8.3"
 dependencies = [
  "blake3",
  "hex",
  "rusqlite",
  "serde_json",
  "silentsilo-app 1.6.1",
- "silentsilo-app 1.8.2",
- "silentsilo-core 1.8.2",
+ "silentsilo-app 1.8.3",
+ "silentsilo-core 1.8.3",
  "silentsilo-crypto 1.0.0",
  "silentsilo-crypto 1.6.1",
- "silentsilo-crypto 1.8.2",
+ "silentsilo-crypto 1.8.3",
  "silentsilo-store 1.0.0",
  "silentsilo-store 1.6.1",
- "silentsilo-store 1.8.2",
+ "silentsilo-store 1.8.3",
  "silentsilo-sync 1.0.0",
  "silentsilo-sync 1.6.1",
- "silentsilo-sync 1.8.2",
+ "silentsilo-sync 1.8.3",
  "silentsilo-vault 1.0.0",
  "silentsilo-vault 1.6.1",
- "silentsilo-vault 1.8.2",
+ "silentsilo-vault 1.8.3",
  "silentsilo-vfs 1.0.0",
  "silentsilo-vfs 1.6.1",
- "silentsilo-vfs 1.8.2",
+ "silentsilo-vfs 1.8.3",
  "tempfile",
  "tokio",
  "uuid",
@@ -4176,7 +4259,7 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-s3"
-version = "1.8.2"
+version = "1.8.3"
 dependencies = [
  "aws-credential-types",
  "aws-sdk-s3",
@@ -4187,7 +4270,7 @@ dependencies = [
  "jni",
  "rustls",
  "rustls-platform-verifier",
- "silentsilo-core 1.8.2",
+ "silentsilo-core 1.8.3",
  "silentsilo-testkit",
  "tempfile",
  "thiserror",
@@ -4197,17 +4280,17 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-soak"
-version = "1.8.2"
+version = "1.8.3"
 dependencies = [
  "libc",
  "rusqlite",
  "serde",
  "serde_json",
- "silentsilo-app 1.8.2",
- "silentsilo-store 1.8.2",
- "silentsilo-sync 1.8.2",
- "silentsilo-vault 1.8.2",
- "silentsilo-vfs 1.8.2",
+ "silentsilo-app 1.8.3",
+ "silentsilo-store 1.8.3",
+ "silentsilo-sync 1.8.3",
+ "silentsilo-vault 1.8.3",
+ "silentsilo-vfs 1.8.3",
  "tokio",
  "uuid",
  "windows-sys 0.61.2",
@@ -4222,7 +4305,7 @@ dependencies = [
  "percent-encoding",
  "quick-xml",
  "reqwest",
- "russh",
+ "russh 0.62.7",
  "russh-sftp",
  "serde",
  "silentsilo-core 1.0.0",
@@ -4243,7 +4326,7 @@ dependencies = [
  "percent-encoding",
  "quick-xml",
  "reqwest",
- "russh",
+ "russh 0.62.7",
  "russh-sftp",
  "serde",
  "silentsilo-core 1.6.1",
@@ -4258,18 +4341,18 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-store"
-version = "1.8.2"
+version = "1.8.3"
 dependencies = [
  "async-trait",
  "percent-encoding",
  "quick-xml",
  "reqwest",
- "russh",
+ "russh 0.63.3",
  "russh-sftp",
  "serde",
  "serde_json",
- "silentsilo-core 1.8.2",
- "silentsilo-s3 1.8.2",
+ "silentsilo-core 1.8.3",
+ "silentsilo-s3 1.8.3",
  "silentsilo-testkit",
  "tempfile",
  "thiserror",
@@ -4319,20 +4402,20 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-sync"
-version = "1.8.2"
+version = "1.8.3"
 dependencies = [
  "async-trait",
  "hex",
  "rusqlite",
  "serde",
  "serde_json",
- "silentsilo-core 1.8.2",
- "silentsilo-crypto 1.8.2",
- "silentsilo-s3 1.8.2",
- "silentsilo-store 1.8.2",
+ "silentsilo-core 1.8.3",
+ "silentsilo-crypto 1.8.3",
+ "silentsilo-s3 1.8.3",
+ "silentsilo-store 1.8.3",
  "silentsilo-testkit",
- "silentsilo-vault 1.8.2",
- "silentsilo-vfs 1.8.2",
+ "silentsilo-vault 1.8.3",
+ "silentsilo-vfs 1.8.3",
  "tempfile",
  "thiserror",
  "tokio",
@@ -4342,7 +4425,7 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-testkit"
-version = "1.8.2"
+version = "1.8.3"
 
 [[package]]
 name = "silentsilo-vault"
@@ -4392,7 +4475,7 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-vault"
-version = "1.8.2"
+version = "1.8.3"
 dependencies = [
  "aes-gcm 0.10.3",
  "argon2 0.5.3",
@@ -4405,9 +4488,9 @@ dependencies = [
  "serde",
  "serde_json",
  "silentsilo-cloud",
- "silentsilo-core 1.8.2",
- "silentsilo-crypto 1.8.2",
- "silentsilo-store 1.8.2",
+ "silentsilo-core 1.8.3",
+ "silentsilo-crypto 1.8.3",
+ "silentsilo-store 1.8.3",
  "silentsilo-testkit",
  "tempfile",
  "thiserror",
@@ -4457,7 +4540,7 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-vfs"
-version = "1.8.2"
+version = "1.8.3"
 dependencies = [
  "base64",
  "blake3",
@@ -4466,9 +4549,9 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
- "silentsilo-core 1.8.2",
- "silentsilo-crypto 1.8.2",
- "silentsilo-vault 1.8.2",
+ "silentsilo-core 1.8.3",
+ "silentsilo-crypto 1.8.3",
+ "silentsilo-vault 1.8.3",
  "tempfile",
  "unicode-normalization",
  "uuid",
@@ -4515,7 +4598,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4696,10 +4779,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4953,7 +5036,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5201,7 +5284,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

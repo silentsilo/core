@@ -11,6 +11,15 @@ release notes should say.
 
 ## [Unreleased]
 
+## [1.8.3] - russh 0.63
+
+### Security
+
+- `russh` 0.62 to 0.63 for SFTP, for four advisories GitHub lists and
+  RustSec does not yet (GHSA-47hw-gvq5-r2gm, GHSA-35g8-35p8-c8fw,
+  GHSA-p8qx-h547-fjw9, GHSA-w3jg-pjxf-73p4). Each needs the SFTP server to
+  be hostile. A host certificate is still refused: silos pin the server key.
+
 ## [1.8.2] - Audit fixes before the cloud releases
 
 ### Fixed
