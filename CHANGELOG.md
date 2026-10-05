@@ -33,6 +33,14 @@ release notes should say.
 - Joining read `keys/content.kek` and every revocation marker as if they
   were key envelopes, and logged each one as unreadable.
 
+### Added
+
+- `MAX_ENTRY_BYTES`: `upsert_password` refuses an entry over 512 KB, so its
+  record stays under the 1 MiB readers before core 1.4.0 accept. Nothing
+  wrote entries that large; history inside the entry could.
+- `FORMATS.md` describes the entry's `fields` and `history`, and a fixture
+  test proves 1.0.0 keeps both through replay, snapshot and compaction.
+
 ### Changed
 
 - `seed_target_checked` takes this device's keys, and

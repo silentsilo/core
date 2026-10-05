@@ -21,7 +21,7 @@ pub use oplog::{
     target_failures, target_last_success, target_ready, target_retry_in, undelivered_own_ops,
     verify_chains,
 };
-pub use ops::{AttachmentBlob, Vfs, guess_mime};
+pub use ops::{AttachmentBlob, MAX_ENTRY_BYTES, Vfs, guess_mime};
 pub use schema::{SCHEMA_VERSION, init_schema, root_folder_id_for};
 pub use snapshot::{
     CompactionPolicy, PruneReport, SNAPSHOT_VERSION, Snapshot, base_horizon, capture_at,

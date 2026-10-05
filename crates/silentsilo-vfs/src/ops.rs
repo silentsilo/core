@@ -45,6 +45,12 @@ const PURGE_IDS_PER_RECORD: usize = 10_000;
 #[cfg(test)]
 const PURGE_IDS_PER_RECORD: usize = 40;
 
+/// The largest entry `upsert_password` takes, as JSON. Sealed, encoded and
+/// wrapped in its record it stays well under the 1 MiB readers before core
+/// 1.4.0 apply to a record: one over that is unreadable to them, and every
+/// record after it is held back on those devices.
+pub const MAX_ENTRY_BYTES: usize = 512 * 1024;
+
 pub struct Vfs<'a> {
     session: &'a VaultSession,
 }
@@ -1471,6 +1477,11 @@ impl<'a> Vfs<'a> {
     /// leave this device disagreeing with every other about the bytes of the
     /// same operation. Under the KEK it never has to change.
     pub fn upsert_password(&self, id: Uuid, data: &str) -> CoreResult<()> {
+        if data.len() > MAX_ENTRY_BYTES {
+            return Err(CoreError::InvalidName(
+                "This entry is too large to save. Clear its history or shorten its notes.".into(),
+            ));
+        }
         let sealed = silentsilo_crypto::seal_with_key(data.as_bytes(), self.session.kek.as_bytes())
             .map_err(|e| CoreError::Crypto(e.to_string()))?;
         crate::oplog::emit(

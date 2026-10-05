@@ -511,6 +511,37 @@ loaded object, so fields they do not name are written back.
 A reader offers only passkeys whose `version` it knows and leaves the others
 in their entries. An older client shows the entry as a login.
 
+## Custom fields and history
+
+Two more optional fields of the same entry JSON, from desktop 1.4 and
+Android 1.3, for the same reason as the passkey: a field rides through
+replay, snapshots and edits on every version, and a record type would not.
+
+```json
+"fields": [
+  { "name": "Customer number", "value": "40021", "hidden": false },
+  { "name": "Card PIN", "value": "1234", "hidden": true }
+],
+"history": [
+  { "saved_at": 1789000000000, "password": "old-pass", "username": "ana", "...": "..." }
+]
+```
+
+A hidden field is masked and copied like a password. `history` is the
+entry's earlier versions, newest first, each the entry's content as it was
+with `saved_at` its `updated_at` then. A version leaves out `id`,
+`history`, `attachments`, `passkey`, `favorite`, `category`, `created_at`,
+`updated_at` and `require_reauth`: attachments are counted only from the
+entry itself (`attachment_blobs`, on 1.0.0 too), so a blob referenced from
+history alone would be swept. How many versions a client keeps is its own
+setting; the whole history stays under 256 KB.
+
+An older client shows neither, and keeps both when it saves the entry, but
+adds no version of its own. `upsert_password` refuses an entry over
+`MAX_ENTRY_BYTES` (512 KB), so the record stays under the 1 MiB readers
+before core 1.4.0 accept. `silentsilo-fixture/tests/entry_fields_on_1_0_0.rs`
+replays, snapshots, compacts and restores such an entry with 1.0.0's code.
+
 ## The index is not a format
 
 Every table in `vault.db` except `vault_meta` and `oplog` is a cache of the
