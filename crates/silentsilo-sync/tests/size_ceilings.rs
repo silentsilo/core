@@ -102,7 +102,7 @@ async fn oversized_small_objects_are_never_downloaded() {
     let mut local = StoredFidoKeys {
         keys: vec![credential("cc33")],
     };
-    let outcome = reconcile_key_envelopes(&store, &kek, &mut local, 0)
+    let outcome = reconcile_key_envelopes(&store, &kek, &mut local, 0, &Default::default())
         .await
         .unwrap();
     assert!(outcome.added.is_empty() && outcome.revoked.is_empty());

@@ -32,7 +32,7 @@ mod key_sync;
 pub use error::SyncError;
 pub use key_sync::{
     KeyReconcile, RECOVERY_MARKER_ID, REVOKED_PREFIX, is_key_revoked, mark_recovery_disabled,
-    plausible_credential_id, reconcile_key_envelopes, revoked_at,
+    plausible_credential_id, reconcile_key_envelopes, revocation_marks, revoked_at,
 };
 
 /// Where operation objects live inside the vault prefix.
@@ -845,6 +845,11 @@ pub struct SeedOutcome {
     /// behind, or they would overwrite the current ones. Only
     /// [`seed_target_checked`] counts these.
     pub stale: usize,
+    /// Key envelopes of keys this device does not hold as in use. Left
+    /// behind: a never-delete copy keeps the envelope of a removed key, and
+    /// nothing would ever delete it from the copy it was seeded into. The
+    /// pass that follows publishes every key this device knows.
+    pub withheld: usize,
 }
 
 /// Everything a silo keeps in its storage, in the order it is worth
@@ -964,27 +969,32 @@ pub async fn seed_target(
 /// - records, snapshots and the KEK envelope are copied only when they open
 ///   under `current`, so an append-only copy that kept the old key cannot
 ///   undo a rotation on the other side;
-/// - key envelopes and revocation markers, which `current` does not open,
-///   are copied only where the destination has none; the sync pass that
-///   follows publishes this device's own;
+/// - key envelopes are copied only for keys `keys` holds as in use, and
+///   only where the destination has none; the sync pass that follows
+///   publishes every key this device knows;
+/// - revocation markers, which `current` does not open, only where the
+///   destination has none;
 /// - the manifest likewise, so a newer one is never put back.
 pub async fn seed_target_checked(
     from: &dyn ObjectStore,
     to: &dyn ObjectStore,
     current: &MasterDek,
+    keys: &StoredFidoKeys,
     progress: &mut (dyn FnMut(SeedProgress) + Send),
     cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<SeedOutcome, SyncError> {
-    seed(from, to, Some(current), progress, cancel).await
+    let in_use = keys.active().map(|k| k.credential_id.clone()).collect();
+    seed(from, to, Some((current, in_use)), progress, cancel).await
 }
 
 async fn seed(
     from: &dyn ObjectStore,
     to: &dyn ObjectStore,
-    current: Option<&MasterDek>,
+    checked: Option<(&MasterDek, std::collections::HashSet<String>)>,
     progress: &mut (dyn FnMut(SeedProgress) + Send),
     cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<SeedOutcome, SyncError> {
+    let current = checked.as_ref().map(|(dek, _)| *dek);
     let mut outcome = SeedOutcome::default();
 
     let mut work = Vec::new();
@@ -1042,6 +1052,14 @@ async fn seed(
         let sealed = entry.key.starts_with(OPS_PREFIX)
             || entry.key.starts_with(SNAPSHOTS_PREFIX)
             || entry.key == CONTENT_KEK_KEY;
+        if let Some((_, in_use)) = &checked
+            && let Some(id) = envelope_id(&entry.key)
+            && !in_use.contains(id)
+        {
+            outcome.withheld += 1;
+            reporter.finish_object();
+            continue;
+        }
         if current.is_some()
             && !sealed
             && entry.key.starts_with(KEYS_PREFIX)
@@ -1120,6 +1138,13 @@ async fn seed(
 
     reporter.emit(true);
     Ok(outcome)
+}
+
+/// The credential id of a key envelope's object name, `keys/<id>.env`.
+fn envelope_id(key: &str) -> Option<&str> {
+    key.strip_prefix(KEYS_PREFIX)?
+        .strip_suffix(".env")
+        .filter(|id| !id.contains('/'))
 }
 
 /// Whether a staged object opens under `dek`. Read whole, as every sealed
@@ -2194,6 +2219,10 @@ pub async fn fetch_key_envelopes(
 ) -> Result<Vec<StoredFidoCredential>, SyncError> {
     let mut out = Vec::new();
     for entry in client.list(KEYS_PREFIX).await? {
+        // The KEK envelope and revocation markers share the prefix.
+        if !entry.key.ends_with(".env") || entry.key.starts_with(REVOKED_PREFIX) {
+            continue;
+        }
         if too_large(entry.size) {
             eprintln!("skipping oversized key envelope {}", entry.key);
             continue;

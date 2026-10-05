@@ -121,14 +121,57 @@ impl KeyReconcile {
     }
 }
 
+/// The credential id a marker revokes, if it opens under `kek` and names
+/// the key its object name does.
+fn open_marker(bytes: &[u8], kek: &ContentKek, id: &str) -> Option<String> {
+    unseal_with_key(bytes, kek.as_bytes())
+        .ok()
+        .and_then(|plain| serde_json::from_slice::<RevocationMarker>(&plain).ok())
+        .filter(|m| m.version == MARKER_VERSION && m.credential_id == id)
+        .map(|m| m.credential_id)
+}
+
+/// Every key `client` holds a marker for that opens under `kek`.
+///
+/// A pass reads these from every copy before reconciling any: a copy that
+/// was unplugged when a key was removed still holds its envelope and no
+/// marker, and judged on its own markers it put the key back.
+pub async fn revocation_marks(
+    client: &dyn ObjectStore,
+    kek: &ContentKek,
+) -> Result<HashSet<String>, SyncError> {
+    let mut marked = HashSet::new();
+    for entry in client.list(KEYS_PREFIX).await? {
+        if crate::too_large(entry.size) {
+            continue;
+        }
+        let Some(id) = entry
+            .key
+            .strip_prefix(REVOKED_PREFIX)
+            .and_then(|name| name.strip_suffix(".sealed"))
+        else {
+            continue;
+        };
+        let Ok(bytes) = client.get(&entry.key).await else {
+            continue;
+        };
+        marked.extend(open_marker(&bytes, kek, id));
+    }
+    Ok(marked)
+}
+
 /// Reads the envelopes and revocation markers `client` holds, writes a
 /// marker for every revocation of this device's that lacks one, and folds
 /// the rest into `local`. The caller saves `local` when [`KeyReconcile::changed`].
+///
+/// `marked_elsewhere` is what [`revocation_marks`] found on the other copies:
+/// an envelope is not taken in when any copy holds a marker for its key.
 pub async fn reconcile_key_envelopes(
     client: &dyn ObjectStore,
     kek: &ContentKek,
     local: &mut StoredFidoKeys,
     now: i64,
+    marked_elsewhere: &HashSet<String>,
 ) -> Result<KeyReconcile, SyncError> {
     let mut published = Vec::new();
     let mut marked = HashSet::new();
@@ -144,13 +187,7 @@ pub async fn reconcile_key_envelopes(
             let Ok(bytes) = client.get(&entry.key).await else {
                 continue;
             };
-            let opened = unseal_with_key(&bytes, kek.as_bytes())
-                .ok()
-                .and_then(|plain| serde_json::from_slice::<RevocationMarker>(&plain).ok())
-                .filter(|m| m.version == MARKER_VERSION && m.credential_id == id);
-            if let Some(marker) = opened {
-                marked.insert(marker.credential_id);
-            }
+            marked.extend(open_marker(&bytes, kek, id));
             continue;
         }
         if !entry.key.ends_with(".env") {
@@ -181,7 +218,8 @@ pub async fn reconcile_key_envelopes(
         marked.insert(key.credential_id.clone());
     }
 
-    let mut outcome = merge(local, published, &marked);
+    let everywhere: HashSet<String> = marked.union(marked_elsewhere).cloned().collect();
+    let mut outcome = merge(local, published, &everywhere);
     outcome.marked = marked;
     Ok(outcome)
 }

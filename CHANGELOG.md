@@ -11,6 +11,36 @@ release notes should say.
 
 ## [Unreleased]
 
+### Fixed
+
+- A removed key could come back. A copy that was unplugged when the key was
+  removed (an external drive, say) still held its envelope and no marker,
+  and once the removal was confirmed elsewhere, plugging it in put the key
+  back on this device and published it again. A pass now reads the
+  revocation markers on every copy before it takes in any envelope.
+- Seeding a new copy from a never-delete one could copy back the envelope of
+  a removed key, and nothing would ever delete it there. The checked seed
+  now copies envelopes only for keys this device holds as in use; the pass
+  that follows publishes the rest.
+- A sign-in to OneDrive, Dropbox or Google Drive that was never used stayed
+  in memory until the app quit, unless another sign-in pushed it out. It now
+  goes when its dialog closes, when the silos lock, or after 30 minutes, and
+  a Dropbox one is revoked as it goes.
+- A refresh token Microsoft rotated right after a copy was added or
+  reconnected was not written, and a pass still running during a reconnect
+  could write an older token over the new one, or write one back for a copy
+  just removed. Only the source a copy currently uses writes its token now.
+- Joining read `keys/content.kek` and every revocation marker as if they
+  were key envelopes, and logged each one as unreadable.
+
+### Changed
+
+- `seed_target_checked` takes this device's keys, and
+  `reconcile_key_envelopes` the markers found on the other copies
+  (`revocation_marks`). New: `cancel_cloud_sign_in` and
+  `forget_cloud_sign_ins`, for a client to call when a sign-in dialog closes
+  and when the silos lock.
+
 ## [1.8.3] - russh 0.63
 
 ### Security

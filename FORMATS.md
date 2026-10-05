@@ -240,7 +240,10 @@ So the rule for anything reading these:
   keys file is never given one, because it opens with its device secret; and
   an organisation's key is not tombstoned on another device's say-so, since
   retiring one needs its proof. 1.0.0 skips the markers, so a 1.0.0 client
-  neither sees keys enrolled after it joined nor honours a marker.
+  neither sees keys enrolled after it joined nor honours a marker. From core
+  1.9.0 a pass reads the markers on every copy before it takes in any
+  envelope: a copy unplugged when a key was removed holds its envelope and
+  no marker, and judged on its own markers it put the key back.
 - **A joining device keeps `policy` only where it was proven** (after core
   1.5.0). Joining with the recovery code clears `policy` on every
   envelope it saves; joining with a key keeps `org` on that key alone, since

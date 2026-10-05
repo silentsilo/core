@@ -447,9 +447,15 @@ async fn a_phone_whose_key_was_revoked_is_refused_even_with_its_envelope_put_bac
     // credentials, put the plain envelope back.
     let mut revoked = silentsilo_vault::load_fido_keys(&device.silo.path).unwrap();
     revoked.keys.iter_mut().for_each(|k| k.revoked = true);
-    silentsilo_sync::reconcile_key_envelopes(&store, &device.kek(), &mut revoked, 0)
-        .await
-        .unwrap();
+    silentsilo_sync::reconcile_key_envelopes(
+        &store,
+        &device.kek(),
+        &mut revoked,
+        0,
+        &Default::default(),
+    )
+    .await
+    .unwrap();
     assert!(store.head("keys/aa11.env").await.unwrap().is_some());
 
     let item_id = send_photo(&store, &phone, b"a photo").await;

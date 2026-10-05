@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -39,11 +40,31 @@ fn token_path(target_id: Uuid) -> PathBuf {
         .join(format!("{target_id}.token"))
 }
 
+/// The source a target uses, and the generation that tells it apart from
+/// one it replaced.
+struct Held {
+    generation: u64,
+    source: Arc<TokenSource>,
+}
+
 /// One source per target for the whole process, so a sync pass that opens
 /// the store again does not refresh again.
-fn sources() -> &'static Mutex<HashMap<Uuid, Arc<TokenSource>>> {
-    static SOURCES: OnceLock<Mutex<HashMap<Uuid, Arc<TokenSource>>>> = OnceLock::new();
+fn sources() -> &'static Mutex<HashMap<Uuid, Held>> {
+    static SOURCES: OnceLock<Mutex<HashMap<Uuid, Held>>> = OnceLock::new();
     SOURCES.get_or_init(Default::default)
+}
+
+fn next_generation() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Whether `generation` is still the source `target_id` uses.
+fn is_current(target_id: Uuid, generation: u64) -> bool {
+    sources().lock().is_ok_and(|s| {
+        s.get(&target_id)
+            .is_some_and(|h| h.generation == generation)
+    })
 }
 
 /// Stores a refresh token, from a sign-in or a rotation. A new sign-in
@@ -150,18 +171,23 @@ fn token_source(provider: Provider, target_id: Uuid) -> Result<Arc<TokenSource>,
     let mut sources = sources()
         .lock()
         .map_err(|_| StoreError::Other("token cache poisoned".into()))?;
-    if let Some(source) = sources.get(&target_id) {
-        return Ok(source.clone());
+    if let Some(held) = sources.get(&target_id) {
+        return Ok(held.source.clone());
     }
     let refresh = load_cloud_token(target_id)
         .ok_or_else(|| StoreError::Denied(format!("Sign in to {} again", provider.name())))?;
     let oauth = OAuth::new(provider).map_err(|e| StoreError::Other(e.to_string()))?;
-    let source = Arc::new(TokenSource::new(
-        oauth,
-        refresh.to_string(),
-        Arc::new(Keep(target_id)),
-    ));
-    sources.insert(target_id, source.clone());
+    let generation = next_generation();
+    let keep = Arc::new(Keep::default());
+    keep.target(target_id, generation);
+    let source = Arc::new(TokenSource::new(oauth, refresh.to_string(), keep));
+    sources.insert(
+        target_id,
+        Held {
+            generation,
+            source: source.clone(),
+        },
+    );
     Ok(source)
 }
 
@@ -174,12 +200,23 @@ struct Pending {
     provider: Provider,
     account: Account,
     tokens: Arc<TokenSource>,
+    /// Where the tokens write a rotation, pointed at the target on adoption.
+    keep: Arc<Keep>,
     at: Instant,
 }
 
 fn pending() -> &'static Mutex<HashMap<Uuid, Pending>> {
     static PENDING: OnceLock<Mutex<HashMap<Uuid, Pending>>> = OnceLock::new();
     PENDING.get_or_init(Default::default)
+}
+
+/// The pending sign-ins, with the ones past their time dropped.
+fn live_pending() -> Result<std::sync::MutexGuard<'static, HashMap<Uuid, Pending>>, StoreError> {
+    let mut pending = pending()
+        .lock()
+        .map_err(|_| StoreError::Other("sign-in list poisoned".into()))?;
+    pending.retain(|_, p| p.at.elapsed() < PENDING_FOR);
+    Ok(pending)
 }
 
 /// What the app shows of a sign-in.
@@ -189,16 +226,6 @@ pub struct CloudSignIn {
     pub id: Uuid,
     pub provider: Provider,
     pub account: Account,
-}
-
-/// A rotated token of a sign-in with no target yet has nowhere to go: it
-/// stays in memory and moves with the rest when the sign-in is adopted.
-struct NotYet;
-
-impl PersistToken for NotYet {
-    fn save(&self, _: &str) -> Result<(), String> {
-        Err("not stored yet".into())
-    }
 }
 
 fn store_error(error: CloudError) -> StoreError {
@@ -226,7 +253,10 @@ pub async fn cloud_sign_in_when(
     open: impl FnOnce(&str) -> Result<(), String>,
     ready: impl std::future::Future<Output = ()>,
 ) -> Result<CloudSignIn, StoreError> {
-    let signed_in = silentsilo_cloud::sign_in_when(provider, Arc::new(NotYet), open, ready)
+    // A rotated token of a sign-in with no target yet has nowhere to go: it
+    // stays in memory and is written once the sign-in is adopted.
+    let keep = Arc::new(Keep::default());
+    let signed_in = silentsilo_cloud::sign_in_when(provider, keep.clone(), open, ready)
         .await
         .map_err(store_error)?;
     let id = Uuid::new_v4();
@@ -235,16 +265,13 @@ pub async fn cloud_sign_in_when(
         provider,
         account: signed_in.account.clone(),
     };
-    let mut pending = pending()
-        .lock()
-        .map_err(|_| StoreError::Other("sign-in list poisoned".into()))?;
-    pending.retain(|_, p| p.at.elapsed() < PENDING_FOR);
-    pending.insert(
+    live_pending()?.insert(
         id,
         Pending {
             provider,
             account: signed_in.account,
             tokens: signed_in.tokens,
+            keep,
             at: Instant::now(),
         },
     );
@@ -252,23 +279,39 @@ pub async fn cloud_sign_in_when(
 }
 
 fn pending_tokens(sign_in: Uuid) -> Result<(Provider, Arc<TokenSource>), StoreError> {
-    let pending = pending()
-        .lock()
-        .map_err(|_| StoreError::Other("sign-in list poisoned".into()))?;
-    pending
+    live_pending()?
         .get(&sign_in)
-        .filter(|p| p.at.elapsed() < PENDING_FOR)
         .map(|p| (p.provider, p.tokens.clone()))
         .ok_or_else(|| StoreError::Denied("the sign-in expired; sign in again".into()))
 }
 
 /// The provider and account of a pending sign-in, to build the target.
 pub fn cloud_sign_in_account(sign_in: Uuid) -> Option<(Provider, Account)> {
-    let pending = pending().lock().ok()?;
-    pending
+    live_pending()
+        .ok()?
         .get(&sign_in)
-        .filter(|p| p.at.elapsed() < PENDING_FOR)
         .map(|p| (p.provider, p.account.clone()))
+}
+
+/// Drops a sign-in nothing will adopt, as when its dialog is closed, and
+/// ends it at the provider where that touches no other sign-in (Dropbox).
+pub async fn cancel_cloud_sign_in(sign_in: Uuid) {
+    let dropped = live_pending().ok().and_then(|mut p| p.remove(&sign_in));
+    if let Some(dropped) = dropped {
+        let _ = dropped.tokens.revoke().await;
+    }
+}
+
+/// Drops every sign-in not adopted yet, on locking: the tokens live only in
+/// memory, and nothing should be able to use them once the silos close.
+pub async fn forget_cloud_sign_ins() {
+    let dropped: Vec<Pending> = match pending().lock() {
+        Ok(mut pending) => pending.drain().map(|(_, p)| p).collect(),
+        Err(_) => return,
+    };
+    for sign_in in dropped {
+        let _ = sign_in.tokens.revoke().await;
+    }
 }
 
 /// Opens a target not saved yet with a pending sign-in's tokens, to check
@@ -304,12 +347,17 @@ pub async fn cloud_silo_folders(sign_in: Uuid) -> Result<Vec<String>, StoreError
 /// Refused when the target names another account: a reconnect to a
 /// different account would point the target at an empty folder.
 pub async fn adopt_cloud_sign_in(sign_in: Uuid, config: &StoreConfig) -> Result<(), StoreError> {
-    let (provider, tokens) = pending_tokens(sign_in)?;
-    let account_id = pending()
-        .lock()
-        .ok()
-        .and_then(|p| p.get(&sign_in).map(|p| p.account.id.clone()))
-        .unwrap_or_default();
+    let (provider, tokens, keep, account_id) = live_pending()?
+        .get(&sign_in)
+        .map(|p| {
+            (
+                p.provider,
+                p.tokens.clone(),
+                p.keep.clone(),
+                p.account.id.clone(),
+            )
+        })
+        .ok_or_else(|| StoreError::Denied("the sign-in expired; sign in again".into()))?;
     let Some(cloud) = config.cloud() else {
         return Err(StoreError::Other("not a cloud storage".into()));
     };
@@ -324,8 +372,27 @@ pub async fn adopt_cloud_sign_in(sign_in: Uuid, config: &StoreConfig) -> Result<
             provider.name()
         )));
     }
-    save_cloud_token(config.target_id(), &tokens.refresh_token().await)
+    let target_id = config.target_id();
+    write_token(target_id, &tokens.refresh_token().await)
         .map_err(|e| StoreError::Other(e.to_string()))?;
+    // The same source becomes the target's, rather than a new one read from
+    // disk: whatever already holds it (the store that was checked, a seed)
+    // goes on using it, and a rotation it makes from now on is written. It
+    // replaces the old source in one step, so nothing loads a third from disk
+    // in between, and is pointed at the target only once it is current: a
+    // rotation before that stays unsaved and is written on its next use.
+    let generation = next_generation();
+    sources()
+        .lock()
+        .map_err(|_| StoreError::Other("token cache poisoned".into()))?
+        .insert(
+            target_id,
+            Held {
+                generation,
+                source: tokens,
+            },
+        );
+    keep.target(target_id, generation);
     if let Ok(mut pending) = pending().lock() {
         pending.remove(&sign_in);
     }
@@ -345,12 +412,37 @@ pub async fn end_cloud_sign_in(config: &StoreConfig) {
     forget_cloud_token(target_id);
 }
 
-/// Writes a refresh token the provider rotated.
-struct Keep(Uuid);
+/// Writes a refresh token the provider rotated, for the target its source
+/// belongs to.
+///
+/// A sign-in with no target yet has nowhere to write: the rotated token
+/// stays in memory, unsaved, and is written once the sign-in is adopted. A
+/// source the target no longer uses (signed in again, removed) writes
+/// nothing: a pass still holding it would otherwise put an older token over
+/// the new one, or write one back for a target that is gone.
+#[derive(Default)]
+struct Keep {
+    target: Mutex<Option<(Uuid, u64)>>,
+}
+
+impl Keep {
+    fn target(&self, target_id: Uuid, generation: u64) {
+        if let Ok(mut target) = self.target.lock() {
+            *target = Some((target_id, generation));
+        }
+    }
+}
 
 impl PersistToken for Keep {
     fn save(&self, refresh_token: &str) -> Result<(), String> {
-        write_token(self.0, refresh_token).map_err(|e| e.to_string())
+        let target = *self.target.lock().map_err(|_| "poisoned".to_string())?;
+        match target {
+            None => Err("not stored yet".into()),
+            Some((target_id, generation)) if is_current(target_id, generation) => {
+                write_token(target_id, refresh_token).map_err(|e| e.to_string())
+            }
+            Some(_) => Ok(()),
+        }
     }
 }
 
@@ -416,8 +508,14 @@ pub(crate) mod tests {
 
     /// A sign-in as `cloud_sign_in` leaves it, without the browser.
     fn pending_for(account: &str) -> Uuid {
+        pending_with(account).0
+    }
+
+    /// A pending sign-in and the hook its tokens write a rotation through.
+    fn pending_with(account: &str) -> (Uuid, Arc<Keep>) {
         let oauth = OAuth::new(Provider::OneDrive).unwrap();
-        let tokens = Arc::new(TokenSource::new(oauth, "rt-new".into(), Arc::new(NotYet)));
+        let keep = Arc::new(Keep::default());
+        let tokens = Arc::new(TokenSource::new(oauth, "rt-new".into(), keep.clone()));
         let id = Uuid::new_v4();
         pending().lock().unwrap().insert(
             id,
@@ -430,10 +528,11 @@ pub(crate) mod tests {
                     total_bytes: None,
                 },
                 tokens,
+                keep: keep.clone(),
                 at: Instant::now(),
             },
         );
-        id
+        (id, keep)
     }
 
     #[test]
@@ -464,8 +563,10 @@ pub(crate) mod tests {
         assert!(adopt_cloud_sign_in(right, &config).await.is_err());
     }
 
-    #[tokio::test]
-    async fn an_old_sign_in_is_not_handed_out() {
+    #[test]
+    fn an_old_sign_in_is_not_handed_out() {
+        let _serial = keyring_lock();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
         let id = pending_for("drive-1");
         let Some(long_ago) = Instant::now().checked_sub(PENDING_FOR + Duration::from_secs(1))
         else {
@@ -473,9 +574,108 @@ pub(crate) mod tests {
         };
         pending().lock().unwrap().get_mut(&id).unwrap().at = long_ago;
         assert!(matches!(
-            cloud_silo_folders(id).await,
+            runtime.block_on(cloud_silo_folders(id)),
             Err(StoreError::Denied(_))
         ));
+    }
+
+    fn generation_of(target_id: Uuid) -> Option<u64> {
+        sources()
+            .lock()
+            .unwrap()
+            .get(&target_id)
+            .map(|h| h.generation)
+    }
+
+    #[test]
+    fn a_rotation_after_adoption_is_written_and_one_before_waits() {
+        let _serial = keyring_lock();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let config = onedrive("drive-r", "Silo");
+            let target = Scratch(config.target_id());
+            let (id, keep) = pending_with("drive-r");
+
+            // Not adopted yet: nowhere to write, so the token stays unsaved.
+            assert!(keep.save("rt-early").is_err());
+
+            adopt_cloud_sign_in(id, &config).await.unwrap();
+            keep.save("rt-rotated").unwrap();
+            assert_eq!(
+                load_cloud_token(target.0).as_deref().map(|t| t.as_str()),
+                Some("rt-rotated")
+            );
+            assert!(
+                generation_of(target.0).is_some(),
+                "the sign-in's source is kept"
+            );
+        });
+    }
+
+    #[test]
+    fn a_replaced_source_writes_nothing_over_the_new_sign_in() {
+        let _serial = keyring_lock();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let config = onedrive("drive-s", "Silo");
+            let target = Scratch(config.target_id());
+            save_cloud_token(target.0, "rt-old").unwrap();
+            token_source(Provider::OneDrive, target.0).unwrap();
+            let old = Keep::default();
+            old.target(target.0, generation_of(target.0).unwrap());
+
+            // Signed in again while a pass still holds the old source.
+            let (id, _) = pending_with("drive-s");
+            adopt_cloud_sign_in(id, &config).await.unwrap();
+            old.save("rt-old-rotated").unwrap();
+            assert_eq!(
+                load_cloud_token(target.0).as_deref().map(|t| t.as_str()),
+                Some("rt-new")
+            );
+
+            // Removed: nothing writes a token back for it.
+            let current = Keep::default();
+            current.target(target.0, generation_of(target.0).unwrap());
+            forget_cloud_token(target.0);
+            current.save("rt-after-removal").unwrap();
+            assert!(gone(target.0));
+        });
+    }
+
+    // Every test that touches the sign-in list holds the keyring lock:
+    // forgetting them all on lock would otherwise take another test's.
+    #[test]
+    fn a_cancelled_sign_in_is_gone() {
+        let _serial = keyring_lock();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (id, _) = pending_with("drive-c");
+        runtime.block_on(cancel_cloud_sign_in(id));
+        assert!(cloud_sign_in_account(id).is_none());
+        assert!(!pending().lock().unwrap().contains_key(&id));
+    }
+
+    #[test]
+    fn locking_forgets_every_sign_in_not_adopted() {
+        let _serial = keyring_lock();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (a, _) = pending_with("drive-l1");
+        let (b, _) = pending_with("drive-l2");
+        runtime.block_on(forget_cloud_sign_ins());
+        let pending = pending().lock().unwrap();
+        assert!(!pending.contains_key(&a) && !pending.contains_key(&b));
+    }
+
+    #[test]
+    fn an_expired_sign_in_is_dropped_not_just_hidden() {
+        let _serial = keyring_lock();
+        let (id, _) = pending_with("drive-e");
+        let Some(long_ago) = Instant::now().checked_sub(PENDING_FOR + Duration::from_secs(1))
+        else {
+            return;
+        };
+        pending().lock().unwrap().get_mut(&id).unwrap().at = long_ago;
+        assert!(cloud_sign_in_account(id).is_none());
+        assert!(!pending().lock().unwrap().contains_key(&id));
     }
 
     #[test]

@@ -650,9 +650,10 @@ async fn the_revocation_marker_still_revokes() {
     };
 
     let kek = silentsilo_crypto::ContentKek::from_bytes([0x4b; 32]);
-    let outcome = silentsilo_sync::reconcile_key_envelopes(&store, &kek, &mut local, 0)
-        .await
-        .expect("reconciles");
+    let outcome =
+        silentsilo_sync::reconcile_key_envelopes(&store, &kek, &mut local, 0, &Default::default())
+            .await
+            .expect("reconciles");
     assert_eq!(
         outcome.revoked,
         vec!["bb22".to_string()],

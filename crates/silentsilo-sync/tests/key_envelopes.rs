@@ -9,6 +9,7 @@ use silentsilo_crypto::generate_dek;
 use silentsilo_store::{FolderStore, ObjectStore};
 use silentsilo_sync::{
     fetch_all_ops_above, fetch_key_envelopes, fetch_missing_ops, publish_key_envelopes,
+    reconcile_key_envelopes, revocation_marks,
 };
 use silentsilo_vault::{StoredFidoCredential, StoredFidoKeys};
 
@@ -414,4 +415,124 @@ async fn an_organisation_policy_survives_publish_and_fetch() {
         vec!["aa11"],
         "the organisation key, and only it, comes back managed"
     );
+}
+
+/// A folder store that records every key read whole.
+struct Watched {
+    inner: FolderStore,
+    read: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for Watched {
+    async fn put(&self, key: &str, body: Vec<u8>) -> Result<(), silentsilo_store::StoreError> {
+        self.inner.put(key, body).await
+    }
+    async fn get(&self, key: &str) -> Result<Vec<u8>, silentsilo_store::StoreError> {
+        self.read.lock().unwrap().push(key.to_string());
+        self.inner.get(key).await
+    }
+    async fn head(&self, key: &str) -> Result<Option<i64>, silentsilo_store::StoreError> {
+        self.inner.head(key).await
+    }
+    async fn delete(&self, key: &str) -> Result<(), silentsilo_store::StoreError> {
+        self.inner.delete(key).await
+    }
+    async fn list(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<silentsilo_store::StoredObject>, silentsilo_store::StoreError> {
+        self.inner.list(prefix).await
+    }
+    fn describe(&self) -> String {
+        self.inner.describe()
+    }
+}
+
+#[tokio::test]
+async fn fetching_envelopes_reads_only_envelopes() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = Watched {
+        inner: store(&dir),
+        read: Default::default(),
+    };
+    let keys = StoredFidoKeys {
+        keys: vec![credential("aa11", 0)],
+    };
+    publish_key_envelopes(&client as &dyn ObjectStore, &keys, true)
+        .await
+        .unwrap();
+    // The KEK envelope and a revocation marker share the prefix and are not
+    // JSON: a join used to download both and report them unreadable.
+    client.put("keys/content.kek", vec![1; 80]).await.unwrap();
+    client
+        .put("keys/revoked/bb22.sealed", vec![2; 80])
+        .await
+        .unwrap();
+    client.read.lock().unwrap().clear();
+
+    let held = fetch_key_envelopes(&client as &dyn ObjectStore)
+        .await
+        .unwrap();
+
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].credential_id, "aa11");
+    assert_eq!(*client.read.lock().unwrap(), vec!["keys/aa11.env"]);
+}
+
+#[tokio::test]
+async fn a_copy_unplugged_during_a_removal_does_not_bring_the_key_back() {
+    let kek = silentsilo_crypto::generate_content_kek();
+    let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (working, drive) = (store(&dir_a), store(&dir_b));
+    let both = StoredFidoKeys {
+        keys: vec![credential("aa11", 0), credential("bb22", 1)],
+    };
+    for copy in [&working, &drive] {
+        publish_key_envelopes(copy as &dyn ObjectStore, &both, true)
+            .await
+            .unwrap();
+    }
+
+    // bb22 is removed while the drive is unplugged: the working copy gets
+    // the marker and loses the envelope, and the tombstone goes.
+    let mut removing = both.clone();
+    removing.keys[1].revoked = true;
+    reconcile_key_envelopes(&working, &kek, &mut removing, 0, &Default::default())
+        .await
+        .unwrap();
+    publish_key_envelopes(&working as &dyn ObjectStore, &removing, true)
+        .await
+        .unwrap();
+    let after = StoredFidoKeys {
+        keys: vec![credential("aa11", 0)],
+    };
+
+    // Judged on the drive's own markers, the drive puts it back.
+    let mut alone = after.clone();
+    reconcile_key_envelopes(&drive, &kek, &mut alone, 0, &Default::default())
+        .await
+        .unwrap();
+    assert!(alone.keys.iter().any(|k| k.credential_id == "bb22"));
+
+    // With every copy's markers, it stays removed.
+    let marked = revocation_marks(&working, &kek).await.unwrap();
+    let mut local = after.clone();
+    let outcome = reconcile_key_envelopes(&drive, &kek, &mut local, 0, &marked)
+        .await
+        .unwrap();
+    assert!(outcome.added.is_empty(), "{outcome:?}");
+    assert_eq!(local.keys.len(), 1);
+}
+
+#[tokio::test]
+async fn a_marker_that_does_not_open_counts_for_nothing() {
+    let kek = silentsilo_crypto::generate_content_kek();
+    let dir = tempfile::tempdir().unwrap();
+    let client = store(&dir);
+    client
+        .put("keys/revoked/bb22.sealed", vec![9; 80])
+        .await
+        .unwrap();
+    assert!(revocation_marks(&client, &kek).await.unwrap().is_empty());
 }

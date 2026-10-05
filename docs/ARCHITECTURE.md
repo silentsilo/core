@@ -231,6 +231,10 @@ The app seeds with `seed_target_checked`: records, snapshots and the KEK
 envelope are copied only when they open under the current key, and key
 envelopes and the manifest only where the destination has none, so an
 append-only copy that missed a rotation cannot undo it on another target.
+Key envelopes go only for keys this device holds as in use: a never-delete
+copy keeps the envelope of a removed key, and once the removal's tombstone
+is gone nothing would delete it from the copy it was seeded into. The pass
+after the seed publishes every key this device knows.
 
 ## The operation log
 
@@ -658,7 +662,16 @@ Read this before "fixing" any of it.
   that sign-in reached, never from what the UI sent, checked with the pending
   tokens, and only stored under the target id once the list is saved: a
   failed check leaves no token behind. A reconnect must reach the same
-  account, or the target would point at an empty folder.
+  account, or the target would point at an empty folder. A sign-in nobody
+  adopts goes when its dialog closes (`cancel_cloud_sign_in`), when the
+  silos lock (`forget_cloud_sign_ins`) or after 30 minutes, and a Dropbox one
+  is revoked as it goes.
+- **Adopting a sign-in keeps its token source.** The store that was checked
+  with it goes on using the same source, so a rotation from then on is
+  written under the target. Each target's source carries a generation, and
+  only the current one writes: a pass still holding the source a reconnect
+  replaced would otherwise put an older token over the new one, and one
+  holding the source of a removed target would write a token back for it.
 - **On a phone the code is traded after the app is back.** The browser is
   answered as soon as the redirect arrives, and the exchange waits for the
   `ready` a client passes (`sign_in_when`, `cloud_sign_in_when`); the phone

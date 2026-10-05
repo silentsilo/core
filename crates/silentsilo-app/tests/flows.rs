@@ -280,7 +280,7 @@ async fn a_removed_key_whose_envelope_came_back_does_not_join() {
         key.revoked = key.credential_id == "aa11";
     }
     let mut local = silentsilo_vault::StoredFidoKeys { keys };
-    silentsilo_sync::reconcile_key_envelopes(&store, &kek, &mut local, 0)
+    silentsilo_sync::reconcile_key_envelopes(&store, &kek, &mut local, 0, &Default::default())
         .await
         .unwrap();
 

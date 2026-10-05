@@ -30,6 +30,32 @@ fn record(lamport: u64, device_id: Uuid) -> OpRecord {
     )
 }
 
+/// This device's keys, as the checked seed is given them.
+fn keys(ids: &[&str]) -> silentsilo_vault::StoredFidoKeys {
+    silentsilo_vault::StoredFidoKeys {
+        keys: ids
+            .iter()
+            .map(|id| silentsilo_vault::StoredFidoCredential {
+                kind: silentsilo_vault::KIND_FIDO2.to_string(),
+                derivation: silentsilo_vault::DERIVATION_HMAC_V1.to_string(),
+                policy: String::new(),
+                credential_id: id.to_string(),
+                public_key: "cafe".into(),
+                key_slot: 0,
+                rp_id: "silentsilo.com".into(),
+                label: String::new(),
+                wrapped_dek: "deadbeef".into(),
+                platform: false,
+                revoked: false,
+            })
+            .collect(),
+    }
+}
+
+fn no_keys() -> silentsilo_vault::StoredFidoKeys {
+    keys(&[])
+}
+
 /// Fills a store the way a silo would: some records, some content, a manifest.
 async fn populate(store: &dyn ObjectStore, dek: &silentsilo_crypto::MasterDek, vault_id: Uuid) {
     let device = Uuid::new_v4();
@@ -339,7 +365,7 @@ async fn rotated_pair() -> (
 async fn a_checked_seed_does_not_undo_a_rotation() {
     let (_a, _b, stale, rotated, new) = rotated_pair().await;
 
-    let outcome = seed_target_checked(&stale, &rotated, &new, &mut |_| {}, &|| false)
+    let outcome = seed_target_checked(&stale, &rotated, &new, &no_keys(), &mut |_| {}, &|| false)
         .await
         .unwrap();
 
@@ -357,7 +383,7 @@ async fn a_checked_seed_does_not_undo_a_rotation() {
 async fn a_checked_seed_brings_a_stale_copy_up_to_the_current_key() {
     let (_a, _b, stale, rotated, new) = rotated_pair().await;
 
-    let outcome = seed_target_checked(&rotated, &stale, &new, &mut |_| {}, &|| false)
+    let outcome = seed_target_checked(&rotated, &stale, &new, &no_keys(), &mut |_| {}, &|| false)
         .await
         .unwrap();
 
@@ -390,13 +416,86 @@ async fn a_checked_seed_leaves_key_envelopes_and_the_manifest_that_are_there() {
     let kept = Uuid::new_v4();
     put_manifest(&dest, kept).await.unwrap();
 
-    seed_target_checked(&source, &dest, &dek, &mut |_| {}, &|| false)
-        .await
-        .unwrap();
+    seed_target_checked(
+        &source,
+        &dest,
+        &dek,
+        &keys(&["abc", "new"]),
+        &mut |_| {},
+        &|| false,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(dest.get("keys/abc.env").await.unwrap(), b"newer envelope");
     assert_eq!(dest.get("keys/new.env").await.unwrap(), b"only here");
     assert_eq!(read_manifest(&dest).await.unwrap().unwrap().vault_id, kept);
+}
+
+#[tokio::test]
+async fn a_checked_seed_copies_only_the_envelopes_of_keys_still_in_use() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let dest_dir = tempfile::tempdir().unwrap();
+    let source = FolderStore::new(source_dir.path().to_path_buf());
+    let dest = FolderStore::new(dest_dir.path().to_path_buf());
+    let dek = generate_dek();
+
+    // A never-delete copy keeps the envelope of a key removed since, and the
+    // removal's tombstone is gone here once storage confirmed it.
+    source
+        .put("keys/aa11.env", b"in use".to_vec())
+        .await
+        .unwrap();
+    source
+        .put("keys/bb22.env", b"removed".to_vec())
+        .await
+        .unwrap();
+    source
+        .put("keys/revoked/bb22.sealed", b"marker".to_vec())
+        .await
+        .unwrap();
+
+    let outcome = seed_target_checked(&source, &dest, &dek, &keys(&["aa11"]), &mut |_| {}, &|| {
+        false
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(dest.get("keys/aa11.env").await.unwrap(), b"in use");
+    assert_eq!(dest.head("keys/bb22.env").await.unwrap(), None);
+    assert_eq!(
+        dest.get("keys/revoked/bb22.sealed").await.unwrap(),
+        b"marker"
+    );
+    assert_eq!(outcome.withheld, 1, "{outcome:?}");
+}
+
+#[tokio::test]
+async fn a_tombstoned_key_is_not_seeded_either() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let dest_dir = tempfile::tempdir().unwrap();
+    let source = FolderStore::new(source_dir.path().to_path_buf());
+    let dest = FolderStore::new(dest_dir.path().to_path_buf());
+    let mut local = keys(&["aa11", "bb22"]);
+    local.keys[1].revoked = true;
+
+    source
+        .put("keys/bb22.env", b"removed".to_vec())
+        .await
+        .unwrap();
+
+    seed_target_checked(
+        &source,
+        &dest,
+        &generate_dek(),
+        &local,
+        &mut |_| {},
+        &|| false,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(dest.head("keys/bb22.env").await.unwrap(), None);
 }
 
 /// A store that hands its bytes over in pieces with a pause between them,

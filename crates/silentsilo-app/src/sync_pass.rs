@@ -604,9 +604,26 @@ pub async fn run_sync_pass(
     if silentsilo_vault::is_fido_enrolled(&root)
         && let Ok(mut local) = load_fido_keys(&root)
     {
+        // Every copy's markers first: one that was unplugged when a key was
+        // removed holds its envelope and no marker, and would put it back.
+        let mut marked_anywhere = std::collections::HashSet::new();
+        for target in &targets {
+            match sync::revocation_marks(&*target.store, &kek).await {
+                Ok(found) => marked_anywhere.extend(found),
+                Err(e) => host.warn("keys", &format!("{}: {e}", target.label)),
+            }
+        }
         let mut changed = false;
         for target in &targets {
-            match sync::reconcile_key_envelopes(&*target.store, &kek, &mut local, now).await {
+            match sync::reconcile_key_envelopes(
+                &*target.store,
+                &kek,
+                &mut local,
+                now,
+                &marked_anywhere,
+            )
+            .await
+            {
                 Ok(outcome) => {
                     changed |= outcome.changed();
                     marked.extend(outcome.marked);

@@ -201,3 +201,59 @@ async fn a_forged_revocation_marker_does_not_revoke_anything() {
     device.pass(&host).await;
     assert_eq!(device.active_ids(), vec!["aa11"]);
 }
+
+/// Several copies at once, as a person with a working copy and a drive has.
+struct Copies(Vec<BackupTarget>);
+
+impl Host for Copies {
+    fn emit(&self, _event: AppEvent) {}
+    fn warn(&self, area: &str, detail: &str) {
+        panic!("[{area}] {detail}");
+    }
+    fn targets(&self, _silo_id: Uuid) -> Vec<BackupTarget> {
+        self.0.clone()
+    }
+}
+
+#[tokio::test]
+async fn a_drive_unplugged_during_a_removal_does_not_bring_the_key_back() {
+    let (working, drive) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let both = Copies(vec![target(&working).0, target(&drive).0]);
+    let working_only = Copies(vec![target(&working).0]);
+
+    let desktop = Device::new(Uuid::new_v4(), None, &target(&working));
+    desktop.enrol("aa11", 1);
+    desktop.enrol("bb22", 2);
+    run_sync_pass(&desktop.state, &both, &desktop.silo)
+        .await
+        .unwrap();
+
+    // Removed with the drive unplugged: the working copy confirms it and the
+    // tombstone goes, while the drive keeps the envelope and has no marker.
+    let mut keys = desktop.keys();
+    keys.keys
+        .iter_mut()
+        .find(|k| k.credential_id == "bb22")
+        .unwrap()
+        .revoked = true;
+    silentsilo_vault::save_fido_keys(
+        &desktop.silo.path,
+        &keys,
+        silentsilo_vault::Authority::Machine,
+    )
+    .unwrap();
+    run_sync_pass(&desktop.state, &working_only, &desktop.silo)
+        .await
+        .unwrap();
+    assert_eq!(desktop.keys().keys.len(), 1, "the tombstone is dropped");
+    let on_drive = FolderStore::new(drive.path().to_path_buf());
+    assert!(on_drive.head("keys/bb22.env").await.unwrap().is_some());
+
+    // Plugged back in.
+    run_sync_pass(&desktop.state, &both, &desktop.silo)
+        .await
+        .unwrap();
+    assert_eq!(desktop.active_ids(), vec!["aa11"]);
+    let on_working = FolderStore::new(working.path().to_path_buf());
+    assert!(on_working.head("keys/bb22.env").await.unwrap().is_none());
+}
