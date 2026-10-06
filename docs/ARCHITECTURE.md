@@ -93,6 +93,14 @@ A personal log is turned on and off on the device (`AppState::set_audit_log`),
 copies or not: the queue keeps the key and the policy, and the pass writes
 the newest policy, by `changed_at`, to every copy that lacks it
 (`settle_audit_policy`), so turning it on never waits for storage.
+Reading (`audit_read::read_audit_log`) takes every segment from the cache
+beside the silo, this device's outbox and its pending records, and every
+copy it can reach, keeping what it fetched. It checks each device's chain
+and event count from the oldest segment present (a retention may have
+removed what came before) and names what is missing, records that do not
+open with the log's key, and copies it could not read. A personal silo's
+log opens with the content key; an organisation's only with an
+organisation key's wrap key.
 The device's queue (`Spool`) is held under a file lock while it is open, so
 a command recording an event and the pass closing a segment take turns
 instead of numbering two events alike. The pass opens it for each local step

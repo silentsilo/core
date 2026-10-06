@@ -309,7 +309,7 @@ async fn a_log_turned_on_with_no_copies_records_at_once() {
     assert!(!device.state.audit_status(id).unwrap().enabled);
     device.state.set_audit_log(id, true).unwrap();
     let status = device.state.audit_status(id).unwrap();
-    assert!(status.enabled && !status.organisation);
+    assert!(status.enabled && status.kept && !status.organisation);
     // The start, then what happened after it.
     assert_eq!(
         device
@@ -418,4 +418,142 @@ async fn an_organisation_log_cannot_be_turned_off() {
         .unwrap();
     assert!(device.state.set_audit_log(device.silo.id, false).is_err());
     assert!(device.state.audit_status(device.silo.id).unwrap().enabled);
+}
+
+mod reading {
+    use super::*;
+    use silentsilo_app::audit_read::{Reader, read_audit_log};
+
+    /// Another device's run of segments, its events numbered from 0.
+    fn their_segments(device: Uuid, public: &[u8], per_segment: &[u16]) -> Vec<Segment> {
+        let mut out: Vec<Segment> = Vec::new();
+        let mut i = 0;
+        for (seq, codes_in) in per_segment.iter().enumerate() {
+            let mut records = Vec::new();
+            for _ in 0..*codes_in {
+                let mut event = Event::new(codes::FILE_OPENED, 100 + i as i64);
+                event.i = i;
+                records.push(silentsilo_audit::seal_event(public, device, &event).unwrap());
+                i += 1;
+            }
+            let prev = out.last().map_or([0u8; 32], |s| s.hash());
+            out.push(Segment {
+                device,
+                seq: seq as u64,
+                prev,
+                closed_at: 1,
+                records,
+            });
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn a_log_with_no_copies_reads_from_this_computer() {
+        let host = Copies(Vec::new(), true);
+        let device = Device::new(&host);
+        let id = device.silo.id;
+        device.state.set_audit_log(id, true).unwrap();
+        device
+            .state
+            .audit_record(
+                id,
+                Event::new(codes::SECRET_COPIED, i64::MAX / 2).on("e1", "Bank"),
+            )
+            .unwrap();
+        let read = read_audit_log(&device.state, &host, &device.silo, Reader::Silo)
+            .await
+            .unwrap();
+        let codes_read: Vec<u16> = read.entries.iter().map(|e| e.event.c).collect();
+        assert_eq!(codes_read, vec![codes::SECRET_COPIED, codes::LOG_STARTED]);
+        assert_eq!(read.entries[0].what, "Secret copied");
+        assert_eq!(read.devices.len(), 1);
+        assert!(read.devices[0].missing_events.is_empty());
+        assert_eq!(read.unreadable, 0);
+    }
+
+    #[tokio::test]
+    async fn every_device_s_segments_are_read_and_a_hole_is_named() {
+        let a = tempfile::tempdir().unwrap();
+        let host = Copies(vec![copy(a.path())], true);
+        let device = Device::new(&host);
+        let id = device.silo.id;
+        let store = FolderStore::new(a.path().to_path_buf());
+        device.state.set_audit_log(id, true).unwrap();
+        run_sync_pass(&device.state, &host, &device.silo)
+            .await
+            .unwrap();
+
+        // Another device wrote three segments; the middle one is gone.
+        let public = device.spool().key().unwrap().unwrap().public().unwrap();
+        let other = Uuid::new_v4();
+        for segment in their_segments(other, &public, &[2, 3, 1]) {
+            if segment.seq != 1 {
+                store.put(&segment.key(), segment.to_bytes()).await.unwrap();
+            }
+        }
+        // And one record sealed to a key that is not the log's.
+        let stranger = KeyPair::generate();
+        let mut odd = their_segments(Uuid::new_v4(), &stranger.public, &[1]);
+        let odd = odd.remove(0);
+        store.put(&odd.key(), odd.to_bytes()).await.unwrap();
+
+        let read = read_audit_log(&device.state, &host, &device.silo, Reader::Silo)
+            .await
+            .unwrap();
+        let theirs = read.devices.iter().find(|d| d.device == other).unwrap();
+        assert_eq!(theirs.events, 3);
+        assert_eq!(theirs.missing_segments, vec![1]);
+        assert_eq!(theirs.missing_events, vec![(2, 4)]);
+        assert_eq!(read.unreadable, 1);
+        assert!(read.copies_unread.is_empty());
+
+        // Read again from what was kept, with the copy gone.
+        std::fs::remove_dir_all(a.path().join("audit")).unwrap();
+        let again = read_audit_log(&device.state, &host, &device.silo, Reader::Silo)
+            .await
+            .unwrap();
+        assert_eq!(
+            again
+                .devices
+                .iter()
+                .find(|d| d.device == other)
+                .unwrap()
+                .events,
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn a_copy_that_cannot_be_read_is_named() {
+        let (a, holder) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let b = holder.path().join("b");
+        std::fs::create_dir(&b).unwrap();
+        let host = Copies(vec![copy(a.path()), copy(&b)], false);
+        let device = Device::new(&host);
+        device.state.set_audit_log(device.silo.id, true).unwrap();
+        unplug(&b);
+        let read = read_audit_log(&device.state, &host, &device.silo, Reader::Silo)
+            .await
+            .unwrap();
+        assert_eq!(read.copies_unread.len(), 1);
+        plug_in(&b);
+    }
+
+    #[tokio::test]
+    async fn an_organisation_log_is_not_read_with_the_silo_s_key() {
+        let host = Copies(Vec::new(), true);
+        let device = Device::new(&host);
+        let keys = KeyPair::generate();
+        let policy = AuditPolicy::new(true, &keys.id(), Some(365), Scope::Org, 1);
+        device
+            .spool()
+            .apply_policy(&policy, &AuditKey::new(&keys, Scope::Org, 1), 1)
+            .unwrap();
+        assert!(
+            read_audit_log(&device.state, &host, &device.silo, Reader::Silo)
+                .await
+                .is_err()
+        );
+    }
 }

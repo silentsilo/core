@@ -372,6 +372,14 @@ impl Spool {
         }
     }
 
+    /// Records not in a segment yet, as (event number, sealed record).
+    pub fn pending(&self) -> Result<Vec<(u64, Vec<u8>)>, SpoolError> {
+        Ok(read_pending(&self.dir.join("pending"))?
+            .into_iter()
+            .filter(|(n, _)| *n >= self.state.closed_through)
+            .collect())
+    }
+
     /// Events waiting, in segments or not: what a lock would leave behind.
     pub fn waiting(&self) -> Result<usize, SpoolError> {
         let pending = read_pending(&self.dir.join("pending"))?

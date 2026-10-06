@@ -64,6 +64,8 @@ pub struct AppState {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct AuditStatus {
     pub enabled: bool,
+    /// This computer holds the log's key: there is a log to read, on or off.
+    pub kept: bool,
     /// Kept by an organisation: on for good, read with an organisation key.
     pub organisation: bool,
     pub retention_days: Option<u32>,
@@ -212,6 +214,7 @@ impl AppState {
         let pinned = spool.pinned();
         Ok(AuditStatus {
             enabled: pinned.is_some_and(|p| p.enabled),
+            kept: spool.key().map_err(|e| e.to_string())?.is_some(),
             organisation: pinned.is_some_and(|p| p.scope == silentsilo_audit::Scope::Org),
             retention_days: pinned.and_then(|p| p.retention_days),
             waiting: spool.waiting().map_err(|e| e.to_string())?,
@@ -293,7 +296,7 @@ impl AppState {
     /// The open silo's queue, noting on the way whether its log is an
     /// organisation's. Opened outside the sessions lock: it may wait for
     /// the sync pass.
-    fn audit_spool(&self, id: Uuid) -> Result<silentsilo_audit::Spool, String> {
+    pub(crate) fn audit_spool(&self, id: Uuid) -> Result<silentsilo_audit::Spool, String> {
         let (root, device) = {
             let sessions = self.sessions.lock().map_err(|e| e.to_string())?;
             let session = sessions.get(&id).ok_or("That silo is not open.")?;

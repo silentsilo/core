@@ -29,6 +29,10 @@ release notes should say.
   the key and policy, and the pass writes the newest policy to every copy
   that lacks it. Turned on again, it keeps its key. An organisation's log
   cannot be turned off.
+- `audit_read::read_audit_log`: the whole log, from this computer and every
+  copy, opened with the log's key, with each device's missing segments and
+  events, the records that do not open, and the copies that could not be
+  read. Fetched segments are kept in `audit-cache/` beside the silo.
 - `silentsilo_app::record_lock`: the lock event and the segment it closes,
   for a client that closes its sessions itself.
 

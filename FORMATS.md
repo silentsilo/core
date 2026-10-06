@@ -632,6 +632,11 @@ log's key file as storage holds it, and its policy in clear) and `lock`
 (held while the queue is open). New in core 1.9.0; a build that reads it
 takes absent fields as their defaults.
 
+**Segments read before**, `<silo>/audit-cache/<device>/<seq>.seg`, in the
+storage format and layout, not synced: a segment never changes, so a reader
+fetches each one once. One that does not parse, or names another device or
+number than its path, is ignored and fetched again.
+
 ## The index is not a format
 
 Every table in `vault.db` except `vault_meta` and `oplog` is a cache of the
