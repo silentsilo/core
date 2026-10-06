@@ -128,8 +128,29 @@ pub async fn read_audit_log(
         .into_iter()
         .map(|(_, record)| (this_device, record))
         .collect();
-    let mut read = silentsilo_audit::reading::read_log(segments.into_values(), &unsent, &private);
+    // What was opened before is opened again only if its bytes changed.
+    let mut opened = state
+        .audit_opened
+        .lock()
+        .map_err(|e| e.to_string())?
+        .remove(&silo.id)
+        .unwrap_or_default();
+    let mut read = silentsilo_audit::reading::read_log_with(
+        segments.into_values(),
+        &unsent,
+        &private,
+        &mut opened,
+    );
     read.copies_unread = copies_unread;
+    // Put back only while the silo is still open, checked and kept under
+    // the sessions lock: a close removes the session first and forgets the
+    // read after, so a lock during the read leaves nothing in memory.
+    if let Ok(sessions) = state.sessions.lock()
+        && sessions.contains_key(&silo.id)
+        && let Ok(mut held) = state.audit_opened.lock()
+    {
+        held.insert(silo.id, opened);
+    }
     Ok(read)
 }
 

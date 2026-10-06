@@ -58,6 +58,10 @@ pub struct AppState {
     /// forgotten while it runs: a queue that later cannot be read must not
     /// make such a silo look like one that may go on unrecorded.
     pub(crate) audit_org: Mutex<HashSet<Uuid>>,
+    /// Each open silo's activity log as read so far, so the next read opens
+    /// only new segments. The log in clear: forgotten when the silo closes
+    /// ([`AppState::forget_audit_read`]), never written anywhere.
+    pub(crate) audit_opened: Mutex<HashMap<Uuid, silentsilo_audit::reading::Opened>>,
 }
 
 /// A silo's activity log, as this device knows it.
@@ -150,6 +154,7 @@ impl AppState {
                 if let Some(old) = sessions.remove(stale) {
                     close_one(host, old);
                 }
+                self.forget_audit_read(*stale);
                 touched.remove(stale);
             })
         };
@@ -162,6 +167,7 @@ impl AppState {
     /// Closes one silo, leaving any others open.
     pub fn close_session(&self, host: &dyn Host, id: Uuid) -> Result<(), String> {
         let closed = self.sessions.lock().map_err(|e| e.to_string())?.remove(&id);
+        self.forget_audit_read(id);
         if let Ok(mut touched) = self.last_touched.lock() {
             touched.remove(&id);
         }
@@ -169,6 +175,24 @@ impl AppState {
             close_one(host, session);
         }
         Ok(())
+    }
+
+    /// Drops what was read of a silo's activity log. Every path that closes
+    /// a silo calls it, the client's own included.
+    pub fn forget_audit_read(&self, id: Uuid) {
+        let mut opened = self
+            .audit_opened
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        opened.remove(&id);
+    }
+
+    /// Whether anything read of a silo's activity log is held in memory.
+    pub fn holds_audit_read(&self, id: Uuid) -> bool {
+        self.audit_opened
+            .lock()
+            .map(|held| held.contains_key(&id))
+            .unwrap_or(false)
     }
 
     /// Records `event` in the open silo's activity log. `Ok(None)` when the

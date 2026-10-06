@@ -470,6 +470,15 @@ mod reading {
         assert_eq!(read.devices.len(), 1);
         assert!(read.devices[0].missing_events.is_empty());
         assert_eq!(read.unreadable, 0);
+
+        // Held for the next read while the silo is open, gone once it locks.
+        assert!(device.state.holds_audit_read(id));
+        let again = read_audit_log(&device.state, &host, &device.silo, Reader::Silo)
+            .await
+            .unwrap();
+        assert_eq!(again.entries.len(), read.entries.len());
+        device.state.close_session(&host, id).unwrap();
+        assert!(!device.state.holds_audit_read(id));
     }
 
     #[tokio::test]

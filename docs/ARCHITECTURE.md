@@ -107,7 +107,14 @@ and event count from the oldest segment present (a retention may have
 removed what came before) and names what is missing, records that do not
 open with the log's key, and copies it could not read. A personal silo's
 log opens with the content key; an organisation's only with an
-organisation key's wrap key.
+organisation key's wrap key. Opening a record is about 150 microseconds of
+X25519 and AES-GCM, so records are opened on every core
+(`reading::read_log_with`), and what was opened is kept in `AppState` per
+silo (`audit_opened`), matched by each segment's bytes: the next read opens
+only new segments. That is the log in clear, so it stays in memory and is
+dropped by every path that closes the silo (`forget_audit_read`, which a
+client with its own close path calls too). 100,000 events read in about
+half a second the first time on 28 threads, and in a tenth of that after.
 The device's queue (`Spool`) is held under a file lock while it is open, so
 a command recording an event and the pass closing a segment take turns
 instead of numbering two events alike. The pass opens it for each local step

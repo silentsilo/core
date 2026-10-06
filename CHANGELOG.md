@@ -13,6 +13,11 @@ release notes should say.
 
 ### Added
 
+- Reading the activity log opens its records on every core, and keeps what
+  it opened while the silo is open, so a second read opens only what is
+  new: 100,000 events went from 15 seconds to half a second, then 65 ms.
+  `AppState::forget_audit_read` drops it; a client with its own close path
+  calls it.
 - Event code 15, "Signed with an SSH key", for the desktop's SSH agent,
   and the optional `ssh_agent` flag on an SSH-key entry (`FORMATS.md`): an
   older client keeps it when it saves the entry, shown by the 1.0.0 test.
