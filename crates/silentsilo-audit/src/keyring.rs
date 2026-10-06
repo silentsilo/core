@@ -116,6 +116,24 @@ impl AuditKey {
             .map_err(|_| AuditError::BadKey)
     }
 
+    /// This key with every way in `other` holds that this one lacks. Two
+    /// devices may each add a way at once; whichever copy is read, the
+    /// union is kept. A way is never taken away here.
+    pub fn merged(&self, other: &AuditKey) -> AuditKey {
+        let mut out = self.clone();
+        if other.key_id == self.key_id {
+            for wrapped in &other.wrapped {
+                if !out.wrapped.iter().any(|w| w.by == wrapped.by) {
+                    out.wrapped.push(wrapped.clone());
+                }
+            }
+        }
+        // One order on every device, or two copies that hold the same ways
+        // would each look different and be written again at every pass.
+        out.wrapped.sort_by(|x, y| x.by.cmp(&y.by));
+        out
+    }
+
     pub fn to_json(&self) -> Result<Vec<u8>, AuditError> {
         Ok(serde_json::to_vec_pretty(self)?)
     }
@@ -179,6 +197,26 @@ impl AuditPolicy {
             return Err(AuditError::Newer("log policy"));
         }
         Ok(policy)
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+
+    #[test]
+    fn ways_in_added_on_two_devices_are_both_kept() {
+        let keys = KeyPair::generate();
+        let mut a = AuditKey::new(&keys, Scope::Org, 1);
+        let mut b = a.clone();
+        a.wrap_for("key-a", &keys.private, &[1; 32]).unwrap();
+        b.wrap_for("key-b", &keys.private, &[2; 32]).unwrap();
+        let both = a.merged(&b);
+        assert!(both.unwrap_with("key-a", &[1; 32]).is_ok());
+        assert!(both.unwrap_with("key-b", &[2; 32]).is_ok());
+        assert_eq!(both, b.merged(&a).merged(&both).merged(&a));
+        let other = AuditKey::new(&KeyPair::generate(), Scope::Org, 1);
+        assert_eq!(a.merged(&other), a, "another key's ways are not taken");
     }
 }
 

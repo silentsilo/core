@@ -29,6 +29,12 @@ release notes should say.
   the key and policy, and the pass writes the newest policy to every copy
   that lacks it. Turned on again, it keeps its key. An organisation's log
   cannot be turned off.
+- `audit_admin`: an organisation's log, started with one of its keys
+  touched and readable only by its keys; another key added the same way;
+  retention changed; segments past it removed from every copy that takes
+  deletes. A personal log now follows the key a newer policy names, so
+  devices follow an organisation starting its log; an organisation's key
+  stays pinned. Copies of the log's key merge their ways in.
 - `audit_read::read_audit_log`: the whole log, from this computer and every
   copy, opened with the log's key, with each device's missing segments and
   events, the records that do not open, and the copies that could not be

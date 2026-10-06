@@ -74,7 +74,8 @@ pub struct Pinned {
 /// What reading the policy again changed.
 #[derive(Debug, PartialEq, Eq)]
 pub enum PolicyRead {
-    /// The first key this device has heard of, now pinned.
+    /// A key now pinned: the first this device heard of, or one that
+    /// replaces a personal log's.
     Pinned,
     /// The same key; the setting or the retention may have moved.
     Kept,
@@ -211,6 +212,12 @@ impl Spool {
         }
         let public = hex::encode(key.public()?);
         let read = match &self.state.pinned {
+            // A personal log follows the newest policy: whoever could name
+            // another key also holds the content key that reads it. An
+            // organisation's key stays pinned for good.
+            Some(pinned) if pinned.key_id != policy.key_id && pinned.scope == Scope::Silo => {
+                PolicyRead::Pinned
+            }
             Some(pinned) if pinned.key_id != policy.key_id => PolicyRead::KeyChanged {
                 pinned: pinned.key_id.clone(),
                 named: policy.key_id.clone(),
@@ -243,6 +250,33 @@ impl Spool {
         }
         self.save_state()?;
         Ok(read)
+    }
+
+    /// Pins `key` under `policy` whatever was pinned before, closing what is
+    /// pending under the old key first. Only for an organisation starting
+    /// its log where a personal one was kept; never from what storage says.
+    pub fn repin(
+        &mut self,
+        policy: &AuditPolicy,
+        key: &AuditKey,
+        now_ms: i64,
+    ) -> Result<(), SpoolError> {
+        self.close(now_ms)?;
+        self.state.pinned = None;
+        // Checked at 0: the next pass publishes it.
+        self.apply_policy(policy, key, 0).map(|_| ())
+    }
+
+    /// Keeps a newer copy of the pinned key, with another way in.
+    pub fn keep_key(&self, key: &AuditKey) -> Result<(), SpoolError> {
+        match &self.state.pinned {
+            Some(pinned) if pinned.key_id == key.key_id => {
+                key.public()?;
+                write_whole(&self.dir.join(KEY_FILE), &key.to_json()?)?;
+                Ok(())
+            }
+            _ => Err(AuditError::BadKey.into()),
+        }
     }
 
     /// The pinned log's key, as storage holds it.
@@ -465,8 +499,8 @@ mod tests {
         let mut spool = Spool::open(dir.path(), Uuid::new_v4()).unwrap();
         assert!(spool.key().unwrap().is_none());
         let keys = KeyPair::generate();
-        let key = AuditKey::new(&keys, Scope::Silo, 1);
-        let on = AuditPolicy::new(true, &keys.id(), Some(90), Scope::Silo, 1);
+        let key = AuditKey::new(&keys, Scope::Org, 1);
+        let on = AuditPolicy::new(true, &keys.id(), Some(90), Scope::Org, 1);
         spool.apply_policy(&on, &key, 10).unwrap();
         assert_eq!(spool.key().unwrap(), Some(key.clone()));
         assert_eq!(spool.policy().unwrap(), Some(on.clone()));
@@ -478,6 +512,27 @@ mod tests {
             .unwrap();
         assert_eq!(spool.key().unwrap(), Some(key));
         assert_eq!(spool.policy().unwrap(), Some(on));
+    }
+
+    #[test]
+    fn a_personal_log_follows_a_newer_key_and_an_organisation_s_replaces_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut spool = Spool::open(dir.path(), Uuid::new_v4()).unwrap();
+        let mine = KeyPair::generate();
+        let on = AuditPolicy::new(true, &mine.id(), None, Scope::Silo, 1);
+        spool
+            .apply_policy(&on, &AuditKey::new(&mine, Scope::Silo, 1), 10)
+            .unwrap();
+        let org = KeyPair::generate();
+        let theirs = AuditPolicy::new(true, &org.id(), Some(365), Scope::Org, 2);
+        assert_eq!(
+            spool
+                .apply_policy(&theirs, &AuditKey::new(&org, Scope::Org, 2), 20)
+                .unwrap(),
+            PolicyRead::Pinned
+        );
+        assert_eq!(spool.pinned().unwrap().key_id, hex::encode(org.id()));
+        assert_eq!(spool.pinned().unwrap().scope, Scope::Org);
     }
 
     #[test]

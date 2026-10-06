@@ -87,8 +87,13 @@ ten minutes and pins the key the policy names, closes a segment once the
 oldest queued event is fifteen minutes old, and sends what waits to every
 copy. A segment leaves the device only once every configured copy holds it,
 as a record does, so a copy in a drawer keeps it queued; a failure warns
-and never stops the sync. A policy that later names another key is not
-followed: the device goes on sealing to the key it pinned, and says so.
+and never stops the sync. A policy that later names another key than an
+organisation's pinned one is not followed: the device goes on sealing to
+the key it pinned, and says so. A personal log follows the newest policy.
+An organisation's log (`audit_admin`) is started, given another reading
+key, has its retention changed and its old segments removed only after a
+touch of one of its keys, which the client asks for; core takes the wrap
+key that touch gave.
 A personal log is turned on and off on the device (`AppState::set_audit_log`),
 copies or not: the queue keeps the key and the policy, and the pass writes
 the newest policy, by `changed_at`, to every copy that lacks it

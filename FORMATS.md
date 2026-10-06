@@ -610,10 +610,24 @@ match its id is refused.
 
 **The policy**, `audit/policy.sealed`, sealed under the content KEK: whether
 the log is on, the id of the key events are sealed to, the retention in days
-(absent means kept), the scope and when it changed. A device pins the key it
-is first told and does not follow a policy that names another in silence. On an administered silo the log is on whatever it says; only
-the retention is read from it, and only the holder of an organisation key
-deletes a segment, whole, once it is past the retention.
+(absent means kept), the scope and when it changed. A device pins an
+organisation's key for good and does not follow a policy that names
+another in silence. A personal log's key it replaces with the one a newer
+policy names: whoever could name it also holds the content key that reads
+the personal log, so pinning it would protect nothing, and an organisation
+starting its log on a silo that kept a personal one has to be followed. On
+an administered silo the log is on whatever it says; only the retention is
+read from it, and only the holder of an organisation key deletes a segment,
+whole, once it is past the retention.
+
+An organisation's log is started with one of its keys touched: the device
+makes the key, wraps the private half for that key alone and pins it. A
+second organisation key is added with the first touched as well, since the
+private half has to be unwrapped to be wrapped again. Copies of the key
+file are merged by `by`, kept in that order, so a key added on one device
+reaches every copy and none is written again for nothing. A way in is never
+removed by a merge: a retired organisation key still reads the log until a
+new one is started.
 
 A personal log is turned on from one device, with or without copies: that
 device makes the key, wraps it under the content KEK and pins it. Turned

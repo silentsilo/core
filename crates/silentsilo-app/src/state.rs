@@ -57,7 +57,7 @@ pub struct AppState {
     /// Silos this process has seen keep an organisation's log. Never
     /// forgotten while it runs: a queue that later cannot be read must not
     /// make such a silo look like one that may go on unrecorded.
-    audit_org: Mutex<HashSet<Uuid>>,
+    pub(crate) audit_org: Mutex<HashSet<Uuid>>,
 }
 
 /// A silo's activity log, as this device knows it.

@@ -430,21 +430,45 @@ async fn settle_audit_policy(
         }
     }
 
-    for (target, held) in &on_copies {
-        if held
-            .as_ref()
-            .is_some_and(|held| held.changed_at >= policy.changed_at)
-        {
-            continue;
-        }
-        let published = async {
-            if sync::audit_log::read_audit_key(&*target.store, &key.key_id)
-                .await?
-                .is_none()
-            {
-                sync::audit_log::write_audit_key(&*target.store, &key).await?;
+    // The key with every way in any copy holds: an organisation key added
+    // on one device reaches the others this way.
+    let mut merged = key.clone();
+    let mut copy_keys = Vec::new();
+    for (target, _) in &on_copies {
+        match sync::audit_log::read_audit_key(&*target.store, &key.key_id).await {
+            Ok(held) => {
+                if let Some(held) = &held {
+                    merged = merged.merged(held);
+                }
+                copy_keys.push(Some(held));
             }
-            sync::audit_log::write_audit_policy(&*target.store, kek, &policy).await
+            Err(e) => {
+                host.warn("audit", &format!("{}: {e}", target.label));
+                copy_keys.push(None);
+            }
+        }
+    }
+    if merged != key
+        && let Some(spool) = open()
+        && let Err(e) = spool.keep_key(&merged)
+    {
+        host.warn("audit", &e.to_string());
+    }
+
+    for ((target, held), copy_key) in on_copies.iter().zip(copy_keys) {
+        // A copy whose key could not be read is left for the next pass.
+        let Some(copy_key) = copy_key else { continue };
+        let policy_behind = held
+            .as_ref()
+            .is_none_or(|held| held.changed_at < policy.changed_at);
+        let published = async {
+            if copy_key.as_ref() != Some(&merged) {
+                sync::audit_log::write_audit_key(&*target.store, &merged).await?;
+            }
+            if policy_behind {
+                sync::audit_log::write_audit_policy(&*target.store, kek, &policy).await?;
+            }
+            Ok::<(), sync::SyncError>(())
         };
         if let Err(e) = published.await {
             host.warn("audit", &format!("{}: {e}", target.label));

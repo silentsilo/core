@@ -557,3 +557,183 @@ mod reading {
         );
     }
 }
+
+mod organisation {
+    use super::*;
+    use silentsilo_app::audit_admin::{OrgKeyTouch, expire_audit_segments};
+    use silentsilo_app::audit_read::{Reader, read_audit_log};
+    use zeroize::Zeroizing;
+
+    fn touch(id: &str, byte: u8) -> OrgKeyTouch {
+        OrgKeyTouch {
+            credential_id: id.into(),
+            wrap_key: Zeroizing::new([byte; 32]),
+        }
+    }
+
+    fn reader(t: &OrgKeyTouch) -> Reader {
+        Reader::Organisation {
+            credential_id: t.credential_id.clone(),
+            wrap_key: t.wrap_key.clone(),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_organisation_log_replaces_a_personal_one_and_only_its_keys_read_it() {
+        let a = tempfile::tempdir().unwrap();
+        let host = Copies(vec![copy(a.path())], true);
+        let device = Device::new(&host);
+        let id = device.silo.id;
+        device.state.set_audit_log(id, true).unwrap();
+        let admin = touch("aa", 1);
+        device
+            .state
+            .start_org_audit_log(id, &admin, Some(365))
+            .unwrap();
+
+        let status = device.state.audit_status(id).unwrap();
+        assert!(status.enabled && status.organisation);
+        assert_eq!(status.retention_days, Some(365));
+        assert!(device.state.audit_is_mandatory(id));
+        assert!(device.state.set_audit_log(id, false).is_err());
+        assert!(
+            device.state.start_org_audit_log(id, &admin, None).is_err(),
+            "started once"
+        );
+
+        run_sync_pass(&device.state, &host, &device.silo)
+            .await
+            .unwrap();
+        assert!(
+            read_audit_log(&device.state, &host, &device.silo, Reader::Silo)
+                .await
+                .is_err(),
+            "the silo's own key does not read it"
+        );
+        let read = read_audit_log(&device.state, &host, &device.silo, reader(&admin))
+            .await
+            .unwrap();
+        assert_eq!(read.entries[0].event.c, codes::LOG_STARTED);
+        // The personal log's records are sealed to its own key.
+        assert_eq!(read.unreadable, 2);
+    }
+
+    #[tokio::test]
+    async fn another_organisation_key_reads_it_and_ways_in_reach_every_copy() {
+        let a = tempfile::tempdir().unwrap();
+        let host = Copies(vec![copy(a.path())], true);
+        let device = Device::new(&host);
+        let id = device.silo.id;
+        let store = FolderStore::new(a.path().to_path_buf());
+        let (first, second, third) = (touch("aa", 1), touch("bb", 2), touch("cc", 3));
+        device
+            .state
+            .start_org_audit_log(id, &first, Some(365))
+            .unwrap();
+        device
+            .state
+            .add_org_audit_reader(id, &first, &second)
+            .unwrap();
+        assert!(
+            device
+                .state
+                .add_org_audit_reader(id, &third, &third)
+                .is_err(),
+            "a key that does not read it cannot add one"
+        );
+        run_sync_pass(&device.state, &host, &device.silo)
+            .await
+            .unwrap();
+        assert!(
+            read_audit_log(&device.state, &host, &device.silo, reader(&second))
+                .await
+                .is_ok()
+        );
+
+        // Another device added a third way in on the copy.
+        let key_id = device.spool().key().unwrap().unwrap().key_id;
+        let mut theirs = silentsilo_sync::audit_log::read_audit_key(&store, &key_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let private = theirs.unwrap_with("aa", &[1; 32]).unwrap();
+        theirs.wrap_for("cc", &private, &[3; 32]).unwrap();
+        silentsilo_sync::audit_log::write_audit_key(&store, &theirs)
+            .await
+            .unwrap();
+        // Due again, as it is every ten minutes.
+        {
+            let mut spool = device.spool();
+            let (policy, key) = (
+                spool.policy().unwrap().unwrap(),
+                spool.key().unwrap().unwrap(),
+            );
+            spool.apply_policy(&policy, &key, 0).unwrap();
+        }
+        run_sync_pass(&device.state, &host, &device.silo)
+            .await
+            .unwrap();
+        let here = device.spool().key().unwrap().unwrap();
+        for (by, byte) in [("aa", 1), ("bb", 2), ("cc", 3)] {
+            assert!(here.unwrap_with(by, &[byte; 32]).is_ok(), "{by}");
+        }
+        let there = silentsilo_sync::audit_log::read_audit_key(&store, &key_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(there, here);
+    }
+
+    #[tokio::test]
+    async fn segments_past_the_retention_are_removed_and_the_rest_kept() {
+        let a = tempfile::tempdir().unwrap();
+        let host = Copies(vec![copy(a.path())], true);
+        let device = Device::new(&host);
+        let id = device.silo.id;
+        let store = FolderStore::new(a.path().to_path_buf());
+        let admin = touch("aa", 1);
+        device.state.start_org_audit_log(id, &admin, None).unwrap();
+        let public = device.spool().key().unwrap().unwrap().public().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let other = Uuid::new_v4();
+        for (seq, age_days) in [(0u64, 40i64), (1, 20), (2, 1)] {
+            let mut event = Event::new(codes::FILE_OPENED, now);
+            event.i = seq;
+            let segment = Segment {
+                device: other,
+                seq,
+                prev: [0; 32],
+                closed_at: now - age_days * 86_400_000,
+                records: vec![silentsilo_audit::seal_event(&public, other, &event).unwrap()],
+            };
+            store.put(&segment.key(), segment.to_bytes()).await.unwrap();
+        }
+
+        assert_eq!(
+            expire_audit_segments(&device.state, &host, &device.silo)
+                .await
+                .unwrap(),
+            0,
+            "kept for good"
+        );
+        device.state.set_org_audit_retention(id, Some(30)).unwrap();
+        assert_eq!(
+            expire_audit_segments(&device.state, &host, &device.silo)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(segments_in(&store).await.len(), 2);
+        let read = read_audit_log(&device.state, &host, &device.silo, reader(&admin))
+            .await
+            .unwrap();
+        assert!(
+            read.entries
+                .iter()
+                .any(|e| e.event.c == codes::SEGMENTS_EXPIRED)
+        );
+    }
+}
