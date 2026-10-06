@@ -60,6 +60,17 @@ pub struct AppState {
     audit_org: Mutex<HashSet<Uuid>>,
 }
 
+/// A silo's activity log, as this device knows it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AuditStatus {
+    pub enabled: bool,
+    /// Kept by an organisation: on for good, read with an organisation key.
+    pub organisation: bool,
+    pub retention_days: Option<u32>,
+    /// Events on this computer not yet on every copy.
+    pub waiting: usize,
+}
+
 /// The focused silo's session, held for as long as the caller needs it.
 ///
 /// Deliberately shaped like the `Option<VaultSession>` this replaced, so
@@ -193,6 +204,90 @@ impl AppState {
                 .pinned()
                 .is_some_and(|p| p.scope == silentsilo_audit::Scope::Org)
         })
+    }
+
+    /// The open silo's log as this device knows it.
+    pub fn audit_status(&self, id: Uuid) -> Result<AuditStatus, String> {
+        let spool = self.audit_spool(id)?;
+        let pinned = spool.pinned();
+        Ok(AuditStatus {
+            enabled: pinned.is_some_and(|p| p.enabled),
+            organisation: pinned.is_some_and(|p| p.scope == silentsilo_audit::Scope::Org),
+            retention_days: pinned.and_then(|p| p.retention_days),
+            waiting: spool.waiting().map_err(|e| e.to_string())?,
+        })
+    }
+
+    /// Turns the open silo's own log on or off: on this device at once,
+    /// with no copies needed, and on every copy at the next pass. A log this
+    /// device already knows is turned back on under the same key. An
+    /// organisation's log stays on.
+    pub fn set_audit_log(&self, id: Uuid, enabled: bool) -> Result<(), String> {
+        use silentsilo_audit::{AuditKey, AuditPolicy, BY_SILO, Event, KeyPair, Scope, codes};
+
+        let kek = {
+            let sessions = self.sessions.lock().map_err(|e| e.to_string())?;
+            sessions
+                .get(&id)
+                .ok_or("That silo is not open.")?
+                .kek
+                .clone()
+        };
+        let mut spool = self.audit_spool(id)?;
+        if spool.pinned().is_some_and(|p| p.scope == Scope::Org) {
+            return Err(
+                "This silo's activity log is kept by its organisation and stays on.".into(),
+            );
+        }
+        let known = spool.key().map_err(|e| e.to_string())?;
+        if spool.pinned().is_some() && known.is_none() {
+            return Err(
+                "This computer has not received the activity log's key yet. Sync, then try again."
+                    .into(),
+            );
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let now = now_ms / 1000;
+        let key = match known {
+            Some(key) => key,
+            None if !enabled => return Ok(()),
+            None => {
+                let keys = KeyPair::generate();
+                let mut key = AuditKey::new(&keys, Scope::Silo, now);
+                key.wrap_for(BY_SILO, &keys.private, kek.as_bytes())
+                    .map_err(|e| e.to_string())?;
+                key
+            }
+        };
+        let key_id: silentsilo_audit::KeyId = hex::decode(&key.key_id)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .ok_or("The activity log's key is damaged.")?;
+        let previous = spool.policy().map_err(|e| e.to_string())?;
+        // After the policy it replaces, even on a clock that is behind.
+        let changed_at = previous.as_ref().map_or(now, |p| now.max(p.changed_at + 1));
+        let retention = previous.and_then(|p| p.retention_days);
+
+        let at = |code| Event::new(code, now_ms);
+        if !enabled {
+            spool
+                .record(at(codes::LOG_STOPPED))
+                .map_err(|e| e.to_string())?;
+        }
+        let policy = AuditPolicy::new(enabled, &key_id, retention, Scope::Silo, changed_at);
+        // Checked at 0: the next pass reads the copies and publishes this.
+        spool
+            .apply_policy(&policy, &key, 0)
+            .map_err(|e| e.to_string())?;
+        if enabled {
+            spool
+                .record(at(codes::LOG_STARTED))
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 
     /// The open silo's queue, noting on the way whether its log is an

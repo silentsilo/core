@@ -11,6 +11,10 @@
 //!   of the last segment, and the number below which every event is already
 //!   in a segment;
 //! - `outbox/<seq>.seg`: closed segments waiting for every copy to hold them;
+//! - `key.json` and `policy.json`: the log's key (its private half only
+//!   wrapped, as storage holds it) and the policy this device last took in,
+//!   so a silo with no copies has them, and the pass can publish them to a
+//!   copy that does not;
 //! - `lock`: held by whoever has the spool open. One at a time, across
 //!   threads and processes: two holders would each read the state, move it
 //!   and write it back, and number two events alike.
@@ -32,6 +36,8 @@ use uuid::Uuid;
 use crate::{AuditError, AuditKey, AuditPolicy, Event, Scope, Segment, seal_event};
 
 pub const QUEUE_DIR: &str = "audit-queue";
+const KEY_FILE: &str = "key.json";
+const POLICY_FILE: &str = "policy.json";
 
 /// How long opening waits for another holder. Every holder is local work,
 /// never a network call, so this is only reached when something is stuck.
@@ -227,8 +233,36 @@ impl Spool {
             retention_days: policy.retention_days,
             checked_at: now,
         });
+        // Another key's policy is not kept: it is not this device's log.
+        if !matches!(read, PolicyRead::KeyChanged { .. }) {
+            write_whole(&self.dir.join(KEY_FILE), &key.to_json()?)?;
+            write_whole(
+                &self.dir.join(POLICY_FILE),
+                &serde_json::to_vec(policy).map_err(AuditError::from)?,
+            )?;
+        }
         self.save_state()?;
         Ok(read)
+    }
+
+    /// The pinned log's key, as storage holds it.
+    pub fn key(&self) -> Result<Option<AuditKey>, SpoolError> {
+        match fs::read(self.dir.join(KEY_FILE)) {
+            Ok(bytes) => Ok(Some(AuditKey::from_json(&bytes)?)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The pinned log's policy, as this device last took it in.
+    pub fn policy(&self) -> Result<Option<AuditPolicy>, SpoolError> {
+        match fs::read(self.dir.join(POLICY_FILE)) {
+            Ok(bytes) => Ok(Some(
+                serde_json::from_slice(&bytes).map_err(AuditError::from)?,
+            )),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     fn save_state(&self) -> Result<(), SpoolError> {
@@ -415,6 +449,27 @@ mod tests {
         assert_eq!(spool.record(Event::new(1, 1_000)).unwrap(), Some(0));
         assert!(!spool.due(1_000 + 899_999, 900_000));
         assert!(spool.due(1_000 + 900_000, 900_000));
+    }
+
+    #[test]
+    fn the_pinned_key_and_policy_are_kept_and_another_key_s_are_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut spool = Spool::open(dir.path(), Uuid::new_v4()).unwrap();
+        assert!(spool.key().unwrap().is_none());
+        let keys = KeyPair::generate();
+        let key = AuditKey::new(&keys, Scope::Silo, 1);
+        let on = AuditPolicy::new(true, &keys.id(), Some(90), Scope::Silo, 1);
+        spool.apply_policy(&on, &key, 10).unwrap();
+        assert_eq!(spool.key().unwrap(), Some(key.clone()));
+        assert_eq!(spool.policy().unwrap(), Some(on.clone()));
+
+        let theirs = KeyPair::generate();
+        let swapped = AuditPolicy::new(false, &theirs.id(), None, Scope::Silo, 2);
+        spool
+            .apply_policy(&swapped, &AuditKey::new(&theirs, Scope::Silo, 2), 20)
+            .unwrap();
+        assert_eq!(spool.key().unwrap(), Some(key));
+        assert_eq!(spool.policy().unwrap(), Some(on));
     }
 
     #[test]

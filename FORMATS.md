@@ -615,6 +615,23 @@ is first told and does not follow a policy that names another in silence. On an 
 the retention is read from it, and only the holder of an organisation key
 deletes a segment, whole, once it is past the retention.
 
+A personal log is turned on from one device, with or without copies: that
+device makes the key, wraps it under the content KEK and pins it. Turned
+back on later it uses the same key. The newest policy wins, by `changed_at`:
+each pass that reads the policy writes it, with its key, to every copy that
+has none or an older one, so a log turned on before a copy existed reaches
+it. A policy naming a key other than the one the device pinned is never
+spread.
+
+**The queue on the device**, `<silo>/audit-queue/`, beside the silo and not
+synced: `pending` (records not yet in a segment, each prefixed with its event
+number and length), `state.json` (the counters, the hash of the last segment
+and the pinned key), `outbox/<seq>.seg` (closed segments, in the storage
+format, waiting for every copy), `key.json` and `policy.json` (the pinned
+log's key file as storage holds it, and its policy in clear) and `lock`
+(held while the queue is open). New in core 1.9.0; a build that reads it
+takes absent fields as their defaults.
+
 ## The index is not a format
 
 Every table in `vault.db` except `vault_meta` and `oplog` is a cache of the

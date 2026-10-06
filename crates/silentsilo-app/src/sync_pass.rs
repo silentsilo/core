@@ -292,7 +292,7 @@ async fn deliver_audit(
     required: &std::collections::HashSet<Uuid>,
     now: i64,
 ) {
-    use silentsilo_audit::{AuditKey, AuditPolicy, PolicyRead, Spool};
+    use silentsilo_audit::Spool;
 
     // The spool is opened for each local step and closed before the network:
     // a command recording an event waits for it.
@@ -310,38 +310,7 @@ async fn deliver_audit(
         .is_none_or(|p| now.saturating_sub(p.checked_at) >= AUDIT_POLICY_EVERY);
     drop(spool);
     if stale {
-        let mut found: Option<(AuditPolicy, AuditKey)> = None;
-        for target in targets {
-            let policy = match sync::audit_log::read_audit_policy(&*target.store, kek).await {
-                Ok(Some(policy)) => policy,
-                Ok(None) => continue,
-                Err(e) => {
-                    host.warn("audit", &format!("{}: {e}", target.label));
-                    continue;
-                }
-            };
-            match sync::audit_log::read_audit_key(&*target.store, &policy.key_id).await {
-                Ok(Some(key)) => {
-                    found = Some((policy, key));
-                    break;
-                }
-                Ok(None) => continue,
-                Err(e) => host.warn("audit", &format!("{}: {e}", target.label)),
-            }
-        }
-        if let Some((policy, key)) = found {
-            let Some(mut spool) = open() else { return };
-            match spool.apply_policy(&policy, &key, now) {
-                Ok(PolicyRead::KeyChanged { pinned, named }) => host.warn(
-                    "audit",
-                    &format!(
-                        "the activity log names another key ({named}); this device goes on sealing to {pinned}"
-                    ),
-                ),
-                Ok(_) => {}
-                Err(e) => host.warn("audit", &e.to_string()),
-            }
-        }
+        settle_audit_policy(host, kek, targets, &open, now).await;
     }
 
     let now_ms = now.saturating_mul(1000);
@@ -384,6 +353,101 @@ async fn deliver_audit(
             .is_some_and(|held| required.is_subset(held));
         if everywhere && let Err(e) = spool.delivered(segment.seq) {
             host.warn("audit", &e.to_string());
+        }
+    }
+}
+
+/// Takes in the newest policy any copy or this device holds, and writes it
+/// to every copy that has none or an older one: a log turned on with no
+/// copies, or before a copy was added, reaches them this way. A policy
+/// naming a key other than the one this device pinned is never spread.
+async fn settle_audit_policy(
+    host: &dyn Host,
+    kek: &silentsilo_crypto::ContentKek,
+    targets: &[OpenTarget],
+    open: &(dyn Fn() -> Option<silentsilo_audit::Spool> + Sync),
+    now: i64,
+) {
+    use silentsilo_audit::{AuditKey, AuditPolicy, PolicyRead};
+
+    let (local_key, local_policy) = {
+        let Some(spool) = open() else { return };
+        (spool.key().ok().flatten(), spool.policy().ok().flatten())
+    };
+    // What each copy that answered holds; one that failed is left alone.
+    let mut on_copies: Vec<(&OpenTarget, Option<AuditPolicy>)> = Vec::new();
+    for target in targets {
+        match sync::audit_log::read_audit_policy(&*target.store, kek).await {
+            Ok(policy) => on_copies.push((target, policy)),
+            Err(e) => host.warn("audit", &format!("{}: {e}", target.label)),
+        }
+    }
+
+    let mut newest: Option<(AuditPolicy, AuditKey)> = local_policy
+        .zip(local_key.clone())
+        .filter(|(policy, key)| policy.key_id == key.key_id);
+    for (target, policy) in &on_copies {
+        let Some(policy) = policy else { continue };
+        if newest
+            .as_ref()
+            .is_some_and(|(n, _)| policy.changed_at <= n.changed_at)
+        {
+            continue;
+        }
+        let key = match local_key.as_ref().filter(|k| k.key_id == policy.key_id) {
+            Some(key) => key.clone(),
+            None => match sync::audit_log::read_audit_key(&*target.store, &policy.key_id).await {
+                Ok(Some(key)) => key,
+                Ok(None) => continue,
+                Err(e) => {
+                    host.warn("audit", &format!("{}: {e}", target.label));
+                    continue;
+                }
+            },
+        };
+        newest = Some((policy.clone(), key));
+    }
+    let Some((policy, key)) = newest else { return };
+
+    let read = {
+        let Some(mut spool) = open() else { return };
+        spool.apply_policy(&policy, &key, now)
+    };
+    match read {
+        Ok(PolicyRead::KeyChanged { pinned, named }) => {
+            host.warn(
+                "audit",
+                &format!(
+                    "the activity log names another key ({named}); this device goes on sealing to {pinned}"
+                ),
+            );
+            return;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            host.warn("audit", &e.to_string());
+            return;
+        }
+    }
+
+    for (target, held) in &on_copies {
+        if held
+            .as_ref()
+            .is_some_and(|held| held.changed_at >= policy.changed_at)
+        {
+            continue;
+        }
+        let published = async {
+            if sync::audit_log::read_audit_key(&*target.store, &key.key_id)
+                .await?
+                .is_none()
+            {
+                sync::audit_log::write_audit_key(&*target.store, &key).await?;
+            }
+            sync::audit_log::write_audit_policy(&*target.store, kek, &policy).await
+        };
+        if let Err(e) = published.await {
+            host.warn("audit", &format!("{}: {e}", target.label));
         }
     }
 }
@@ -1545,6 +1609,16 @@ async fn run_blob_sweep(
     let _ = silentsilo_vfs::snapshot::set_gc_first_seen(&mut session.conn, target, &seen);
     let _ = silentsilo_vfs::snapshot::record_sweep(&session.conn, target, now);
     Ok(restored)
+}
+
+/// A client runs the pass on a spawned task, so its future has to be `Send`.
+/// Checked here, where a change that breaks it fails to compile, rather than
+/// in the client that pins the next tag.
+#[allow(dead_code)]
+fn the_pass_runs_on_any_thread(state: &AppState, host: &dyn Host, silo: &SiloEntry) {
+    fn send<T: Send>(_: T) {}
+    send(run_sync_pass(state, host, silo));
+    send(sync_now(state, host, silo));
 }
 
 #[cfg(test)]

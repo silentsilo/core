@@ -24,6 +24,11 @@ release notes should say.
   pruning and sweep leave `audit/` byte for byte.
 - A seed copies `audit/`, and never writes over a segment the destination
   holds.
+- `AppState::set_audit_log` and `audit_status`: a personal silo's log is
+  turned on or off on the device, with or without copies; the queue keeps
+  the key and policy, and the pass writes the newest policy to every copy
+  that lacks it. Turned on again, it keeps its key. An organisation's log
+  cannot be turned off.
 - `silentsilo_app::record_lock`: the lock event and the segment it closes,
   for a client that closes its sessions itself.
 

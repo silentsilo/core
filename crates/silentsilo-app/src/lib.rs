@@ -20,8 +20,8 @@ mod sync_pass;
 
 pub use host::{AppEvent, Host};
 pub use state::{
-    AppState, MAX_OPEN_SILOS, SessionGuard, SessionSnapshot, open_scratch_dir, record_lock,
-    wipe_open_scratch,
+    AppState, AuditStatus, MAX_OPEN_SILOS, SessionGuard, SessionSnapshot, open_scratch_dir,
+    record_lock, wipe_open_scratch,
 };
 pub use store_config::{SftpAuthInput, StoreConfigInput, StoreConfigView};
 pub use sync_pass::{

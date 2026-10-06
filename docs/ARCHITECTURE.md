@@ -89,6 +89,10 @@ copy. A segment leaves the device only once every configured copy holds it,
 as a record does, so a copy in a drawer keeps it queued; a failure warns
 and never stops the sync. A policy that later names another key is not
 followed: the device goes on sealing to the key it pinned, and says so.
+A personal log is turned on and off on the device (`AppState::set_audit_log`),
+copies or not: the queue keeps the key and the policy, and the pass writes
+the newest policy, by `changed_at`, to every copy that lacks it
+(`settle_audit_policy`), so turning it on never waits for storage.
 The device's queue (`Spool`) is held under a file lock while it is open, so
 a command recording an event and the pass closing a segment take turns
 instead of numbering two events alike. The pass opens it for each local step

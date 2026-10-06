@@ -300,3 +300,122 @@ async fn a_lock_is_the_last_event_and_closes_its_segment() {
         .collect();
     assert_eq!(codes_written, vec![codes::UNLOCKED, codes::LOCKED]);
 }
+
+#[tokio::test]
+async fn a_log_turned_on_with_no_copies_records_at_once() {
+    let host = Copies(Vec::new(), true);
+    let device = Device::new(&host);
+    let id = device.silo.id;
+    assert!(!device.state.audit_status(id).unwrap().enabled);
+    device.state.set_audit_log(id, true).unwrap();
+    let status = device.state.audit_status(id).unwrap();
+    assert!(status.enabled && !status.organisation);
+    // The start, then what happened after it.
+    assert_eq!(
+        device
+            .state
+            .audit_record(id, Event::new(codes::SECRET_COPIED, 5))
+            .unwrap(),
+        Some(1)
+    );
+    assert_eq!(device.state.audit_status(id).unwrap().waiting, 2);
+}
+
+#[tokio::test]
+async fn a_log_turned_on_reaches_the_copies_and_turns_off_there_too() {
+    let a = tempfile::tempdir().unwrap();
+    let host = Copies(vec![copy(a.path())], true);
+    let device = Device::new(&host);
+    let id = device.silo.id;
+    let store = FolderStore::new(a.path().to_path_buf());
+
+    device.state.set_audit_log(id, true).unwrap();
+    run_sync_pass(&device.state, &host, &device.silo)
+        .await
+        .unwrap();
+    let on = silentsilo_sync::audit_log::read_audit_policy(&store, &device.kek())
+        .await
+        .unwrap()
+        .expect("published");
+    assert!(on.enabled);
+    let key = silentsilo_sync::audit_log::read_audit_key(&store, &on.key_id)
+        .await
+        .unwrap()
+        .expect("its key too");
+    // Whoever opens the silo reads its log.
+    assert!(
+        key.unwrap_with(silentsilo_audit::BY_SILO, device.kek().as_bytes())
+            .is_ok()
+    );
+
+    device.state.set_audit_log(id, false).unwrap();
+    assert_eq!(
+        device
+            .state
+            .audit_record(id, Event::new(codes::SECRET_COPIED, 5))
+            .unwrap(),
+        None,
+        "off"
+    );
+    run_sync_pass(&device.state, &host, &device.silo)
+        .await
+        .unwrap();
+    let off = silentsilo_sync::audit_log::read_audit_policy(&store, &device.kek())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!off.enabled);
+    assert!(off.changed_at > on.changed_at);
+
+    // On again, under the same key.
+    device.state.set_audit_log(id, true).unwrap();
+    assert_eq!(device.spool().policy().unwrap().unwrap().key_id, on.key_id);
+}
+
+#[tokio::test]
+async fn a_newer_policy_on_a_copy_wins_over_this_device_s() {
+    let a = tempfile::tempdir().unwrap();
+    let host = Copies(vec![copy(a.path())], true);
+    let device = Device::new(&host);
+    let id = device.silo.id;
+    let store = FolderStore::new(a.path().to_path_buf());
+    device.state.set_audit_log(id, true).unwrap();
+    run_sync_pass(&device.state, &host, &device.silo)
+        .await
+        .unwrap();
+
+    // Another device turned it off later.
+    let mut later = device.spool().policy().unwrap().unwrap();
+    later.enabled = false;
+    later.changed_at += 100;
+    silentsilo_sync::audit_log::write_audit_policy(&store, &device.kek(), &later)
+        .await
+        .unwrap();
+    // Read again at the next pass that finds the policy due.
+    {
+        let mut spool = device.spool();
+        let (policy, key) = (
+            spool.policy().unwrap().unwrap(),
+            spool.key().unwrap().unwrap(),
+        );
+        spool.apply_policy(&policy, &key, 0).unwrap();
+    }
+    run_sync_pass(&device.state, &host, &device.silo)
+        .await
+        .unwrap();
+    assert!(!device.state.audit_status(id).unwrap().enabled);
+}
+
+#[tokio::test]
+async fn an_organisation_log_cannot_be_turned_off() {
+    let host = Copies(Vec::new(), true);
+    let device = Device::new(&host);
+    let keys = KeyPair::generate();
+    let policy = AuditPolicy::new(true, &keys.id(), Some(365), Scope::Org, 1);
+    device
+        .spool()
+        .apply_policy(&policy, &AuditKey::new(&keys, Scope::Org, 1), 1)
+        .unwrap();
+    assert!(device.state.set_audit_log(device.silo.id, false).is_err());
+    assert!(device.state.audit_status(device.silo.id).unwrap().enabled);
+}
