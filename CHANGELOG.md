@@ -13,6 +13,9 @@ release notes should say.
 
 ### Added
 
+- Event code 15, "Signed with an SSH key", for the desktop's SSH agent,
+  and the optional `ssh_agent` flag on an SSH-key entry (`FORMATS.md`): an
+  older client keeps it when it saves the entry, shown by the 1.0.0 test.
 - `silentsilo-audit`: the format of the activity log, nothing that writes
   it yet. Each event is sealed alone with HPKE (RFC 9180) to the log's key,
   queued on the device (`audit-queue/` beside the silo, safe against a crash

@@ -80,6 +80,8 @@ pub mod codes {
     pub const CODE_COPIED: u16 = 12;
     pub const BROWSER_FILLED: u16 = 13;
     pub const APP_FILLED: u16 = 14;
+    /// The desktop's SSH agent signed with a key kept in the silo.
+    pub const SSH_SIGNED: u16 = 15;
 
     pub const ENTRY_CREATED: u16 = 20;
     pub const ENTRY_EDITED: u16 = 21;
@@ -124,6 +126,7 @@ pub fn describe(code: u16) -> String {
         CODE_COPIED => "One-time code copied",
         BROWSER_FILLED => "Filled in the browser",
         APP_FILLED => "Filled in an app",
+        SSH_SIGNED => "Signed with an SSH key",
         ENTRY_CREATED => "Entry created",
         ENTRY_EDITED => "Entry edited",
         ENTRY_DELETED => "Entry deleted",
@@ -190,6 +193,7 @@ mod tests {
             (CODE_COPIED, 12),
             (BROWSER_FILLED, 13),
             (APP_FILLED, 14),
+            (SSH_SIGNED, 15),
             (ENTRY_CREATED, 20),
             (ENTRY_EDITED, 21),
             (ENTRY_DELETED, 22),

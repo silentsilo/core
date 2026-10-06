@@ -1,5 +1,5 @@
-//! Custom fields and history live inside the password entry, as fields 1.0.0
-//! never heard of. What 1.0.0 does with them, by its own code: applies the
+//! Custom fields, history and the SSH agent flag live inside the password
+//! entry, as fields 1.0.0 never heard of. What 1.0.0 does with them, by its own code: applies the
 //! record, keeps the entry byte for byte, and carries it through its own
 //! snapshot, its compaction, and a device restored from that snapshot.
 
@@ -13,9 +13,9 @@ use silentsilo_vfs::{MAX_ENTRY_BYTES, Vfs};
 use silentsilo_vfs_v1_0_0 as vfs_v1;
 use uuid::Uuid;
 
-/// An entry as 1.4 writes it: two custom fields, one hidden, and a version
-/// in its history.
-const ENTRY: &str = r#"{"id":"0190a0a0-0000-7000-8000-00000000e001","service":"Bank","username":"ana","password":"new-pass","url":"https://bank.example","notes":"","category":"","created_at":1789000000000,"updated_at":1789000500000,"type":"login","fields":[{"name":"Customer number","value":"40021","hidden":false},{"name":"Card PIN","value":"1234","hidden":true}],"history":[{"saved_at":1789000000000,"service":"Bank","username":"ana","password":"old-pass","url":"https://bank.example","notes":"","type":"login","fields":[]}]}"#;
+/// An entry as 1.4 writes it: two custom fields, one hidden, a version in
+/// its history, and an SSH key offered to the agent.
+const ENTRY: &str = r#"{"id":"0190a0a0-0000-7000-8000-00000000e001","service":"Bank","username":"ana","password":"new-pass","url":"https://bank.example","notes":"","category":"","created_at":1789000000000,"updated_at":1789000500000,"type":"login","ssh_agent":true,"fields":[{"name":"Customer number","value":"40021","hidden":false},{"name":"Card PIN","value":"1234","hidden":true}],"history":[{"saved_at":1789000000000,"service":"Bank","username":"ana","password":"old-pass","url":"https://bank.example","notes":"","type":"login","fields":[]}]}"#;
 
 fn db() -> Connection {
     let conn = Connection::open_in_memory().unwrap();

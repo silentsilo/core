@@ -540,7 +540,12 @@ history alone would be swept. How many versions a client keeps is its own
 setting; the whole history stays under 256 KB.
 
 An older client shows neither, and keeps both when it saves the entry, but
-adds no version of its own. `upsert_password` refuses an entry over
+adds no version of its own.
+
+From desktop 1.4, an `ssh_key` entry may carry `"ssh_agent": true`: the
+desktop's SSH agent offers that key and signs with it, after the person
+confirms. Absent means no. An older client ignores it and keeps it when it
+saves the entry, like the fields above, and the same test carries it. `upsert_password` refuses an entry over
 `MAX_ENTRY_BYTES` (512 KB), so the record stays under the 1 MiB readers
 before core 1.4.0 accept. `silentsilo-fixture/tests/entry_fields_on_1_0_0.rs`
 replays, snapshots, compacts and restores such an entry with 1.0.0's code.
