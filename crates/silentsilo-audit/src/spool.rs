@@ -10,7 +10,10 @@
 //! - `state.json`: the next event number, the next segment number, the hash
 //!   of the last segment, and the number below which every event is already
 //!   in a segment;
-//! - `outbox/<seq>.seg`: closed segments waiting for every copy to hold them.
+//! - `outbox/<seq>.seg`: closed segments waiting for every copy to hold them;
+//! - `lock`: held by whoever has the spool open. One at a time, across
+//!   threads and processes: two holders would each read the state, move it
+//!   and write it back, and number two events alike.
 //!
 //! The order of writes is what makes a crash harmless. A record is appended
 //! and synced before the count moves past it; a segment is written whole
@@ -21,6 +24,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -28,6 +32,10 @@ use uuid::Uuid;
 use crate::{AuditError, AuditKey, AuditPolicy, Event, Scope, Segment, seal_event};
 
 pub const QUEUE_DIR: &str = "audit-queue";
+
+/// How long opening waits for another holder. Every holder is local work,
+/// never a network call, so this is only reached when something is stuck.
+const LOCK_WAIT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct State {
@@ -73,12 +81,16 @@ pub struct Spool {
     dir: PathBuf,
     device: Uuid,
     state: State,
+    /// Locked while the spool is open; dropping it lets the next one in.
+    _lock: File,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum SpoolError {
     #[error("the activity log could not be written on this computer: {0}")]
     Io(#[from] std::io::Error),
+    #[error("the activity log is held by another task on this computer")]
+    Busy,
     #[error(transparent)]
     Audit(#[from] AuditError),
 }
@@ -131,10 +143,33 @@ fn read_pending(path: &Path) -> std::io::Result<Vec<(u64, Vec<u8>)>> {
     Ok(out)
 }
 
+/// Takes the spool's lock, waiting up to [`LOCK_WAIT`] for another holder.
+fn take_lock(dir: &Path) -> Result<File, SpoolError> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join("lock"))?;
+    let started = Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(fs::TryLockError::WouldBlock) if started.elapsed() < LOCK_WAIT => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(fs::TryLockError::WouldBlock) => return Err(SpoolError::Busy),
+            Err(fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
+    }
+}
+
 impl Spool {
+    /// Opens the spool, waiting for anyone else who has it open. Keep it
+    /// open only for local work: never across a network call.
     pub fn open(silo_root: &Path, device: Uuid) -> Result<Self, SpoolError> {
         let dir = silo_root.join(QUEUE_DIR);
         fs::create_dir_all(dir.join("outbox"))?;
+        let lock = take_lock(&dir)?;
         let mut state: State = match fs::read(dir.join("state.json")) {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(AuditError::from)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => State::default(),
@@ -144,11 +179,14 @@ impl Spool {
         if let Some((last, _)) = read_pending(&dir.join("pending"))?.last() {
             state.next_event = state.next_event.max(last + 1);
         }
-        Ok(Self { dir, device, state })
+        Ok(Self {
+            dir,
+            device,
+            state,
+            _lock: lock,
+        })
     }
 
-    /// Seals `event` to `public_key` and queues it. Returns once it is on
-    /// disk; the number it was given is set on it.
     /// What this device logs to, if it has been told.
     pub fn pinned(&self) -> Option<&Pinned> {
         self.state.pinned.as_ref()
@@ -218,6 +256,8 @@ impl Spool {
         self.record_to(&public, event).map(Some)
     }
 
+    /// Seals `event` to `public_key` and queues it. Returns once it is on
+    /// disk, with the number it was given.
     fn record_to(&mut self, public_key: &[u8], mut event: Event) -> Result<u64, SpoolError> {
         event.i = self.state.next_event;
         let sealed = seal_event(public_key, self.device, &event)?;
@@ -432,6 +472,7 @@ mod tests {
             br#"{"next_event":0,"next_segment":0,"last_hash":"","closed_through":0}"#,
         )
         .unwrap();
+        drop(spool);
 
         let mut spool = Spool::open(dir.path(), device).unwrap();
         assert_eq!(spool.record_to(&keys.public, Event::new(2, 2)).unwrap(), 1);
@@ -449,6 +490,7 @@ mod tests {
         let pending = dir.path().join(QUEUE_DIR).join("pending");
         let mut file = OpenOptions::new().append(true).open(&pending).unwrap();
         file.write_all(&[0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1]).unwrap();
+        drop(spool);
 
         let mut spool = Spool::open(dir.path(), device).unwrap();
         let segment = spool.close(5).unwrap().unwrap();
@@ -481,6 +523,7 @@ mod tests {
         file.write_all(&(sealed.len() as u32).to_be_bytes())
             .unwrap();
         file.write_all(&sealed).unwrap();
+        drop(spool);
 
         let mut spool = Spool::open(dir.path(), device).unwrap();
         assert!(spool.close(6).unwrap().is_none(), "already in a segment");
@@ -492,5 +535,39 @@ mod tests {
         let events = events_in(&segments, &keys);
         assert_eq!(events.iter().map(|e| e.i).collect::<Vec<_>>(), vec![0, 1]);
         assert!(check_chain(&segments, 0).is_whole());
+    }
+
+    /// A command recording while the sync pass closes a segment: each opens
+    /// its own spool, and the lock keeps the count whole.
+    #[test]
+    fn spools_opened_at_once_take_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = KeyPair::generate();
+        let device = Uuid::new_v4();
+        let workers: Vec<_> = (0..4)
+            .map(|w| {
+                let root = dir.path().to_path_buf();
+                let public = keys.public.clone();
+                std::thread::spawn(move || {
+                    for n in 0..25 {
+                        let mut spool = Spool::open(&root, device).unwrap();
+                        spool.record_to(&public, Event::new(1, n)).unwrap();
+                        if (w + n) % 7 == 0 {
+                            spool.close(n).unwrap();
+                        }
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let mut spool = Spool::open(dir.path(), device).unwrap();
+        spool.close(100).unwrap();
+        let segments = spool.outbox().unwrap();
+        assert!(check_chain(&segments, 0).is_whole());
+        let mut numbers: Vec<u64> = events_in(&segments, &keys).iter().map(|e| e.i).collect();
+        numbers.sort_unstable();
+        assert_eq!(numbers, (0..100).collect::<Vec<_>>());
     }
 }

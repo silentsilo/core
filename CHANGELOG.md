@@ -24,6 +24,8 @@ release notes should say.
   pruning and sweep leave `audit/` byte for byte.
 - A seed copies `audit/`, and never writes over a segment the destination
   holds.
+- `silentsilo_app::record_lock`: the lock event and the segment it closes,
+  for a client that closes its sessions itself.
 
 ### Fixed
 
@@ -46,6 +48,14 @@ release notes should say.
   just removed. Only the source a copy currently uses writes its token now.
 - Joining read `keys/content.kek` and every revocation marker as if they
   were key envelopes, and logged each one as unreadable.
+- The activity log's queue on the device had no lock: an event recorded
+  while the pass closed a segment could take a number already used. The
+  queue is now held under a file lock while open, and the pass holds it only
+  for local work, never across an upload.
+- `audit_is_mandatory` answered no for an organisation's silo whose queue
+  could no longer be read, which let a client go on unrecorded exactly when
+  writing failed. A silo seen with an organisation's log now stays mandatory
+  for as long as the process runs.
 
 ### Added
 

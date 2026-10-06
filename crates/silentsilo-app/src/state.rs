@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
@@ -54,6 +54,10 @@ pub struct AppState {
     /// firing while the user is holding the button, would each read the
     /// same pending queue and upload it twice.
     pub sync_in_flight: AtomicBool,
+    /// Silos this process has seen keep an organisation's log. Never
+    /// forgotten while it runs: a queue that later cannot be read must not
+    /// make such a silo look like one that may go on unrecorded.
+    audit_org: Mutex<HashSet<Uuid>>,
 }
 
 /// The focused silo's session, held for as long as the caller needs it.
@@ -166,6 +170,35 @@ impl AppState {
         id: Uuid,
         event: silentsilo_audit::Event,
     ) -> Result<Option<u64>, String> {
+        let mut spool = self.audit_spool(id)?;
+        spool.record(event).map_err(|e| e.to_string())
+    }
+
+    /// Whether the open silo's log is an organisation's, which this device
+    /// may not go on without. Once seen, remembered: a queue that can no
+    /// longer be read still answers yes.
+    pub fn audit_is_mandatory(&self, id: Uuid) -> bool {
+        // A poisoned lock answers yes: wrongly locking beats going on
+        // unrecorded.
+        if self
+            .audit_org
+            .lock()
+            .map(|org| org.contains(&id))
+            .unwrap_or(true)
+        {
+            return true;
+        }
+        self.audit_spool(id).is_ok_and(|spool| {
+            spool
+                .pinned()
+                .is_some_and(|p| p.scope == silentsilo_audit::Scope::Org)
+        })
+    }
+
+    /// The open silo's queue, noting on the way whether its log is an
+    /// organisation's. Opened outside the sessions lock: it may wait for
+    /// the sync pass.
+    fn audit_spool(&self, id: Uuid) -> Result<silentsilo_audit::Spool, String> {
         let (root, device) = {
             let sessions = self.sessions.lock().map_err(|e| e.to_string())?;
             let session = sessions.get(&id).ok_or("That silo is not open.")?;
@@ -174,29 +207,15 @@ impl AppState {
                 silentsilo_vfs::device_id(&session.conn).map_err(|e| e.to_string())?,
             )
         };
-        silentsilo_audit::Spool::open(&root, device)
-            .and_then(|mut spool| spool.record(event))
-            .map_err(|e| e.to_string())
-    }
-
-    /// Whether the open silo's log is an organisation's, which this device
-    /// may not go on without.
-    pub fn audit_is_mandatory(&self, id: Uuid) -> bool {
-        let Ok(sessions) = self.sessions.lock() else {
-            return false;
-        };
-        let Some(session) = sessions.get(&id) else {
-            return false;
-        };
-        silentsilo_vfs::device_id(&session.conn)
-            .ok()
-            .and_then(|device| silentsilo_audit::Spool::open(&session.paths.root, device).ok())
-            .and_then(|spool| {
-                spool
-                    .pinned()
-                    .map(|p| p.scope == silentsilo_audit::Scope::Org)
-            })
-            .unwrap_or(false)
+        let spool = silentsilo_audit::Spool::open(&root, device).map_err(|e| e.to_string())?;
+        if spool
+            .pinned()
+            .is_some_and(|p| p.scope == silentsilo_audit::Scope::Org)
+            && let Ok(mut org) = self.audit_org.lock()
+        {
+            org.insert(id);
+        }
+        Ok(spool)
     }
 
     /// Removes the plaintext scratch of every silo that is not open, including
@@ -360,24 +379,28 @@ fn close_one(host: &dyn Host, session: VaultSession) {
 /// The lock as the session's last event, and the batch it ends closed into a
 /// segment at once: the next pass sends it, whenever that is.
 fn log_lock(host: &dyn Host, session: &VaultSession) {
-    let Ok(device) = silentsilo_vfs::device_id(&session.conn) else {
-        return;
-    };
+    if let Err(e) = record_lock(session) {
+        host.warn("audit", &e);
+    }
+}
+
+/// What [`AppState::close_session`] records as it locks, for a client that
+/// closes its sessions itself. Call it before the session is dropped.
+pub fn record_lock(session: &VaultSession) -> Result<(), String> {
+    let device = silentsilo_vfs::device_id(&session.conn).map_err(|e| e.to_string())?;
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    let logged =
-        silentsilo_audit::Spool::open(&session.paths.root, device).and_then(|mut spool| {
+    silentsilo_audit::Spool::open(&session.paths.root, device)
+        .and_then(|mut spool| {
             spool.record(silentsilo_audit::Event::new(
                 silentsilo_audit::codes::LOCKED,
                 now_ms,
             ))?;
             spool.close(now_ms).map(|_| ())
-        });
-    if let Err(e) = logged {
-        host.warn("audit", &e.to_string());
-    }
+        })
+        .map_err(|e| e.to_string())
 }
 
 /// Where a file goes when the user opens it rather than exporting it.

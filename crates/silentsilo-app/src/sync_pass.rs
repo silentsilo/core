@@ -292,20 +292,25 @@ async fn deliver_audit(
     required: &std::collections::HashSet<Uuid>,
     now: i64,
 ) {
-    use silentsilo_audit::{PolicyRead, Spool};
+    use silentsilo_audit::{AuditKey, AuditPolicy, PolicyRead, Spool};
 
-    let mut spool = match Spool::open(root, device) {
-        Ok(spool) => spool,
+    // The spool is opened for each local step and closed before the network:
+    // a command recording an event waits for it.
+    let open = || match Spool::open(root, device) {
+        Ok(spool) => Some(spool),
         Err(e) => {
             host.warn("audit", &e.to_string());
-            return;
+            None
         }
     };
 
+    let Some(spool) = open() else { return };
     let stale = spool
         .pinned()
         .is_none_or(|p| now.saturating_sub(p.checked_at) >= AUDIT_POLICY_EVERY);
+    drop(spool);
     if stale {
+        let mut found: Option<(AuditPolicy, AuditKey)> = None;
         for target in targets {
             let policy = match sync::audit_log::read_audit_policy(&*target.store, kek).await {
                 Ok(Some(policy)) => policy,
@@ -317,39 +322,46 @@ async fn deliver_audit(
             };
             match sync::audit_log::read_audit_key(&*target.store, &policy.key_id).await {
                 Ok(Some(key)) => {
-                    match spool.apply_policy(&policy, &key, now) {
-                        Ok(PolicyRead::KeyChanged { pinned, named }) => host.warn(
-                            "audit",
-                            &format!(
-                                "the activity log names another key ({named}); this device goes on sealing to {pinned}"
-                            ),
-                        ),
-                        Ok(_) => {}
-                        Err(e) => host.warn("audit", &e.to_string()),
-                    }
+                    found = Some((policy, key));
                     break;
                 }
                 Ok(None) => continue,
                 Err(e) => host.warn("audit", &format!("{}: {e}", target.label)),
             }
         }
-    }
-    if spool.pinned().is_none() {
-        return;
+        if let Some((policy, key)) = found {
+            let Some(mut spool) = open() else { return };
+            match spool.apply_policy(&policy, &key, now) {
+                Ok(PolicyRead::KeyChanged { pinned, named }) => host.warn(
+                    "audit",
+                    &format!(
+                        "the activity log names another key ({named}); this device goes on sealing to {pinned}"
+                    ),
+                ),
+                Ok(_) => {}
+                Err(e) => host.warn("audit", &e.to_string()),
+            }
+        }
     }
 
     let now_ms = now.saturating_mul(1000);
-    if spool.due(now_ms, AUDIT_SEGMENT_EVERY_MS)
-        && let Err(e) = spool.close(now_ms)
-    {
-        host.warn("audit", &e.to_string());
-    }
-    let outbox = match spool.outbox() {
-        Ok(outbox) if !outbox.is_empty() => outbox,
-        Ok(_) => return,
-        Err(e) => {
-            host.warn("audit", &e.to_string());
+    let outbox = {
+        let Some(mut spool) = open() else { return };
+        if spool.pinned().is_none() {
             return;
+        }
+        if spool.due(now_ms, AUDIT_SEGMENT_EVERY_MS)
+            && let Err(e) = spool.close(now_ms)
+        {
+            host.warn("audit", &e.to_string());
+        }
+        match spool.outbox() {
+            Ok(outbox) if !outbox.is_empty() => outbox,
+            Ok(_) => return,
+            Err(e) => {
+                host.warn("audit", &e.to_string());
+                return;
+            }
         }
     };
 
@@ -365,6 +377,7 @@ async fn deliver_audit(
             Err(e) => host.warn("audit", &format!("{}: {e}", target.label)),
         }
     }
+    let Some(spool) = open() else { return };
     for segment in &outbox {
         let everywhere = holders
             .get(&segment.seq)

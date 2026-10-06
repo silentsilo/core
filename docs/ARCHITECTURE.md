@@ -89,6 +89,11 @@ copy. A segment leaves the device only once every configured copy holds it,
 as a record does, so a copy in a drawer keeps it queued; a failure warns
 and never stops the sync. A policy that later names another key is not
 followed: the device goes on sealing to the key it pinned, and says so.
+The device's queue (`Spool`) is held under a file lock while it is open, so
+a command recording an event and the pass closing a segment take turns
+instead of numbering two events alike. The pass opens it for each local step
+and never across a network call, which keeps a recording command's wait
+short.
 
 The extract binary deliberately reuses the same crates rather than
 reimplementing the read path: a second interpretation of the log is a second

@@ -160,6 +160,7 @@ async fn events_reach_every_copy_before_they_leave_the_device() {
         .record(Event::new(codes::SECRET_COPIED, 2).on("e1", "Bank"))
         .unwrap();
     spool.close(3).unwrap();
+    drop(spool);
 
     // B unplugged: the segment reaches A and stays here.
     unplug(&b);
@@ -197,6 +198,57 @@ async fn events_reach_every_copy_before_they_leave_the_device() {
     let event = open_event(&keys.private, device.id(), &on_b[0].records[0]).unwrap();
     assert_eq!(event.c, codes::SECRET_COPIED);
     assert_eq!(event.l.as_deref(), Some("Bank"));
+}
+
+#[tokio::test]
+async fn an_organisation_log_stays_mandatory_when_its_queue_breaks() {
+    let host = Copies(Vec::new(), true);
+    let device = Device::new(&host);
+    let id = device.silo.id;
+    let keys = KeyPair::generate();
+    let policy = AuditPolicy::new(true, &keys.id(), Some(365), Scope::Org, 1);
+    device
+        .spool()
+        .apply_policy(&policy, &AuditKey::new(&keys, Scope::Org, 1), 1)
+        .unwrap();
+    assert_eq!(
+        device
+            .state
+            .audit_record(id, Event::new(codes::UNLOCKED, 1))
+            .unwrap(),
+        Some(0)
+    );
+
+    let state = device
+        .silo
+        .path
+        .join(silentsilo_audit::QUEUE_DIR)
+        .join("state.json");
+    std::fs::write(&state, b"not json").unwrap();
+    assert!(
+        device
+            .state
+            .audit_record(id, Event::new(codes::SECRET_COPIED, 2))
+            .is_err()
+    );
+    assert!(
+        device.state.audit_is_mandatory(id),
+        "still an organisation's"
+    );
+}
+
+#[tokio::test]
+async fn a_personal_silo_with_a_broken_queue_is_not_mandatory() {
+    let host = Copies(Vec::new(), true);
+    let device = Device::new(&host);
+    let state = device
+        .silo
+        .path
+        .join(silentsilo_audit::QUEUE_DIR)
+        .join("state.json");
+    std::fs::create_dir_all(state.parent().unwrap()).unwrap();
+    std::fs::write(&state, b"not json").unwrap();
+    assert!(!device.state.audit_is_mandatory(device.silo.id));
 }
 
 #[tokio::test]
