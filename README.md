@@ -24,12 +24,16 @@ from this repository. Mobile clients will do the same.
 | `silentsilo-vault` | Silo provisioning, keys on disk, the index sealed at rest and ciphered while open |
 | `silentsilo-vfs` | Operation log, folder and file tree, name resolution, snapshots |
 | `silentsilo-sync` | Bucket layout and the transport half of a sync pass |
+| `silentsilo-app` | What every client shares: sessions, the sync pass, the recovery and device-key flows |
 | `silentsilo-store` | Backup storage: bucket, folder, WebDAV or SFTP |
+| `silentsilo-cloud` | OneDrive, Dropbox and Google Drive: sign-in, tokens, stores |
+| `silentsilo-audit` | The activity log: events sealed with HPKE, chained segments, the device queue |
 | `silentsilo-s3` | S3-compatible object storage client |
 | `silentsilo-fido` | FIDO2 security keys and Windows Hello |
 | `silentsilo-extract` | Standalone recovery binary, no interface, no hardware key |
 | `silentsilo-fixture` | Format compatibility corpus |
 | `silentsilo-testkit` | Dev-only: hostile conditions, skip detector |
+| `silentsilo-soak` | Dev-only: long runs of several devices against real storage |
 
 ## Recovering a silo without this project
 

@@ -138,6 +138,10 @@ impl AuditKey {
 pub struct AuditPolicy {
     pub version: u32,
     pub enabled: bool,
+    /// The key events are sealed to, by id (`audit/keys/<id>.json`). A
+    /// device pins the first it is told and does not follow a change to
+    /// another in silence.
+    pub key_id: String,
     /// Segments older than this many days may go; `None` keeps them.
     pub retention_days: Option<u32>,
     pub scope: Scope,
@@ -147,10 +151,17 @@ pub struct AuditPolicy {
 pub const POLICY_PATH: &str = "audit/policy.sealed";
 
 impl AuditPolicy {
-    pub fn new(enabled: bool, retention_days: Option<u32>, scope: Scope, changed_at: i64) -> Self {
+    pub fn new(
+        enabled: bool,
+        key_id: &KeyId,
+        retention_days: Option<u32>,
+        scope: Scope,
+        changed_at: i64,
+    ) -> Self {
         Self {
             version: POLICY_VERSION,
             enabled,
+            key_id: hex::encode(key_id),
             retention_days,
             scope,
             changed_at,
@@ -207,7 +218,7 @@ mod tests {
 
     #[test]
     fn the_policy_opens_with_the_content_key_only() {
-        let policy = AuditPolicy::new(true, Some(365), Scope::Silo, 7);
+        let policy = AuditPolicy::new(true, &[3; 8], Some(365), Scope::Silo, 7);
         let sealed = policy.seal(&[9; 32]).unwrap();
         assert_eq!(AuditPolicy::open(&sealed, &[9; 32]).unwrap(), policy);
         assert!(AuditPolicy::open(&sealed, &[8; 32]).is_err());

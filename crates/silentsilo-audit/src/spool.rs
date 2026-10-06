@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{AuditError, Event, Segment, seal_event};
+use crate::{AuditError, AuditKey, AuditPolicy, Event, Scope, Segment, seal_event};
 
 pub const QUEUE_DIR: &str = "audit-queue";
 
@@ -36,6 +36,37 @@ struct State {
     last_hash: String,
     /// Every event below this number is in a segment already.
     closed_through: u64,
+    /// When the oldest event not yet in a segment happened.
+    #[serde(default)]
+    pending_since: Option<i64>,
+    #[serde(default)]
+    pinned: Option<Pinned>,
+}
+
+/// The log this device writes to, as storage first told it. Kept here so a
+/// device records offline, and so a key named later is not followed in
+/// silence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pinned {
+    pub key_id: String,
+    pub public_key: String,
+    pub scope: Scope,
+    pub enabled: bool,
+    pub retention_days: Option<u32>,
+    /// When the policy was last read from storage, in seconds.
+    pub checked_at: i64,
+}
+
+/// What reading the policy again changed.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PolicyRead {
+    /// The first key this device has heard of, now pinned.
+    Pinned,
+    /// The same key; the setting or the retention may have moved.
+    Kept,
+    /// The policy names another key. Not followed: the device goes on
+    /// sealing to the pinned one, and says so.
+    KeyChanged { pinned: String, named: String },
 }
 
 pub struct Spool {
@@ -118,7 +149,76 @@ impl Spool {
 
     /// Seals `event` to `public_key` and queues it. Returns once it is on
     /// disk; the number it was given is set on it.
-    pub fn record(&mut self, public_key: &[u8], mut event: Event) -> Result<u64, SpoolError> {
+    /// What this device logs to, if it has been told.
+    pub fn pinned(&self) -> Option<&Pinned> {
+        self.state.pinned.as_ref()
+    }
+
+    /// Takes in the policy and the key it names, as read from storage at
+    /// `now` (seconds).
+    pub fn apply_policy(
+        &mut self,
+        policy: &AuditPolicy,
+        key: &AuditKey,
+        now: i64,
+    ) -> Result<PolicyRead, SpoolError> {
+        if key.key_id != policy.key_id {
+            return Err(AuditError::BadKey.into());
+        }
+        let public = hex::encode(key.public()?);
+        let read = match &self.state.pinned {
+            Some(pinned) if pinned.key_id != policy.key_id => PolicyRead::KeyChanged {
+                pinned: pinned.key_id.clone(),
+                named: policy.key_id.clone(),
+            },
+            Some(_) => PolicyRead::Kept,
+            None => PolicyRead::Pinned,
+        };
+        let (key_id, public_key) = match (&read, &self.state.pinned) {
+            (PolicyRead::KeyChanged { .. }, Some(pinned)) => {
+                (pinned.key_id.clone(), pinned.public_key.clone())
+            }
+            _ => (policy.key_id.clone(), public),
+        };
+        self.state.pinned = Some(Pinned {
+            key_id,
+            public_key,
+            // An organisation's log does not stop because its policy says so.
+            enabled: policy.enabled || key.scope == Scope::Org,
+            scope: key.scope,
+            retention_days: policy.retention_days,
+            checked_at: now,
+        });
+        self.save_state()?;
+        Ok(read)
+    }
+
+    fn save_state(&self) -> Result<(), SpoolError> {
+        write_whole(
+            &self.dir.join("state.json"),
+            &serde_json::to_vec(&self.state).map_err(AuditError::from)?,
+        )?;
+        Ok(())
+    }
+
+    /// Whether the oldest event waiting is `after_ms` old by `now_ms`.
+    pub fn due(&self, now_ms: i64, after_ms: i64) -> bool {
+        self.state
+            .pending_since
+            .is_some_and(|since| now_ms.saturating_sub(since) >= after_ms)
+    }
+
+    /// Records `event` in the log this device was told of. `None` when there
+    /// is none, or it is off: a personal silo that never turned it on.
+    pub fn record(&mut self, event: Event) -> Result<Option<u64>, SpoolError> {
+        let Some(pinned) = self.state.pinned.clone().filter(|p| p.enabled) else {
+            return Ok(None);
+        };
+        let public = hex::decode(&pinned.public_key).map_err(|_| AuditError::BadKey)?;
+        self.record_to(&public, event).map(Some)
+    }
+
+    fn record_to(&mut self, public_key: &[u8], mut event: Event) -> Result<u64, SpoolError> {
         event.i = self.state.next_event;
         let sealed = seal_event(public_key, self.device, &event)?;
         let mut file = OpenOptions::new()
@@ -130,10 +230,10 @@ impl Spool {
         file.write_all(&sealed)?;
         file.sync_all()?;
         self.state.next_event = event.i + 1;
-        write_whole(
-            &self.dir.join("state.json"),
-            &serde_json::to_vec(&self.state).map_err(AuditError::from)?,
-        )?;
+        if self.state.pending_since.is_none() {
+            self.state.pending_since = Some(event.t);
+        }
+        self.save_state()?;
         Ok(event.i)
     }
 
@@ -167,10 +267,8 @@ impl Spool {
         self.state.next_segment = segment.seq + 1;
         self.state.last_hash = hex::encode(segment.hash());
         self.state.closed_through = through;
-        write_whole(
-            &self.dir.join("state.json"),
-            &serde_json::to_vec(&self.state).map_err(AuditError::from)?,
-        )?;
+        self.state.pending_since = None;
+        self.save_state()?;
         let _ = fs::remove_file(self.dir.join("pending"));
         Ok(Some(segment))
     }
@@ -214,6 +312,7 @@ impl Spool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{AuditKey, AuditPolicy, Scope};
     use crate::{KeyPair, check_chain, codes, counter_gaps, open_event};
 
     fn events_in(segments: &[Segment], keys: &KeyPair) -> Vec<Event> {
@@ -235,12 +334,12 @@ mod tests {
         let mut spool = Spool::open(dir.path(), device).unwrap();
         for _ in 0..3 {
             spool
-                .record(&keys.public, Event::new(codes::SECRET_COPIED, 1))
+                .record_to(&keys.public, Event::new(codes::SECRET_COPIED, 1))
                 .unwrap();
         }
         let first = spool.close(10).unwrap().unwrap();
         spool
-            .record(&keys.public, Event::new(codes::LOCKED, 2))
+            .record_to(&keys.public, Event::new(codes::LOCKED, 2))
             .unwrap();
         let second = spool.close(20).unwrap().unwrap();
         assert!(spool.close(30).unwrap().is_none(), "nothing pending");
@@ -260,16 +359,63 @@ mod tests {
     }
 
     #[test]
+    fn nothing_is_recorded_until_the_device_is_told_of_a_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut spool = Spool::open(dir.path(), Uuid::new_v4()).unwrap();
+        assert_eq!(spool.record(Event::new(1, 1)).unwrap(), None);
+
+        let keys = KeyPair::generate();
+        let key = AuditKey::new(&keys, Scope::Silo, 1);
+        let off = AuditPolicy::new(false, &keys.id(), None, Scope::Silo, 1);
+        spool.apply_policy(&off, &key, 10).unwrap();
+        assert_eq!(spool.record(Event::new(1, 1)).unwrap(), None, "turned off");
+
+        let on = AuditPolicy::new(true, &keys.id(), Some(365), Scope::Silo, 2);
+        assert_eq!(spool.apply_policy(&on, &key, 20).unwrap(), PolicyRead::Kept);
+        assert_eq!(spool.record(Event::new(1, 1_000)).unwrap(), Some(0));
+        assert!(!spool.due(1_000 + 899_999, 900_000));
+        assert!(spool.due(1_000 + 900_000, 900_000));
+    }
+
+    #[test]
+    fn an_organisation_log_stays_on_and_its_key_stays_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut spool = Spool::open(dir.path(), Uuid::new_v4()).unwrap();
+        let keys = KeyPair::generate();
+        let key = AuditKey::new(&keys, Scope::Org, 1);
+        let policy = AuditPolicy::new(false, &keys.id(), Some(365), Scope::Org, 1);
+        assert_eq!(
+            spool.apply_policy(&policy, &key, 10).unwrap(),
+            PolicyRead::Pinned
+        );
+        assert!(spool.pinned().unwrap().enabled, "off does not stop it");
+
+        // Someone with the content key names a key of their own.
+        let theirs = KeyPair::generate();
+        let their_key = AuditKey::new(&theirs, Scope::Org, 2);
+        let swapped = AuditPolicy::new(true, &theirs.id(), None, Scope::Org, 2);
+        let read = spool.apply_policy(&swapped, &their_key, 20).unwrap();
+        assert!(matches!(read, PolicyRead::KeyChanged { .. }));
+        assert_eq!(spool.pinned().unwrap().key_id, hex::encode(keys.id()));
+
+        // What it writes still opens with the organisation's key only.
+        spool.record(Event::new(11, 5)).unwrap();
+        let segment = spool.close(6).unwrap().unwrap();
+        assert!(open_event(&keys.private, segment.device, &segment.records[0]).is_ok());
+        assert!(open_event(&theirs.private, segment.device, &segment.records[0]).is_err());
+    }
+
+    #[test]
     fn the_count_carries_on_after_a_restart() {
         let dir = tempfile::tempdir().unwrap();
         let keys = KeyPair::generate();
         let device = Uuid::new_v4();
         Spool::open(dir.path(), device)
             .unwrap()
-            .record(&keys.public, Event::new(1, 1))
+            .record_to(&keys.public, Event::new(1, 1))
             .unwrap();
         let mut again = Spool::open(dir.path(), device).unwrap();
-        assert_eq!(again.record(&keys.public, Event::new(2, 2)).unwrap(), 1);
+        assert_eq!(again.record_to(&keys.public, Event::new(2, 2)).unwrap(), 1);
     }
 
     #[test]
@@ -278,7 +424,7 @@ mod tests {
         let keys = KeyPair::generate();
         let device = Uuid::new_v4();
         let mut spool = Spool::open(dir.path(), device).unwrap();
-        spool.record(&keys.public, Event::new(1, 1)).unwrap();
+        spool.record_to(&keys.public, Event::new(1, 1)).unwrap();
         // Dies after the append, before the state was written.
         let state = dir.path().join(QUEUE_DIR).join("state.json");
         fs::write(
@@ -288,7 +434,7 @@ mod tests {
         .unwrap();
 
         let mut spool = Spool::open(dir.path(), device).unwrap();
-        assert_eq!(spool.record(&keys.public, Event::new(2, 2)).unwrap(), 1);
+        assert_eq!(spool.record_to(&keys.public, Event::new(2, 2)).unwrap(), 1);
         let segment = spool.close(5).unwrap().unwrap();
         assert!(counter_gaps(&events_in(&[segment], &keys), 0).is_empty());
     }
@@ -299,7 +445,7 @@ mod tests {
         let keys = KeyPair::generate();
         let device = Uuid::new_v4();
         let mut spool = Spool::open(dir.path(), device).unwrap();
-        spool.record(&keys.public, Event::new(1, 1)).unwrap();
+        spool.record_to(&keys.public, Event::new(1, 1)).unwrap();
         let pending = dir.path().join(QUEUE_DIR).join("pending");
         let mut file = OpenOptions::new().append(true).open(&pending).unwrap();
         file.write_all(&[0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1]).unwrap();
@@ -315,7 +461,7 @@ mod tests {
         let keys = KeyPair::generate();
         let device = Uuid::new_v4();
         let mut spool = Spool::open(dir.path(), device).unwrap();
-        spool.record(&keys.public, Event::new(1, 1)).unwrap();
+        spool.record_to(&keys.public, Event::new(1, 1)).unwrap();
         spool.close(5).unwrap();
         // Dies after the state, before the pending file was emptied: what is
         // left there is already in segment 0.
@@ -338,7 +484,7 @@ mod tests {
 
         let mut spool = Spool::open(dir.path(), device).unwrap();
         assert!(spool.close(6).unwrap().is_none(), "already in a segment");
-        spool.record(&keys.public, Event::new(2, 2)).unwrap();
+        spool.record_to(&keys.public, Event::new(2, 2)).unwrap();
         let segments = {
             spool.close(7).unwrap();
             spool.outbox().unwrap()

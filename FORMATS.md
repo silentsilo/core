@@ -609,8 +609,9 @@ key derived for this purpose alone (BLAKE3 `derive_key`, context
 match its id is refused.
 
 **The policy**, `audit/policy.sealed`, sealed under the content KEK: whether
-the log is on, the retention in days (absent means kept), the scope and when
-it changed. On an administered silo the log is on whatever it says; only
+the log is on, the id of the key events are sealed to, the retention in days
+(absent means kept), the scope and when it changed. A device pins the key it
+is first told and does not follow a policy that names another in silence. On an administered silo the log is on whatever it says; only
 the retention is read from it, and only the holder of an organisation key
 deletes a segment, whole, once it is past the retention.
 

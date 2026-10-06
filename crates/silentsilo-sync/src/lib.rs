@@ -26,6 +26,7 @@ use silentsilo_vault::{
 use std::path::Path;
 use uuid::Uuid;
 
+pub mod audit_log;
 mod error;
 pub mod inbox;
 mod key_sync;

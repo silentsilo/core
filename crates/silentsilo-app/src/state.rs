@@ -154,6 +154,51 @@ impl AppState {
         Ok(())
     }
 
+    /// Records `event` in the open silo's activity log. `Ok(None)` when the
+    /// silo keeps none. An error means the event could not be written on
+    /// this computer; on a silo whose log is an organisation's
+    /// ([`audit_is_mandatory`]), the client locks it rather than go on
+    /// unrecorded.
+    ///
+    /// [`audit_is_mandatory`]: AppState::audit_is_mandatory
+    pub fn audit_record(
+        &self,
+        id: Uuid,
+        event: silentsilo_audit::Event,
+    ) -> Result<Option<u64>, String> {
+        let (root, device) = {
+            let sessions = self.sessions.lock().map_err(|e| e.to_string())?;
+            let session = sessions.get(&id).ok_or("That silo is not open.")?;
+            (
+                session.paths.root.clone(),
+                silentsilo_vfs::device_id(&session.conn).map_err(|e| e.to_string())?,
+            )
+        };
+        silentsilo_audit::Spool::open(&root, device)
+            .and_then(|mut spool| spool.record(event))
+            .map_err(|e| e.to_string())
+    }
+
+    /// Whether the open silo's log is an organisation's, which this device
+    /// may not go on without.
+    pub fn audit_is_mandatory(&self, id: Uuid) -> bool {
+        let Ok(sessions) = self.sessions.lock() else {
+            return false;
+        };
+        let Some(session) = sessions.get(&id) else {
+            return false;
+        };
+        silentsilo_vfs::device_id(&session.conn)
+            .ok()
+            .and_then(|device| silentsilo_audit::Spool::open(&session.paths.root, device).ok())
+            .and_then(|spool| {
+                spool
+                    .pinned()
+                    .map(|p| p.scope == silentsilo_audit::Scope::Org)
+            })
+            .unwrap_or(false)
+    }
+
     /// Removes the plaintext scratch of every silo that is not open, including
     /// what a crash or kill left behind, and keeps their ciphered working
     /// copies. The client calls it at start and after each lock; not from
@@ -303,12 +348,36 @@ fn stalest(ids: impl Iterator<Item = Uuid>, touched: &HashMap<Uuid, Instant>) ->
 /// The session is dropped before anything is removed: Windows will not
 /// delete a file that still has an open handle.
 fn close_one(host: &dyn Host, session: VaultSession) {
+    log_lock(host, &session);
     if let Err(e) = session.seal_for_lock() {
         host.warn("lock", &format!("local snapshot failed: {e}"));
     }
     let paths = session.paths.clone();
     drop(session);
     silentsilo_vault::wipe_plaintext_working_copy(&paths);
+}
+
+/// The lock as the session's last event, and the batch it ends closed into a
+/// segment at once: the next pass sends it, whenever that is.
+fn log_lock(host: &dyn Host, session: &VaultSession) {
+    let Ok(device) = silentsilo_vfs::device_id(&session.conn) else {
+        return;
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let logged =
+        silentsilo_audit::Spool::open(&session.paths.root, device).and_then(|mut spool| {
+            spool.record(silentsilo_audit::Event::new(
+                silentsilo_audit::codes::LOCKED,
+                now_ms,
+            ))?;
+            spool.close(now_ms).map(|_| ())
+        });
+    if let Err(e) = logged {
+        host.warn("audit", &e.to_string());
+    }
 }
 
 /// Where a file goes when the user opens it rather than exporting it.

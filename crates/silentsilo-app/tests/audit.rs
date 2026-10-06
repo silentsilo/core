@@ -1,0 +1,250 @@
+//! The activity log through the sync pass: a device learns of the log from
+//! storage, and its sealed events reach every copy before they leave it.
+
+use std::path::Path;
+
+use silentsilo_app::{AppEvent, AppState, Host, run_sync_pass};
+use silentsilo_audit::{
+    AuditKey, AuditPolicy, Event, KeyPair, Scope, Segment, Spool, codes, open_event,
+};
+use silentsilo_store::{FolderStore, ObjectStore, StoreConfig};
+use silentsilo_vault::{BackupTarget, SiloEntry, TargetRole, VaultSession};
+use silentsilo_vfs::Vfs;
+use uuid::Uuid;
+
+/// The copies a device has. Strict, a warning fails the test; a copy that
+/// is unplugged on purpose warns, so that test is not.
+struct Copies(Vec<BackupTarget>, bool);
+
+impl Host for Copies {
+    fn emit(&self, _event: AppEvent) {}
+    fn warn(&self, area: &str, detail: &str) {
+        if self.1 {
+            panic!("[{area}] {detail}");
+        }
+    }
+    fn targets(&self, _silo_id: Uuid) -> Vec<BackupTarget> {
+        self.0.clone()
+    }
+}
+
+/// Copy B's folder taken away and a file left in its place, so every write
+/// to it fails, as for a drive in a drawer. Undone by [`plug_in`].
+fn unplug(dir: &Path) {
+    std::fs::rename(dir, dir.with_extension("away")).unwrap();
+    std::fs::write(dir, b"not a folder").unwrap();
+}
+
+fn plug_in(dir: &Path) {
+    std::fs::remove_file(dir).unwrap();
+    std::fs::rename(dir.with_extension("away"), dir).unwrap();
+}
+
+fn copy(dir: &Path) -> BackupTarget {
+    BackupTarget {
+        config: StoreConfig::Folder {
+            path: dir.to_path_buf(),
+        },
+        label: String::new(),
+        role: TargetRole::Working,
+    }
+}
+
+struct Device {
+    _dir: tempfile::TempDir,
+    state: AppState,
+    silo: SiloEntry,
+}
+
+impl Device {
+    fn new(host: &Copies) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("silo");
+        let vault_id = Uuid::new_v4();
+        let session = VaultSession::provision(root.clone(), vault_id, "s").unwrap();
+        Vfs::new(&session).ensure_initialized().unwrap();
+        let state = AppState::default();
+        state.open_session(host, vault_id, session).unwrap();
+        Self {
+            _dir: dir,
+            state,
+            silo: SiloEntry {
+                id: vault_id,
+                name: "T".into(),
+                path: root,
+                last_opened: 0,
+                auto_lock_minutes: None,
+            },
+        }
+    }
+
+    fn id(&self) -> Uuid {
+        let sessions = self.state.sessions.lock().unwrap();
+        silentsilo_vfs::device_id(&sessions[&self.silo.id].conn).unwrap()
+    }
+
+    fn kek(&self) -> silentsilo_crypto::ContentKek {
+        self.state.sessions.lock().unwrap()[&self.silo.id]
+            .kek
+            .clone()
+    }
+
+    fn spool(&self) -> Spool {
+        Spool::open(&self.silo.path, self.id()).unwrap()
+    }
+}
+
+/// A personal log, turned on, as enabling it will leave storage.
+async fn turn_on(device: &Device, store: &FolderStore) -> KeyPair {
+    let keys = KeyPair::generate();
+    let mut key = AuditKey::new(&keys, Scope::Silo, 1);
+    key.wrap_for(
+        silentsilo_audit::BY_SILO,
+        &keys.private,
+        device.kek().as_bytes(),
+    )
+    .unwrap();
+    let policy = AuditPolicy::new(true, &keys.id(), None, Scope::Silo, 1);
+    silentsilo_sync::audit_log::write_audit_key(store, &key)
+        .await
+        .unwrap();
+    silentsilo_sync::audit_log::write_audit_policy(store, &device.kek(), &policy)
+        .await
+        .unwrap();
+    keys
+}
+
+async fn segments_in(store: &FolderStore) -> Vec<Segment> {
+    let mut out = Vec::new();
+    for entry in store.list("audit/").await.unwrap() {
+        if silentsilo_audit::parse_segment_key(&entry.key).is_some() {
+            out.push(Segment::from_bytes(&store.get(&entry.key).await.unwrap()).unwrap());
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn events_reach_every_copy_before_they_leave_the_device() {
+    let (a, holder) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let b = holder.path().join("b");
+    std::fs::create_dir(&b).unwrap();
+    let both = Copies(vec![copy(a.path()), copy(&b)], true);
+    let lenient = Copies(vec![copy(a.path()), copy(&b)], false);
+    let device = Device::new(&both);
+    let (store_a, store_b) = (
+        FolderStore::new(a.path().to_path_buf()),
+        FolderStore::new(b.clone()),
+    );
+
+    // No log yet: the first pass learns nothing, so nothing is recorded.
+    run_sync_pass(&device.state, &both, &device.silo)
+        .await
+        .unwrap();
+    assert_eq!(
+        device
+            .spool()
+            .record(Event::new(codes::UNLOCKED, 1))
+            .unwrap(),
+        None
+    );
+
+    // Turned on; the next pass learns of it and pins the key.
+    let keys = turn_on(&device, &store_a).await;
+    run_sync_pass(&device.state, &both, &device.silo)
+        .await
+        .unwrap();
+    let mut spool = device.spool();
+    assert!(spool.pinned().is_some());
+    spool
+        .record(Event::new(codes::SECRET_COPIED, 2).on("e1", "Bank"))
+        .unwrap();
+    spool.close(3).unwrap();
+
+    // B unplugged: the segment reaches A and stays here.
+    unplug(&b);
+    run_sync_pass(&device.state, &lenient, &device.silo)
+        .await
+        .unwrap();
+    assert_eq!(segments_in(&store_a).await.len(), 1);
+    assert_eq!(
+        device.spool().outbox().unwrap().len(),
+        1,
+        "B does not hold it yet"
+    );
+
+    // Plugged back in: B gets it too, and it leaves this device. B backs off
+    // after its failure, so the pass that reaches it is a later one.
+    plug_in(&b);
+    for _ in 0..3 {
+        if device.spool().outbox().unwrap().is_empty() {
+            break;
+        }
+        {
+            let sessions = device.state.sessions.lock().unwrap();
+            let conn = &sessions[&device.silo.id].conn;
+            silentsilo_vfs::reset_target_backoff(conn, copy(&b).config.target_id()).unwrap();
+        }
+        run_sync_pass(&device.state, &both, &device.silo)
+            .await
+            .unwrap();
+    }
+    let on_b = segments_in(&store_b).await;
+    assert_eq!(on_b.len(), 1);
+    assert!(device.spool().outbox().unwrap().is_empty());
+
+    // What storage holds opens with the log's key only.
+    let event = open_event(&keys.private, device.id(), &on_b[0].records[0]).unwrap();
+    assert_eq!(event.c, codes::SECRET_COPIED);
+    assert_eq!(event.l.as_deref(), Some("Bank"));
+}
+
+#[tokio::test]
+async fn a_silo_without_a_log_writes_nothing_under_audit() {
+    let a = tempfile::tempdir().unwrap();
+    let host = Copies(vec![copy(a.path())], true);
+    let device = Device::new(&host);
+    run_sync_pass(&device.state, &host, &device.silo)
+        .await
+        .unwrap();
+    let store = FolderStore::new(a.path().to_path_buf());
+    assert!(store.list("audit/").await.unwrap().is_empty());
+    assert!(device.spool().pinned().is_none());
+}
+
+#[tokio::test]
+async fn a_lock_is_the_last_event_and_closes_its_segment() {
+    let a = tempfile::tempdir().unwrap();
+    let host = Copies(vec![copy(a.path())], true);
+    let device = Device::new(&host);
+    let store = FolderStore::new(a.path().to_path_buf());
+    let keys = turn_on(&device, &store).await;
+    run_sync_pass(&device.state, &host, &device.silo)
+        .await
+        .unwrap();
+
+    let id = device.silo.id;
+    assert_eq!(
+        device
+            .state
+            .audit_record(id, Event::new(codes::UNLOCKED, 1))
+            .unwrap(),
+        Some(0)
+    );
+    assert!(!device.state.audit_is_mandatory(id), "a personal log");
+    let device_id = device.id();
+    device.state.close_session(&host, id).unwrap();
+
+    // Closed into a segment at the lock, with no pass in between.
+    let outbox = Spool::open(&device.silo.path, device_id)
+        .unwrap()
+        .outbox()
+        .unwrap();
+    assert_eq!(outbox.len(), 1);
+    let codes_written: Vec<u16> = outbox[0]
+        .records
+        .iter()
+        .map(|r| open_event(&keys.private, device_id, r).unwrap().c)
+        .collect();
+    assert_eq!(codes_written, vec![codes::UNLOCKED, codes::LOCKED]);
+}

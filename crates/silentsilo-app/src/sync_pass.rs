@@ -272,6 +272,109 @@ impl Drop for SyncGuard<'_> {
 }
 
 /// A target opened and ready to talk to, with what it is called.
+/// How long the oldest event waits before its segment closes. Fewer, larger
+/// segments are fewer requests to a cloud provider; a lock closes one at once.
+const AUDIT_SEGMENT_EVERY_MS: i64 = 15 * 60 * 1000;
+
+/// How often the log's policy is read again, in seconds.
+const AUDIT_POLICY_EVERY: i64 = 10 * 60;
+
+/// Reads the log's policy now and then, closes a segment when one is due, and
+/// sends what waits to every copy. A segment leaves this device only once
+/// every copy holds it, as a record does. Failures are reported and tried
+/// again on the next pass; none of this stops the sync.
+async fn deliver_audit(
+    host: &dyn Host,
+    root: &std::path::Path,
+    device: Uuid,
+    kek: &silentsilo_crypto::ContentKek,
+    targets: &[OpenTarget],
+    required: &std::collections::HashSet<Uuid>,
+    now: i64,
+) {
+    use silentsilo_audit::{PolicyRead, Spool};
+
+    let mut spool = match Spool::open(root, device) {
+        Ok(spool) => spool,
+        Err(e) => {
+            host.warn("audit", &e.to_string());
+            return;
+        }
+    };
+
+    let stale = spool
+        .pinned()
+        .is_none_or(|p| now.saturating_sub(p.checked_at) >= AUDIT_POLICY_EVERY);
+    if stale {
+        for target in targets {
+            let policy = match sync::audit_log::read_audit_policy(&*target.store, kek).await {
+                Ok(Some(policy)) => policy,
+                Ok(None) => continue,
+                Err(e) => {
+                    host.warn("audit", &format!("{}: {e}", target.label));
+                    continue;
+                }
+            };
+            match sync::audit_log::read_audit_key(&*target.store, &policy.key_id).await {
+                Ok(Some(key)) => {
+                    match spool.apply_policy(&policy, &key, now) {
+                        Ok(PolicyRead::KeyChanged { pinned, named }) => host.warn(
+                            "audit",
+                            &format!(
+                                "the activity log names another key ({named}); this device goes on sealing to {pinned}"
+                            ),
+                        ),
+                        Ok(_) => {}
+                        Err(e) => host.warn("audit", &e.to_string()),
+                    }
+                    break;
+                }
+                Ok(None) => continue,
+                Err(e) => host.warn("audit", &format!("{}: {e}", target.label)),
+            }
+        }
+    }
+    if spool.pinned().is_none() {
+        return;
+    }
+
+    let now_ms = now.saturating_mul(1000);
+    if spool.due(now_ms, AUDIT_SEGMENT_EVERY_MS)
+        && let Err(e) = spool.close(now_ms)
+    {
+        host.warn("audit", &e.to_string());
+    }
+    let outbox = match spool.outbox() {
+        Ok(outbox) if !outbox.is_empty() => outbox,
+        Ok(_) => return,
+        Err(e) => {
+            host.warn("audit", &e.to_string());
+            return;
+        }
+    };
+
+    let mut holders: std::collections::HashMap<u64, std::collections::HashSet<Uuid>> =
+        std::collections::HashMap::new();
+    for target in targets {
+        match sync::audit_log::push_audit_segments(&*target.store, &outbox).await {
+            Ok(held) => {
+                for seq in held {
+                    holders.entry(seq).or_default().insert(target.id);
+                }
+            }
+            Err(e) => host.warn("audit", &format!("{}: {e}", target.label)),
+        }
+    }
+    for segment in &outbox {
+        let everywhere = holders
+            .get(&segment.seq)
+            .is_some_and(|held| required.is_subset(held));
+        if everywhere && let Err(e) = spool.delivered(segment.seq) {
+            host.warn("audit", &e.to_string());
+        }
+    }
+}
+
 struct OpenTarget {
     id: uuid::Uuid,
     label: String,
@@ -770,6 +873,23 @@ pub async fn run_sync_pass(
             retry_in: 0,
             waiting: false,
         });
+    }
+
+    // The activity log rides on the same copies, after this device's own
+    // records: a segment is never what holds them back.
+    let audit_device = {
+        let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
+        sessions
+            .get(&silo.id)
+            .and_then(|s| silentsilo_vfs::device_id(&s.conn).ok())
+    };
+    if let Some(device) = audit_device {
+        let required: std::collections::HashSet<Uuid> = every_target
+            .iter()
+            .copied()
+            .filter(|id| !retired.contains(id))
+            .collect();
+        deliver_audit(host, &root, device, &kek, &targets, &required, now).await;
     }
 
     // ── In, from every target ───────────────────────────────────────

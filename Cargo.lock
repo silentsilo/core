@@ -4051,6 +4051,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "silentsilo-audit",
  "silentsilo-core 1.8.3",
  "silentsilo-crypto 1.8.3",
  "silentsilo-store 1.8.3",

@@ -81,7 +81,14 @@ storage settings. The order and invariants of the pass are described in the
 desktop repository's `docs/ARCHITECTURE.md` until the move is done, with one
 two steps that exist only here so far: before pushing, the pass reconciles
 the enrolled keys with `keys/` (`silentsilo-sync/key_sync.rs`, `FORMATS.md`),
-and after pulling it imports the inbox (below).
+and after pulling it imports the inbox (below). After its own records it
+delivers the activity log (`deliver_audit`): it reads the log's policy every
+ten minutes and pins the key the policy names, closes a segment once the
+oldest queued event is fifteen minutes old, and sends what waits to every
+copy. A segment leaves the device only once every configured copy holds it,
+as a record does, so a copy in a drawer keeps it queued; a failure warns
+and never stops the sync. A policy that later names another key is not
+followed: the device goes on sealing to the key it pinned, and says so.
 
 The extract binary deliberately reuses the same crates rather than
 reimplementing the read path: a second interpretation of the log is a second
