@@ -30,6 +30,9 @@ Anything else needs a version discriminator first.
 | Inbox sender | `inbox/senders/….sealed` | `INBOX_VERSION = 1`, sealed under the content KEK | As above |
 | Revocation marker | `keys/revoked/….sealed` | `version: 1` inside a sealed payload under the content KEK, `silentsilo-sync/key_sync.rs` | 1.0.0 lists it with the key envelopes and skips it as unreadable |
 | Inbox item | `inbox/items/….sslo` and `….env` | The blob as in `blobs/`; the envelope carries `INBOX_VERSION = 1` | 1.0.0 never lists `inbox/`. A build with the inbox leaves an item of another version where it is and says to update |
+| Activity log segment | `audit/<device>/<seq>.seg` | `SEGMENT_VERSION = 1` in its header; each record inside carries `RECORD_VERSION = 1` and its HPKE suite, `silentsilo-audit` | No release before core 1.9.0 lists `audit/`. A build with the log names a newer segment, record or suite rather than misreading it |
+| Activity log key | `audit/keys/<key id>.json` | `version: 1`, `silentsilo-audit/keyring.rs` | As above; a newer version is refused by name |
+| Activity log policy | `audit/policy.sealed` | `version: 1` inside a sealed payload under the content KEK | As above |
 
 ## Reading a backup from scratch
 
@@ -541,6 +544,75 @@ adds no version of its own. `upsert_password` refuses an entry over
 `MAX_ENTRY_BYTES` (512 KB), so the record stays under the 1 MiB readers
 before core 1.4.0 accept. `silentsilo-fixture/tests/entry_fields_on_1_0_0.rs`
 replays, snapshots, compacts and restores such an entry with 1.0.0's code.
+
+## The activity log
+
+From core 1.9.0, a silo can keep a log of what was done in it: unlocks,
+entries shown or copied, logins filled, files opened or saved outside,
+imports and exports, key changes, and the changes the operation log also
+records. On a silo an organisation administers it is always on; on any
+other it is a setting. `silentsilo-audit` owns the format.
+
+**Why its own place.** A record type 1.0.0 does not know is skipped, then
+dropped from its snapshot and pruned from storage. So the log is not in
+`ops/`, and no release before it lists `audit/`: they prune `ops/` and sweep
+`blobs/`, and nothing else. `silentsilo-fixture/tests/audit_untouched_by_old.rs`
+runs 1.0.0's and 1.6.1's pruning and sweep over storage holding a log, and
+the log comes through byte for byte.
+
+**An event** is JSON with short names, sealed alone:
+
+```json
+{ "i": 41, "t": 1789000000000, "c": 11, "n": 1, "o": "<entry id>", "l": "Bank", "x": { "field": "password" } }
+```
+
+`i` is the device's own count of events, from 0 with no gaps, so a record
+missing from the log leaves a hole. `t` is the device's clock, in
+milliseconds. `c` is the event code: a number, stable for good, never reused
+or renumbered (`events.rs`, pinned by a test); a reader names a code it does
+not know "Unknown event N". `n` counts repeats folded together and is left
+out when 1. `o` and `l` are what the event was about, by id and by the name
+it had then, so it stays recognisable once it is gone. `x` carries the rest
+by name; a reader shows what it does not know as it is. No event carries a
+password, a field's value or a file's content.
+
+**A record** is one event sealed with HPKE (RFC 9180), base mode, to the
+log's public key: `SSAR`, `RECORD_VERSION` (1), the suite as three RFC 9180
+identifiers (KEM, KDF, AEAD; this build writes X25519-HKDF-SHA256,
+HKDF-SHA256, AES-256-GCM), the key id (8 bytes: BLAKE3 of the public key),
+the encapsulated key and the ciphertext, each length-prefixed. The info
+string is `silentsilo audit v1`; the associated data binds the writing
+device's id and the key id, so a record moved under another device does not
+open. A device seals each event the moment it happens and queues it; it
+never needs to read one back. A suite this build does not know is refused
+by name, which is what lets a later build move to a post-quantum KEM for
+logs kept for years.
+
+**A segment** is a batch of one device's records: `SSAS`, `SEGMENT_VERSION`
+(1), the device id, `seq` (from 0 per device), `prev` (the BLAKE3 of the
+previous segment's bytes, zeros for the first), the time it was closed, and
+the records, each length-prefixed. Its storage key is
+`audit/<device>/<seq, 12 digits>.seg`. A reader checks the run per device:
+a missing number or a `prev` that does not match is named. Segments are
+written once and never rewritten; a seed copies one only where the
+destination has none. Nothing larger than 8 MiB is read.
+
+**The key** is a random HPKE key pair, not one derived from any security
+key, so retiring or losing a key never makes old logs unreadable.
+`audit/keys/<key id>.json` holds the public half, the suite, the scope
+(`org` or `silo`) and the private half wrapped once per way in: under each
+organisation key's wrap key on an administered silo, so devices write the
+log and cannot read it, or under the content KEK (`by: "silo"`) on a
+personal silo, so whoever opens the silo reads its log. Each wrapping uses a
+key derived for this purpose alone (BLAKE3 `derive_key`, context
+`silentsilo audit private key v1`). A key file whose public key does not
+match its id is refused.
+
+**The policy**, `audit/policy.sealed`, sealed under the content KEK: whether
+the log is on, the retention in days (absent means kept), the scope and when
+it changed. On an administered silo the log is on whatever it says; only
+the retention is read from it, and only the holder of an organisation key
+deletes a segment, whole, once it is past the retention.
 
 ## The index is not a format
 

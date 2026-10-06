@@ -1,0 +1,21 @@
+[package]
+name = "silentsilo-audit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# HPKE (RFC 9180), MIT/Apache-2.0: X25519, HKDF-SHA256, AES-256-GCM in this
+# version; the suite is written into every record, so another can follow.
+hpke = { version = "0.14", default-features = false, features = ["alloc", "getrandom", "x25519", "aes", "hkdfsha2"] }
+blake3 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+zeroize = { workspace = true }
+hex = "0.4"
+silentsilo-crypto = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

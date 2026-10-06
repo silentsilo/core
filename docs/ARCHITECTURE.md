@@ -44,6 +44,7 @@ flowchart TD
         CLOUD["silentsilo-cloud<br/>OneDrive, Dropbox, Google Drive:<br/>sign-in, tokens, stores"]
         S3C["silentsilo-s3"]
         FIDO["silentsilo-fido"]
+    AUDIT["silentsilo-audit<br/>activity log: sealed events, segments"]
         CORE["silentsilo-core<br/>shared types"]
     end
     APP["silentsilo-app<br/>sessions, sync pass order (being moved in)"]
@@ -54,7 +55,8 @@ flowchart TD
 
     CLIENT --> APP & VFS & VAULT & SYNC & FIDO
     APP --> SYNC & VFS & VAULT & STORE
-    SYNC --> VFS & VAULT & CRYPTO & STORE
+    SYNC --> VFS & VAULT & CRYPTO & STORE & AUDIT
+    AUDIT --> CRYPTO
     VFS --> VAULT & CRYPTO & CORE
     VAULT --> CRYPTO & CLOUD
     CLOUD --> STORE & S3C

@@ -1,0 +1,350 @@
+//! Where a device keeps its sealed events until they reach storage.
+//!
+//! `<silo>/audit-queue/`, beside the silo rather than in the scratch
+//! directory a lock sweeps: an event must outlive the lock it records.
+//! Everything here is already sealed to the log's key.
+//!
+//! - `pending`: records not yet in a segment, each with its event number in
+//!   clear beside it, so a restart knows where the count stands without
+//!   opening anything;
+//! - `state.json`: the next event number, the next segment number, the hash
+//!   of the last segment, and the number below which every event is already
+//!   in a segment;
+//! - `outbox/<seq>.seg`: closed segments waiting for every copy to hold them.
+//!
+//! The order of writes is what makes a crash harmless. A record is appended
+//! and synced before the count moves past it; a segment is written whole
+//! before the state says it exists, and the pending file is emptied only
+//! after that. Whatever moment the process dies, a restart neither numbers
+//! two events alike nor puts one event in two segments.
+
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::{AuditError, Event, Segment, seal_event};
+
+pub const QUEUE_DIR: &str = "audit-queue";
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct State {
+    next_event: u64,
+    next_segment: u64,
+    last_hash: String,
+    /// Every event below this number is in a segment already.
+    closed_through: u64,
+}
+
+pub struct Spool {
+    dir: PathBuf,
+    device: Uuid,
+    state: State,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SpoolError {
+    #[error("the activity log could not be written on this computer: {0}")]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Audit(#[from] AuditError),
+}
+
+/// Writes `bytes` to `path` whole or not at all.
+fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    {
+        let mut file = File::create(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    // A scanner holding the old file refuses the rename for a moment.
+    let mut tries = 0;
+    loop {
+        match fs::rename(&tmp, path) {
+            Ok(()) => return Ok(()),
+            Err(_) if tries < 20 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// The pending records, as (event number, sealed record).
+fn read_pending(path: &Path) -> std::io::Result<Vec<(u64, Vec<u8>)>> {
+    let mut bytes = Vec::new();
+    match File::open(path) {
+        Ok(mut file) => {
+            file.read_to_end(&mut bytes)?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    }
+    let mut out = Vec::new();
+    let mut at = 0;
+    // A record cut off by a crash mid-append is the last one, and it was
+    // never counted: it is dropped, not read as damage.
+    while at + 12 <= bytes.len() {
+        let number = u64::from_be_bytes(bytes[at..at + 8].try_into().expect("eight"));
+        let len = u32::from_be_bytes(bytes[at + 8..at + 12].try_into().expect("four")) as usize;
+        if at + 12 + len > bytes.len() {
+            break;
+        }
+        out.push((number, bytes[at + 12..at + 12 + len].to_vec()));
+        at += 12 + len;
+    }
+    Ok(out)
+}
+
+impl Spool {
+    pub fn open(silo_root: &Path, device: Uuid) -> Result<Self, SpoolError> {
+        let dir = silo_root.join(QUEUE_DIR);
+        fs::create_dir_all(dir.join("outbox"))?;
+        let mut state: State = match fs::read(dir.join("state.json")) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(AuditError::from)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => State::default(),
+            Err(e) => return Err(e.into()),
+        };
+        // Appended and synced, but the count had not moved past it.
+        if let Some((last, _)) = read_pending(&dir.join("pending"))?.last() {
+            state.next_event = state.next_event.max(last + 1);
+        }
+        Ok(Self { dir, device, state })
+    }
+
+    /// Seals `event` to `public_key` and queues it. Returns once it is on
+    /// disk; the number it was given is set on it.
+    pub fn record(&mut self, public_key: &[u8], mut event: Event) -> Result<u64, SpoolError> {
+        event.i = self.state.next_event;
+        let sealed = seal_event(public_key, self.device, &event)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.dir.join("pending"))?;
+        file.write_all(&event.i.to_be_bytes())?;
+        file.write_all(&(sealed.len() as u32).to_be_bytes())?;
+        file.write_all(&sealed)?;
+        file.sync_all()?;
+        self.state.next_event = event.i + 1;
+        write_whole(
+            &self.dir.join("state.json"),
+            &serde_json::to_vec(&self.state).map_err(AuditError::from)?,
+        )?;
+        Ok(event.i)
+    }
+
+    /// Turns what is pending into the next segment, in the outbox. Nothing
+    /// pending, nothing written.
+    pub fn close(&mut self, now: i64) -> Result<Option<Segment>, SpoolError> {
+        let pending: Vec<(u64, Vec<u8>)> = read_pending(&self.dir.join("pending"))?
+            .into_iter()
+            .filter(|(number, _)| *number >= self.state.closed_through)
+            .collect();
+        if pending.is_empty() {
+            return Ok(None);
+        }
+        let prev = if self.state.last_hash.is_empty() {
+            [0u8; 32]
+        } else {
+            hex::decode(&self.state.last_hash)
+                .ok()
+                .and_then(|h| h.try_into().ok())
+                .unwrap_or([0u8; 32])
+        };
+        let through = pending.iter().map(|(n, _)| *n).max().unwrap_or(0) + 1;
+        let segment = Segment {
+            device: self.device,
+            seq: self.state.next_segment,
+            prev,
+            closed_at: now,
+            records: pending.into_iter().map(|(_, r)| r).collect(),
+        };
+        write_whole(&self.outbox_path(segment.seq), &segment.to_bytes())?;
+        self.state.next_segment = segment.seq + 1;
+        self.state.last_hash = hex::encode(segment.hash());
+        self.state.closed_through = through;
+        write_whole(
+            &self.dir.join("state.json"),
+            &serde_json::to_vec(&self.state).map_err(AuditError::from)?,
+        )?;
+        let _ = fs::remove_file(self.dir.join("pending"));
+        Ok(Some(segment))
+    }
+
+    fn outbox_path(&self, seq: u64) -> PathBuf {
+        self.dir.join("outbox").join(format!("{seq:012}.seg"))
+    }
+
+    /// Closed segments not yet everywhere, oldest first.
+    pub fn outbox(&self) -> Result<Vec<Segment>, SpoolError> {
+        let mut out = Vec::new();
+        for entry in fs::read_dir(self.dir.join("outbox"))? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|e| e == "seg") {
+                out.push(Segment::from_bytes(&fs::read(&path)?)?);
+            }
+        }
+        out.sort_by_key(|s| s.seq);
+        Ok(out)
+    }
+
+    /// Every copy holds segment `seq`: it leaves this computer.
+    pub fn delivered(&self, seq: u64) -> Result<(), SpoolError> {
+        match fs::remove_file(self.outbox_path(seq)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        }
+    }
+
+    /// Events waiting, in segments or not: what a lock would leave behind.
+    pub fn waiting(&self) -> Result<usize, SpoolError> {
+        let pending = read_pending(&self.dir.join("pending"))?
+            .into_iter()
+            .filter(|(n, _)| *n >= self.state.closed_through)
+            .count();
+        let queued: usize = self.outbox()?.iter().map(|s| s.records.len()).sum();
+        Ok(pending + queued)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{KeyPair, check_chain, codes, counter_gaps, open_event};
+
+    fn events_in(segments: &[Segment], keys: &KeyPair) -> Vec<Event> {
+        segments
+            .iter()
+            .flat_map(|s| {
+                s.records
+                    .iter()
+                    .map(|r| open_event(&keys.private, s.device, r).unwrap())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn events_become_numbered_chained_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = KeyPair::generate();
+        let device = Uuid::new_v4();
+        let mut spool = Spool::open(dir.path(), device).unwrap();
+        for _ in 0..3 {
+            spool
+                .record(&keys.public, Event::new(codes::SECRET_COPIED, 1))
+                .unwrap();
+        }
+        let first = spool.close(10).unwrap().unwrap();
+        spool
+            .record(&keys.public, Event::new(codes::LOCKED, 2))
+            .unwrap();
+        let second = spool.close(20).unwrap().unwrap();
+        assert!(spool.close(30).unwrap().is_none(), "nothing pending");
+
+        let segments = spool.outbox().unwrap();
+        assert_eq!(segments, vec![first, second]);
+        assert!(check_chain(&segments, 0).is_whole());
+        let events = events_in(&segments, &keys);
+        assert_eq!(
+            events.iter().map(|e| e.i).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(spool.waiting().unwrap(), 4);
+
+        spool.delivered(0).unwrap();
+        assert_eq!(spool.outbox().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_count_carries_on_after_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = KeyPair::generate();
+        let device = Uuid::new_v4();
+        Spool::open(dir.path(), device)
+            .unwrap()
+            .record(&keys.public, Event::new(1, 1))
+            .unwrap();
+        let mut again = Spool::open(dir.path(), device).unwrap();
+        assert_eq!(again.record(&keys.public, Event::new(2, 2)).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_record_appended_before_the_count_moved_is_not_numbered_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = KeyPair::generate();
+        let device = Uuid::new_v4();
+        let mut spool = Spool::open(dir.path(), device).unwrap();
+        spool.record(&keys.public, Event::new(1, 1)).unwrap();
+        // Dies after the append, before the state was written.
+        let state = dir.path().join(QUEUE_DIR).join("state.json");
+        fs::write(
+            &state,
+            br#"{"next_event":0,"next_segment":0,"last_hash":"","closed_through":0}"#,
+        )
+        .unwrap();
+
+        let mut spool = Spool::open(dir.path(), device).unwrap();
+        assert_eq!(spool.record(&keys.public, Event::new(2, 2)).unwrap(), 1);
+        let segment = spool.close(5).unwrap().unwrap();
+        assert!(counter_gaps(&events_in(&[segment], &keys), 0).is_empty());
+    }
+
+    #[test]
+    fn an_append_cut_short_is_dropped_not_misread() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = KeyPair::generate();
+        let device = Uuid::new_v4();
+        let mut spool = Spool::open(dir.path(), device).unwrap();
+        spool.record(&keys.public, Event::new(1, 1)).unwrap();
+        let pending = dir.path().join(QUEUE_DIR).join("pending");
+        let mut file = OpenOptions::new().append(true).open(&pending).unwrap();
+        file.write_all(&[0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1]).unwrap();
+
+        let mut spool = Spool::open(dir.path(), device).unwrap();
+        let segment = spool.close(5).unwrap().unwrap();
+        assert_eq!(segment.records.len(), 1);
+    }
+
+    #[test]
+    fn a_segment_written_before_the_state_moved_is_not_repeated() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = KeyPair::generate();
+        let device = Uuid::new_v4();
+        let mut spool = Spool::open(dir.path(), device).unwrap();
+        spool.record(&keys.public, Event::new(1, 1)).unwrap();
+        spool.close(5).unwrap();
+        // Dies after the state, before the pending file was emptied: what is
+        // left there is already in segment 0.
+        let queue = dir.path().join(QUEUE_DIR);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(queue.join("pending"))
+            .unwrap();
+        let sealed = seal_event(&keys.public, device, &{
+            let mut e = Event::new(1, 1);
+            e.i = 0;
+            e
+        })
+        .unwrap();
+        file.write_all(&0u64.to_be_bytes()).unwrap();
+        file.write_all(&(sealed.len() as u32).to_be_bytes())
+            .unwrap();
+        file.write_all(&sealed).unwrap();
+
+        let mut spool = Spool::open(dir.path(), device).unwrap();
+        assert!(spool.close(6).unwrap().is_none(), "already in a segment");
+        spool.record(&keys.public, Event::new(2, 2)).unwrap();
+        let segments = {
+            spool.close(7).unwrap();
+            spool.outbox().unwrap()
+        };
+        let events = events_in(&segments, &keys);
+        assert_eq!(events.iter().map(|e| e.i).collect::<Vec<_>>(), vec![0, 1]);
+        assert!(check_chain(&segments, 0).is_whole());
+    }
+}

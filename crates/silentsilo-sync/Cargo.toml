@@ -7,6 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+silentsilo-audit = { workspace = true }
 silentsilo-core = { workspace = true }
 silentsilo-crypto = { workspace = true }
 silentsilo-store = { workspace = true }

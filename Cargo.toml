@@ -15,6 +15,7 @@ members = [
     "crates/silentsilo-extract",
     "crates/silentsilo-app",
     "crates/silentsilo-soak",
+    "crates/silentsilo-audit",
 ]
 
 [workspace.package]
@@ -51,6 +52,7 @@ silentsilo-store = { path = "crates/silentsilo-store" }
 silentsilo-cloud = { path = "crates/silentsilo-cloud" }
 silentsilo-sync = { path = "crates/silentsilo-sync" }
 silentsilo-app = { path = "crates/silentsilo-app" }
+silentsilo-audit = { path = "crates/silentsilo-audit" }
 # default-https-client, not the legacy "rustls" feature: that one drags in
 # rustls 0.21 with a webpki release carrying three RUSTSEC advisories, while
 # this one rides the maintained rustls 0.23 / aws-lc stack the tree already

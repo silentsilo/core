@@ -855,7 +855,13 @@ pub struct SeedOutcome {
 /// Everything a silo keeps in its storage, in the order it is worth
 /// copying: content and records first, the manifest last, so an interrupted
 /// copy never looks like a silo that lost its history.
-const SEED_PREFIXES: [&str; 4] = [BLOBS_PREFIX, OPS_PREFIX, SNAPSHOTS_PREFIX, KEYS_PREFIX];
+const SEED_PREFIXES: [&str; 5] = [
+    BLOBS_PREFIX,
+    OPS_PREFIX,
+    SNAPSHOTS_PREFIX,
+    KEYS_PREFIX,
+    silentsilo_audit::AUDIT_PREFIX,
+];
 
 /// How often a seed says where it has got to. A silo is hundreds of
 /// thousands of objects and a single blob can take minutes, so the reports
@@ -1044,6 +1050,15 @@ async fn seed(
         // Nothing else gets the shortcut. A rotation re-seals records,
         // snapshots and key envelopes in place at exactly the same length,
         // and a size check would skip the one write that matters.
+        // The activity log is written once and never again: a segment the
+        // destination holds stays as it is, whichever side the seed trusts.
+        if entry.key.starts_with(silentsilo_audit::AUDIT_PREFIX)
+            && to.head(&entry.key).await?.is_some()
+        {
+            outcome.skipped += 1;
+            reporter.finish_object();
+            continue;
+        }
         if entry.key.starts_with(BLOBS_PREFIX) && to.head(&entry.key).await? == Some(entry.size) {
             outcome.skipped += 1;
             reporter.finish_object();

@@ -11,6 +11,20 @@ release notes should say.
 
 ## [Unreleased]
 
+### Added
+
+- `silentsilo-audit`: the format of the activity log, nothing that writes
+  it yet. Each event is sealed alone with HPKE (RFC 9180) to the log's key,
+  queued on the device (`audit-queue/` beside the silo, safe against a crash
+  at any point), and sent in numbered, chained segments under `audit/`. The
+  key is random, its private half wrapped under each organisation key or
+  under the content key, so devices on an organisation's silo write the log
+  and cannot read it. Event codes are numbers, fixed for good. The format is
+  in `FORMATS.md`, pinned by a byte vector, and 1.0.0's and 1.6.1's own
+  pruning and sweep leave `audit/` byte for byte.
+- A seed copies `audit/`, and never writes over a segment the destination
+  holds.
+
 ### Fixed
 
 - A removed key could come back. A copy that was unplugged when the key was

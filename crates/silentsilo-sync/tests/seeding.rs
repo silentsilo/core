@@ -659,3 +659,42 @@ async fn a_stop_lands_inside_an_object_and_the_next_run_carries_on() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_seed_brings_the_activity_log_and_never_writes_over_it() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let dest_dir = tempfile::tempdir().unwrap();
+    let source = FolderStore::new(source_dir.path().to_path_buf());
+    let dest = FolderStore::new(dest_dir.path().to_path_buf());
+    let device = Uuid::new_v4();
+    let first = format!("audit/{device}/000000000000.seg");
+    let second = format!("audit/{device}/000000000001.seg");
+    source
+        .put(&first, b"from the source".to_vec())
+        .await
+        .unwrap();
+    source.put(&second, b"only here".to_vec()).await.unwrap();
+    dest.put(&first, b"already there".to_vec()).await.unwrap();
+
+    seed_target(&source, &dest, &mut |_| {}, &|| false)
+        .await
+        .unwrap();
+    assert_eq!(dest.get(&first).await.unwrap(), b"already there");
+    assert_eq!(dest.get(&second).await.unwrap(), b"only here");
+
+    let other_dir = tempfile::tempdir().unwrap();
+    let other = FolderStore::new(other_dir.path().to_path_buf());
+    other.put(&first, b"kept".to_vec()).await.unwrap();
+    seed_target_checked(
+        &source,
+        &other,
+        &generate_dek(),
+        &no_keys(),
+        &mut |_| {},
+        &|| false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(other.get(&first).await.unwrap(), b"kept");
+    assert_eq!(other.get(&second).await.unwrap(), b"only here");
+}
