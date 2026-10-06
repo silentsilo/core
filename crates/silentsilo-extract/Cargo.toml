@@ -15,6 +15,7 @@ path = "src/main.rs"
 # Deliberately no FIDO and no interface. Unlocking here is the recovery code
 # and nothing else, which is what keeps this buildable for Windows, Linux and
 # macOS from one source with no hardware in the loop.
+silentsilo-audit = { workspace = true }
 silentsilo-core = { workspace = true }
 silentsilo-crypto = { workspace = true }
 silentsilo-store = { workspace = true }

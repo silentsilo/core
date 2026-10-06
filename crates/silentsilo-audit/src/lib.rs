@@ -6,12 +6,14 @@
 //! - [`record`]: one event sealed with HPKE to the log's public key;
 //! - [`segment`]: a device's batch of records under `audit/`, chained;
 //! - [`keyring`]: the log's key and policy as storage holds them;
-//! - [`spool`]: a device's queue of sealed events until storage holds them.
+//! - [`spool`]: a device's queue of sealed events until storage holds them;
+//! - [`reading`]: a gathered log opened, checked and written out.
 //!
 //! The format is in `FORMATS.md`, "The activity log".
 
 pub mod events;
 pub mod keyring;
+pub mod reading;
 pub mod record;
 pub mod segment;
 pub mod spool;

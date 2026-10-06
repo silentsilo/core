@@ -237,6 +237,98 @@ pub async fn open(store: &dyn ObjectStore, code: &str) -> Result<Backup, Extract
     })
 }
 
+/// A silo's activity log, as a backup holds it.
+pub enum ActivityLog {
+    /// The silo keeps none.
+    None,
+    /// An organisation's: only its keys read it, and they are security keys
+    /// this tool does not use. The app reads it with one.
+    Organisation,
+    /// A personal log, opened with the content key.
+    Read(silentsilo_audit::reading::LogRead),
+}
+
+/// Reads the backup's activity log, when it keeps a personal one.
+pub async fn activity_log(
+    backup: &Backup,
+    store: &dyn ObjectStore,
+) -> Result<ActivityLog, ExtractError> {
+    let storage = |e: silentsilo_sync::SyncError| ExtractError::Storage(e.to_string());
+    let Some(policy) = silentsilo_sync::audit_log::read_audit_policy(store, &backup.kek)
+        .await
+        .map_err(storage)?
+    else {
+        return Ok(ActivityLog::None);
+    };
+    let key = silentsilo_sync::audit_log::read_audit_key(store, &policy.key_id)
+        .await
+        .map_err(storage)?
+        .ok_or_else(|| ExtractError::Storage("the activity log's key is not in it".into()))?;
+    if key.scope == silentsilo_audit::Scope::Org {
+        return Ok(ActivityLog::Organisation);
+    }
+    let private = key
+        .unwrap_with(silentsilo_audit::BY_SILO, backup.kek.as_bytes())
+        .map_err(|_| ExtractError::Storage("the activity log's key does not open".into()))?;
+
+    let listed = store
+        .list(silentsilo_audit::AUDIT_PREFIX)
+        .await
+        .map_err(|e| ExtractError::Storage(e.to_string()))?;
+    let mut segments = Vec::new();
+    for object in listed {
+        let Some((device, seq)) = silentsilo_audit::parse_segment_key(&object.key) else {
+            continue;
+        };
+        if object.size as u64 > silentsilo_audit::MAX_SEGMENT_BYTES {
+            continue;
+        }
+        let bytes = store
+            .get(&object.key)
+            .await
+            .map_err(|e| ExtractError::Storage(e.to_string()))?;
+        // One that does not parse is left out; the chain check names it.
+        if let Ok(segment) = silentsilo_audit::Segment::from_bytes(&bytes)
+            && segment.device == device
+            && segment.seq == seq
+        {
+            segments.push(segment);
+        }
+    }
+    Ok(ActivityLog::Read(silentsilo_audit::reading::read_log(
+        segments,
+        &[],
+        &private,
+    )))
+}
+
+/// Writes a personal activity log under `dest/_activity/`, as CSV and as
+/// JSON lines. Returns what it found, so the caller can say so.
+pub async fn write_activity_log(
+    backup: &Backup,
+    store: &dyn ObjectStore,
+    dest: &Path,
+) -> Result<ActivityLog, ExtractError> {
+    let log = activity_log(backup, store).await?;
+    if let ActivityLog::Read(read) = &log {
+        let dir = dest.join("_activity");
+        let io = |e: std::io::Error| ExtractError::Io(e.to_string());
+        std::fs::create_dir_all(&dir).map_err(io)?;
+        let names = HashMap::new();
+        std::fs::write(
+            dir.join("activity-log.csv"),
+            silentsilo_audit::reading::to_csv(&read.entries, &names),
+        )
+        .map_err(io)?;
+        std::fs::write(
+            dir.join("activity-log.jsonl"),
+            silentsilo_audit::reading::to_jsonl(&read.entries, &names),
+        )
+        .map_err(io)?;
+    }
+    Ok(log)
+}
+
 /// Decrypts every password row with the content KEK, the same key the app
 /// itself uses. A row that will not open is a damaged backup, reported
 /// rather than silently shortened: this is a password manager, and a

@@ -29,6 +29,14 @@ release notes should say.
   the key and policy, and the pass writes the newest policy to every copy
   that lacks it. Turned on again, it keeps its key. An organisation's log
   cannot be turned off.
+- `silentsilo-extract` writes a personal activity log to `_activity/`, as
+  CSV and JSON lines, next to the files; `list` counts its events. An
+  organisation's log is named and left alone: only its security keys read
+  it.
+- `silentsilo_audit::reading`: opening and checking a gathered log, and its
+  CSV and JSON lines, shared by the app and the extract tool so the two
+  cannot read it differently. CSV cells that look like a formula are kept
+  as text.
 - `audit_admin`: an organisation's log, started with one of its keys
   touched and readable only by its keys; another key added the same way;
   retention changed; segments past it removed from every copy that takes

@@ -296,3 +296,94 @@ async fn passwords_and_attachments_come_out_with_the_files() {
         b"attached bytes"
     );
 }
+
+/// A log as a device leaves it in storage: key, policy, one segment.
+async fn put_log(
+    session: &VaultSession,
+    store: &dyn ObjectStore,
+    scope: silentsilo_audit::Scope,
+) -> Uuid {
+    use silentsilo_audit::{AuditKey, AuditPolicy, Event, KeyPair, Segment, codes, seal_event};
+    let keys = KeyPair::generate();
+    let mut key = AuditKey::new(&keys, scope, 1);
+    key.wrap_for(
+        silentsilo_audit::BY_SILO,
+        &keys.private,
+        session.kek.as_bytes(),
+    )
+    .unwrap();
+    silentsilo_sync::audit_log::write_audit_key(store, &key)
+        .await
+        .unwrap();
+    let policy = AuditPolicy::new(true, &keys.id(), None, scope, 1);
+    silentsilo_sync::audit_log::write_audit_policy(store, &session.kek, &policy)
+        .await
+        .unwrap();
+    let device = Uuid::new_v4();
+    let records = (0..2)
+        .map(|i| {
+            let mut event =
+                Event::new(codes::SECRET_COPIED, 1_789_000_000_000 + i).on("e1", "=Bank");
+            event.i = i as u64;
+            seal_event(&keys.public, device, &event).unwrap()
+        })
+        .collect();
+    let segment = Segment {
+        device,
+        seq: 0,
+        prev: [0; 32],
+        closed_at: 1,
+        records,
+    };
+    store.put(&segment.key(), segment.to_bytes()).await.unwrap();
+    device
+}
+
+#[tokio::test]
+async fn a_personal_activity_log_comes_out_with_the_files() {
+    let silo_dir = tempfile::tempdir().unwrap();
+    let store_dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let store = FolderStore::new(store_dir.path().to_path_buf());
+    let session = silo(silo_dir.path());
+    let code = publish(&session, &store as &dyn ObjectStore, &[]).await;
+    let device = put_log(&session, &store, silentsilo_audit::Scope::Silo).await;
+
+    let backup = silentsilo_extract::open(&store as &dyn ObjectStore, &code)
+        .await
+        .unwrap();
+    let log = silentsilo_extract::write_activity_log(&backup, &store, out_dir.path())
+        .await
+        .unwrap();
+    let silentsilo_extract::ActivityLog::Read(read) = log else {
+        panic!("a personal log is read");
+    };
+    assert_eq!(read.entries.len(), 2);
+    let csv = std::fs::read_to_string(out_dir.path().join("_activity/activity-log.csv")).unwrap();
+    assert_eq!(csv.lines().count(), 3);
+    assert!(csv.contains(&device.to_string()));
+    assert!(csv.contains(",'=Bank,"), "a formula is kept as text");
+    let jsonl =
+        std::fs::read_to_string(out_dir.path().join("_activity/activity-log.jsonl")).unwrap();
+    assert_eq!(jsonl.lines().count(), 2);
+}
+
+#[tokio::test]
+async fn an_organisation_s_log_is_named_and_left_alone() {
+    let silo_dir = tempfile::tempdir().unwrap();
+    let store_dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let store = FolderStore::new(store_dir.path().to_path_buf());
+    let session = silo(silo_dir.path());
+    let code = publish(&session, &store as &dyn ObjectStore, &[]).await;
+    put_log(&session, &store, silentsilo_audit::Scope::Org).await;
+
+    let backup = silentsilo_extract::open(&store as &dyn ObjectStore, &code)
+        .await
+        .unwrap();
+    let log = silentsilo_extract::write_activity_log(&backup, &store, out_dir.path())
+        .await
+        .unwrap();
+    assert!(matches!(log, silentsilo_extract::ActivityLog::Organisation));
+    assert!(!out_dir.path().join("_activity").exists());
+}

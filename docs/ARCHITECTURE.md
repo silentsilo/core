@@ -98,6 +98,8 @@ A personal log is turned on and off on the device (`AppState::set_audit_log`),
 copies or not: the queue keeps the key and the policy, and the pass writes
 the newest policy, by `changed_at`, to every copy that lacks it
 (`settle_audit_policy`), so turning it on never waits for storage.
+Gathering is the caller's and reading is shared: the app and the extract
+tool both hand their segments to `silentsilo_audit::reading::read_log`.
 Reading (`audit_read::read_audit_log`) takes every segment from the cache
 beside the silo, this device's outbox and its pending records, and every
 copy it can reach, keeping what it fetched. It checks each device's chain

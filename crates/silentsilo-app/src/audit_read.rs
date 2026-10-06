@@ -5,14 +5,11 @@
 //! silo (`audit-cache/<device>/<seq>.seg`, the storage layout) and not
 //! fetched again. It is sealed: the cache holds nothing a copy does not.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::path::Path;
 
-use serde::Serialize;
-use silentsilo_audit::{
-    AUDIT_PREFIX, BY_SILO, Event, MAX_SEGMENT_BYTES, Segment, check_chain, counter_gaps, describe,
-    open_event, parse_segment_key,
-};
+pub use silentsilo_audit::reading::{DeviceTrail, LogEntry, LogRead};
+use silentsilo_audit::{AUDIT_PREFIX, BY_SILO, MAX_SEGMENT_BYTES, Segment, parse_segment_key};
 use silentsilo_vault::SiloEntry;
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -31,39 +28,6 @@ pub enum Reader {
         credential_id: String,
         wrap_key: Zeroizing<[u8; 32]>,
     },
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct LogEntry {
-    pub device: Uuid,
-    /// The code's name, as this build knows it.
-    pub what: String,
-    #[serde(flatten)]
-    pub event: Event,
-}
-
-/// One device's part of the log, and what is missing from it.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-pub struct DeviceTrail {
-    pub device: Uuid,
-    pub events: usize,
-    /// Runs of event numbers that should be there and are not, inclusive.
-    pub missing_events: Vec<(u64, u64)>,
-    pub missing_segments: Vec<u64>,
-    /// Segments that do not follow the one before them.
-    pub broken_segments: Vec<u64>,
-}
-
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct LogRead {
-    /// Newest first.
-    pub entries: Vec<LogEntry>,
-    pub devices: Vec<DeviceTrail>,
-    /// Records that do not open with this log's key.
-    pub unreadable: usize,
-    /// Copies that could not be read, by name: what only they hold is not
-    /// here.
-    pub copies_unread: Vec<String>,
 }
 
 /// Reads the open silo's log from this computer and every copy.
@@ -160,56 +124,12 @@ pub async fn read_audit_log(
         }
     }
 
-    let mut by_device: BTreeMap<Uuid, Vec<Segment>> = BTreeMap::new();
-    for ((device, _), segment) in segments {
-        by_device.entry(device).or_default().push(segment);
-    }
-    by_device.entry(this_device).or_default();
-
-    let mut read = LogRead {
-        copies_unread,
-        ..LogRead::default()
-    };
-    for (device, segments) in by_device {
-        let from = segments.iter().map(|s| s.seq).min().unwrap_or(0);
-        let chain = check_chain(&segments, from);
-        let mut events = Vec::new();
-        let records = segments.iter().flat_map(|s| s.records.iter());
-        let unsent = pending
-            .iter()
-            .filter(|_| device == this_device)
-            .map(|(_, record)| record);
-        let mut seen = HashSet::new();
-        for record in records.chain(unsent) {
-            match open_event(&private, device, record) {
-                Ok(event) => {
-                    if seen.insert(event.i) {
-                        events.push(event);
-                    }
-                }
-                Err(_) => read.unreadable += 1,
-            }
-        }
-        if events.is_empty() && segments.is_empty() {
-            continue;
-        }
-        let first = events.iter().map(|e| e.i).min().unwrap_or(0);
-        read.devices.push(DeviceTrail {
-            device,
-            events: events.len(),
-            missing_events: counter_gaps(&events, first),
-            missing_segments: chain.missing,
-            broken_segments: chain.broken,
-        });
-        read.entries
-            .extend(events.into_iter().map(|event| LogEntry {
-                device,
-                what: describe(event.c),
-                event,
-            }));
-    }
-    read.entries
-        .sort_by_key(|e| std::cmp::Reverse((e.event.t, e.event.i)));
+    let unsent: Vec<(Uuid, Vec<u8>)> = pending
+        .into_iter()
+        .map(|(_, record)| (this_device, record))
+        .collect();
+    let mut read = silentsilo_audit::reading::read_log(segments.into_values(), &unsent, &private);
+    read.copies_unread = copies_unread;
     Ok(read)
 }
 
