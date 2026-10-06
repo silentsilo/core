@@ -15,14 +15,48 @@ pub mod ctap2;
 pub mod enclave;
 #[cfg(feature = "passkey")]
 pub mod passkey;
-// Only the hardware backends build client data; its deps are optional and
-// follow the same feature.
-#[cfg(all(feature = "hardware", not(feature = "test-authenticator")))]
+// Only the Windows backend builds client data: WebAuthn takes it whole. The
+// CTAP2 path sends its hash and makes it in `ctap2`.
+#[cfg(all(feature = "hardware", not(feature = "test-authenticator"), windows))]
 mod client_data;
 mod error;
 mod types;
 
 pub use error::FidoError;
+
+/// What a security key asks for before it answers: its PIN, the first time
+/// or again after a wrong one, with the tries the key says are left. Only
+/// keys reached over USB or NFC ask through this; Windows asks in its own
+/// dialog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PinAsk {
+    Enter { retries: Option<u8> },
+    Wrong { retries: Option<u8> },
+}
+
+/// How the client asks for a PIN. Called on the ceremony's own thread, it
+/// waits for the person; `None` is a cancel.
+pub type PinPrompt = Box<dyn Fn(PinAsk) -> Option<zeroize::Zeroizing<String>> + Send + Sync>;
+
+static PIN_PROMPT: std::sync::RwLock<Option<PinPrompt>> = std::sync::RwLock::new(None);
+
+/// Sets how a PIN is asked for. Without one, a key with a PIN is refused as
+/// cancelled.
+pub fn set_pin_prompt(prompt: PinPrompt) {
+    if let Ok(mut slot) = PIN_PROMPT.write() {
+        *slot = Some(prompt);
+    }
+}
+
+#[cfg_attr(
+    any(windows, not(feature = "hardware"), feature = "test-authenticator"),
+    allow(dead_code)
+)]
+pub(crate) fn ask_pin(question: PinAsk) -> Option<zeroize::Zeroizing<String>> {
+    let slot = PIN_PROMPT.read().ok()?;
+    slot.as_ref()?(question)
+}
 pub use types::{
     Authenticator, CredentialInfo, Enrollment, EnrollmentChallenge, FidoStatus, UnlockMaterial,
 };

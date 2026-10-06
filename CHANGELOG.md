@@ -52,6 +52,22 @@ release notes should say.
 
 ### Fixed
 
+- Opening a silo could fail now and then with "no such function:
+  sqlcipher_export", seen on Linux CI. SQLite marks itself initialised
+  before SQLCipher's setup has registered that function, so a thread
+  opening its first connection at the wrong moment got one without it.
+  `init_openssl`, which runs before every connection, now initialises
+  SQLite too, inside the same `Once`.
+- A security key with a PIN, enrolled on Linux or macOS, did not open the
+  silo on Windows or Android, and the other way round. Those builds talked
+  to keys through `ctap-hid-fido2` and never asked for the PIN, so they
+  read the key's other `hmac-secret`. They now go through this crate's own
+  CTAP2 code, the one Android uses, over USB HID (`hidapi`): a key with a
+  PIN is asked for it, as Windows does. The client asks through
+  `set_pin_prompt`; without one, such a key is refused as cancelled.
+  `ctap-hid-fido2` is gone. A key that is plugged in but cannot be opened
+  is reported as such (`FidoError::NoAccess`, a missing udev rule on
+  Linux) rather than as no key.
 - A removed key could come back. A copy that was unplugged when the key was
   removed (an external drive, say) still held its envelope and no marker,
   and once the removal was confirmed elsewhere, plugging it in put the key

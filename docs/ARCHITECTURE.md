@@ -145,6 +145,17 @@ rotation affordable on a terabyte. The KEK itself never rotates; the DEK
 does. Password entries seal under the KEK for the same reason: the
 ciphertext travels inside records.
 
+A security key's wrap key is BLAKE3 of its `hmac-secret` output for the
+silo's salt. `hmac-secret` keeps two secrets per credential, one for
+assertions verified with the key's PIN and one without, and Windows verifies
+every ceremony on a key that has a PIN. So every platform does the same: a
+key with a PIN is asked for it, one without never is. Windows does this in
+its own dialog; Linux and macOS speak CTAP2 over USB HID through
+`silentsilo_fido::ctap2` (`ceremony.rs`, the code Android uses over NFC and
+USB) and ask through the prompt the client registers with
+`set_pin_prompt`. A silo made by a Linux build before core 1.9.0 on a key
+with a PIN holds the unverified secret, and has to enrol that key again.
+
 Rotation state machine (`silentsilo-vault/rotation.rs`, driven by the
 client application):
 

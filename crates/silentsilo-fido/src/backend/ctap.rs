@@ -1,127 +1,94 @@
-use ctap_hid_fido2::fidokey::FidoKeyHid;
-use ctap_hid_fido2::fidokey::get_assertion::Extension as Gext;
-use ctap_hid_fido2::fidokey::get_assertion::GetAssertionArgsBuilder;
-use ctap_hid_fido2::fidokey::make_credential::Extension as Mext;
-use ctap_hid_fido2::fidokey::make_credential::MakeCredentialArgsBuilder;
-use ctap_hid_fido2::public_key_credential_user_entity::PublicKeyCredentialUserEntity;
-use ctap_hid_fido2::{Cfg, FidoKeyHidFactory, HidParam, get_fidokey_devices, get_hid_devices};
+//! Removable security keys over USB HID, spoken in CTAP2 by this crate's own
+//! [`crate::ctap2`]: the code Android uses over NFC and USB, so a silo made on
+//! one opens on the other.
+//!
+//! A key with a PIN is always asked for it, as Windows does. `hmac-secret`
+//! keeps one secret for assertions with the PIN and another for those
+//! without, so a key asked differently on two platforms opens neither's
+//! silo on the other. The PIN is asked through [`crate::set_pin_prompt`],
+//! which the client answers in its own window; the ceremony itself is in
+//! [`crate::ctap2::ceremony`], tested on every platform.
+
 use rand::RngCore;
 
-use crate::client_data::{create_client_data_json, get_client_data_json, hmac_salt_from_string};
-use crate::types::{
-    Authenticator, CredentialInfo, Enrollment, EnrollmentChallenge, UnlockMaterial,
-};
-use crate::{FidoError, RP_ID, dek_salt_for_vault};
+use crate::ctap2::CtapError;
+use crate::ctap2::ceremony::{enrol_on, unlock_on};
+use crate::ctap2::hid::{Hid, REPORT_LEN, Reports};
+use crate::types::{Authenticator, Enrollment, EnrollmentChallenge, UnlockMaterial};
+use crate::{FidoError, RP_ID};
 
-const KNOWN_FIDO_VIDS: &[u16] = &[0x1050, 0x096E, 0x0483, 0x20A0, 0x32A3, 0x2581];
+/// The FIDO usage page and its CTAPHID usage. A key is found by these, so one
+/// whose vendor nobody listed still counts.
+const FIDO_USAGE_PAGE: u16 = 0xF1D0;
+const FIDO_USAGE: u16 = 0x01;
 
-pub(crate) fn fido_key_present() -> bool {
-    if !get_fidokey_devices().is_empty() {
-        return true;
+/// One key's HID interface. hidapi writes the report id first; CTAPHID uses
+/// none, so it is 0.
+struct UsbLink(hidapi::HidDevice);
+
+impl Reports for UsbLink {
+    fn write(&mut self, report: &[u8; REPORT_LEN]) -> Result<(), CtapError> {
+        let mut out = [0u8; REPORT_LEN + 1];
+        out[1..].copy_from_slice(report);
+        self.0
+            .write(&out)
+            .map(|_| ())
+            .map_err(|e| CtapError::Transport(e.to_string()))
     }
-    get_hid_devices().iter().any(|d| {
-        KNOWN_FIDO_VIDS.contains(&d.vid)
-            || d.info.contains(FIDO_USAGE_PAGE)
-            || matches_known_vid_pid(d.vid, d.pid)
-    })
+
+    fn read(&mut self, timeout_ms: u32) -> Result<Option<[u8; REPORT_LEN]>, CtapError> {
+        let mut report = [0u8; REPORT_LEN];
+        let timeout = i32::try_from(timeout_ms).unwrap_or(i32::MAX);
+        match self.0.read_timeout(&mut report, timeout) {
+            Ok(0) => Ok(None),
+            Ok(_) => Ok(Some(report)),
+            Err(e) => Err(CtapError::Transport(e.to_string())),
+        }
+    }
 }
 
-fn matches_known_vid_pid(vid: u16, pid: u16) -> bool {
-    HidParam::get().iter().any(|param| {
-        matches!(param, HidParam::VidPid { vid: known_vid, pid: known_pid } if *known_vid == vid && *known_pid == pid)
-    })
+fn fido_devices(api: &hidapi::HidApi) -> Vec<&hidapi::DeviceInfo> {
+    api.device_list()
+        .filter(|d| d.usage_page() == FIDO_USAGE_PAGE && d.usage() == FIDO_USAGE)
+        .collect()
+}
+
+pub(crate) fn fido_key_present() -> bool {
+    hidapi::HidApi::new().is_ok_and(|api| !fido_devices(&api).is_empty())
 }
 
 pub(crate) fn fido_interface_accessible() -> bool {
-    if !fido_key_present() {
-        return false;
+    open_key().is_ok()
+}
+
+/// The first key that opens. One plugged in that will not open is, on Linux,
+/// almost always a missing udev rule, and is said as such rather than as no
+/// key at all.
+fn open_key() -> Result<Hid<UsbLink>, FidoError> {
+    let api = hidapi::HidApi::new().map_err(|e| FidoError::UnlockFailed(e.to_string()))?;
+    let devices = fido_devices(&api);
+    if devices.is_empty() {
+        return Err(FidoError::NoDevice);
     }
-    fido_ctap_works()
-}
-
-fn fido_ctap_works() -> bool {
-    match open_device() {
-        Ok(device) => device.get_info().is_ok(),
-        Err(_) => false,
-    }
-}
-
-fn map_device_error(err: impl std::fmt::Display) -> FidoError {
-    FidoError::UnlockFailed(err.to_string())
-}
-
-fn map_check_in_error(err: impl std::fmt::Display) -> FidoError {
-    FidoError::CheckInFailed(err.to_string())
-}
-
-fn map_enroll_error(err: impl std::fmt::Display) -> FidoError {
-    FidoError::EnrollmentFailed(err.to_string())
-}
-
-fn open_device() -> Result<FidoKeyHid, FidoError> {
-    let cfg = Cfg::init();
-    if let Ok(device) = FidoKeyHidFactory::create(&cfg) {
-        return Ok(device);
-    }
-    for path in fido_hid_paths() {
-        let params = [HidParam::Path(path)];
-        if let Ok(device) = FidoKeyHid::new(&params, &cfg) {
-            return Ok(device);
+    for device in devices {
+        if let Ok(open) = device.open_device(&api) {
+            return Ok(Hid::new(UsbLink(open)));
         }
     }
-    Err(FidoError::UnlockFailed(
-        "Could not open the FIDO2 security key. Replug the key and retry.".into(),
-    ))
-}
-
-/// The FIDO usage page, `0xF1D0`. CTAP over HID is defined by it, so an
-/// interface that reports it is a key whatever its vendor id, and hidapi
-/// exposes the page the same way on Linux and macOS.
-const FIDO_USAGE_PAGE: &str = "usage_page=61904";
-
-/// Every HID path worth trying, keys the library recognises first.
-///
-/// The library's own list is by vendor and product id, so a key it has not
-/// heard of only shows up through its usage page. This used to also rewrite
-/// Windows interface paths (`MI_00` to `MI_01`, a trailing `\KBD`), which
-/// never matched anything here: this backend is compiled only off Windows,
-/// where hidapi paths look like `/dev/hidraw3` or an IOKit service id.
-fn fido_hid_paths() -> Vec<String> {
-    let mut paths = Vec::new();
-    for dev in get_fidokey_devices() {
-        if let HidParam::Path(path) = &dev.param {
-            paths.push(path.clone());
-        }
-    }
-    for d in get_hid_devices() {
-        if d.info.contains(FIDO_USAGE_PAGE)
-            && let HidParam::Path(path) = &d.param
-        {
-            paths.push(path.clone());
-        }
-    }
-    paths.sort();
-    paths.dedup();
-    paths
+    Err(FidoError::NoAccess)
 }
 
 pub fn probe_device() -> Result<(), FidoError> {
-    if !fido_key_present() {
-        return Err(FidoError::NoDevice);
-    }
-    open_device()?;
-    Ok(())
+    open_key().map(|_| ())
 }
 
-/// Always false here: this backend speaks CTAP2 over USB HID, which by
-/// definition only reaches removable keys. Reaching Touch ID would mean
-/// going through the OS, not the wire.
+/// Always false here: USB HID reaches removable keys only.
 pub(crate) fn platform_authenticator_available() -> bool {
     false
 }
 
-/// Nothing to wait for: this backend talks to the key over USB HID and no
-/// dialog of the platform's own stands between the two ceremonies.
+/// Nothing to wait for: no dialog of the platform's own stands between two
+/// ceremonies.
 pub(crate) fn wait_for_ceremony_teardown(_timeout_ms: u64) {}
 
 pub fn begin_enrollment(
@@ -145,127 +112,19 @@ pub fn begin_enrollment(
 }
 
 pub fn complete_enrollment(challenge: &EnrollmentChallenge) -> Result<Enrollment, FidoError> {
-    let device = open_device()?;
-
-    // The same pair the Windows backend sends, and just as deliberately
-    // generic: the silo's own name would leak to the provider.
-    let user = PublicKeyCredentialUserEntity::new(
-        Some(challenge.user_id.as_bytes()),
-        Some("silo"),
-        Some("SilentSilo"),
-    );
-    let extensions = vec![Mext::HmacSecret(Some(true))];
-    let client_data = create_client_data_json(&challenge.challenge);
-    let args = MakeCredentialArgsBuilder::new(&challenge.rp_id, &client_data)
-        .without_pin_and_uv()
-        .user_entity(&user)
-        .extensions(&extensions)
-        .build();
-    let att = device
-        .make_credential_with_args(&args)
-        .map_err(map_enroll_error)?;
-
-    let hmac_enabled = att
-        .extensions
-        .iter()
-        .any(|ext| matches!(ext, Mext::HmacSecret(Some(true))));
-    if !hmac_enabled {
-        return Err(FidoError::EnrollmentFailed(
-            "Security key did not enable hmac-secret. Use a FIDO2 key with hmac-secret support \
-             (e.g. YubiKey 5, Nitrokey 3, SoloKeys)."
-                .into(),
-        ));
-    }
-
-    // CTAP's `hmac-secret` says only that the credential has one; the output
-    // itself comes from an assertion, so the second ceremony is not optional
-    // here. There is also no dialog of the platform's own to race with.
-    Ok(Enrollment {
-        credential: CredentialInfo {
-            credential_id: att.credential_descriptor.id.clone(),
-            public_key: att.credential_publickey.der.clone(),
-            key_slot: challenge.key_slot,
-            rp_id: challenge.rp_id.clone(),
-            authenticator: challenge.authenticator,
-        },
-        unlock: None,
-    })
+    let mut key = open_key()?;
+    enrol_on(&mut key, challenge)
 }
 
 pub fn derive_unlock_material(
     credential_ids: &[Vec<u8>],
     vault_id: &str,
-    // CTAP over USB has one attachment by definition, so there is
-    // nothing here to pin.
+    // USB has one kind of authenticator, so there is nothing to pin.
     _on: Option<Authenticator>,
 ) -> Result<UnlockMaterial, FidoError> {
     if credential_ids.is_empty() {
         return Err(FidoError::UnlockFailed("No enrolled security keys".into()));
     }
-    let device = open_device()?;
-    let salt = dek_salt_for_vault(vault_id);
-    let salt_bytes = hmac_salt_from_string(&salt);
-    let extensions = vec![Gext::HmacSecret(Some(salt_bytes))];
-
-    let mut last_err = None;
-    for credential_id in credential_ids {
-        let mut challenge = [0u8; 32];
-        rand::rng().fill_bytes(&mut challenge);
-        let client_data = get_client_data_json(&challenge);
-        let args = GetAssertionArgsBuilder::new(RP_ID, &client_data)
-            .without_pin_and_uv()
-            .credential_id(credential_id)
-            .extensions(&extensions)
-            .build();
-        match device.get_assertion_with_args(&args) {
-            Ok(assertions) => {
-                let assertion = assertions.first().ok_or_else(|| {
-                    FidoError::UnlockFailed("Security key returned no assertion".into())
-                })?;
-                let hmac =
-                    extract_hmac_from_extensions(&assertion.extensions).ok_or_else(|| {
-                        FidoError::UnlockFailed(
-                        "Security key did not return hmac-secret. Enrollment may be incomplete."
-                            .into(),
-                    )
-                    })?;
-                return Ok(UnlockMaterial {
-                    wrap_key: blake3_key(&hmac),
-                    credential_id: credential_id.clone(),
-                });
-            }
-            Err(e) => last_err = Some(e),
-        }
-    }
-
-    Err(last_err
-        .map(map_device_error)
-        .unwrap_or_else(|| FidoError::UnlockFailed("No matching security key".into())))
-}
-
-fn extract_hmac_from_extensions(extensions: &[Gext]) -> Option<[u8; 32]> {
-    for ext in extensions {
-        if let Gext::HmacSecret(Some(bytes)) = ext {
-            return Some(*bytes);
-        }
-    }
-    None
-}
-
-fn blake3_key(data: &[u8]) -> [u8; 32] {
-    *blake3::hash(data).as_bytes()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn detects_yubikey_via_hid_when_fido_page_hidden() {
-        let hid_yubico = get_hid_devices().iter().any(|d| d.vid == 0x1050);
-        let fido_enum = !get_fidokey_devices().is_empty();
-        if hid_yubico && !fido_enum {
-            assert!(fido_key_present());
-        }
-    }
+    let mut key = open_key()?;
+    unlock_on(&mut key, credential_ids, vault_id)
 }

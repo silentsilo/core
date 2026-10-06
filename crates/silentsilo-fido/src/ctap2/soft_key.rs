@@ -10,9 +10,9 @@ use super::*;
 
 const VAULT: &str = "0198b7e2-5a3c-7d10-9c1e-3f2a4b5c6d7e";
 
-struct SoftKey {
+pub(crate) struct SoftKey {
     protocols: Vec<i64>,
-    pin: Option<String>,
+    pub(crate) pin: Option<String>,
     max_list: usize,
     /// Id and `CredRandomWithoutUV`.
     credentials: Vec<(Vec<u8>, [u8; 32])>,
@@ -23,7 +23,7 @@ struct SoftKey {
 }
 
 impl SoftKey {
-    fn new(protocols: &[i64]) -> Self {
+    pub(crate) fn new(protocols: &[i64]) -> Self {
         Self {
             protocols: protocols.to_vec(),
             pin: None,

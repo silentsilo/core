@@ -10,6 +10,7 @@
 //! token when enrolment requires one, a credential with `hmac-secret`, and
 //! an assertion carrying its output.
 
+pub(crate) mod ceremony;
 pub mod hid;
 pub mod nfc;
 
@@ -365,7 +366,7 @@ impl Info {
 
     /// The first protocol the key lists that this code speaks. A key that
     /// lists none predates the field and speaks one.
-    fn protocol(&self) -> Result<u8, CtapError> {
+    pub(crate) fn protocol(&self) -> Result<u8, CtapError> {
         if self.pin_protocols.is_empty() {
             return Ok(1);
         }
@@ -775,7 +776,7 @@ fn parse_auth_data(raw: &[u8]) -> Result<AuthData, CtapError> {
 }
 
 #[cfg(test)]
-mod soft_key;
+pub(crate) mod soft_key;
 
 #[cfg(test)]
 mod tests {

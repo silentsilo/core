@@ -2,6 +2,13 @@
 //! its OPENSSLDIR. Left to itself, libcrypto reads `openssl.cnf` from there,
 //! or from `OPENSSL_CONF`, on first use, and a config can load a provider
 //! library into the process. So it is initialised first, with no config.
+//!
+//! SQLite is initialised in the same step. SQLite marks itself initialised
+//! before it runs SQLCipher's own setup, and SQLCipher registers
+//! `sqlcipher_export` only at the end of that setup. A second thread opening
+//! its first connection in between got one without the function, and the
+//! working copy's export failed with "no such function: sqlcipher_export".
+//! Inside the `Once`, every other thread waits until both are done.
 
 use std::sync::Once;
 
@@ -23,5 +30,6 @@ pub fn init_openssl() {
     // Safety: no settings pointer, and later initialisations keep these options.
     ONCE.call_once(|| unsafe {
         OPENSSL_init_crypto(OPENSSL_INIT_NO_LOAD_CONFIG, std::ptr::null());
+        rusqlite::ffi::sqlite3_initialize();
     });
 }
