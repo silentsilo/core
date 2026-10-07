@@ -14,22 +14,30 @@ release notes should say.
 ### Added
 
 - The activity log is on by default for a personal silo nobody ever set it
-  for: started at the first sync pass once every copy has answered that
-  none holds a policy, or when opened for a silo with no copies
+  for: started at the first sync pass once every copy the silo has
+  answered (those resting after a failure included) and none holds a
+  policy, or when opened for a silo with no copies
   (`AppState::start_audit_by_default`). A choice of off, on any copy, is
-  kept.
+  kept, and so is off chosen on this device before the log ever started.
 - Reading the activity log opens its records on every core, and keeps what
   it opened while the silo is open, so a second read opens only what is
   new: 100,000 events went from 15 seconds to half a second, then 65 ms.
   `AppState::forget_audit_read` drops it; a client with its own close path
-  calls it.
+  calls it. A personal log opens with every key in `audit/keys/` the
+  content key unwraps, so records two devices sealed to their own keys,
+  having started the log at the same time, both read.
 - Event code 15, "Signed with an SSH key", for the desktop's SSH agent,
   and the optional `ssh_agent` flag on an SSH-key entry (`FORMATS.md`): an
-  older client keeps it when it saves the entry, shown by the 1.0.0 test.
-- `silentsilo-audit`: the format of the activity log, nothing that writes
-  it yet. Each event is sealed alone with HPKE (RFC 9180) to the log's key,
-  queued on the device (`audit-queue/` beside the silo, safe against a crash
-  at any point), and sent in numbered, chained segments under `audit/`. The
+  older client keeps it when it saves the entry, since desktop and Android
+  edit a copy of the whole entry.
+- `silentsilo-audit`: the activity log. Each event is sealed alone with
+  HPKE (RFC 9180) to the log's key, queued on the device (`audit-queue/`
+  beside the silo, safe against a crash at any point: a record cut short is
+  cut off before the next is appended), and sent in numbered, chained
+  segments under `audit/`, each under 8 MiB and 100,000 records. A segment
+  in the queue that does not read is set aside rather than holding back the
+  rest, and one a copy holds under the same number with other bytes is
+  kept here, not counted as delivered. The
   key is random, its private half wrapped under each organisation key or
   under the content key, so devices on an organisation's silo write the log
   and cannot read it. Event codes are numbers, fixed for good. The format is
@@ -53,15 +61,26 @@ release notes should say.
 - `audit_admin`: an organisation's log, started with one of its keys
   touched and readable only by its keys; another key added the same way;
   retention changed; segments past it removed from every copy that takes
-  deletes. A personal log now follows the key a newer policy names, so
-  devices follow an organisation starting its log; an organisation's key
-  stays pinned. Copies of the log's key merge their ways in.
+  deletes, never below 90 days whatever the policy says. A personal log
+  follows the key a newer policy names, so devices follow an organisation
+  starting its log; an organisation's key stays pinned, and a policy
+  naming another key changes nothing of it. The scope pinned is the sealed
+  policy's, and a key file it does not confirm is refused. Copies of the
+  log's key merge their ways in, with the one on the device as well.
 - `audit_read::read_audit_log`: the whole log, from this computer and every
   copy, opened with the log's key, with each device's missing segments and
   events, the records that do not open, and the copies that could not be
   read. Fetched segments are kept in `audit-cache/` beside the silo.
 - `silentsilo_app::record_lock`: the lock event and the segment it closes,
   for a client that closes its sessions itself.
+- `MAX_ENTRY_BYTES`: `upsert_password` refuses an entry over 512 KB, so its
+  record stays under the 1 MiB readers before core 1.4.0 accept. Nothing
+  wrote entries that large; history inside the entry could.
+- `FORMATS.md` describes the entry's `fields` and `history`, and a fixture
+  test proves 1.0.0 keeps both through replay, snapshot and compaction.
+- `fixtures/v1.9.0` and its compacted twin: a silo whose storage holds a
+  personal activity log, and an entry with custom fields, history and
+  `ssh_agent`. The fixture digest now lists the activity log a store holds.
 
 ### Fixed
 
@@ -92,8 +111,9 @@ release notes should say.
   that follows publishes the rest.
 - A sign-in to OneDrive, Dropbox or Google Drive that was never used stayed
   in memory until the app quit, unless another sign-in pushed it out. It now
-  goes when its dialog closes, when the silos lock, or after 30 minutes, and
-  a Dropbox one is revoked as it goes.
+  goes when its dialog closes or when the silos lock, and a Dropbox one is
+  revoked then; after 30 minutes it is no longer offered. Adopting one takes
+  it out of the list first, so a lock at that moment cannot revoke it.
 - A refresh token Microsoft rotated right after a copy was added or
   reconnected was not written, and a pass still running during a reconnect
   could write an older token over the new one, or write one back for a copy
@@ -108,14 +128,6 @@ release notes should say.
   could no longer be read, which let a client go on unrecorded exactly when
   writing failed. A silo seen with an organisation's log now stays mandatory
   for as long as the process runs.
-
-### Added
-
-- `MAX_ENTRY_BYTES`: `upsert_password` refuses an entry over 512 KB, so its
-  record stays under the 1 MiB readers before core 1.4.0 accept. Nothing
-  wrote entries that large; history inside the entry could.
-- `FORMATS.md` describes the entry's `fields` and `history`, and a fixture
-  test proves 1.0.0 keeps both through replay, snapshot and compaction.
 
 ### Changed
 

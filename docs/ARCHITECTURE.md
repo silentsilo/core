@@ -44,7 +44,7 @@ flowchart TD
         CLOUD["silentsilo-cloud<br/>OneDrive, Dropbox, Google Drive:<br/>sign-in, tokens, stores"]
         S3C["silentsilo-s3"]
         FIDO["silentsilo-fido"]
-    AUDIT["silentsilo-audit<br/>activity log: sealed events, segments"]
+        AUDIT["silentsilo-audit<br/>activity log: sealed events, segments"]
         CORE["silentsilo-core<br/>shared types"]
     end
     APP["silentsilo-app<br/>sessions, sync pass order (being moved in)"]
@@ -54,15 +54,15 @@ flowchart TD
     CLIENT["client applications<br/>(silentsilo/desktop, silentsilo/mobile)"]
 
     CLIENT --> APP & VFS & VAULT & SYNC & FIDO
-    APP --> SYNC & VFS & VAULT & STORE
+    APP --> SYNC & VFS & VAULT & STORE & AUDIT
     SYNC --> VFS & VAULT & CRYPTO & STORE & AUDIT
     AUDIT --> CRYPTO
     VFS --> VAULT & CRYPTO & CORE
     VAULT --> CRYPTO & CLOUD
     CLOUD --> STORE & S3C
     STORE --> S3C
-    EXTRACT --> SYNC & VFS & VAULT & CRYPTO & STORE
-    FIXTURE --> SYNC & VFS & VAULT
+    EXTRACT --> SYNC & VFS & VAULT & CRYPTO & STORE & AUDIT
+    FIXTURE --> SYNC & VFS & VAULT & AUDIT
     VAULT & STORE & SYNC & S3C -.dev.-> TESTKIT
 ```
 
@@ -88,21 +88,31 @@ oldest queued event is fifteen minutes old, and sends what waits to every
 copy. A segment leaves the device only once every configured copy holds it,
 as a record does, so a copy in a drawer keeps it queued; a failure warns
 and never stops the sync. A policy that later names another key than an
-organisation's pinned one is not followed: the device goes on sealing to
-the key it pinned, and says so. A personal log follows the newest policy.
-An organisation's log (`audit_admin`) is started, given another reading
-key, has its retention changed and its old segments removed only after a
-touch of one of its keys, which the client asks for; core takes the wrap
-key that touch gave.
+organisation's pinned one is not followed, and nothing of it is taken in:
+the device goes on sealing to the key it pinned, with the setting, scope and
+retention it had, and says so. A personal log follows the newest policy.
+An organisation's log (`audit_admin`) is started and given another reading
+key with the wrap key a touch of one of its keys gave, which the client
+asks for. Changing its retention and removing old segments need the
+organisation's key pinned on this device; the client asks for a touch
+before either. Removal never goes below 90 days (`MIN_RETENTION_DAYS`),
+since anyone with the content key can write a policy.
 A personal log is turned on and off on the device (`AppState::set_audit_log`),
 copies or not: the queue keeps the key and the policy, and the pass writes
 the newest policy, by `changed_at`, to every copy that lacks it
 (`settle_audit_policy`), so turning it on never waits for storage. It is
 on by default: when neither this device nor any copy holds a policy, and
-every copy answered, the pass starts it (`start_silo_log`); a silo with no
-copies starts it when opened (`AppState::start_audit_by_default`, which the
-client calls). Waiting for every copy is what keeps a new device from
-starting a log over a copy's "off" with a newer "on".
+every copy the silo has answered (`required`, those resting after a failure
+included), the pass starts it (`start_silo_log`); a silo with no copies
+starts it when opened (`AppState::start_audit_by_default`, which the client
+calls). Waiting for every copy is what keeps a new device from starting a
+log over a copy's "off" with a newer "on", and a copy holding a policy whose
+key did not read counts as holding one. Off chosen before the log ever
+started is written as a policy saying off. A policy read from the copies is
+not applied over one changed on this device while they were being read:
+the newer local one is spread at the next pass instead. A key file is
+merged with the one on this device, never written over it, so a reading key
+added meanwhile stays.
 Gathering is the caller's and reading is shared: the app and the extract
 tool both hand their segments to `silentsilo_audit::reading::read_log`.
 Reading (`audit_read::read_audit_log`) takes every segment from the cache
@@ -111,8 +121,12 @@ copy it can reach, keeping what it fetched. It checks each device's chain
 and event count from the oldest segment present (a retention may have
 removed what came before) and names what is missing, records that do not
 open with the log's key, and copies it could not read. A personal silo's
-log opens with the content key; an organisation's only with an
-organisation key's wrap key. Opening a record is about 150 microseconds of
+log opens with the content key, with every personal key in `audit/keys/`
+it unwraps: two devices that started the log at once each sealed some
+records to their own key. An organisation's opens only with an
+organisation key's wrap key. The cache is never pruned to match storage:
+a segment deleted from every copy stays readable here, so whoever can
+delete in storage cannot erase what this computer already read. Opening a record is about 150 microseconds of
 X25519 and AES-GCM, so records are opened on every core
 (`reading::read_log_with`), and what was opened is kept in `AppState` per
 silo (`audit_opened`), matched by each segment's bytes: the next read opens
@@ -719,9 +733,12 @@ Read this before "fixing" any of it.
   tokens, and only stored under the target id once the list is saved: a
   failed check leaves no token behind. A reconnect must reach the same
   account, or the target would point at an empty folder. A sign-in nobody
-  adopts goes when its dialog closes (`cancel_cloud_sign_in`), when the
-  silos lock (`forget_cloud_sign_ins`) or after 30 minutes, and a Dropbox one
-  is revoked as it goes.
+  adopts goes when its dialog closes (`cancel_cloud_sign_in`) or when the
+  silos lock (`forget_cloud_sign_ins`), and a Dropbox one is revoked then.
+  After 30 minutes it is no longer offered and is dropped from memory the
+  next time the list is read, without a revocation. Adoption takes it out
+  of the list first, so a lock meanwhile cannot revoke what is being
+  adopted; a failed adoption puts it back.
 - **Adopting a sign-in keeps its token source.** The store that was checked
   with it goes on using the same source, so a rotation from then on is
   written under the target. Each target's source carries a generation, and

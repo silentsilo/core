@@ -149,6 +149,9 @@ fn republish(
         .map_err(|e| e.to_string())
 }
 
+/// The shortest retention the app offers. Expiry never goes below it.
+pub const MIN_RETENTION_DAYS: u32 = 90;
+
 /// Removes the organisation log's segments closed before its retention
 /// allows, from every copy that takes deletes and from this computer's
 /// cache. A copy kept append-only keeps them. Returns how many went.
@@ -157,27 +160,32 @@ pub async fn expire_audit_segments(
     host: &dyn Host,
     silo: &SiloEntry,
 ) -> Result<usize, String> {
-    let (retention, root) = {
+    // The sessions lock first and on its own: opening a silo holds it while
+    // it closes another, which opens that one's spool.
+    let root = state
+        .sessions
+        .lock()
+        .map_err(|e| e.to_string())?
+        .get(&silo.id)
+        .ok_or("That silo is not open.")?
+        .paths
+        .root
+        .clone();
+    let retention = {
         let spool = state.audit_spool(silo.id)?;
         org_key(&spool)?;
-        let policy = spool
+        spool
             .policy()
             .map_err(|e| e.to_string())?
-            .ok_or("This silo keeps no activity log.")?;
-        let root = state
-            .sessions
-            .lock()
-            .map_err(|e| e.to_string())?
-            .get(&silo.id)
-            .ok_or("That silo is not open.")?
-            .paths
-            .root
-            .clone();
-        (policy.retention_days, root)
+            .ok_or("This silo keeps no activity log.")?
+            .retention_days
     };
     let Some(days) = retention else {
         return Ok(0);
     };
+    // Anyone with the content key can write a policy. A retention shorter
+    // than any the app offers is not one an organisation chose.
+    let days = days.max(MIN_RETENTION_DAYS);
     let now = now_ms();
     let cutoff = now.saturating_sub(i64::from(days) * 86_400_000);
     let cache = root.join(CACHE_DIR);

@@ -267,9 +267,14 @@ pub async fn activity_log(
     if key.scope == silentsilo_audit::Scope::Org {
         return Ok(ActivityLog::Organisation);
     }
-    let private = key
-        .unwrap_with(silentsilo_audit::BY_SILO, backup.kek.as_bytes())
+    key.unwrap_with(silentsilo_audit::BY_SILO, backup.kek.as_bytes())
         .map_err(|_| ExtractError::Storage("the activity log's key does not open".into()))?;
+    // Every personal key it holds: records name the one they were sealed to.
+    let keys = silentsilo_sync::audit_log::read_silo_keys(store, &backup.kek)
+        .await
+        .map_err(storage)?;
+    let held: Vec<(silentsilo_audit::KeyId, &[u8])> =
+        keys.iter().map(|(id, k)| (*id, &k[..])).collect();
 
     let listed = store
         .list(silentsilo_audit::AUDIT_PREFIX)
@@ -298,7 +303,7 @@ pub async fn activity_log(
     Ok(ActivityLog::Read(silentsilo_audit::reading::read_log(
         segments,
         &[],
-        &private,
+        &held,
     )))
 }
 

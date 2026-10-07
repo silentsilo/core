@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::{Event, Segment, check_chain, counter_gaps, describe, open_event};
+use crate::{Event, KeyId, Segment, check_chain, counter_gaps, describe, open_event, record_key};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LogEntry {
@@ -53,7 +53,7 @@ pub struct LogRead {
 /// clear.
 #[derive(Default)]
 pub struct Opened {
-    /// Which private key opened them: another reader starts over.
+    /// Which keys opened them: another reader starts over.
     key: Option<[u8; 32]>,
     segments: HashMap<(Uuid, u64), OpenedSegment>,
 }
@@ -69,10 +69,22 @@ impl Opened {
     }
 }
 
+/// The private keys a reader holds, each by the id records name it with.
+/// A personal log can have had more than one: two devices that started it
+/// at once, before either heard of the other's.
+pub type ReadKeys<'a> = [(KeyId, &'a [u8])];
+
+/// Opens `record` with the key it names, if the reader holds it.
+fn open_with(keys: &ReadKeys, device: Uuid, record: &[u8]) -> Option<Event> {
+    let id = record_key(record).ok()?;
+    let (_, private) = keys.iter().find(|(held, _)| *held == id)?;
+    open_event(private, device, record).ok()
+}
+
 /// Opens every record of `jobs`, each a device and its records, on all the
 /// cores there are. One record is about 150 microseconds of X25519 and
 /// AES-GCM, so a year of a busy log takes seconds on one core.
-fn open_all(private: &[u8], jobs: &[(Uuid, &[Vec<u8>])]) -> Vec<Vec<Option<Event>>> {
+fn open_all(keys: &ReadKeys, jobs: &[(Uuid, &[Vec<u8>])]) -> Vec<Vec<Option<Event>>> {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -92,7 +104,7 @@ fn open_all(private: &[u8], jobs: &[(Uuid, &[Vec<u8>])]) -> Vec<Vec<Option<Event
             };
             let opened: Vec<Option<Event>> = records
                 .iter()
-                .map(|record| open_event(private, *device, record).ok())
+                .map(|record| open_with(keys, *device, record))
                 .collect();
             if let Ok(mut slot) = results[job].lock() {
                 *slot = opened;
@@ -119,9 +131,9 @@ fn open_all(private: &[u8], jobs: &[(Uuid, &[Vec<u8>])]) -> Vec<Vec<Option<Event
 pub fn read_log(
     segments: impl IntoIterator<Item = Segment>,
     unsent: &[(Uuid, Vec<u8>)],
-    private: &[u8],
+    keys: &ReadKeys,
 ) -> LogRead {
-    read_log_with(segments, unsent, private, &mut Opened::default())
+    read_log_with(segments, unsent, keys, &mut Opened::default())
 }
 
 /// [`read_log`], opening only the segments `opened` does not hold yet, and
@@ -129,10 +141,19 @@ pub fn read_log(
 pub fn read_log_with(
     segments: impl IntoIterator<Item = Segment>,
     unsent: &[(Uuid, Vec<u8>)],
-    private: &[u8],
+    keys: &ReadKeys,
     opened: &mut Opened,
 ) -> LogRead {
-    let key = *blake3::hash(private).as_bytes();
+    let key = {
+        let mut held: Vec<&(KeyId, &[u8])> = keys.iter().collect();
+        held.sort_by_key(|(id, _)| *id);
+        let mut hasher = blake3::Hasher::new();
+        for (id, private) in held {
+            hasher.update(id);
+            hasher.update(private);
+        }
+        *hasher.finalize().as_bytes()
+    };
     if opened.key != Some(key) {
         opened.segments.clear();
         opened.key = Some(key);
@@ -169,7 +190,7 @@ pub fn read_log_with(
         .iter()
         .map(|s| (s.device, s.records.as_slice()))
         .collect();
-    for (segment, events) in fresh.iter().zip(open_all(private, &jobs)) {
+    for (segment, events) in fresh.iter().zip(open_all(keys, &jobs)) {
         let id = (segment.device, segment.seq);
         opened.segments.insert(id, (hashes[&id], events));
     }
@@ -184,7 +205,7 @@ pub fn read_log_with(
         let pending: Vec<Option<Event>> = unsent
             .iter()
             .filter(|(d, _)| *d == device)
-            .map(|(_, record)| open_event(private, device, record).ok())
+            .map(|(_, record)| open_with(keys, device, record))
             .collect();
         let held = segments
             .iter()
@@ -348,7 +369,7 @@ mod tests {
             closed_at: 1,
             records: vec![sealed(0, 10), sealed(1, 20)],
         };
-        let read = read_log([segment], &[(device, sealed(3, 40))], &keys.private);
+        let read = read_log([segment], &[(device, sealed(3, 40))], &one(&keys));
         assert_eq!(read.entries.len(), 3);
         assert_eq!(read.entries[0].event.i, 3, "newest first");
         assert_eq!(read.devices[0].missing_events, vec![(2, 2)]);
@@ -362,6 +383,28 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(parsed["device_name"], "Laptop");
         assert_eq!(parsed["record"]["l"], "Bank");
+    }
+
+    fn one(keys: &KeyPair) -> [(KeyId, &[u8]); 1] {
+        [(keys.id(), &keys.private[..])]
+    }
+
+    #[test]
+    fn records_under_an_earlier_key_open_with_it() {
+        let first = KeyPair::generate();
+        let second = KeyPair::generate();
+        let device = Uuid::new_v4();
+        let mut a = log(&first, device, 1, 2);
+        let b = log(&second, device, 2, 2);
+        a.push(b[1].clone());
+        let both = [
+            (first.id(), &first.private[..]),
+            (second.id(), &second.private[..]),
+        ];
+        let read = read_log(a.clone(), &[], &both);
+        assert_eq!((read.entries.len(), read.unreadable), (4, 0));
+        let only = read_log(a, &[], &one(&second));
+        assert_eq!((only.entries.len(), only.unreadable), (2, 2));
     }
 
     fn log(keys: &KeyPair, device: Uuid, segments: u64, per: u64) -> Vec<Segment> {
@@ -388,7 +431,7 @@ mod tests {
         let keys = KeyPair::generate();
         let device = Uuid::new_v4();
         let all = log(&keys, device, 6, 50);
-        let plain = read_log(all.clone(), &[], &keys.private);
+        let plain = read_log(all.clone(), &[], &one(&keys));
         assert_eq!(plain.entries.len(), 300);
         assert_eq!(
             plain.entries[0].event.i, 299,
@@ -396,9 +439,9 @@ mod tests {
         );
 
         let mut opened = Opened::default();
-        let first = read_log_with(all[..4].to_vec(), &[], &keys.private, &mut opened);
+        let first = read_log_with(all[..4].to_vec(), &[], &one(&keys), &mut opened);
         assert_eq!((first.entries.len(), opened.segments()), (200, 4));
-        let second = read_log_with(all.clone(), &[], &keys.private, &mut opened);
+        let second = read_log_with(all.clone(), &[], &one(&keys), &mut opened);
         assert_eq!(opened.segments(), 6);
         let ids = |r: &LogRead| r.entries.iter().map(|e| e.event.i).collect::<Vec<_>>();
         assert_eq!(ids(&second), ids(&plain));
@@ -411,10 +454,10 @@ mod tests {
         let device = Uuid::new_v4();
         let mut all = log(&keys, device, 2, 3);
         let mut opened = Opened::default();
-        read_log_with(all.clone(), &[], &keys.private, &mut opened);
+        read_log_with(all.clone(), &[], &one(&keys), &mut opened);
         // Same place, other records: a copy that does not hold what was read.
         all[1].records.truncate(1);
-        let again = read_log_with(all, &[], &keys.private, &mut opened);
+        let again = read_log_with(all, &[], &one(&keys), &mut opened);
         assert_eq!(again.entries.len(), 4);
     }
 
@@ -425,8 +468,8 @@ mod tests {
         let device = Uuid::new_v4();
         let all = log(&keys, device, 2, 3);
         let mut opened = Opened::default();
-        read_log_with(all.clone(), &[], &keys.private, &mut opened);
-        let wrong = read_log_with(all, &[], &other.private, &mut opened);
+        read_log_with(all.clone(), &[], &one(&keys), &mut opened);
+        let wrong = read_log_with(all, &[], &one(&other), &mut opened);
         assert_eq!((wrong.entries.len(), wrong.unreadable), (0, 6));
     }
 }

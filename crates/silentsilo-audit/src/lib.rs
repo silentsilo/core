@@ -20,10 +20,10 @@ pub mod spool;
 
 pub use events::{Event, codes, describe};
 pub use keyring::{AuditKey, AuditPolicy, BY_SILO, POLICY_PATH, Scope, audit_key_path};
-pub use record::{KeyId, KeyPair, open_event, record_key, seal_event};
+pub use record::{KeyId, KeyPair, key_id, open_event, record_key, seal_event};
 pub use segment::{
-    AUDIT_PREFIX, ChainReport, MAX_SEGMENT_BYTES, Segment, check_chain, parse_segment_key,
-    segment_key,
+    AUDIT_PREFIX, ChainReport, MAX_RECORDS, MAX_SEGMENT_BYTES, Segment, check_chain,
+    parse_segment_key, segment_key,
 };
 pub use spool::{Pinned, PolicyRead, QUEUE_DIR, Spool, SpoolError, start_silo_log};
 
@@ -57,7 +57,7 @@ pub fn counter_gaps(events: &[Event], first: u64) -> Vec<(u64, u64)> {
         if i > expected {
             gaps.push((expected, i - 1));
         }
-        expected = i + 1;
+        expected = i.saturating_add(1);
     }
     gaps
 }

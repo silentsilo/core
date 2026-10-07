@@ -8,6 +8,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+silentsilo-audit = { workspace = true }
 silentsilo-core = { workspace = true }
 silentsilo-crypto = { workspace = true }
 silentsilo-store = { workspace = true }
@@ -36,6 +37,5 @@ silentsilo-store-v1_6_1 = { package = "silentsilo-store", git = "https://github.
 silentsilo-crypto-v1_6_1 = { package = "silentsilo-crypto", git = "https://github.com/silentsilo/core", tag = "v1.6.1" }
 silentsilo-vfs-v1_6_1 = { package = "silentsilo-vfs", git = "https://github.com/silentsilo/core", tag = "v1.6.1" }
 silentsilo-app = { workspace = true }
-silentsilo-audit = { workspace = true }
 hex = "0.4"
 blake3 = { workspace = true }

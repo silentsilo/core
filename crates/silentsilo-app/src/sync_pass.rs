@@ -310,7 +310,7 @@ async fn deliver_audit(
         .is_none_or(|p| now.saturating_sub(p.checked_at) >= AUDIT_POLICY_EVERY);
     drop(spool);
     if stale {
-        settle_audit_policy(host, kek, targets, &open, now).await;
+        settle_audit_policy(host, kek, targets, required, &open, now).await;
     }
 
     let now_ms = now.saturating_mul(1000);
@@ -338,9 +338,19 @@ async fn deliver_audit(
         std::collections::HashMap::new();
     for target in targets {
         match sync::audit_log::push_audit_segments(&*target.store, &outbox).await {
-            Ok(held) => {
-                for seq in held {
+            Ok(pushed) => {
+                for seq in pushed.held {
                     holders.entry(seq).or_default().insert(target.id);
+                }
+                // Kept here, and said, rather than lost as delivered.
+                for seq in pushed.differ {
+                    host.warn(
+                        "audit",
+                        &format!(
+                            "{}: holds another activity segment {seq} from this device; this one stays on this computer",
+                            target.label
+                        ),
+                    );
                 }
             }
             Err(e) => host.warn("audit", &format!("{}: {e}", target.label)),
@@ -367,6 +377,10 @@ fn start_by_default(
     now: i64,
 ) -> Option<(silentsilo_audit::AuditPolicy, silentsilo_audit::AuditKey)> {
     let mut spool = open()?;
+    // Set here while the copies were being read: that choice stands.
+    if spool.pinned().is_some() || !matches!(spool.policy(), Ok(None)) {
+        return None;
+    }
     match silentsilo_audit::start_silo_log(&mut spool, kek.as_bytes(), now) {
         Ok(started) => Some(started),
         Err(e) => {
@@ -384,6 +398,7 @@ async fn settle_audit_policy(
     host: &dyn Host,
     kek: &silentsilo_crypto::ContentKek,
     targets: &[OpenTarget],
+    required: &std::collections::HashSet<Uuid>,
     open: &(dyn Fn() -> Option<silentsilo_audit::Spool> + Sync),
     now: i64,
 ) {
@@ -429,15 +444,31 @@ async fn settle_audit_policy(
         newest = Some((policy.clone(), key));
     }
     // Nobody ever set it, here or on any copy: the log is on by default.
-    // Only when every copy answered, so a device that has not seen a
-    // copy's "off" yet cannot override it with a newer "on".
-    if newest.is_none() && local_policy_absent && on_copies.len() == targets.len() {
+    // Only when every copy the silo has answered, those resting after a
+    // failure included, and none holds a policy, even one whose key did not
+    // read: a device that has not seen a copy's "off" must not override it
+    // with a newer "on".
+    let none_held = on_copies.iter().all(|(_, policy)| policy.is_none());
+    let all_answered = required
+        .iter()
+        .all(|id| on_copies.iter().any(|(target, _)| target.id == *id));
+    if newest.is_none() && local_policy_absent && none_held && all_answered {
         newest = start_by_default(host, kek, open, now);
     }
     let Some((policy, key)) = newest else { return };
 
     let read = {
         let Some(mut spool) = open() else { return };
+        // Changed on this computer while the copies were read: that is the
+        // newer choice, and the next pass spreads it.
+        if spool
+            .policy()
+            .ok()
+            .flatten()
+            .is_some_and(|mine| mine.changed_at > policy.changed_at)
+        {
+            return;
+        }
         spool.apply_policy(&policy, &key, now)
     };
     match read {

@@ -34,8 +34,13 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    AuditError, AuditKey, AuditPolicy, BY_SILO, Event, KeyPair, Scope, Segment, codes, seal_event,
+    AuditError, AuditKey, AuditPolicy, BY_SILO, Event, KeyPair, MAX_RECORDS, MAX_SEGMENT_BYTES,
+    Scope, Segment, codes, seal_event,
 };
+
+/// What a segment's header and a record's length take, beside the records.
+const SEGMENT_HEADER: usize = 73;
+const RECORD_FRAME: usize = 4;
 
 pub const QUEUE_DIR: &str = "audit-queue";
 const KEY_FILE: &str = "key.json";
@@ -144,14 +149,22 @@ fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     }
 }
 
+/// Records not in a segment yet, as (event number, sealed record).
+type Records = Vec<(u64, Vec<u8>)>;
+
 /// The pending records, as (event number, sealed record).
-fn read_pending(path: &Path) -> std::io::Result<Vec<(u64, Vec<u8>)>> {
+fn read_pending(path: &Path) -> std::io::Result<Records> {
+    Ok(read_pending_with_end(path)?.0)
+}
+
+/// The pending records, and where the last whole one ends.
+fn read_pending_with_end(path: &Path) -> std::io::Result<(Records, u64)> {
     let mut bytes = Vec::new();
     match File::open(path) {
         Ok(mut file) => {
             file.read_to_end(&mut bytes)?;
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
         Err(e) => return Err(e),
     }
     let mut out = Vec::new();
@@ -167,7 +180,7 @@ fn read_pending(path: &Path) -> std::io::Result<Vec<(u64, Vec<u8>)>> {
         out.push((number, bytes[at + 12..at + 12 + len].to_vec()));
         at += 12 + len;
     }
-    Ok(out)
+    Ok((out, at as u64))
 }
 
 /// Takes the spool's lock, waiting up to [`LOCK_WAIT`] for another holder.
@@ -202,9 +215,18 @@ impl Spool {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => State::default(),
             Err(e) => return Err(e.into()),
         };
+        let pending_path = dir.join("pending");
+        let (pending, end) = read_pending_with_end(&pending_path)?;
         // Appended and synced, but the count had not moved past it.
-        if let Some((last, _)) = read_pending(&dir.join("pending"))?.last() {
-            state.next_event = state.next_event.max(last + 1);
+        if let Some((last, _)) = pending.last() {
+            state.next_event = state.next_event.max(last.saturating_add(1));
+        }
+        // A record cut short by a crash is cut off here, or the next one
+        // would be appended after it and read as part of it.
+        if fs::metadata(&pending_path).is_ok_and(|m| m.len() > end) {
+            let file = OpenOptions::new().write(true).open(&pending_path)?;
+            file.set_len(end)?;
+            file.sync_all()?;
         }
         Ok(Self {
             dir,
@@ -227,7 +249,9 @@ impl Spool {
         key: &AuditKey,
         now: i64,
     ) -> Result<PolicyRead, SpoolError> {
-        if key.key_id != policy.key_id {
+        // The key file is not sealed; the policy is. A key whose scope the
+        // policy does not confirm is damage, not a log to follow.
+        if key.key_id != policy.key_id || key.scope != policy.scope {
             return Err(AuditError::BadKey.into());
         }
         let public = hex::encode(key.public()?);
@@ -245,24 +269,29 @@ impl Spool {
             Some(_) => PolicyRead::Kept,
             None => PolicyRead::Pinned,
         };
-        let (key_id, public_key) = match (&read, &self.state.pinned) {
-            (PolicyRead::KeyChanged { .. }, Some(pinned)) => {
-                (pinned.key_id.clone(), pinned.public_key.clone())
-            }
-            _ => (policy.key_id.clone(), public),
-        };
-        self.state.pinned = Some(Pinned {
-            key_id,
-            public_key,
-            // An organisation's log does not stop because its policy says so.
-            enabled: policy.enabled || key.scope == Scope::Org,
-            scope: key.scope,
-            retention_days: policy.retention_days,
-            checked_at: now,
+        self.state.pinned = Some(match (&read, &self.state.pinned) {
+            // Nothing of another key's policy is taken in: not its setting,
+            // its scope or its retention. Only that it was read.
+            (PolicyRead::KeyChanged { .. }, Some(pinned)) => Pinned {
+                checked_at: now,
+                ..pinned.clone()
+            },
+            _ => Pinned {
+                key_id: policy.key_id.clone(),
+                public_key: public,
+                // An organisation's log does not stop because its policy says so.
+                enabled: policy.enabled || policy.scope == Scope::Org,
+                scope: policy.scope,
+                retention_days: policy.retention_days,
+                checked_at: now,
+            },
         });
         // Another key's policy is not kept: it is not this device's log.
         if !matches!(read, PolicyRead::KeyChanged { .. }) {
-            write_whole(&self.dir.join(KEY_FILE), &key.to_json()?)?;
+            write_whole(
+                &self.dir.join(KEY_FILE),
+                &self.with_kept_ways(key)?.to_json()?,
+            )?;
             write_whole(
                 &self.dir.join(POLICY_FILE),
                 &serde_json::to_vec(policy).map_err(AuditError::from)?,
@@ -292,11 +321,23 @@ impl Spool {
         match &self.state.pinned {
             Some(pinned) if pinned.key_id == key.key_id => {
                 key.public()?;
-                write_whole(&self.dir.join(KEY_FILE), &key.to_json()?)?;
+                write_whole(
+                    &self.dir.join(KEY_FILE),
+                    &self.with_kept_ways(key)?.to_json()?,
+                )?;
                 Ok(())
             }
             _ => Err(AuditError::BadKey.into()),
         }
+    }
+
+    /// `key` with every way in the copy on this computer has: one added
+    /// here while a pass was reading the copies is not written over.
+    fn with_kept_ways(&self, key: &AuditKey) -> Result<AuditKey, SpoolError> {
+        Ok(match self.key()? {
+            Some(kept) if kept.key_id == key.key_id => key.merged(&kept),
+            _ => key.clone(),
+        })
     }
 
     /// The pinned log's key, as storage holds it.
@@ -349,14 +390,20 @@ impl Spool {
     fn record_to(&mut self, public_key: &[u8], mut event: Event) -> Result<u64, SpoolError> {
         event.i = self.state.next_event;
         let sealed = seal_event(public_key, self.device, &event)?;
+        let mut frame = Vec::with_capacity(12 + sealed.len());
+        frame.extend_from_slice(&event.i.to_be_bytes());
+        frame.extend_from_slice(&(sealed.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&sealed);
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(self.dir.join("pending"))?;
-        file.write_all(&event.i.to_be_bytes())?;
-        file.write_all(&(sealed.len() as u32).to_be_bytes())?;
-        file.write_all(&sealed)?;
-        file.sync_all()?;
+        let before = file.metadata()?.len();
+        if let Err(e) = file.write_all(&frame).and_then(|()| file.sync_all()) {
+            // Half a record left behind would swallow the next one.
+            let _ = file.set_len(before);
+            return Err(e.into());
+        }
         self.state.next_event = event.i + 1;
         if self.state.pending_since.is_none() {
             self.state.pending_since = Some(event.t);
@@ -365,16 +412,41 @@ impl Spool {
         Ok(event.i)
     }
 
-    /// Turns what is pending into the next segment, in the outbox. Nothing
-    /// pending, nothing written.
+    /// Turns what is pending into the next segment, in the outbox, or into
+    /// several when it is more than a reader takes in one. Returns the last.
+    /// Nothing pending, nothing written.
     pub fn close(&mut self, now: i64) -> Result<Option<Segment>, SpoolError> {
         let pending: Vec<(u64, Vec<u8>)> = read_pending(&self.dir.join("pending"))?
             .into_iter()
             .filter(|(number, _)| *number >= self.state.closed_through)
             .collect();
-        if pending.is_empty() {
-            return Ok(None);
+        let mut last = None;
+        let mut rest = pending.as_slice();
+        while !rest.is_empty() {
+            let mut size = SEGMENT_HEADER;
+            let mut take = 0;
+            for (_, record) in rest {
+                let next = size + RECORD_FRAME + record.len();
+                if take > 0 && (take == MAX_RECORDS || next as u64 > MAX_SEGMENT_BYTES) {
+                    break;
+                }
+                size = next;
+                take += 1;
+            }
+            let (chunk, after) = rest.split_at(take);
+            last = Some(self.close_chunk(chunk, now)?);
+            rest = after;
         }
+        if last.is_some() {
+            self.state.pending_since = None;
+            self.save_state()?;
+            let _ = fs::remove_file(self.dir.join("pending"));
+        }
+        Ok(last)
+    }
+
+    /// One segment of `records`, written before the state says it exists.
+    fn close_chunk(&mut self, records: &[(u64, Vec<u8>)], now: i64) -> Result<Segment, SpoolError> {
         let prev = if self.state.last_hash.is_empty() {
             [0u8; 32]
         } else {
@@ -383,35 +455,45 @@ impl Spool {
                 .and_then(|h| h.try_into().ok())
                 .unwrap_or([0u8; 32])
         };
-        let through = pending.iter().map(|(n, _)| *n).max().unwrap_or(0) + 1;
+        let through = records
+            .iter()
+            .map(|(n, _)| *n)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
         let segment = Segment {
             device: self.device,
             seq: self.state.next_segment,
             prev,
             closed_at: now,
-            records: pending.into_iter().map(|(_, r)| r).collect(),
+            records: records.iter().map(|(_, r)| r.clone()).collect(),
         };
         write_whole(&self.outbox_path(segment.seq), &segment.to_bytes())?;
         self.state.next_segment = segment.seq + 1;
         self.state.last_hash = hex::encode(segment.hash());
         self.state.closed_through = through;
-        self.state.pending_since = None;
         self.save_state()?;
-        let _ = fs::remove_file(self.dir.join("pending"));
-        Ok(Some(segment))
+        Ok(segment)
     }
 
     fn outbox_path(&self, seq: u64) -> PathBuf {
         self.dir.join("outbox").join(format!("{seq:012}.seg"))
     }
 
-    /// Closed segments not yet everywhere, oldest first.
+    /// Closed segments not yet everywhere, oldest first. One that does not
+    /// read is set aside as `.damaged`, kept but no longer sent: it must not
+    /// hold back every segment after it. The reader then names the hole.
     pub fn outbox(&self) -> Result<Vec<Segment>, SpoolError> {
         let mut out = Vec::new();
         for entry in fs::read_dir(self.dir.join("outbox"))? {
             let path = entry?.path();
             if path.extension().is_some_and(|e| e == "seg") {
-                out.push(Segment::from_bytes(&fs::read(&path)?)?);
+                match Segment::from_bytes(&fs::read(&path)?) {
+                    Ok(segment) => out.push(segment),
+                    Err(_) => {
+                        let _ = fs::rename(&path, path.with_extension("damaged"));
+                    }
+                }
             }
         }
         out.sort_by_key(|s| s.seq);
@@ -527,11 +609,34 @@ mod tests {
 
         let theirs = KeyPair::generate();
         let swapped = AuditPolicy::new(false, &theirs.id(), None, Scope::Silo, 2);
+        let before = spool.pinned().cloned().unwrap();
         spool
             .apply_policy(&swapped, &AuditKey::new(&theirs, Scope::Silo, 2), 20)
             .unwrap();
         assert_eq!(spool.key().unwrap(), Some(key));
         assert_eq!(spool.policy().unwrap(), Some(on));
+        // Not switched off, not made personal, retention unchanged.
+        let after = spool.pinned().cloned().unwrap();
+        assert_eq!(
+            after,
+            Pinned {
+                checked_at: 20,
+                ..before
+            }
+        );
+        assert!(spool.record(Event::new(11, 30)).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_key_whose_scope_the_policy_does_not_confirm_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut spool = Spool::open(dir.path(), Uuid::new_v4()).unwrap();
+        let keys = KeyPair::generate();
+        // Storage edited the unsealed key file from Org to Silo.
+        let key = AuditKey::new(&keys, Scope::Silo, 1);
+        let policy = AuditPolicy::new(true, &keys.id(), Some(365), Scope::Org, 1);
+        assert!(spool.apply_policy(&policy, &key, 10).is_err());
+        assert!(spool.pinned().is_none());
     }
 
     #[test]
@@ -633,6 +738,75 @@ mod tests {
         let mut spool = Spool::open(dir.path(), device).unwrap();
         let segment = spool.close(5).unwrap().unwrap();
         assert_eq!(segment.records.len(), 1);
+    }
+
+    #[test]
+    fn an_event_after_an_append_cut_short_is_read_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = KeyPair::generate();
+        let device = Uuid::new_v4();
+        let mut spool = Spool::open(dir.path(), device).unwrap();
+        spool.record_to(&keys.public, Event::new(1, 1)).unwrap();
+        let pending = dir.path().join(QUEUE_DIR).join("pending");
+        let mut file = OpenOptions::new().append(true).open(&pending).unwrap();
+        file.write_all(&[0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1]).unwrap();
+        drop(spool);
+
+        let mut spool = Spool::open(dir.path(), device).unwrap();
+        spool.record_to(&keys.public, Event::new(2, 2)).unwrap();
+        spool.record_to(&keys.public, Event::new(3, 3)).unwrap();
+        let segment = spool.close(5).unwrap().unwrap();
+        let events = events_in(&[segment], &keys);
+        assert_eq!(
+            events.iter().map(|e| (e.c, e.i)).collect::<Vec<_>>(),
+            vec![(1, 0), (2, 1), (3, 2)]
+        );
+    }
+
+    #[test]
+    fn more_than_a_segment_holds_goes_into_several_chained_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = KeyPair::generate();
+        let device = Uuid::new_v4();
+        let mut spool = Spool::open(dir.path(), device).unwrap();
+        // 600 records of about 15 KB: more than 8 MiB.
+        let big = "x".repeat(15_000);
+        for t in 0..600 {
+            spool
+                .record_to(&keys.public, Event::new(1, t).with("pad", big.as_str()))
+                .unwrap();
+        }
+        spool.close(5).unwrap().unwrap();
+        let outbox = spool.outbox().unwrap();
+        assert_eq!(outbox.len(), 2);
+        assert_eq!(outbox[1].prev, outbox[0].hash());
+        for segment in &outbox {
+            assert!(segment.to_bytes().len() as u64 <= MAX_SEGMENT_BYTES);
+            Segment::from_bytes(&segment.to_bytes()).unwrap();
+        }
+        assert_eq!(events_in(&outbox, &keys).len(), 600);
+        assert!(spool.pending().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_damaged_segment_in_the_outbox_does_not_hold_the_rest_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = KeyPair::generate();
+        let device = Uuid::new_v4();
+        let mut spool = Spool::open(dir.path(), device).unwrap();
+        spool.record_to(&keys.public, Event::new(1, 1)).unwrap();
+        spool.close(5).unwrap();
+        spool.record_to(&keys.public, Event::new(2, 2)).unwrap();
+        spool.close(6).unwrap();
+        let first = dir
+            .path()
+            .join(QUEUE_DIR)
+            .join("outbox")
+            .join(format!("{:012}.seg", 0));
+        fs::write(&first, b"noise").unwrap();
+        let outbox = spool.outbox().unwrap();
+        assert_eq!(outbox.iter().map(|s| s.seq).collect::<Vec<_>>(), vec![1]);
+        assert!(first.with_extension("damaged").exists());
     }
 
     #[test]

@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use silentsilo_app::{AppEvent, AppState, Host, run_sync_pass};
+use silentsilo_app::{AppEvent, AppState, Host, run_sync_pass, sync_now};
 use silentsilo_audit::{
     AuditKey, AuditPolicy, Event, KeyPair, Scope, Segment, Spool, codes, open_event,
 };
@@ -303,9 +303,53 @@ async fn a_copy_that_cannot_be_read_holds_the_default_back() {
     unplug(&b);
     run_sync_pass(&device.state, &host, &device.silo).await.ok();
     assert!(device.spool().pinned().is_none(), "not started blind");
-    plug_in(&b);
+    // Resting after its failure, it is not asked at all: still a copy
+    // that has not answered.
     run_sync_pass(&device.state, &host, &device.silo).await.ok();
+    assert!(device.spool().pinned().is_none(), "not while it rests");
+    plug_in(&b);
+    sync_now(&device.state, &host, &device.silo).await.ok();
     assert!(device.spool().pinned().is_some_and(|p| p.enabled));
+}
+
+#[tokio::test]
+async fn a_copy_holding_a_policy_whose_key_does_not_read_holds_the_default_back() {
+    let a = tempfile::tempdir().unwrap();
+    let host = Copies(vec![copy(a.path())], false);
+    let device = Device::new(&host);
+    let store = FolderStore::new(a.path().to_path_buf());
+    // "Off" reached the copy; its key file did not.
+    let keys = KeyPair::generate();
+    let off = AuditPolicy::new(false, &keys.id(), None, Scope::Silo, 5);
+    silentsilo_sync::audit_log::write_audit_policy(&store, &device.kek(), &off)
+        .await
+        .unwrap();
+
+    run_sync_pass(&device.state, &host, &device.silo).await.ok();
+    assert!(device.spool().pinned().is_none(), "not started over an off");
+    let still = silentsilo_sync::audit_log::read_audit_policy(&store, &device.kek())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(still, off);
+}
+
+#[tokio::test]
+async fn off_chosen_before_the_log_started_is_kept_and_spread() {
+    let a = tempfile::tempdir().unwrap();
+    let host = Copies(vec![copy(a.path())], true);
+    let device = Device::new(&host);
+    device.state.set_audit_log(device.silo.id, false).unwrap();
+    run_sync_pass(&device.state, &host, &device.silo)
+        .await
+        .unwrap();
+    assert!(!device.state.audit_status(device.silo.id).unwrap().enabled);
+    let store = FolderStore::new(a.path().to_path_buf());
+    let policy = silentsilo_sync::audit_log::read_audit_policy(&store, &device.kek())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!policy.enabled, "the copy holds the choice");
 }
 
 #[tokio::test]
@@ -541,6 +585,45 @@ mod reading {
     }
 
     #[tokio::test]
+    async fn records_under_a_key_this_device_left_still_read() {
+        let a = tempfile::tempdir().unwrap();
+        let host = Copies(vec![copy(a.path())], true);
+        let device = Device::new(&host);
+        let id = device.silo.id;
+        let store = FolderStore::new(a.path().to_path_buf());
+        device.state.set_audit_log(id, true).unwrap();
+        run_sync_pass(&device.state, &host, &device.silo)
+            .await
+            .unwrap();
+
+        // Another device started the log at the same time, under its own
+        // key, and its policy is the newer: this one follows it.
+        let theirs = KeyPair::generate();
+        let mut key = AuditKey::new(&theirs, Scope::Silo, 2);
+        key.wrap_for(
+            silentsilo_audit::BY_SILO,
+            &theirs.private,
+            device.kek().as_bytes(),
+        )
+        .unwrap();
+        let newer = AuditPolicy::new(true, &theirs.id(), None, Scope::Silo, i64::MAX / 4);
+        silentsilo_sync::audit_log::write_audit_key(&store, &key)
+            .await
+            .unwrap();
+        device.spool().apply_policy(&newer, &key, 0).unwrap();
+        device
+            .state
+            .audit_record(id, Event::new(codes::FILE_OPENED, 50))
+            .unwrap();
+
+        let read = read_audit_log(&device.state, &host, &device.silo, Reader::Silo)
+            .await
+            .unwrap();
+        assert_eq!(read.unreadable, 0, "the first key's records open too");
+        assert_eq!(read.entries.len(), 2);
+    }
+
+    #[tokio::test]
     async fn every_device_s_segments_are_read_and_a_hole_is_named() {
         let a = tempfile::tempdir().unwrap();
         let host = Copies(vec![copy(a.path())], true);
@@ -767,7 +850,7 @@ mod organisation {
             .unwrap()
             .as_millis() as i64;
         let other = Uuid::new_v4();
-        for (seq, age_days) in [(0u64, 40i64), (1, 20), (2, 1)] {
+        for (seq, age_days) in [(0u64, 120i64), (1, 60), (2, 1)] {
             let mut event = Event::new(codes::FILE_OPENED, now);
             event.i = seq;
             let segment = Segment {
@@ -787,12 +870,14 @@ mod organisation {
             0,
             "kept for good"
         );
-        device.state.set_org_audit_retention(id, Some(30)).unwrap();
+        // Shorter than any choice the app offers: taken as the shortest.
+        device.state.set_org_audit_retention(id, Some(1)).unwrap();
         assert_eq!(
             expire_audit_segments(&device.state, &host, &device.silo)
                 .await
                 .unwrap(),
-            1
+            1,
+            "only the one past 90 days"
         );
         assert_eq!(segments_in(&store).await.len(), 2);
         let read = read_audit_log(&device.state, &host, &device.silo, reader(&admin))

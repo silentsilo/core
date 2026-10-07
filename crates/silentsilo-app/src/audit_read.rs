@@ -9,7 +9,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 pub use silentsilo_audit::reading::{DeviceTrail, LogEntry, LogRead};
-use silentsilo_audit::{AUDIT_PREFIX, BY_SILO, MAX_SEGMENT_BYTES, Segment, parse_segment_key};
+use silentsilo_audit::{
+    AUDIT_PREFIX, BY_SILO, KeyId, MAX_SEGMENT_BYTES, Segment, key_id, parse_segment_key,
+};
 use silentsilo_vault::SiloEntry;
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -66,6 +68,13 @@ pub async fn read_audit_log(
         } => key.unwrap_with(credential_id, wrap_key),
     }
     .map_err(|_| "This key cannot read the activity log.".to_string())?;
+    let pinned_id = key
+        .public()
+        .map(|public| key_id(&public))
+        .map_err(|_| "The activity log's key is damaged.".to_string())?;
+    // A personal log may have had an earlier key, from a device that
+    // started it before it heard of this one: its records open with it.
+    let mut keys: Vec<(KeyId, Zeroizing<Vec<u8>>)> = vec![(pinned_id, private)];
 
     let cache = root.join(CACHE_DIR);
     let mut segments: BTreeMap<(Uuid, u64), Segment> = BTreeMap::new();
@@ -81,7 +90,12 @@ pub async fn read_audit_log(
         let store = match target.config.open() {
             Ok(store) => store,
             Err(_) => {
-                copies_unread.push(target.label.clone());
+                // Unnamed and not opened: nothing better to call it by.
+                copies_unread.push(if target.label.is_empty() {
+                    "a copy".to_string()
+                } else {
+                    target.label.clone()
+                });
                 continue;
             }
         };
@@ -97,6 +111,15 @@ pub async fn read_audit_log(
                 continue;
             }
         };
+        if matches!(reader, Reader::Silo)
+            && let Ok(more) = silentsilo_sync::audit_log::read_silo_keys(&*store, &kek).await
+        {
+            for (id, private) in more {
+                if !keys.iter().any(|(held, _)| *held == id) {
+                    keys.push((id, private));
+                }
+            }
+        }
         let mut failed = false;
         for object in listed {
             let Some((device, seq)) = parse_segment_key(&object.key) else {
@@ -135,10 +158,11 @@ pub async fn read_audit_log(
         .map_err(|e| e.to_string())?
         .remove(&silo.id)
         .unwrap_or_default();
+    let held: Vec<(KeyId, &[u8])> = keys.iter().map(|(id, k)| (*id, &k[..])).collect();
     let mut read = silentsilo_audit::reading::read_log_with(
         segments.into_values(),
         &unsent,
-        &private,
+        &held,
         &mut opened,
     );
     read.copies_unread = copies_unread;

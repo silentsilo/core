@@ -278,9 +278,10 @@ impl AppState {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         let now = now_ms / 1000;
+        // Off chosen before the log ever started is kept too, under a key of
+        // its own: otherwise the next pass would start it by default.
         let key = match known {
             Some(key) => key,
-            None if !enabled => return Ok(()),
             None => {
                 let keys = KeyPair::generate();
                 let mut key = AuditKey::new(&keys, Scope::Silo, now);

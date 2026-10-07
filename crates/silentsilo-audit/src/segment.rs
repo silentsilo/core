@@ -18,7 +18,7 @@ const SEGMENT_VERSION: u8 = 1;
 
 /// Storage is untrusted: nothing larger is downloaded, nor holds more.
 pub const MAX_SEGMENT_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_RECORDS: usize = 100_000;
+pub const MAX_RECORDS: usize = 100_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Segment {

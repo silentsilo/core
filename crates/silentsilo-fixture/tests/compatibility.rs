@@ -70,9 +70,13 @@ fn the_silo_folder_an_old_release_left_behind_still_unlocks() {
         // The op count is the one line the two halves are allowed to differ
         // on: compaction prunes the store, the local log keeps everything.
         // Never the other way around.
+        // The activity log lives in storage, not in the silo folder: the
+        // store half answers for it.
         let expected: Vec<&str> = expected
             .lines()
-            .filter(|l| !l.is_empty() && !l.starts_with("ops count="))
+            .filter(|l| {
+                !l.is_empty() && !l.starts_with("ops count=") && !l.starts_with("activity ")
+            })
             .collect();
         let (tree, local_ops): (Vec<&str>, Vec<&str>) = actual
             .iter()

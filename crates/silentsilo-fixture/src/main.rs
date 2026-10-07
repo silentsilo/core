@@ -5,7 +5,7 @@
 //! cargo run -p silentsilo-fixture -- digest crates/silentsilo-fixture/fixtures/v1.0.0
 //! ```
 //!
-//! Paths are relative to `src-tauri/`. The compacted twin of a fixture is
+//! Paths are relative to the repository root. The compacted twin of a fixture is
 //! written with `create-compacted` into the directory of the same name with
 //! a `-compacted` suffix.
 //!

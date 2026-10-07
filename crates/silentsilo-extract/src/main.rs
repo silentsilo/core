@@ -31,7 +31,7 @@ Nothing is written anywhere else, no silo is created, and nothing is sent
 over the network beyond reading the backup you named.
 ";
 
-const ORGANISATION_LOG: &str = "This silo keeps an activity log for its organisation. Only the      organisation's security keys read it, in SilentSilo; this tool does not.";
+const ORGANISATION_LOG: &str = "This silo keeps an activity log for its organisation. Only the organisation's security keys read it, in SilentSilo; this tool does not.";
 
 struct Args {
     command: String,

@@ -117,6 +117,8 @@ in this list; that lives on the machine instead, in the table after this one.
 | Index, mid-rotation | `vault.db.enc.next` | Same envelope as `vault.db.enc` | Transient; unlock adopts it, see below |
 | Keys, mid-rotation | `keys/fido.json.next`, `keys/recovery.json.next` | Same as the files they replace | Transient, from core 1.7.0; see below |
 | Base snapshot | `vault_base` table in `vault.db` | `SNAPSHOT_VERSION = 1`, `silentsilo-vfs/snapshot.rs` | Refuses, naming the version |
+| Activity queue | `audit-queue/pending`, `state.json`, `outbox/*.seg`, `key.json`, `policy.json` | **No file version.** `pending` is framed records; `state.json` plain JSON whose added fields read as their defaults; the rest are the storage formats | From core 1.9.0. Not synced. A release before it never opens the folder. See "The activity log" |
+| Segments read before | `audit-cache/<device>/<seq>.seg` | The segment format | From core 1.9.0. A cache: one that does not read is fetched again |
 
 ## On this machine only
 
@@ -540,12 +542,15 @@ history alone would be swept. How many versions a client keeps is its own
 setting; the whole history stays under 256 KB.
 
 An older client shows neither, and keeps both when it saves the entry, but
-adds no version of its own.
+adds no version of its own. That is client code, not core: desktop before
+1.4 and Android before 1.3 edit a copy of the whole entry, so a field they
+do not name is written back.
 
 From desktop 1.4, an `ssh_key` entry may carry `"ssh_agent": true`: the
 desktop's SSH agent offers that key and signs with it, after the person
 confirms. Absent means no. An older client ignores it and keeps it when it
-saves the entry, like the fields above, and the same test carries it. `upsert_password` refuses an entry over
+saves the entry, like the fields above, and the same test carries it.
+`upsert_password` refuses an entry over
 `MAX_ENTRY_BYTES` (512 KB), so the record stays under the 1 MiB readers
 before core 1.4.0 accept. `silentsilo-fixture/tests/entry_fields_on_1_0_0.rs`
 replays, snapshots, compacts and restores such an entry with 1.0.0's code.
@@ -560,6 +565,12 @@ other it is on by default and a setting. A silo nobody ever set it for
 starts it at its first sync pass, once every copy has answered that none
 holds a policy, or when opened if it has no copies; a policy that says off,
 here or on any copy, is followed. `silentsilo-audit` owns the format.
+
+"Every copy" means every copy the silo has, those resting after a failure
+included, and "none holds a policy" includes one whose key file did not
+read: a device that has not seen a copy's "off" must not override it with a
+newer "on". Off chosen before the log ever started is kept as a policy
+saying off, under a key of its own, and spread like any other.
 
 **Why its own place.** A record type 1.0.0 does not know is skipped, then
 dropped from its snapshot and pruned from storage. So the log is not in
@@ -623,10 +634,14 @@ organisation's key for good and does not follow a policy that names
 another in silence. A personal log's key it replaces with the one a newer
 policy names: whoever could name it also holds the content key that reads
 the personal log, so pinning it would protect nothing, and an organisation
-starting its log on a silo that kept a personal one has to be followed. On
-an administered silo the log is on whatever it says; only the retention is
-read from it, and only the holder of an organisation key deletes a segment,
-whole, once it is past the retention.
+starting its log on a silo that kept a personal one has to be followed. A policy naming another key changes nothing
+on the device: not whether the log is on, not its scope, not its retention.
+The scope a device pins is the policy's, which is sealed, and a key file
+whose scope the policy does not confirm is refused. On an administered silo
+the log is on whatever the policy says; only the retention is read from it.
+The app deletes a segment, whole, only for the holder of an organisation
+key and only once it is past the retention, never below 90 days whatever
+the policy says.
 
 An organisation's log is started with one of its keys touched: the device
 makes the key, wraps the private half for that key alone and pins it. A
@@ -639,7 +654,10 @@ new one is started.
 
 A personal log is turned on from one device, with or without copies: that
 device makes the key, wraps it under the content KEK and pins it. Turned
-back on later it uses the same key. The newest policy wins, by `changed_at`:
+back on later it uses the same key. Two devices that start it at the same
+time each make one, and both follow the newer policy; the records sealed to
+the other key still open, since a reader of a personal log tries every key
+in `audit/keys/` the content KEK unwraps, by the id each record names. The newest policy wins, by `changed_at`:
 each pass that reads the policy writes it, with its key, to every copy that
 has none or an older one, so a log turned on before a copy existed reaches
 it. A policy naming a key other than the one the device pinned is never
@@ -652,7 +670,23 @@ and the pinned key), `outbox/<seq>.seg` (closed segments, in the storage
 format, waiting for every copy), `key.json` and `policy.json` (the pinned
 log's key file as storage holds it, and its policy in clear) and `lock`
 (held while the queue is open). New in core 1.9.0; a build that reads it
-takes absent fields as their defaults.
+takes absent fields as their defaults. A record cut short by a crash is cut
+off the end of `pending` when the queue opens. A close writes as many
+segments as it takes to stay under 8 MiB and 100,000 records each. A
+segment in the outbox that does not read is renamed `.damaged` and no longer
+sent, and the reader names the hole it leaves. A copy that already holds a
+segment under the same number with other bytes (a queue put back from an old
+backup) keeps it; this device keeps its own and says so.
+
+**What the log does not protect against.** Whoever holds the content key
+can write a policy, so a member of an organisation can write one; the
+device does not follow it to another key, and expiry never goes below 90
+days. Records are sealed in HPKE base mode, which does not say who sealed
+them: anyone with the public key, which storage holds in clear, can write a
+record under any device's name. Whoever can delete in storage can delete
+segments, and the newest segments of a device leave no hole when they go.
+The log tells an honest device's story to its readers; it is not proof
+against someone who holds the silo's keys or its storage.
 
 **Segments read before**, `<silo>/audit-cache/<device>/<seq>.seg`, in the
 storage format and layout, not synced: a segment never changes, so a reader
@@ -718,6 +752,12 @@ has no golden bytes and a break in it passes every test.
 A change that alters a fixture's output is a break. The fixture is the
 released format; updating it to match new behaviour only hides the problem
 from the people who will hit it.
+
+`v1.9.0` and its twin are the first whose storage holds an activity log (a
+personal key, its sealed policy and two chained segments) and an entry with
+custom fields, history and `ssh_agent`. Their `expected.txt` lists the log
+as read back, one `activity` line each; the silo-folder half of the test
+skips those lines, since the log lives in storage.
 
 The one exception, and it expires with this release: while nothing had
 shipped, the formats iterated freely and the fixture was regenerated to match,

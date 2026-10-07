@@ -1,0 +1,25 @@
+folder / deleted=0 fav=0
+folder /Acte deleted=0 fav=1
+folder /Acte/2026 deleted=0 fav=0
+folder /Arhivă deleted=0 fav=0
+folder /Vechituri deleted=1 fav=0
+folder /Ștampile deleted=0 fav=0
+file /::.gitignore deleted=0 fav=0 size=7 hash=hash-dot mime=
+file /::notițe.md deleted=0 fav=0 size=250 hash=hash-notes-second mime=text/markdown
+file /::șiret.txt deleted=0 fav=0 size=9 hash=hash-nfd mime=
+file /Acte::contract.pdf deleted=0 fav=1 size=2048 hash=hash-contract mime=application/pdf
+file /Acte::final.txt deleted=0 fav=0 size=64 hash=hash-draft mime=
+file /Acte/2026::vechi.txt deleted=1 fav=0 size=10 hash=hash-old mime=
+file /Vechituri::ruginit.dat deleted=1 fav=0 size=5 hash=hash-rust mime=
+file /Ștampile::gol.bin deleted=0 fav=0 size=0 hash=hash-empty mime=
+password 00000000-0000-0000-0000-000000000021
+password 00000000-0000-0000-0000-000000000022
+password 00000000-0000-0000-0000-000000000024
+ops count=15
+activity event 51170000-0000-0000-0000-00000000a0d1 i=0 t=1789000000000 c=60 o= l= x={}
+activity event 51170000-0000-0000-0000-00000000a0d1 i=1 t=1789000001000 c=1 o= l= x={"key":"YubiKey"}
+activity event 51170000-0000-0000-0000-00000000a0d1 i=2 t=1789000002000 c=11 o=00000000-0000-0000-0000-000000000024 l=Ștampile SRL x={"field":"password"}
+activity event 51170000-0000-0000-0000-00000000a0d1 i=3 t=1789000003000 c=2 o= l= x={}
+activity policy enabled=true scope="silo" retention=None keys=1
+activity trail 51170000-0000-0000-0000-00000000a0d1 events=4 missing=[] segments_missing=[] broken=[]
+activity unreadable=0

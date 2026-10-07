@@ -347,17 +347,25 @@ pub async fn cloud_silo_folders(sign_in: Uuid) -> Result<Vec<String>, StoreError
 /// Refused when the target names another account: a reconnect to a
 /// different account would point the target at an empty folder.
 pub async fn adopt_cloud_sign_in(sign_in: Uuid, config: &StoreConfig) -> Result<(), StoreError> {
-    let (provider, tokens, keep, account_id) = live_pending()?
-        .get(&sign_in)
-        .map(|p| {
-            (
-                p.provider,
-                p.tokens.clone(),
-                p.keep.clone(),
-                p.account.id.clone(),
-            )
-        })
+    // Taken out of the list first: a lock that forgets the sign-ins while
+    // this runs must not revoke the tokens being given to the target.
+    let taken = live_pending()?
+        .remove(&sign_in)
         .ok_or_else(|| StoreError::Denied("the sign-in expired; sign in again".into()))?;
+    match adopt(&taken, config).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Not adopted: still the dialog's, to retry or to cancel.
+            if let Ok(mut pending) = pending().lock() {
+                pending.insert(sign_in, taken);
+            }
+            Err(e)
+        }
+    }
+}
+
+async fn adopt(taken: &Pending, config: &StoreConfig) -> Result<(), StoreError> {
+    let provider = taken.provider;
     let Some(cloud) = config.cloud() else {
         return Err(StoreError::Other("not a cloud storage".into()));
     };
@@ -366,14 +374,14 @@ pub async fn adopt_cloud_sign_in(sign_in: Uuid, config: &StoreConfig) -> Result<
             "the sign-in is for another provider".into(),
         ));
     }
-    if cloud.account_id != account_id {
+    if cloud.account_id != taken.account.id {
         return Err(StoreError::Denied(format!(
             "That is a different {} account. Sign in with the one this storage uses.",
             provider.name()
         )));
     }
     let target_id = config.target_id();
-    write_token(target_id, &tokens.refresh_token().await)
+    write_token(target_id, &taken.tokens.refresh_token().await)
         .map_err(|e| StoreError::Other(e.to_string()))?;
     // The same source becomes the target's, rather than a new one read from
     // disk: whatever already holds it (the store that was checked, a seed)
@@ -389,13 +397,10 @@ pub async fn adopt_cloud_sign_in(sign_in: Uuid, config: &StoreConfig) -> Result<
             target_id,
             Held {
                 generation,
-                source: tokens,
+                source: taken.tokens.clone(),
             },
         );
-    keep.target(target_id, generation);
-    if let Ok(mut pending) = pending().lock() {
-        pending.remove(&sign_in);
-    }
+    taken.keep.target(target_id, generation);
     Ok(())
 }
 

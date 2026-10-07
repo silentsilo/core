@@ -93,6 +93,7 @@ async fn create_inner(root: &Path, compact: bool) -> Result<(), String> {
     silentsilo_sync::push_ops(&*store, &session.dek, &pending)
         .await
         .map_err(|e| e.to_string())?;
+    write_activity_log(&*store, &session).await?;
 
     if compact {
         // A horizon in the middle of the log, so the fixture holds both
@@ -157,6 +158,7 @@ pub async fn digest_from_store(root: &Path, code: &str) -> Result<Vec<String>, S
         }
         None => silentsilo_crypto::generate_content_kek(),
     };
+    let activity = activity_lines(&*store, &kek).await?;
     let session = VaultSession::provision_with_dek(
         scratch.path().to_path_buf(),
         manifest.vault_id,
@@ -186,7 +188,138 @@ pub async fn digest_from_store(root: &Path, code: &str) -> Result<Vec<String>, S
         .map_err(|e| e.to_string())?;
     replay(&session.conn, ops).map_err(|e| e.to_string())?;
 
-    digest(&session.conn).map_err(|e| e.to_string())
+    let mut lines = digest(&session.conn).map_err(|e| e.to_string())?;
+    lines.extend(activity);
+    Ok(lines)
+}
+
+/// A personal activity log as 1.9.0 first wrote it to storage: the key with
+/// its private half wrapped under the content key, the sealed policy, and
+/// one device's run of two chained segments.
+async fn write_activity_log(store: &dyn ObjectStore, session: &VaultSession) -> Result<(), String> {
+    use silentsilo_audit::{
+        AuditKey, AuditPolicy, BY_SILO, Event, KeyPair, Scope, Segment, codes, seal_event,
+    };
+    let err = |e: silentsilo_audit::AuditError| e.to_string();
+    let sync = |e: silentsilo_sync::SyncError| e.to_string();
+
+    let keys = KeyPair::generate();
+    let mut key = AuditKey::new(&keys, Scope::Silo, 1_789_000_000);
+    key.wrap_for(BY_SILO, &keys.private, session.kek.as_bytes())
+        .map_err(err)?;
+    let policy = AuditPolicy::new(true, &keys.id(), None, Scope::Silo, 1_789_000_000);
+    silentsilo_sync::audit_log::write_audit_key(store, &key)
+        .await
+        .map_err(sync)?;
+    silentsilo_sync::audit_log::write_audit_policy(store, &session.kek, &policy)
+        .await
+        .map_err(sync)?;
+
+    let device = Uuid::from_u128(0x5117_0000_0000_0000_0000_0000_0000_a0d1);
+    let runs = [
+        vec![
+            Event::new(codes::LOG_STARTED, 0),
+            Event::new(codes::UNLOCKED, 0).with("key", "YubiKey"),
+        ],
+        vec![
+            Event::new(codes::SECRET_COPIED, 0)
+                .on("00000000-0000-0000-0000-000000000024", "Ștampile SRL")
+                .with("field", "password"),
+            Event::new(codes::LOCKED, 0),
+        ],
+    ];
+    let mut prev = [0u8; 32];
+    let mut i = 0u64;
+    for (seq, run) in runs.into_iter().enumerate() {
+        let mut records = Vec::new();
+        for mut event in run {
+            event.i = i;
+            event.t = 1_789_000_000_000 + i as i64 * 1000;
+            records.push(seal_event(&keys.public, device, &event).map_err(err)?);
+            i += 1;
+        }
+        let segment = Segment {
+            device,
+            seq: seq as u64,
+            prev,
+            closed_at: 1_789_000_000_000 + i as i64 * 1000,
+            records,
+        };
+        prev = segment.hash();
+        store
+            .put(&segment.key(), segment.to_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// The activity log a store holds, as sorted lines: its policy, every event
+/// in it, and what the reading found wrong. Nothing for a store that keeps
+/// none, which is every fixture written before 1.9.0.
+async fn activity_lines(
+    store: &dyn ObjectStore,
+    kek: &silentsilo_crypto::ContentKek,
+) -> Result<Vec<String>, String> {
+    let sync = |e: silentsilo_sync::SyncError| e.to_string();
+    let Some(policy) = silentsilo_sync::audit_log::read_audit_policy(store, kek)
+        .await
+        .map_err(sync)?
+    else {
+        return Ok(Vec::new());
+    };
+    let keys = silentsilo_sync::audit_log::read_silo_keys(store, kek)
+        .await
+        .map_err(sync)?;
+    let held: Vec<(silentsilo_audit::KeyId, &[u8])> =
+        keys.iter().map(|(id, k)| (*id, &k[..])).collect();
+    let mut segments = Vec::new();
+    for object in store
+        .list(silentsilo_audit::AUDIT_PREFIX)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        if silentsilo_audit::parse_segment_key(&object.key).is_none() {
+            continue;
+        }
+        let bytes = store.get(&object.key).await.map_err(|e| e.to_string())?;
+        segments.push(silentsilo_audit::Segment::from_bytes(&bytes).map_err(|e| e.to_string())?);
+    }
+    let read = silentsilo_audit::reading::read_log(segments, &[], &held);
+
+    let mut lines = vec![format!(
+        "activity policy enabled={} scope={} retention={:?} keys={}",
+        policy.enabled,
+        serde_json::to_string(&policy.scope).map_err(|e| e.to_string())?,
+        policy.retention_days,
+        keys.len()
+    )];
+    for entry in &read.entries {
+        let e = &entry.event;
+        lines.push(format!(
+            "activity event {} i={} t={} c={} o={} l={} x={}",
+            entry.device,
+            e.i,
+            e.t,
+            e.c,
+            e.o.as_deref().unwrap_or(""),
+            e.l.as_deref().unwrap_or(""),
+            serde_json::to_string(&e.x).map_err(|e| e.to_string())?,
+        ));
+    }
+    for trail in &read.devices {
+        lines.push(format!(
+            "activity trail {} events={} missing={:?} segments_missing={:?} broken={:?}",
+            trail.device,
+            trail.events,
+            trail.missing_events,
+            trail.missing_segments,
+            trail.broken_segments
+        ));
+    }
+    lines.push(format!("activity unreadable={}", read.unreadable));
+    lines.sort();
+    Ok(lines)
 }
 
 /// Opens the silo folder itself, the way an installed app does on the first
@@ -364,6 +497,15 @@ fn populate(session: &VaultSession) -> Result<(), String> {
         .map_err(err)?;
     vfs.trash_file(ephemeral.id).map_err(err)?;
     vfs.purge_items(&[ephemeral.id]).map_err(err)?;
+
+    // An entry as 1.4 writes it: custom fields, one hidden, an earlier
+    // version, and an SSH key the agent may offer. Opaque to core, carried
+    // whole forever.
+    vfs.upsert_password(
+        Uuid::from_u128(0x24),
+        r#"{"id":"00000000-0000-0000-0000-000000000024","service":"Ștampile SRL","username":"ana","password":"new-pass","url":"","notes":"","category":"","created_at":1789000000000,"updated_at":1789000100000,"type":"ssh_key","ssh_agent":true,"fields":[{"name":"Customer number","value":"40021","hidden":false},{"name":"Card PIN","value":"1234","hidden":true}],"history":[{"saved_at":1789000000000,"service":"Ștampile SRL","username":"ana","password":"old-pass"}]}"#,
+    )
+    .map_err(err)?;
 
     // A password that was deleted: deletion is a record, not an absence.
     vfs.upsert_password(

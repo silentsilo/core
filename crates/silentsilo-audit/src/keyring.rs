@@ -143,6 +143,11 @@ impl AuditKey {
         if key.version > KEY_VERSION {
             return Err(AuditError::Newer("log key"));
         }
+        // Sealing to a key meant for another suite would write records
+        // nobody can open.
+        if key.suite != SUITE {
+            return Err(AuditError::Newer("log key suite"));
+        }
         key.public()?;
         Ok(key)
     }

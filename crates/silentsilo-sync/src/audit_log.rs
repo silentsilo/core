@@ -5,27 +5,47 @@
 
 use std::collections::HashSet;
 
-use silentsilo_audit::{AuditKey, AuditPolicy, POLICY_PATH, Segment, audit_key_path};
+use silentsilo_audit::{
+    AUDIT_PREFIX, AuditKey, AuditPolicy, BY_SILO, KeyId, POLICY_PATH, Segment, audit_key_path,
+    key_id,
+};
 use silentsilo_crypto::ContentKek;
 use silentsilo_store::ObjectStore;
+use zeroize::Zeroizing;
 
-use crate::{SyncError, fetch_small};
+use crate::{SyncError, fetch_small, too_large};
 
-/// Puts every segment `client` does not hold. Returns the sequence numbers
-/// it holds afterwards, sent now or already there.
+/// What a push left: the segments the copy holds as this device wrote
+/// them, and those it holds under the same number with other bytes.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Pushed {
+    pub held: HashSet<u64>,
+    pub differ: Vec<u64>,
+}
+
+/// Puts every segment `client` does not hold. One already there counts as
+/// held only when its bytes are this device's: a spool put back from an old
+/// backup numbers new events as old ones, and those must not be dropped as
+/// delivered.
 pub async fn push_audit_segments(
     client: &dyn ObjectStore,
     segments: &[Segment],
-) -> Result<HashSet<u64>, SyncError> {
-    let mut held = HashSet::new();
+) -> Result<Pushed, SyncError> {
+    let mut pushed = Pushed::default();
     for segment in segments {
         let key = segment.key();
-        if client.head(&key).await?.is_none() {
-            client.put(&key, segment.to_bytes()).await?;
+        let bytes = segment.to_bytes();
+        match client.head(&key).await? {
+            None => client.put(&key, bytes).await?,
+            Some(size) if size == bytes.len() as i64 && client.get(&key).await? == bytes => {}
+            Some(_) => {
+                pushed.differ.push(segment.seq);
+                continue;
+            }
         }
-        held.insert(segment.seq);
+        pushed.held.insert(segment.seq);
     }
-    Ok(held)
+    Ok(pushed)
 }
 
 /// The log's policy, when the silo has one. One that does not open under
@@ -72,6 +92,32 @@ pub async fn read_audit_key(
         .map_err(|e| SyncError::Vault(e.to_string()))
 }
 
+/// Every personal log key `client` holds that the content key opens, by
+/// id: the one in use, and any a device started before it heard of that
+/// one, whose records name it still.
+pub async fn read_silo_keys(
+    client: &dyn ObjectStore,
+    kek: &ContentKek,
+) -> Result<Vec<(KeyId, Zeroizing<Vec<u8>>)>, SyncError> {
+    let mut out = Vec::new();
+    for object in client.list(&format!("{AUDIT_PREFIX}keys/")).await? {
+        if !object.key.ends_with(".json") || too_large(object.size) {
+            continue;
+        }
+        let Some(bytes) = fetch_small(client, &object.key).await? else {
+            continue;
+        };
+        let Ok(key) = AuditKey::from_json(&bytes) else {
+            continue;
+        };
+        if let (Ok(public), Ok(private)) = (key.public(), key.unwrap_with(BY_SILO, kek.as_bytes()))
+        {
+            out.push((key_id(&public), private));
+        }
+    }
+    Ok(out)
+}
+
 pub async fn write_audit_key(client: &dyn ObjectStore, key: &AuditKey) -> Result<(), SyncError> {
     let id: [u8; 8] = hex::decode(&key.key_id)
         .ok()
@@ -111,10 +157,16 @@ mod tests {
             .await
             .unwrap();
 
-        let held = push_audit_segments(&client, &[first.clone(), segment(device, 1, &keys)])
+        let second = segment(device, 1, &keys);
+        let pushed = push_audit_segments(&client, &[first.clone(), second.clone()])
             .await
             .unwrap();
-        assert_eq!(held, HashSet::from([0, 1]));
+        assert_eq!(pushed.held, HashSet::from([1]));
+        assert_eq!(pushed.differ, vec![0], "not taken as delivered");
+        // The same bytes already there are held.
+        let again = push_audit_segments(&client, &[second]).await.unwrap();
+        assert_eq!(again.held, HashSet::from([1]));
+        assert!(again.differ.is_empty());
         assert_eq!(client.get(&first.key()).await.unwrap(), b"already there");
         assert!(
             client
