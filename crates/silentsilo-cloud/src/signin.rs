@@ -47,42 +47,47 @@ pub struct Loopback {
 
 impl Loopback {
     /// Binds the port the provider will redirect to.
+    ///
+    /// A `localhost` redirect may reach `::1` first, so the same port is
+    /// taken there too. When something else already holds it on `::1`, the
+    /// browser would hand that program the redirect: the port is given up
+    /// and the next one tried (audit CL-3). A machine with no IPv6 loopback
+    /// at all keeps the IPv4 listener alone, which is where the browser
+    /// then goes.
     pub async fn bind(provider: Provider) -> Result<Self, CloudError> {
         let fixed = provider.fixed_ports();
-        let primary = if fixed.is_empty() {
-            TcpListener::bind(("127.0.0.1", 0)).await.ok()
+        // Port 0 asks the system for a free one; a few tries in case the
+        // port it picks is held on ::1.
+        let candidates: Vec<u16> = if fixed.is_empty() {
+            vec![0; 5]
         } else {
-            let mut bound = None;
-            for port in fixed {
-                if let Ok(listener) = TcpListener::bind(("127.0.0.1", *port)).await {
-                    bound = Some(listener);
-                    break;
+            fixed.to_vec()
+        };
+        for wanted in candidates {
+            let Ok(primary) = TcpListener::bind(("127.0.0.1", wanted)).await else {
+                continue;
+            };
+            let port = primary
+                .local_addr()
+                .map_err(|e| CloudError::Other(e.to_string()))?
+                .port();
+            let mut listeners = vec![primary];
+            if provider.redirect_uri(port).contains("localhost") {
+                match TcpListener::bind(("::1", port)).await {
+                    Ok(v6) => listeners.push(v6),
+                    Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
+                    Err(_) => {}
                 }
             }
-            bound
-        };
-        let primary = primary.ok_or_else(|| {
-            CloudError::Other(format!(
-                "no free port for the {} sign-in; close other sign-ins and try again",
-                provider.name()
-            ))
-        })?;
-        let port = primary
-            .local_addr()
-            .map_err(|e| CloudError::Other(e.to_string()))?
-            .port();
-        let mut listeners = vec![primary];
-        // `localhost` may resolve to ::1 first. The same port there too, when
-        // it is free; the browser falls back to 127.0.0.1 otherwise.
-        if provider.redirect_uri(port).contains("localhost")
-            && let Ok(v6) = TcpListener::bind(("::1", port)).await
-        {
-            listeners.push(v6);
+            return Ok(Self {
+                request: AuthRequest::new(provider, port)?,
+                listeners,
+            });
         }
-        Ok(Self {
-            request: AuthRequest::new(provider, port)?,
-            listeners,
-        })
+        Err(CloudError::Other(format!(
+            "no free port for the {} sign-in; close other sign-ins and try again",
+            provider.name()
+        )))
     }
 
     /// The provider's page, for the user's browser.
@@ -533,6 +538,26 @@ mod tests {
             Err(CloudError::Refused(message)) => assert!(message.contains("work or school")),
             other => panic!("expected a refusal, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_port_held_on_ipv6_by_someone_else_is_not_used() {
+        // Dropbox redirects to `localhost` on fixed ports: hold the first on
+        // ::1, as another program could.
+        let first = Provider::Dropbox.fixed_ports()[0];
+        let Ok(squatter) = TcpListener::bind(("::1", first)).await else {
+            return; // No IPv6 loopback here, or the port is busy anyway.
+        };
+        let loopback = Loopback::bind(Provider::Dropbox).await.unwrap();
+        let port: u16 = param(loopback.url(), "redirect_uri")
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .trim_end_matches('/')
+            .parse()
+            .unwrap();
+        assert_ne!(port, first, "the redirect would have gone to the squatter");
+        drop(squatter);
     }
 
     #[tokio::test]
