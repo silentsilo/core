@@ -255,9 +255,11 @@ newest record a rotated-looking copy lists: older means that copy stopped
 before the rotation, and it is left out with `MISSED_ROTATION` as its status;
 newer means another device rotated after everything this one wrote, and the
 gravest answer still sends this device to rejoin. Only records that open
-count on the current side, so a name planted in storage cannot tip the
+under their own name count on the current side, so a name planted in
+storage, or a genuine record copied under a newer name, cannot tip the
 answer towards pushing on a retired key; a name planted on the rotated side
-only makes it more careful.
+only makes it more careful. The witnesses `kek_envelope_state` reads are
+held to the same rule.
 
 ## Data at rest
 
@@ -523,6 +525,52 @@ bytes back cannot undo another device's write. The rules:
 
 No format changes and no new activity-log event: the check's report says
 what was repaired and from where.
+
+A check reports a record whose name does not match its content as damaged
+("holds another record than its name says"), so the repair puts the
+genuine record back from a copy that holds it under its own name.
+
+## Sealed objects and their names
+
+A sealed object's AAD is its 5-byte header (`SSEA` and the version), not its
+role and not its name (audit L1). Whoever can write to storage cannot read
+or forge one, but can put a real one under another object's name, of the
+same kind or of another, and it still opens. Closed without a format change
+(decided 8 Oct 2026, `SEAL_VERSION` stays 1): old data stays version 1 for
+good, so the readers have to compensate anyway, and a version 2 written next
+to 1.4 devices would read to them as a rotation.
+
+**The rule: every reader binds the name to the content itself, and has a
+test that moves a real object under a name of its own kind and of another
+kind and shows it is rejected or ignored, never applied.** A new kind of
+sealed object, or a new reader of an old kind, comes with that test.
+
+| Object | Reader | What binds name to content | Test |
+|--------|--------|----------------------------|------|
+| `ops/*.op` | `fetch_missing_ops` (pass, join, rebuild, extract) | `op_key(record) == name`, else `misplaced`; another kind does not parse and is `unreadable` | `compaction.rs` `a_record_copied_under_another_name_is_skipped_not_replayed`, `moved_objects.rs` `objects_of_another_kind_under_a_record_name_are_never_applied` |
+| `ops/*.op` | `verify_against`, `repair_from` | same comparison; a mismatch is damaged, and a source holding one is not used | `moved_objects.rs` `a_check_names_a_record_moved_under_another_name_and_a_repair_puts_it_right` |
+| `ops/*.op` | `kek_envelope_state` witnesses, `newest_readable_lamport` | same comparison; a mismatch is no witness and lifts nothing | `moved_objects.rs` `a_record_copied_under_a_newer_name_is_no_witness` |
+| `snapshots/*.snap` | `latest_snapshot`, `verified_snapshot_horizon` | `snapshot.horizon == name`; another kind does not parse and is an error | `compaction.rs` `an_old_snapshot_copied_under_a_higher_name_is_not_believed`, `moved_objects.rs` `objects_of_another_kind_under_a_snapshot_name_are_never_adopted` |
+| `keys/content.kek` | `unwrap_kek_bytes`, `kek_envelope_state`, `publish_content_kek_checked` | only a 32-byte key is a KEK; one per silo, so nothing of its kind can move there | `moved_objects.rs` `objects_of_another_kind_at_the_kek_envelope_are_not_a_key` |
+| records, snapshots, KEK envelope | `seed_target_checked` | the three checks above before anything is copied | `moved_objects.rs` `a_seed_copies_nothing_that_is_not_what_its_name_says` |
+| `keys/revoked/*.sealed` | `is_key_revoked`, `revoked_at`, `revocation_marks`, `reconcile_key_envelopes` | `credential_id == name`, version 1; other KEK-sealed kinds do not parse | `moved_objects.rs` `a_revocation_marker_moved_under_another_keys_name_is_not_honoured`, `objects_of_another_kind_under_a_marker_name_are_not_honoured` |
+| `keys/*.env` (wrapped DEK inside) | `fetch_key_envelopes`, joins | the key is read from inside; the wrapped DEK opens only under that key's wrap key | `moved_objects.rs` `a_key_envelope_moved_under_another_keys_name_opens_only_for_its_own_key` |
+| `inbox/keys/*.sealed` | `load_inbox_keys` | `key_id == name`, version 1 | `inbox.rs` `an_inbox_key_moved_under_another_name_opens_nothing` |
+| `inbox/senders/*.sealed` | `load_senders` | `sender_id == name`, version 1 | `inbox.rs` `a_sender_moved_under_another_name_sends_nothing` |
+| `recovery.env`, `keys/recovery.json` | `unwrap_with_code`, `is_authentic` | the wrapped DEK opens only under the code's key; the tag covers it | vault `recovery.rs` `a_security_keys_wrapping_moved_into_the_envelope_opens_nothing` |
+| `audit/policy.sealed` | `read_audit_policy` | one per silo; other KEK-sealed kinds do not parse and are an error | audit `keyring.rs` `a_sealed_object_of_another_kind_is_not_a_policy` |
+| `audit/keys/*.json` (wrapped private key inside) | `read_audit_key`, `AuditKey::unwrap_with`, `read_silo_keys` | `key_id == name`; the private key must give the entry's public key | sync `audit_log.rs` `a_log_key_moved_under_another_keys_name_is_refused`, audit `keyring.rs` `a_private_key_moved_under_another_log_keys_entry_is_refused` |
+| `audit/<device>/<seq>.seg` (HPKE, not `sealed.rs`) | app `audit_read`, `expire_audit_segments`, extract, fixture | header `device` and `seq` == name; records bind the device in their AAD | app `audit.rs` `a_segment_moved_under_another_name_is_not_taken_for_it` |
+| backup as a whole | `silentsilo-extract::open` | the readers above | extract `round_trip.rs` `objects_moved_under_other_names_in_a_backup_are_not_taken` |
+| `content.kek.enc`, `master.dek.enc.next` (silo folder) | `load_kek`, `load_staged_dek` | both are 32 bytes under the DEK: each refuses a key equal to the other | vault `rotation.rs` `the_kek_and_the_staged_key_copied_over_each_other_are_refused`, `kek_store.rs` `another_object_sealed_under_the_dek_is_not_taken_as_the_kek` |
+| `master.dek.enc` and every DEK wrapping | `unwrap_dek_bytes` | each is under a wrap key of its own | vault `dek_store.rs` `a_wrapping_moved_from_another_place_does_not_open_here` |
+| `vault.db.enc` (`.bak`, `.next`), `vault.key` | session open | the image must open as this silo's database, the page key must open the copy; else the shadow copy or a fresh export | vault `session.rs` `a_sealed_object_moved_over_the_snapshot_or_the_page_key_is_not_used` |
+| `protected.enc`, `protected.key` (machine cache) | `load_protected`, `load_seen` | the list must decode, the key must open the ledger; neither reads as empty | vault `protected.rs` `the_list_and_the_ledger_key_swapped_are_both_refused` |
+
+Not on the list: the password entry JSON and the wrapped content keys travel
+inside records and snapshots, which are sealed whole, so nothing reaches them
+alone. `reseal_under_new_key` and the unchecked `seed_target` move bytes
+without reading them, and leave the decision to the readers above.
 
 ## Recovery matrix
 
@@ -867,15 +915,18 @@ The checklist, in order:
    `silentsilo_testkit::skip_or_fail` from a printed line into a failure:
    a suite that skips itself during a run that asked for it is a hole, not
    a note.
-5. **Does it change a write the app cannot afford to lose?** Then it belongs
+5. **Does it read a sealed object?** Sealing does not bind the name, so the
+   reader compares the name with what is inside, with a test that moves a
+   real object there ("Sealed objects and their names").
+6. **Does it change a write the app cannot afford to lose?** Then it belongs
    in `silentsilo-vault/tests/hostile_environment.rs`, which runs each of
    those writes with something holding the destination open and with the temp
    path blocked. A clean temporary directory is not the machine the app runs
    on: the worst defect found so far was a temp-then-rename that a scanner's
    open handle refused, and no test in the suite held anything open.
-6. **Does a client have to change with it?** A release here is a tag, and
+7. **Does a client have to change with it?** A release here is a tag, and
    `silentsilo/desktop` pins one. Say so in the release notes; the client
    moves its pin deliberately, which is the moment the two are tested
    together.
-7. **Update this page and FORMATS.md in the same commit** when behavior they
+8. **Update this page and FORMATS.md in the same commit** when behavior they
    describe moves.

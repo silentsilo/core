@@ -972,4 +972,62 @@ mod organisation {
                 .any(|e| e.event.c == codes::SEGMENTS_EXPIRED)
         );
     }
+
+    /// Audit L1: a segment copied under another one's name is neither read
+    /// as that one nor expired in its place.
+    #[tokio::test]
+    async fn a_segment_moved_under_another_name_is_not_taken_for_it() {
+        let a = tempfile::tempdir().unwrap();
+        let host = Copies(vec![copy(a.path())], true);
+        let device = Device::new(&host);
+        let id = device.silo.id;
+        let store = FolderStore::new(a.path().to_path_buf());
+        let admin = touch("aa", 1);
+        device.state.start_org_audit_log(id, &admin, None).unwrap();
+        let public = device.spool().key().unwrap().unwrap().public().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let other = Uuid::new_v4();
+        let mut segments = Vec::new();
+        for (seq, age_days) in [(0u64, 120i64), (1, 1)] {
+            let mut event = Event::new(codes::FILE_OPENED, now);
+            event.i = seq;
+            let segment = Segment {
+                device: other,
+                seq,
+                prev: [0; 32],
+                closed_at: now - age_days * 86_400_000,
+                records: vec![silentsilo_audit::seal_event(&public, other, &event).unwrap()],
+            };
+            store.put(&segment.key(), segment.to_bytes()).await.unwrap();
+            segments.push(segment);
+        }
+        // The old segment over the recent one's name.
+        store
+            .put(&segments[1].key(), segments[0].to_bytes())
+            .await
+            .unwrap();
+
+        let read = read_audit_log(&device.state, &host, &device.silo, &reader(&admin))
+            .await
+            .unwrap();
+        let trail = read.devices.iter().find(|d| d.device == other).unwrap();
+        assert_eq!(trail.events, 1, "read twice: {trail:?}");
+
+        device.state.set_org_audit_retention(id, Some(1)).unwrap();
+        assert_eq!(
+            expire_audit_segments(&device.state, &host, &device.silo)
+                .await
+                .unwrap(),
+            1,
+            "only the genuine old one"
+        );
+        assert_eq!(
+            store.get(&segments[1].key()).await.unwrap(),
+            segments[0].to_bytes(),
+            "left for the reader to name"
+        );
+    }
 }

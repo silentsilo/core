@@ -213,10 +213,12 @@ pub async fn expire_audit_segments(
                     Err(_) => continue,
                 },
             };
+            // One that names another place is not this segment, and its
+            // age says nothing about the one that belongs here.
             let Ok(segment) = Segment::from_bytes(&bytes) else {
                 continue;
             };
-            if segment.closed_at >= cutoff {
+            if segment.device != device || segment.seq != seq || segment.closed_at >= cutoff {
                 continue;
             }
             if store.delete(&object.key).await.is_ok() {

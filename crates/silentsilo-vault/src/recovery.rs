@@ -341,6 +341,19 @@ mod tests {
     }
 
     #[test]
+    fn a_security_keys_wrapping_moved_into_the_envelope_opens_nothing() {
+        // Storage can edit `recovery.env` freely: the wrapped DEK of a key
+        // envelope put in it is under that key's wrap key, not the code's,
+        // and the tag no longer holds.
+        let dek = generate_dek();
+        let kek = kek();
+        let (code, mut envelope) = create_recovery_envelope(&dek, &kek).unwrap();
+        envelope.wrapped_dek = hex::encode(wrap_dek_bytes(&dek, &[7u8; 32]).unwrap());
+        assert!(unwrap_with_code(&envelope, &code).is_err());
+        assert!(!envelope.is_authentic(&kek));
+    }
+
+    #[test]
     fn one_code_does_not_open_another_vault() {
         // Each envelope carries its own salt, so the same code typed at a
         // different vault derives a different key.

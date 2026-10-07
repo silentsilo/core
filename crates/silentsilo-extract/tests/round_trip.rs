@@ -145,6 +145,65 @@ async fn the_wrong_code_opens_nothing() {
     assert!(wrong.is_err(), "a guessed code must not open a backup");
 }
 
+/// Audit L1: sealing does not bind an object's name. An old record copied
+/// above a snapshot's horizon is not replayed over it, and a record put
+/// where the content key goes is not taken for one.
+#[tokio::test]
+async fn objects_moved_under_other_names_in_a_backup_are_not_taken() {
+    let silo_dir = tempfile::tempdir().unwrap();
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = FolderStore::new(store_dir.path().to_path_buf());
+
+    let session = silo(silo_dir.path());
+    let vfs = Vfs::new(&session);
+    let root = vfs.root_folder_id().unwrap();
+    let blob = add_file(&session, root, "one.txt", b"same bytes");
+    let file: String = session
+        .conn
+        .query_row(
+            "SELECT id FROM files WHERE blob_id = ?1",
+            [blob.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let file = Uuid::parse_str(&file).unwrap();
+    let before = pending_ops(&session.conn).unwrap().len();
+    vfs.rename_file(file, "two.txt").unwrap();
+    let old = pending_ops(&session.conn).unwrap()[before].clone();
+    vfs.rename_file(file, "three.txt").unwrap();
+    let horizon = pending_ops(&session.conn).unwrap().last().unwrap().lamport;
+    vfs.create_folder(root, "Later").unwrap();
+    let code = publish(&session, &store as &dyn ObjectStore, &[blob]).await;
+
+    let old_bytes = store
+        .get(&format!("ops/{}.op", old.object_key()))
+        .await
+        .unwrap();
+    let snapshot = silentsilo_vfs::capture_at(&session.conn, session.vault_id, horizon).unwrap();
+    silentsilo_sync::publish_compaction(&store as &dyn ObjectStore, &session.dek, &snapshot, true)
+        .await
+        .unwrap();
+    let above = format!(
+        "ops/{:020}-{}-{}.op",
+        horizon + 100,
+        old.device_id,
+        Uuid::new_v4()
+    );
+    store.put(&above, old_bytes.clone()).await.unwrap();
+
+    let backup = silentsilo_extract::open(&store as &dyn ObjectStore, &code)
+        .await
+        .unwrap();
+    let names: Vec<&str> = backup.entries.iter().map(|e| e.path.as_str()).collect();
+    assert_eq!(names, ["three.txt"], "an old rename was replayed");
+
+    store.put("keys/content.kek", old_bytes).await.unwrap();
+    assert!(matches!(
+        silentsilo_extract::open(&store as &dyn ObjectStore, &code).await,
+        Err(silentsilo_extract::ExtractError::NoContentKey)
+    ));
+}
+
 /// A folder with nothing of ours in it should say so plainly rather than
 /// producing an empty result that reads like a silo with no files.
 #[tokio::test]

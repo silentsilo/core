@@ -508,6 +508,45 @@ mod tests {
     }
 
     #[test]
+    fn the_list_and_the_ledger_key_swapped_are_both_refused() {
+        // Both are sealed under the KEK, and sealing does not say which is
+        // which. Neither may read as the other, nor as empty.
+        let dir = tempfile::tempdir().unwrap();
+        let silo = dir.path().join("Personal");
+        std::fs::create_dir_all(&silo).unwrap();
+        let kek = generate_content_kek();
+        let file = write(dir.path(), "a.txt", "x");
+        save_protected(
+            &silo,
+            &kek,
+            &ProtectedFolders {
+                folders: vec![ProtectedFolder {
+                    path: dir.path().to_path_buf(),
+                    target: "/A".into(),
+                }],
+            },
+        )
+        .unwrap();
+        mark_seen(&silo, &kek, &file, stat_of(&file)).unwrap();
+        let list = std::fs::read(config_path(&silo)).unwrap();
+        let key = std::fs::read(ledger_key_path(&silo)).unwrap();
+
+        std::fs::write(config_path(&silo), &key).unwrap();
+        std::fs::write(ledger_key_path(&silo), &list).unwrap();
+        assert!(load_protected(&silo, &kek).is_err());
+        assert!(load_seen(&silo, &kek).is_err());
+
+        // A content key wrapped under the KEK is 32 bytes too, and opens
+        // nothing here.
+        let content = silentsilo_crypto::generate_content_key();
+        let wrapped = seal_with_key(content.as_bytes(), kek.as_bytes()).unwrap();
+        std::fs::write(ledger_key_path(&silo), &wrapped).unwrap();
+        assert!(load_seen(&silo, &kek).is_err());
+
+        let _ = std::fs::remove_dir_all(crate::workdir::cache_dir_for(&silo));
+    }
+
+    #[test]
     fn a_list_and_ledger_from_an_older_release_are_taken_over_whole() {
         // The upgrade path. What 1.5.0 wrote is read once, written back
         // sealed and removed. Nothing is lost, because an empty ledger is

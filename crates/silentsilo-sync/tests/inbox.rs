@@ -424,6 +424,63 @@ async fn the_orphan_sweep_never_touches_the_inbox() {
     assert_eq!(s.import().await, 1);
 }
 
+// Audit L1: sealing does not bind the name, so these move real sealed
+// objects under other names and run the readers.
+
+#[tokio::test]
+async fn an_inbox_key_moved_under_another_name_opens_nothing() {
+    let s = setup().await;
+    s.send().await;
+    let genuine = format!("inbox/keys/{}.sealed", s.identity.key_id);
+    let moved = format!("inbox/keys/{}.sealed", Uuid::now_v7());
+    let bytes = s.store.get(&genuine).await.unwrap();
+    s.store.put(&moved, bytes).await.unwrap();
+    s.store.delete(&genuine).await.unwrap();
+    // A sender record under a key's name is no key either.
+    let sender = format!("inbox/senders/{}.sealed", s.identity.sender_id);
+    let other = format!("inbox/keys/{}.sealed", Uuid::now_v7());
+    let bytes = s.store.get(&sender).await.unwrap();
+    s.store.put(&other, bytes).await.unwrap();
+
+    let scan = scan_inbox(&s.store, s.session.vault_id, &s.session.kek)
+        .await
+        .unwrap();
+    assert!(scan.ready.is_empty());
+    assert!(
+        scan.refused[0].reason.contains("inbox key"),
+        "{:?}",
+        scan.refused
+    );
+    let (fresh, _) = ensure_inbox_key(&s.store, &s.session.kek).await.unwrap();
+    assert_ne!(fresh, s.identity.key_id, "the moved key was taken");
+}
+
+#[tokio::test]
+async fn a_sender_moved_under_another_name_sends_nothing() {
+    let s = setup().await;
+    s.send().await;
+    let genuine = format!("inbox/senders/{}.sealed", s.identity.sender_id);
+    let moved = format!("inbox/senders/{}.sealed", Uuid::new_v4());
+    let bytes = s.store.get(&genuine).await.unwrap();
+    s.store.put(&moved, bytes).await.unwrap();
+    s.store.delete(&genuine).await.unwrap();
+    // Nor is the inbox key, under a sender's name.
+    let key = format!("inbox/keys/{}.sealed", s.identity.key_id);
+    let other = format!("inbox/senders/{}.sealed", Uuid::new_v4());
+    let bytes = s.store.get(&key).await.unwrap();
+    s.store.put(&other, bytes).await.unwrap();
+
+    let scan = scan_inbox(&s.store, s.session.vault_id, &s.session.kek)
+        .await
+        .unwrap();
+    assert!(scan.ready.is_empty());
+    assert!(
+        scan.refused[0].reason.contains("allowed to send"),
+        "{:?}",
+        scan.refused
+    );
+}
+
 #[tokio::test]
 async fn an_existing_inbox_key_is_reused() {
     let s = setup().await;

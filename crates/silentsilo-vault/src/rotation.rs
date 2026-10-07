@@ -171,7 +171,22 @@ pub fn load_staged_dek(root: &Path, old_dek: &MasterDek) -> Result<MasterDek, Va
         .as_slice()
         .try_into()
         .map_err(|_| VaultError::InvalidCredentials)?;
+    // The KEK envelope is also 32 bytes sealed under the old key: a copy of
+    // it here would re-seal the silo under its content key.
+    if let Ok(kek) = std::fs::read(kek_path(root))
+        && let Ok(kek) = crate::kek_store::unwrap_kek_bytes(&kek, old_dek)
+        && kek.as_bytes()[..] == key[..]
+    {
+        return Err(VaultError::InvalidCredentials);
+    }
     Ok(MasterDek::from_bytes(key))
+}
+
+/// The staged key a pending rotation holds, if `dek` opens it as one.
+pub(crate) fn staged_key_under(root: &Path, dek: &MasterDek) -> Option<Zeroizing<Vec<u8>>> {
+    let data = std::fs::read(staged_dek_path(root)).ok()?;
+    let plain = Zeroizing::new(unseal(&data, dek).ok()?);
+    (plain.len() == 32).then_some(plain)
 }
 
 /// A rename, or, when something holds the target open, its bytes written
@@ -497,6 +512,43 @@ mod tests {
         assert!(
             load_staged_dek(dir.path(), &generate_dek()).is_err(),
             "and a key that does not open this silo reads nothing"
+        );
+    }
+
+    /// The KEK envelope and the staged key are both 32 bytes sealed under
+    /// the old DEK, and sealing does not say which is which. A copy of one
+    /// over the other, by whatever writes to a synced silo folder, is
+    /// refused rather than taken for the other.
+    #[test]
+    fn the_kek_and_the_staged_key_copied_over_each_other_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (old, kek) = silo(dir.path(), &[3u8; 32]);
+        let new = generate_dek();
+        stage_rotation(dir.path(), &new, &kek, &old).unwrap();
+        let kek_file = std::fs::read(kek_path(dir.path())).unwrap();
+        let staged = std::fs::read(staged_dek_path(dir.path())).unwrap();
+
+        std::fs::write(staged_dek_path(dir.path()), &kek_file).unwrap();
+        assert!(load_staged_dek(dir.path(), &old).is_err());
+        std::fs::write(staged_dek_path(dir.path()), &staged).unwrap();
+
+        std::fs::write(kek_path(dir.path()), &staged).unwrap();
+        assert!(load_kek(dir.path(), &old).is_err());
+        // The staged KEK there is under the new key, which the old one does
+        // not open.
+        let staged_kek = std::fs::read(staged_kek_path(dir.path())).unwrap();
+        std::fs::write(kek_path(dir.path()), &staged_kek).unwrap();
+        assert!(load_kek(dir.path(), &old).is_err());
+
+        // Put back, both read as they were.
+        std::fs::write(kek_path(dir.path()), &kek_file).unwrap();
+        assert_eq!(
+            load_kek(dir.path(), &old).unwrap().as_bytes(),
+            kek.as_bytes()
+        );
+        assert_eq!(
+            load_staged_dek(dir.path(), &old).unwrap().as_bytes(),
+            new.as_bytes()
         );
     }
 

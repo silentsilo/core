@@ -62,6 +62,13 @@ impl KeyPair {
     }
 }
 
+/// The public half of `private`, or `None` when it is not a key of this
+/// suite.
+pub(crate) fn public_of(private: &[u8]) -> Option<Vec<u8>> {
+    let private = <Kem as hpke::Kem>::PrivateKey::from_bytes(private).ok()?;
+    Some(<Kem as hpke::Kem>::sk_to_pk(&private).to_bytes().to_vec())
+}
+
 /// What the record is bound to besides its plaintext: the device that wrote
 /// it and the key it was sealed to. A record moved under another device's
 /// name does not open.

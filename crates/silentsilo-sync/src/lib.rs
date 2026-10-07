@@ -843,8 +843,9 @@ pub struct SeedOutcome {
     pub failed: Vec<(String, String)>,
     /// Records, snapshots or the KEK envelope that do not open under the
     /// silo's current key: the source was not rotated with the rest. Left
-    /// behind, or they would overwrite the current ones. Only
-    /// [`seed_target_checked`] counts these.
+    /// behind, or they would overwrite the current ones. So is one that
+    /// opens but is not what its name says. Only [`seed_target_checked`]
+    /// counts these.
     pub stale: usize,
     /// Key envelopes of keys this device does not hold as in use. Left
     /// behind: a never-delete copy keeps the envelope of a removed key, and
@@ -1095,7 +1096,7 @@ async fn seed(
             Ok(()) => {
                 if let Some(dek) = current
                     && sealed
-                    && !opens_under(&staged, dek)
+                    && !opens_under(&staged, &entry.key, dek)
                 {
                     outcome.stale += 1;
                     reporter.finish_object();
@@ -1163,10 +1164,27 @@ fn envelope_id(key: &str) -> Option<&str> {
         .filter(|id| !id.contains('/'))
 }
 
-/// Whether a staged object opens under `dek`. Read whole, as every sealed
-/// object is when it is used.
-fn opens_under(path: &Path, dek: &MasterDek) -> bool {
-    std::fs::read(path).is_ok_and(|bytes| unseal(&bytes, dek).is_ok())
+/// Whether a staged object opens under `dek` and is what `key` names: a
+/// record named for itself, a snapshot whose horizon is its name's, a KEK
+/// envelope holding a key. Read whole, as every sealed object is when it
+/// is used.
+fn opens_under(path: &Path, key: &str, dek: &MasterDek) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    if key.starts_with(OPS_PREFIX) {
+        return record_bytes_are_sound(&bytes, key, dek);
+    }
+    if key == CONTENT_KEK_KEY {
+        return opens_as_kek(&bytes, dek);
+    }
+    let Ok(plain) = unseal(&bytes, dek) else {
+        return false;
+    };
+    match horizon_from_key(key) {
+        Some(horizon) => Snapshot::from_bytes(&plain).is_ok_and(|s| s.horizon == horizon),
+        None => true,
+    }
 }
 
 /// The callback a backend reports into: it moves the count along and
@@ -1260,6 +1278,12 @@ pub async fn verify_against(
         match client.get(&entry.key).await {
             Ok(sealed) => match unseal(&sealed, dek) {
                 Ok(plain) => match OpRecord::from_bytes(&plain) {
+                    // Sealing does not bind the name: a record copied
+                    // under another's is wrong there.
+                    Ok(record) if op_key(&record) != entry.key => report.damaged.push((
+                        entry.key.clone(),
+                        "holds another record than its name says".to_string(),
+                    )),
                     Ok(_) => report.records_read += 1,
                     Err(e) => report.damaged.push((entry.key.clone(), e.to_string())),
                 },
@@ -2104,7 +2128,7 @@ pub async fn publish_content_kek_checked(
     envelope: &[u8],
 ) -> Result<bool, SyncError> {
     if let Some(held) = fetch_small(client, CONTENT_KEK_KEY).await? {
-        if unseal(&held, dek).is_ok() {
+        if opens_as_kek(&held, dek) {
             return Ok(false);
         }
         return Err(SyncError::Vault(
@@ -2113,6 +2137,13 @@ pub async fn publish_content_kek_checked(
     }
     client.put(CONTENT_KEK_KEY, envelope.to_vec()).await?;
     Ok(true)
+}
+
+/// Whether `bytes` open under `dek` as a KEK envelope. Sealing does not
+/// bind the role, so a record moved to `keys/content.kek` opens too; only a
+/// 32-byte key is one.
+fn opens_as_kek(bytes: &[u8], dek: &MasterDek) -> bool {
+    silentsilo_vault::unwrap_kek_bytes(bytes, dek).is_ok()
 }
 
 /// The KEK envelope as stored, for a device joining the silo.
@@ -2166,13 +2197,14 @@ pub async fn kek_envelope_state(
     let Some(envelope) = fetch_content_kek(client).await? else {
         return Ok(KekState::Absent);
     };
-    if unseal(&envelope, dek).is_ok() {
+    if opens_as_kek(&envelope, dek) {
         return Ok(KekState::Current);
     }
 
     // The newest records, because a rotation that reached the envelope had
     // already been through all of them. An unreadable one is taken as a
-    // rotation, which is what this build did before it asked at all.
+    // rotation, which is what this build did before it asked at all. One
+    // that opens under another record's name is no witness either way.
     let mut listing = client.list(OPS_PREFIX).await?;
     listing.sort_by(|a, b| a.key.cmp(&b.key));
     let mut witnesses = 0;
@@ -2188,6 +2220,9 @@ pub async fn kek_envelope_state(
         };
         if unseal(&sealed, dek).is_err() {
             return Ok(KekState::Rotated);
+        }
+        if !record_bytes_are_sound(&sealed, &entry.key, dek) {
+            continue;
         }
         witnesses += 1;
     }
@@ -2213,7 +2248,8 @@ pub async fn newest_listed_lamport(client: &dyn ObjectStore) -> Result<Option<u6
 
 /// The Lamport counter of the newest record on a target that opens under
 /// this device's key, looking at the newest few only. A name with nothing
-/// behind it that opens (planted, damaged) does not count.
+/// behind it that opens (planted, damaged) does not count, nor does a
+/// record copied under a newer name than its own.
 pub async fn newest_readable_lamport(
     client: &dyn ObjectStore,
     dek: &MasterDek,
@@ -2227,7 +2263,7 @@ pub async fn newest_readable_lamport(
         let Ok(sealed) = client.get(&entry.key).await else {
             continue;
         };
-        if unseal(&sealed, dek).is_ok() {
+        if record_bytes_are_sound(&sealed, &entry.key, dek) {
             return Ok(lamport_from_key(&entry.key));
         }
     }

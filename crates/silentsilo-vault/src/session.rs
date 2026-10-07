@@ -2178,6 +2178,35 @@ mod tests {
         assert_eq!(page_key_bytes(&paths), key);
     }
 
+    /// Sealing does not bind the role, so the KEK envelope, a record or a
+    /// staged key opens under the DEK wherever it is put. Moved over the
+    /// snapshot it is not a database and the shadow copy answers; moved
+    /// over the page key it does not open the copy, which is exported again.
+    #[test]
+    fn a_sealed_object_moved_over_the_snapshot_or_the_page_key_is_not_used() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let session = silo_with_marker(&root, "secret", "kept");
+        let dek = session.dek.clone();
+        let paths = lock(session);
+        let kek = std::fs::read(crate::kek_store::kek_path(&root)).unwrap();
+        let record = seal(br#"{"op_id":"x","lamport":1}"#, &dek).unwrap();
+
+        std::fs::write(paths.db_key_path(), &kek).unwrap();
+        let reopened = VaultSession::open_with_dek(root.clone(), dek.clone()).unwrap();
+        assert_eq!(marker(&reopened.conn), "kept");
+        assert_ne!(page_key_bytes(&paths), kek, "the moved key was kept");
+        let paths = lock(reopened);
+
+        for moved in [&kek, &record] {
+            std::fs::write(paths.db_enc_path(), moved).unwrap();
+            crate::workdir::wipe_work_dir(&root);
+            let reopened = VaultSession::open_with_dek(root.clone(), dek.clone()).unwrap();
+            assert_eq!(marker(&reopened.conn), "kept");
+            lock(reopened);
+        }
+    }
+
     /// The copy's bookkeeping never reaches a snapshot, which every release
     /// reads.
     #[test]

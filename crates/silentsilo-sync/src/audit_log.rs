@@ -87,9 +87,15 @@ pub async fn read_audit_key(
     let Some(bytes) = fetch_small(client, &audit_key_path(&id)).await? else {
         return Ok(None);
     };
-    AuditKey::from_json(&bytes)
-        .map(Some)
-        .map_err(|e| SyncError::Vault(e.to_string()))
+    let key = AuditKey::from_json(&bytes).map_err(|e| SyncError::Vault(e.to_string()))?;
+    // The id is the hash of the public key, so a key copied under another
+    // key's name says so.
+    if key.key_id != hex::encode(id) {
+        return Err(SyncError::Vault(
+            "the activity log's key there is another key than its name says".into(),
+        ));
+    }
+    Ok(Some(key))
 }
 
 /// Every personal log key `client` holds that the content key opens, by
@@ -200,5 +206,40 @@ mod tests {
 
         client.put(POLICY_PATH, vec![0; 64]).await.unwrap();
         assert!(read_audit_policy(&client, &kek).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_log_key_moved_under_another_keys_name_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = FolderStore::new(dir.path().to_path_buf());
+        let kek = silentsilo_crypto::generate_content_kek();
+        let (first, second) = (KeyPair::generate(), KeyPair::generate());
+        let mut key = AuditKey::new(&first, Scope::Silo, 1);
+        key.wrap_for(BY_SILO, &first.private, kek.as_bytes())
+            .unwrap();
+        write_audit_key(&client, &key).await.unwrap();
+        let bytes = client.get(&audit_key_path(&first.id())).await.unwrap();
+        client
+            .put(&audit_key_path(&second.id()), bytes)
+            .await
+            .unwrap();
+
+        let named = hex::encode(second.id());
+        assert!(read_audit_key(&client, &named).await.is_err());
+        // Read by its content, it is still only the first key.
+        let held = read_silo_keys(&client, &kek).await.unwrap();
+        assert_eq!(held.len(), 2);
+        assert!(held.iter().all(|(id, _)| *id == first.id()));
+
+        // Its wrapping moved into the second key's entry opens nothing.
+        let mut other = AuditKey::new(&second, Scope::Silo, 1);
+        other.wrapped = key.wrapped.clone();
+        client
+            .put(&audit_key_path(&second.id()), other.to_json().unwrap())
+            .await
+            .unwrap();
+        let held = read_silo_keys(&client, &kek).await.unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].0, first.id());
     }
 }

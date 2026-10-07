@@ -27,7 +27,13 @@ pub fn save_kek(root: &Path, kek: &ContentKek, dek: &MasterDek) -> Result<(), Va
 }
 
 pub fn load_kek(root: &Path, dek: &MasterDek) -> Result<ContentKek, VaultError> {
-    unwrap_kek_bytes(&std::fs::read(kek_path(root))?, dek)
+    let kek = unwrap_kek_bytes(&std::fs::read(kek_path(root))?, dek)?;
+    // A rotation's staged key is also 32 bytes sealed under this DEK, and
+    // sealing does not say which is which: a copy of it here is refused.
+    if crate::rotation::staged_key_under(root, dek).is_some_and(|k| k[..] == kek.as_bytes()[..]) {
+        return Err(VaultError::InvalidCredentials);
+    }
+    Ok(kek)
 }
 
 /// Same deliberate vagueness as the DEK's: "wrong key" and "not a wrapping
@@ -101,6 +107,18 @@ mod tests {
             load_kek(dir.path(), &old_dek).is_err(),
             "and the old vault key no longer reaches the KEK"
         );
+    }
+
+    #[test]
+    fn another_object_sealed_under_the_dek_is_not_taken_as_the_kek() {
+        // Sealing does not bind the role: a record or snapshot opens under
+        // the same DEK. Only a 32-byte key is a KEK.
+        let dir = tempfile::tempdir().unwrap();
+        let dek = generate_dek();
+        let record = seal(br#"{"op_id":"x","lamport":3}"#, &dek).unwrap();
+        std::fs::write(kek_path(dir.path()), &record).unwrap();
+        assert!(load_kek(dir.path(), &dek).is_err());
+        assert!(unwrap_kek_bytes(&record, &dek).is_err());
     }
 
     #[test]

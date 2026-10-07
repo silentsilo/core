@@ -332,6 +332,28 @@ The header is authenticated, so a payload cannot be relabelled as an older
 version to make a reader interpret it under weaker rules. A version this build
 does not know is refused by name rather than guessed at.
 
+The AAD does not bind the payload's role or its name in storage (audit L1).
+Anyone who can write to storage can put a real sealed object under the name
+of another, of the same kind (another record, snapshot or marker) or of
+another kind (a record where the KEK envelope goes), and it still opens. They
+cannot read it or make one. This is closed without a format change, because
+data already written stays version 1 for good and a version 2 would read to
+older devices as a rotation: every reader binds the name to the content
+itself. A record's name must be its own Lamport value, device and op id; a
+snapshot's its horizon; a marker's, inbox key's or sender's the id inside;
+the KEK envelope must hold a 32-byte key; a log key's entry must hold the
+private half of its own public key. Each reader has a test that moves a real
+object under a name of its own kind and of another kind and shows it is
+rejected or ignored, never applied. The list, with the tests, is in
+[ARCHITECTURE.md](ARCHITECTURE.md), "Sealed objects and their names". A new
+reader of a sealed object comes with the same test.
+
+Two 32-byte keys share the DEK in the silo folder during a rotation: the KEK
+envelope (`content.kek.enc`) and the staged key (`master.dek.enc.next`).
+Nothing in them says which is which, so each reader refuses a key equal to
+the other. Wrapped DEKs need no such rule: each is under a wrap key of its
+own.
+
 A fixed nonce was used here in a pre-release version and is no longer accepted.
 It offered no protection against a later re-wrap reusing a (key, nonce) pair,
 which for AES-GCM leaks the XOR of both plaintexts and the authentication

@@ -111,9 +111,16 @@ impl AuditKey {
             .find(|w| w.by == by)
             .ok_or(AuditError::BadKey)?;
         let sealed = hex::decode(&wrapped.sealed).map_err(|_| AuditError::BadKey)?;
-        unseal_with_key(&sealed, &wrapping(wrap_key))
+        let private = unseal_with_key(&sealed, &wrapping(wrap_key))
             .map(Zeroizing::new)
-            .map_err(|_| AuditError::BadKey)
+            .map_err(|_| AuditError::BadKey)?;
+        // Sealing does not bind which key this is: a wrapping copied from
+        // another log key's entry opens too, and must not be taken as this
+        // one's.
+        if crate::record::public_of(&private) != Some(self.public()?) {
+            return Err(AuditError::BadKey);
+        }
+        Ok(private)
     }
 
     /// This key with every way in `other` holds that this one lacks. Two
@@ -257,6 +264,35 @@ mod tests {
         let mut key = AuditKey::new(&keys, Scope::Silo, 1);
         key.public_key = hex::encode(KeyPair::generate().public);
         assert!(AuditKey::from_json(&key.to_json().unwrap()).is_err());
+    }
+
+    #[test]
+    fn a_private_key_moved_under_another_log_keys_entry_is_refused() {
+        let (first, second) = (KeyPair::generate(), KeyPair::generate());
+        let mut a = AuditKey::new(&first, Scope::Silo, 1);
+        a.wrap_for(BY_SILO, &first.private, &[9; 32]).unwrap();
+        let mut b = AuditKey::new(&second, Scope::Silo, 1);
+        b.wrapped = a.wrapped.clone();
+        let b = AuditKey::from_json(&b.to_json().unwrap()).unwrap();
+        assert!(matches!(
+            b.unwrap_with(BY_SILO, &[9; 32]),
+            Err(AuditError::BadKey)
+        ));
+        assert!(a.unwrap_with(BY_SILO, &[9; 32]).is_ok());
+    }
+
+    #[test]
+    fn a_sealed_object_of_another_kind_is_not_a_policy() {
+        // A revocation marker, sealed under the same content key.
+        let marker = br#"{"version":1,"credential_id":"aa11","revoked_at":5}"#;
+        let sealed = seal_with_key(marker, &[9; 32]).unwrap();
+        assert!(AuditPolicy::open(&sealed, &[9; 32]).is_err());
+        // A private key wrapped for the silo is under a derived key.
+        let keys = KeyPair::generate();
+        let mut key = AuditKey::new(&keys, Scope::Silo, 1);
+        key.wrap_for(BY_SILO, &keys.private, &[9; 32]).unwrap();
+        let wrapped = hex::decode(&key.wrapped[0].sealed).unwrap();
+        assert!(AuditPolicy::open(&wrapped, &[9; 32]).is_err());
     }
 
     #[test]

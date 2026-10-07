@@ -21,6 +21,17 @@ release notes should say.
 
 ### Fixed
 
+- Audit L1 is closed by reader checks, with no format change: a sealed
+  object's AAD does not bind its name, so every reader now compares the
+  name with the content and has a test that moves a real object under
+  another name. Fixed where one did not: a content check reports a record
+  under another record's name as damaged; the rotation check and the
+  missed-rotation check no longer count such a record; the KEK envelope
+  must hold a 32-byte key before a pass takes it as current or a seed
+  copies it; a seed copies no record or snapshot whose name does not match;
+  an activity log key must match its name and its wrapped private key must
+  match its public key; retention skips a segment that names another place;
+  the KEK and a rotation's staged key in the silo folder refuse each other.
 - Reading the activity log no longer waits on the copies one after
   another: they are read together, each given 30 seconds, and one that does
   not answer is named as not read. `read_audit_log_local` gives what this

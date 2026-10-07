@@ -113,4 +113,25 @@ mod tests {
         let wrapped = wrap_dek_bytes(&dek, &[1u8; 32]).unwrap();
         assert!(unwrap_dek_bytes(&wrapped, &[2u8; 32]).is_err());
     }
+
+    /// Every DEK wrapping is under a key of its own (the device secret's,
+    /// each security key's, the recovery code's), so one moved into
+    /// another's place opens nothing there. Nor does the KEK envelope.
+    #[test]
+    fn a_wrapping_moved_from_another_place_does_not_open_here() {
+        let dir = tempfile::tempdir().unwrap();
+        let dek = generate_dek();
+        let (device, security_key) = ([1u8; 32], [2u8; 32]);
+        save_dek(dir.path(), &dek, &device).unwrap();
+
+        let for_key = wrap_dek_bytes(&dek, &security_key).unwrap();
+        save_wrapped_dek_bytes(dir.path(), &for_key).unwrap();
+        assert!(load_dek(dir.path(), &device).is_err());
+
+        let kek =
+            crate::kek_store::wrap_kek_bytes(&silentsilo_crypto::generate_content_kek(), &dek)
+                .unwrap();
+        save_wrapped_dek_bytes(dir.path(), &kek).unwrap();
+        assert!(load_dek(dir.path(), &device).is_err());
+    }
 }
