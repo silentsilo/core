@@ -42,6 +42,12 @@ pub async fn a_prefix_read_returns_the_first_bytes_only(store: Box<dyn ObjectSto
         store.get_prefix("blobs/none.sslo", 82).await,
         Err(StoreError::NotFound(_))
     ));
+    store.put("blobs/empty.sslo", Vec::new()).await.unwrap();
+    assert_eq!(
+        store.get_prefix("blobs/empty.sslo", 82).await.unwrap(),
+        Vec::<u8>::new(),
+        "an empty object has an empty prefix, not an error"
+    );
 }
 
 pub async fn listing_is_ordered_by_key(store: Box<dyn ObjectStore>) {

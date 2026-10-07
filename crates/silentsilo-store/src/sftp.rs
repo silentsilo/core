@@ -511,6 +511,27 @@ impl ObjectStore for SftpStore {
         .await
     }
 
+    /// Reads only as far as `len`: checking a blob's header must not
+    /// download the whole blob.
+    async fn get_prefix(&self, key: &str, len: u64) -> Result<Vec<u8>, StoreError> {
+        self.run(|sftp| async move {
+            let file = sftp.open(self.path_for(key)).await.map_err(|e| {
+                if missing(&e) {
+                    StoreError::NotFound(key.to_string())
+                } else {
+                    StoreError::Other(format!("{key}: {e}"))
+                }
+            })?;
+            let mut out = Vec::new();
+            file.take(len)
+                .read_to_end(&mut out)
+                .await
+                .map_err(|e| StoreError::Other(format!("{key}: {e}")))?;
+            Ok(out)
+        })
+        .await
+    }
+
     async fn put_from_file(&self, key: &str, source: &std::path::Path) -> Result<(), StoreError> {
         self.put_from_file_reporting(key, source, &mut |_| std::ops::ControlFlow::Continue(()))
             .await

@@ -266,6 +266,41 @@ impl ObjectStore for WebDavStore {
         Ok(response.bytes().await.map_err(Self::map_send)?.to_vec())
     }
 
+    /// A ranged GET. A server that ignores the range answers with the whole
+    /// object, which is read only as far as `len` before the connection is
+    /// dropped: checking a blob's header must not download a video.
+    async fn get_prefix(&self, key: &str, len: u64) -> Result<Vec<u8>, StoreError> {
+        if len == 0 {
+            self.head(key)
+                .await?
+                .ok_or_else(|| StoreError::NotFound(key.to_string()))?;
+            return Ok(Vec::new());
+        }
+        let mut response = self
+            .request(Method::GET, &self.url_for(key))
+            .header(reqwest::header::RANGE, format!("bytes=0-{}", len - 1))
+            .send()
+            .await
+            .map_err(Self::map_send)?;
+        // An empty object has no byte 0 to start a range at.
+        if response.status() == StatusCode::RANGE_NOT_SATISFIABLE {
+            return Ok(Vec::new());
+        }
+        if !response.status().is_success() {
+            return Err(Self::map_status(response.status(), key));
+        }
+        let want = usize::try_from(len).unwrap_or(usize::MAX);
+        let mut out = Vec::new();
+        while out.len() < want {
+            match response.chunk().await.map_err(Self::map_send)? {
+                Some(chunk) => out.extend_from_slice(&chunk),
+                None => break,
+            }
+        }
+        out.truncate(want);
+        Ok(out)
+    }
+
     async fn put_from_file(&self, key: &str, source: &std::path::Path) -> Result<(), StoreError> {
         self.put_from_file_reporting(key, source, &mut |_| std::ops::ControlFlow::Continue(()))
             .await
