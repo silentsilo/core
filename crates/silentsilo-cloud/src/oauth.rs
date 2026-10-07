@@ -265,14 +265,22 @@ impl OAuth {
             }
         };
         let status = response.status();
+        // A token answer is a few kilobytes.
         let bytes = Zeroizing::new(
-            response
-                .bytes()
-                .await
-                .map_err(|e| {
-                    CloudError::Unreachable(format!("{name} ({})", crate::http::cause(&e)))
-                })?
-                .to_vec(),
+            match crate::http::read_body_capped(response, 256 * 1024).await {
+                Ok(bytes) => bytes,
+                Err(crate::http::Capped::Transport(e)) => {
+                    return Err(CloudError::Unreachable(format!(
+                        "{name} ({})",
+                        crate::http::cause(&e)
+                    )));
+                }
+                Err(crate::http::Capped::TooLarge) => {
+                    return Err(CloudError::Other(format!(
+                        "{name} answered the sign-in with far too much data"
+                    )));
+                }
+            },
         );
         let json: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|_| CloudError::Other(format!("{name} answered something unreadable")))?;

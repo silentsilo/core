@@ -162,13 +162,52 @@ impl Http {
     }
 
     pub async fn json(&self, response: Response) -> Result<serde_json::Value, StoreError> {
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| transport(self.name, &e))?;
+        let bytes = match read_body_capped(response, MAX_API_ANSWER).await {
+            Ok(bytes) => bytes,
+            Err(Capped::Transport(e)) => return Err(transport(self.name, &e)),
+            Err(Capped::TooLarge) => {
+                return Err(StoreError::Other(format!(
+                    "{} answered with more than {} MB, which is not an answer this app asks for",
+                    self.name,
+                    MAX_API_ANSWER / (1024 * 1024)
+                )));
+            }
+        };
         serde_json::from_slice(&bytes)
             .map_err(|_| StoreError::Other(format!("{} answered something unreadable", self.name)))
     }
+}
+
+/// The largest API answer read: a page of a thousand listed files is about
+/// a megabyte. Anything past this is a broken or hostile server, and is not
+/// held in memory to find out.
+pub(crate) const MAX_API_ANSWER: usize = 8 * 1024 * 1024;
+
+pub(crate) enum Capped {
+    Transport(reqwest::Error),
+    TooLarge,
+}
+
+/// A response body, refused once it passes `max` bytes: by its declared
+/// length before reading, else as it arrives.
+pub(crate) async fn read_body_capped(
+    mut response: Response,
+    max: usize,
+) -> Result<Vec<u8>, Capped> {
+    if response
+        .content_length()
+        .is_some_and(|len| len > max as u64)
+    {
+        return Err(Capped::TooLarge);
+    }
+    let mut out = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(Capped::Transport)? {
+        if out.len() + chunk.len() > max {
+            return Err(Capped::TooLarge);
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
 }
 
 /// Debug builds only, with `SILENTSILO_TRACE_CLOUD` set: one line per
@@ -375,4 +414,36 @@ pub(crate) fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std:
 pub(crate) fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
     use std::os::unix::fs::FileExt;
     file.read_exact_at(buf, offset)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fake::{Reply, serve};
+    use std::sync::Arc;
+
+    async fn answer_of(size: usize) -> Response {
+        let base = serve(Arc::new(move |_| Reply {
+            status: 200,
+            headers: Vec::new(),
+            body: vec![b' '; size],
+        }))
+        .await;
+        reqwest::get(format!("{base}/x")).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_answer_past_the_cap_is_refused_not_read_whole() {
+        assert!(matches!(
+            read_body_capped(answer_of(MAX_API_ANSWER + 1).await, MAX_API_ANSWER).await,
+            Err(Capped::TooLarge)
+        ));
+        assert_eq!(
+            read_body_capped(answer_of(1000).await, MAX_API_ANSWER)
+                .await
+                .ok()
+                .map(|b| b.len()),
+            Some(1000)
+        );
+    }
 }
