@@ -305,6 +305,98 @@ async fn a_never_delete_copy_on_the_old_key_does_not_send_the_device_to_rejoin()
     assert!(!second.key_material_replaced, "{second:?}");
 }
 
+/// What another key leaves on a folder copy: its own envelope, and one record
+/// at `lamport` that this device cannot open.
+async fn left_under_another_key(dir: &std::path::Path, lamport: u64) {
+    let other = silentsilo_crypto::generate_dek();
+    let store = silentsilo_store::FolderStore::new(dir.to_path_buf());
+    let envelope = dir.join(silentsilo_sync::CONTENT_KEK_KEY);
+    std::fs::create_dir_all(envelope.parent().unwrap()).unwrap();
+    std::fs::write(
+        envelope,
+        silentsilo_crypto::seal(b"other envelope", &other).unwrap(),
+    )
+    .unwrap();
+    let record = silentsilo_vfs::OpRecord::authored(
+        Uuid::new_v4(),
+        lamport,
+        Uuid::new_v4(),
+        1_700_000_000,
+        lamport,
+        None,
+        silentsilo_vfs::VaultOp::CreateFolder {
+            id: Uuid::new_v4(),
+            parent_id: Uuid::new_v4(),
+            name: "other".into(),
+        },
+    );
+    silentsilo_sync::push_ops(&store, &other, &[record])
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_working_copy_that_missed_a_rotation_is_left_out_not_a_reason_to_rejoin() {
+    // This device is on the current key; a second working copy only it
+    // lists still holds the silo as it was before the rotation, records
+    // older than anything on the main copy (audit CO-4).
+    let main = tempfile::tempdir().unwrap();
+    let stale = tempfile::tempdir().unwrap();
+    let device = Device::new(Uuid::new_v4(), None);
+    *device.host.targets.lock().unwrap() = vec![folder_target(
+        main.path().to_path_buf(),
+        TargetRole::Working,
+    )];
+    device.make_folder("Documents");
+    device.make_folder("Photos");
+    let first = device.pass().await;
+    assert!(!first.needs_rejoin, "{first:?}");
+
+    left_under_another_key(stale.path(), 1).await;
+    device.host.targets.lock().unwrap().push(folder_target(
+        stale.path().to_path_buf(),
+        TargetRole::Working,
+    ));
+    device.make_folder("After");
+    let second = device.pass().await;
+
+    assert!(!second.needs_rejoin, "{second:?}");
+    let left_out = second
+        .targets
+        .iter()
+        .find(|t| t.failed.as_deref() == Some(silentsilo_app::MISSED_ROTATION));
+    assert!(left_out.is_some(), "the stale copy says why: {second:?}");
+    assert!(
+        second
+            .targets
+            .iter()
+            .any(|t| t.failed.is_none() && t.ops_pushed > 0),
+        "the main copy still gets the new record: {second:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_rotation_newer_than_this_device_still_sends_it_to_rejoin() {
+    // The other way round: another device rotated the main copy after
+    // everything this one wrote, and a second copy missed it. This device's
+    // key is the retired one, and the copy that still opens must not decide.
+    let main = tempfile::tempdir().unwrap();
+    let missed = tempfile::tempdir().unwrap();
+    let device = Device::new(Uuid::new_v4(), None);
+    *device.host.targets.lock().unwrap() = vec![
+        folder_target(main.path().to_path_buf(), TargetRole::Working),
+        folder_target(missed.path().to_path_buf(), TargetRole::Working),
+    ];
+    device.make_folder("Documents");
+    let first = device.pass().await;
+    assert!(!first.needs_rejoin, "{first:?}");
+
+    left_under_another_key(main.path(), 9_999_999).await;
+    let second = device.pass().await;
+
+    assert!(second.needs_rejoin, "{second:?}");
+}
+
 #[tokio::test]
 async fn one_target_failing_does_not_mark_the_other_as_behind() {
     let good = tempfile::tempdir().unwrap();

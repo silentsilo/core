@@ -245,6 +245,20 @@ with `RETIRED_COPY` as its status and does not count it as a copy to reach.
 Counting it held the inbox, the sweep and compaction for as long as it stayed
 configured, since it can never be reached under the new key.
 
+A working copy can miss a rotation the same way: one only this device lists,
+or a drive that was unplugged while another device rotated. To a device the
+rotation kept, it reads as rotated, and voting it sent the device to rejoin,
+which reseals nothing on that copy, so the loop never ended. It is told apart
+from a device whose own key was retired by age. When working copies disagree,
+the newest record this device can open on a current copy is compared with the
+newest record a rotated-looking copy lists: older means that copy stopped
+before the rotation, and it is left out with `MISSED_ROTATION` as its status;
+newer means another device rotated after everything this one wrote, and the
+gravest answer still sends this device to rejoin. Only records that open
+count on the current side, so a name planted in storage cannot tip the
+answer towards pushing on a retired key; a name planted on the rotated side
+only makes it more careful.
+
 ## Data at rest
 
 Three distinct places, and the boundary between them is a security

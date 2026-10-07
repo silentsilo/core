@@ -769,9 +769,11 @@ pub async fn run_sync_pass(
     // loop, and letting them decide while the working copy was unplugged
     // did the same.
     let has_working = configured.iter().any(|t| t.role.allows_delete());
-    let mut states = Vec::new();
+    let mut working = Vec::new();
     let mut archive_states = Vec::new();
-    let mut retired: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+    // Copies left out of this pass, and what each one's status says.
+    let mut retired: std::collections::HashMap<Uuid, &'static str> =
+        std::collections::HashMap::new();
     for target in &targets {
         // Unreachable: it has no say, and the push below fails on it.
         let Ok(state) = sync::kek_envelope_state(&*target.store, &dek).await else {
@@ -791,14 +793,52 @@ pub async fn run_sync_pass(
             );
         }
         if target.role.allows_delete() {
-            states.push(state);
+            working.push((target, state));
         } else {
             if has_working && state == sync::KekState::Rotated {
-                retired.insert(target.id);
+                retired.insert(target.id, RETIRED_COPY);
             }
             archive_states.push(state);
         }
     }
+
+    // A working copy can miss a rotation too: one only this device lists,
+    // a drive that was unplugged. To this device, still on a key the
+    // rotation kept, it then looks rotated, and voting with the others it
+    // sent the device to rejoin, which reseals nothing on that copy, so the
+    // answer never changed (audit CO-4). It is told apart from a device
+    // whose own key was retired by age: a copy that missed the rotation
+    // stops at records older than the newest one this device can open on
+    // a current copy, while a rotation another device made is newer than
+    // everything this device wrote. Only records that open count on the
+    // current side, so a name planted in storage cannot tip it.
+    if working.iter().any(|(_, s)| *s == sync::KekState::Current)
+        && working.iter().any(|(_, s)| *s == sync::KekState::Rotated)
+    {
+        let mut newest_current = None;
+        for (target, state) in &working {
+            if *state == sync::KekState::Current
+                && let Ok(Some(lamport)) = sync::newest_readable_lamport(&*target.store, &dek).await
+            {
+                newest_current = newest_current.max(Some(lamport));
+            }
+        }
+        if let Some(current) = newest_current {
+            for (target, state) in &working {
+                if *state == sync::KekState::Rotated
+                    && let Ok(Some(theirs)) = sync::newest_listed_lamport(&*target.store).await
+                    && theirs < current
+                {
+                    retired.insert(target.id, MISSED_ROTATION);
+                }
+            }
+        }
+    }
+    let states: Vec<sync::KekState> = working
+        .iter()
+        .filter(|(target, _)| !retired.contains_key(&target.id))
+        .map(|(_, state)| *state)
+        .collect();
     let deciding = if has_working {
         gravest_kek_state(&states)
     } else {
@@ -841,15 +881,15 @@ pub async fn run_sync_pass(
     // and compaction for as long as it stayed configured.
     let mut retired_statuses = Vec::new();
     targets.retain(|t| {
-        if !retired.contains(&t.id) {
+        let Some(&why) = retired.get(&t.id) else {
             return true;
-        }
+        };
         retired_statuses.push(TargetStatus {
             id: t.id.to_string(),
             label: t.label.clone(),
             ops_pushed: 0,
             blobs_uploaded: 0,
-            failed: Some(RETIRED_COPY.into()),
+            failed: Some(why.into()),
             last_success: t.last_success,
             retry_in: 0,
             waiting: true,
@@ -1046,7 +1086,7 @@ pub async fn run_sync_pass(
         let required: std::collections::HashSet<Uuid> = every_target
             .iter()
             .copied()
-            .filter(|id| !retired.contains(id))
+            .filter(|id| !retired.contains_key(id))
             .collect();
         deliver_audit(host, &root, device, &kek, &targets, &required, now).await;
     }
@@ -1388,6 +1428,10 @@ async fn missed_below_horizon(
 /// Why a never-delete copy left under a replaced key gets nothing.
 pub const RETIRED_COPY: &str = "Kept under the encryption key that was replaced, so it gets no new \
      backups. Remove it and add a new never-delete copy.";
+
+/// Why a working copy that missed a rotation of the silo's key gets nothing.
+pub const MISSED_ROTATION: &str = "Missed the change of encryption key made on another device, \
+     so it gets no new backups. Remove this copy and add it again.";
 
 /// The answer that decides when copies disagree about the content key:
 /// rotated before replaced before current before absent. A rotation seen on

@@ -9,6 +9,30 @@ This repository has its own version line, separate from the desktop
 application's. A client pins a tag from here; the tag it pins is what its
 release notes should say.
 
+## [Unreleased]
+
+### Fixed
+
+- A working copy that missed a rotation of the silo's key (one only this
+  device lists, or a drive unplugged at the time) no longer sends a device
+  the rotation kept to rejoin in a loop. It is left out of the pass with a
+  status that says to remove and add it again; a device whose own key was
+  retired is still sent to rejoin (audit CO-4).
+- Checking an inbox item's header on WebDAV and SFTP reads only the header,
+  not the whole file (audit CO-3).
+- Answers from OneDrive, Dropbox and Google Drive are read up to 8 MiB, and
+  token answers up to 256 KiB; a larger one is refused rather than held in
+  memory (audit CL-7).
+- A sign-in whose port is held on `::1` by another program moves to the
+  next port, so that program never receives the redirect (audit CL-3).
+- rustls-platform-verifier 0.7.1: on Android, certificates with only a
+  revocation list (Google's now) were reported as revoked.
+
+### Changed
+
+- The cloud tests' fake servers keep listening after a failed accept and
+  close connections cleanly.
+
 ## [1.9.0] - The activity log, custom fields and history
 
 ### Added

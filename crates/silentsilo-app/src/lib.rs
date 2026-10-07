@@ -27,5 +27,5 @@ pub use state::{
 };
 pub use store_config::{SftpAuthInput, StoreConfigInput, StoreConfigView};
 pub use sync_pass::{
-    RETIRED_COPY, SyncProgress, SyncReport, TargetStatus, run_sync_pass, sync_now,
+    MISSED_ROTATION, RETIRED_COPY, SyncProgress, SyncReport, TargetStatus, run_sync_pass, sync_now,
 };

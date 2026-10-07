@@ -2048,6 +2048,41 @@ pub async fn kek_envelope_state(
     Ok(KekState::Replaced)
 }
 
+/// The Lamport counter of the newest record a target lists, read from the
+/// object keys alone. Names are not authenticated: this is for a copy whose
+/// records this device cannot open anyway, never for deciding in its favour.
+pub async fn newest_listed_lamport(client: &dyn ObjectStore) -> Result<Option<u64>, SyncError> {
+    Ok(client
+        .list(OPS_PREFIX)
+        .await?
+        .iter()
+        .filter_map(|entry| lamport_from_key(&entry.key))
+        .max())
+}
+
+/// The Lamport counter of the newest record on a target that opens under
+/// this device's key, looking at the newest few only. A name with nothing
+/// behind it that opens (planted, damaged) does not count.
+pub async fn newest_readable_lamport(
+    client: &dyn ObjectStore,
+    dek: &MasterDek,
+) -> Result<Option<u64>, SyncError> {
+    let mut listing = client.list(OPS_PREFIX).await?;
+    listing.sort_by(|a, b| a.key.cmp(&b.key));
+    for entry in listing.iter().rev().take(KEK_WITNESSES) {
+        if entry.size > MAX_OP_BYTES {
+            continue;
+        }
+        let Ok(sealed) = client.get(&entry.key).await else {
+            continue;
+        };
+        if unseal(&sealed, dek).is_ok() {
+            return Ok(lamport_from_key(&entry.key));
+        }
+    }
+    Ok(None)
+}
+
 /// Whether this device's vault key still opens the silo's published KEK
 /// envelope. `None` when the target holds none yet. `false` covers both ways
 /// it can fail; [`kek_envelope_state`] is the one that tells them apart.
