@@ -96,6 +96,11 @@ jobs:
           key: audit
       - run: cargo install cargo-audit --locked --version 0.22.2
       - run: cargo audit
+      # Licenses and sources: every dependency's license is one deny.toml
+      # allows next to the AGPL, and every crate comes from crates.io or
+      # silentsilo/core. Pinned like cargo-audit.
+      - run: cargo install cargo-deny --locked --version 0.20.2
+      - run: cargo deny check licenses sources
 
   # The dependency direction, as a test rather than as a paragraph. Nothing
   # in this repository may reach a user interface: not Tauri, not a webview,
