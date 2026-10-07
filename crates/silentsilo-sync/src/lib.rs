@@ -1370,6 +1370,157 @@ async fn verify_one(
     Ok(read)
 }
 
+// ── Repairing a copy from a good one ────────────────────────────────
+
+/// What a repair did, object by object.
+#[derive(Debug, Default, Clone)]
+pub struct RepairReport {
+    /// Keys put back, each with where the good bytes came from.
+    pub repaired: Vec<(String, String)>,
+    /// Keys left as they were, with why: no source held them whole, or the
+    /// write did not read back.
+    pub unrepaired: Vec<(String, String)>,
+    /// Keys that were already sound again when the repair looked at them.
+    pub already_sound: Vec<String>,
+}
+
+/// Puts back what a content check found missing or damaged on `target`,
+/// from `sources` (the other copies, and the local cache as a folder store
+/// of the silo's root, which keeps blobs under the same keys). See
+/// `planuri/reparare-automata.md` and ARCHITECTURE, "Repairing a copy".
+///
+/// Only `ops/` and `blobs/` are touched: both are written once and never
+/// changed, so a key holds the same bytes on every copy and putting proven
+/// bytes back cannot undo anybody's write. A source proves itself before
+/// anything is written (a record opens and its name matches its content; a
+/// blob decrypts whole and matches its id), an object on `target` that
+/// proves itself meanwhile is left alone, nothing is deleted, and every write
+/// is read back and checked again. The caller passes only working copies as
+/// `target`: never-delete copies are reported, never rewritten.
+pub async fn repair_from(
+    target: &dyn ObjectStore,
+    found: &VerifyReport,
+    sources: &[(&str, &dyn ObjectStore)],
+    dek: &MasterDek,
+    open: &mut (dyn FnMut(Uuid) -> Option<silentsilo_crypto::ContentKey> + Send),
+    cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<RepairReport, SyncError> {
+    let mut report = RepairReport::default();
+    let mut keys: Vec<String> = found.missing.iter().map(|id| blob_key(*id)).collect();
+    keys.extend(found.damaged.iter().map(|(key, _)| key.clone()));
+    keys.sort();
+    keys.dedup();
+
+    for key in keys {
+        if cancel() {
+            return Err(SyncError::Cancelled);
+        }
+        if key.starts_with(OPS_PREFIX) {
+            if record_is_sound(target, &key, dek).await {
+                report.already_sound.push(key);
+                continue;
+            }
+            let mut put_back = None;
+            for (label, source) in sources {
+                let Ok(bytes) = source.get(&key).await else {
+                    continue;
+                };
+                if record_bytes_are_sound(&bytes, &key, dek) {
+                    put_back = Some((label.to_string(), bytes));
+                    break;
+                }
+            }
+            let Some((from, bytes)) = put_back else {
+                report
+                    .unrepaired
+                    .push((key, "no other copy holds this record whole".into()));
+                continue;
+            };
+            match target.put(&key, bytes).await {
+                Ok(()) if record_is_sound(target, &key, dek).await => {
+                    report.repaired.push((key, from))
+                }
+                Ok(()) => report
+                    .unrepaired
+                    .push((key, "written, but did not read back whole".into())),
+                Err(e) => report.unrepaired.push((key, e.to_string())),
+            }
+        } else if let Some(blob_id) = blob_id_from_key(&key) {
+            let Some(content_key) = open(blob_id) else {
+                report
+                    .unrepaired
+                    .push((key, "no content key is recorded for this file".into()));
+                continue;
+            };
+            if verify_one(target, &key, &content_key, blob_id)
+                .await
+                .is_ok()
+            {
+                report.already_sound.push(key);
+                continue;
+            }
+            let dir = tempfile::Builder::new()
+                .prefix("silentsilo-repair")
+                .tempdir()
+                .map_err(|e| SyncError::Storage(format!("a scratch folder for the repair: {e}")))?;
+            let path = dir.path().join("blob.sslo");
+            let mut from = None;
+            for (label, source) in sources {
+                if source.get_to_file(&key, &path).await.is_ok()
+                    && silentsilo_crypto::verify_blob(&path, &content_key, blob_id).is_ok()
+                {
+                    from = Some(label.to_string());
+                    break;
+                }
+            }
+            let Some(from) = from else {
+                report
+                    .unrepaired
+                    .push((key, "no other copy holds this file whole".into()));
+                continue;
+            };
+            match target.put_from_file(&key, &path).await {
+                Ok(())
+                    if verify_one(target, &key, &content_key, blob_id)
+                        .await
+                        .is_ok() =>
+                {
+                    report.repaired.push((key, from))
+                }
+                Ok(()) => report
+                    .unrepaired
+                    .push((key, "written, but did not read back whole".into())),
+                Err(e) => report.unrepaired.push((key, e.to_string())),
+            }
+        } else {
+            report
+                .unrepaired
+                .push((key, "not something a repair puts back".into()));
+        }
+    }
+    Ok(report)
+}
+
+/// The record at `key` on `client` opens and is the record its name says.
+async fn record_is_sound(client: &dyn ObjectStore, key: &str, dek: &MasterDek) -> bool {
+    match client.get(key).await {
+        Ok(bytes) => record_bytes_are_sound(&bytes, key, dek),
+        Err(_) => false,
+    }
+}
+
+/// Opens under the silo's key, parses, and names itself `key`: a sealed
+/// record moved under another record's name is not taken.
+fn record_bytes_are_sound(bytes: &[u8], key: &str, dek: &MasterDek) -> bool {
+    let Ok(plain) = unseal(bytes, dek) else {
+        return false;
+    };
+    match OpRecord::from_bytes(&plain) {
+        Ok(record) => op_key(&record) == key,
+        Err(_) => false,
+    }
+}
+
 // ── Rotating the vault key ──────────────────────────────────────────
 
 /// What a re-sealing pass did.

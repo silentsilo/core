@@ -11,6 +11,14 @@ release notes should say.
 
 ## [Unreleased]
 
+### Added
+
+- `repair_from`: what a content check finds missing or damaged on a working
+  copy (bit rot, an upload cut short, a lost file, a garbled record) is put
+  back from another copy or the local cache, once that source proves it
+  holds the object whole. Nothing is deleted, never-delete copies are only
+  reported, and every write is read back.
+
 ### Fixed
 
 - A working copy that missed a rotation of the silo's key (one only this

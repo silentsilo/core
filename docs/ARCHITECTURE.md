@@ -499,6 +499,31 @@ that. What keeps them agreeing:
   (`get_prefix`, 82 bytes) before and after the copy and refuses content
   sealed for another item or blob, which covers senders on older builds.
 
+### Repairing a copy
+
+A content check (`verify_against` with `VerifyDepth::Content`) finds what a
+copy is missing and what it holds damaged. `repair_from` puts those objects
+back from the other copies and from the local blob cache, which keeps blobs
+under the same keys and is passed in as a folder store of the silo's root.
+Only `ops/` and `blobs/` are repaired: both are written once and never
+changed, so a key holds the same bytes on every copy, and putting proven
+bytes back cannot undo another device's write. The rules:
+
+- A source proves itself before anything is written: a record opens under
+  the silo's key and its name matches the lamport, device and op id inside
+  it (a valid record moved under another's name is not taken); a blob
+  decrypts whole and matches its id.
+- An object on the damaged copy that proves itself by the time the repair
+  reaches it is left alone.
+- Nothing is deleted, and every write is read back and checked again.
+- Never-delete copies are only reported: the caller never passes one as the
+  copy to repair. Keys, `content.kek`, `recovery.env`, markers and the
+  manifest are never repaired: there "damaged" may be an attack, and each
+  has its own rules above.
+
+No format changes and no new activity-log event: the check's report says
+what was repaired and from where.
+
 ## Recovery matrix
 
 What gets someone out of which hole, all of it built from the same pieces
