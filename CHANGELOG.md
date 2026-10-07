@@ -21,6 +21,11 @@ release notes should say.
 
 ### Fixed
 
+- Reading the activity log no longer waits on the copies one after
+  another: they are read together, each given 30 seconds, and one that does
+  not answer is named as not read. `read_audit_log_local` gives what this
+  computer holds without touching storage; both now take the `Reader` by
+  reference.
 - A working copy that missed a rotation of the silo's key (one only this
   device lists, or a drive unplugged at the time) no longer sends a device
   the rotation kept to rejoin in a loop. It is left out of the pass with a

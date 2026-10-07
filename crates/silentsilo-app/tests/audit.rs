@@ -525,7 +525,9 @@ async fn an_organisation_log_cannot_be_turned_off() {
 
 mod reading {
     use super::*;
-    use silentsilo_app::audit_read::{Reader, read_audit_log};
+    use silentsilo_app::audit_read::{
+        Reader, read_audit_log, read_audit_log_local, read_audit_log_within,
+    };
 
     /// Another device's run of segments, its events numbered from 0.
     fn their_segments(device: Uuid, public: &[u8], per_segment: &[u16]) -> Vec<Segment> {
@@ -564,7 +566,7 @@ mod reading {
                 Event::new(codes::SECRET_COPIED, i64::MAX / 2).on("e1", "Bank"),
             )
             .unwrap();
-        let read = read_audit_log(&device.state, &host, &device.silo, Reader::Silo)
+        let read = read_audit_log(&device.state, &host, &device.silo, &Reader::Silo)
             .await
             .unwrap();
         let codes_read: Vec<u16> = read.entries.iter().map(|e| e.event.c).collect();
@@ -576,12 +578,93 @@ mod reading {
 
         // Held for the next read while the silo is open, gone once it locks.
         assert!(device.state.holds_audit_read(id));
-        let again = read_audit_log(&device.state, &host, &device.silo, Reader::Silo)
+        let again = read_audit_log(&device.state, &host, &device.silo, &Reader::Silo)
             .await
             .unwrap();
         assert_eq!(again.entries.len(), read.entries.len());
         device.state.close_session(&host, id).unwrap();
         assert!(!device.state.holds_audit_read(id));
+    }
+
+    /// A WebDAV address that accepts the connection and never answers.
+    fn silent_copy() -> (std::net::TcpListener, BackupTarget) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let target = BackupTarget {
+            config: StoreConfig::WebDav(silentsilo_store::WebDavConfig {
+                url: format!("http://127.0.0.1:{port}/dav"),
+                username: "u".into(),
+                password: "p".into(),
+            }),
+            label: "Silent NAS".into(),
+            role: TargetRole::Working,
+        };
+        (listener, target)
+    }
+
+    #[tokio::test]
+    async fn a_copy_that_does_not_answer_does_not_hold_the_others() {
+        let a = tempfile::tempdir().unwrap();
+        let (_listener, silent) = silent_copy();
+        let host = Copies(vec![silent, copy(a.path())], false);
+        let device = Device::new(&host);
+        let id = device.silo.id;
+        device.state.set_audit_log(id, true).unwrap();
+        run_sync_pass(
+            &device.state,
+            &Copies(vec![copy(a.path())], false),
+            &device.silo,
+        )
+        .await
+        .unwrap();
+        let store = FolderStore::new(a.path().to_path_buf());
+        let public = device.spool().key().unwrap().unwrap().public().unwrap();
+        let other = Uuid::new_v4();
+        for segment in their_segments(other, &public, &[2]) {
+            store
+                .put(
+                    &silentsilo_audit::segment_key(other, segment.seq),
+                    segment.to_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let started = std::time::Instant::now();
+        let read = read_audit_log_within(
+            &device.state,
+            &host,
+            &device.silo,
+            &Reader::Silo,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert_eq!(read.copies_unread, vec!["Silent NAS".to_string()]);
+        assert!(read.devices.iter().any(|d| d.device == other));
+    }
+
+    #[tokio::test]
+    async fn the_local_read_touches_no_copy() {
+        let (_listener, silent) = silent_copy();
+        let host = Copies(vec![silent], false);
+        let device = Device::new(&host);
+        let id = device.silo.id;
+        device.state.set_audit_log(id, true).unwrap();
+        device
+            .state
+            .audit_record(
+                id,
+                Event::new(codes::SECRET_COPIED, i64::MAX / 2).on("e1", "Bank"),
+            )
+            .unwrap();
+        let started = std::time::Instant::now();
+        let read = read_audit_log_local(&device.state, &device.silo, &Reader::Silo).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(read.copies_unread.is_empty());
+        let codes_read: Vec<u16> = read.entries.iter().map(|e| e.event.c).collect();
+        assert_eq!(codes_read, vec![codes::SECRET_COPIED, codes::LOG_STARTED]);
     }
 
     #[tokio::test]
@@ -616,7 +699,7 @@ mod reading {
             .audit_record(id, Event::new(codes::FILE_OPENED, 50))
             .unwrap();
 
-        let read = read_audit_log(&device.state, &host, &device.silo, Reader::Silo)
+        let read = read_audit_log(&device.state, &host, &device.silo, &Reader::Silo)
             .await
             .unwrap();
         assert_eq!(read.unreadable, 0, "the first key's records open too");
@@ -649,7 +732,7 @@ mod reading {
         let odd = odd.remove(0);
         store.put(&odd.key(), odd.to_bytes()).await.unwrap();
 
-        let read = read_audit_log(&device.state, &host, &device.silo, Reader::Silo)
+        let read = read_audit_log(&device.state, &host, &device.silo, &Reader::Silo)
             .await
             .unwrap();
         let theirs = read.devices.iter().find(|d| d.device == other).unwrap();
@@ -661,7 +744,7 @@ mod reading {
 
         // Read again from what was kept, with the copy gone.
         std::fs::remove_dir_all(a.path().join("audit")).unwrap();
-        let again = read_audit_log(&device.state, &host, &device.silo, Reader::Silo)
+        let again = read_audit_log(&device.state, &host, &device.silo, &Reader::Silo)
             .await
             .unwrap();
         assert_eq!(
@@ -684,7 +767,7 @@ mod reading {
         let device = Device::new(&host);
         device.state.set_audit_log(device.silo.id, true).unwrap();
         unplug(&b);
-        let read = read_audit_log(&device.state, &host, &device.silo, Reader::Silo)
+        let read = read_audit_log(&device.state, &host, &device.silo, &Reader::Silo)
             .await
             .unwrap();
         assert_eq!(read.copies_unread.len(), 1);
@@ -702,7 +785,7 @@ mod reading {
             .apply_policy(&policy, &AuditKey::new(&keys, Scope::Org, 1), 1)
             .unwrap();
         assert!(
-            read_audit_log(&device.state, &host, &device.silo, Reader::Silo)
+            read_audit_log(&device.state, &host, &device.silo, &Reader::Silo)
                 .await
                 .is_err()
         );
@@ -756,12 +839,12 @@ mod organisation {
             .await
             .unwrap();
         assert!(
-            read_audit_log(&device.state, &host, &device.silo, Reader::Silo)
+            read_audit_log(&device.state, &host, &device.silo, &Reader::Silo)
                 .await
                 .is_err(),
             "the silo's own key does not read it"
         );
-        let read = read_audit_log(&device.state, &host, &device.silo, reader(&admin))
+        let read = read_audit_log(&device.state, &host, &device.silo, &reader(&admin))
             .await
             .unwrap();
         assert_eq!(read.entries[0].event.c, codes::LOG_STARTED);
@@ -796,7 +879,7 @@ mod organisation {
             .await
             .unwrap();
         assert!(
-            read_audit_log(&device.state, &host, &device.silo, reader(&second))
+            read_audit_log(&device.state, &host, &device.silo, &reader(&second))
                 .await
                 .is_ok()
         );
@@ -880,7 +963,7 @@ mod organisation {
             "only the one past 90 days"
         );
         assert_eq!(segments_in(&store).await.len(), 2);
-        let read = read_audit_log(&device.state, &host, &device.silo, reader(&admin))
+        let read = read_audit_log(&device.state, &host, &device.silo, &reader(&admin))
             .await
             .unwrap();
         assert!(

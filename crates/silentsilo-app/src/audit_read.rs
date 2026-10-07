@@ -5,8 +5,12 @@
 //! silo (`audit-cache/<device>/<seq>.seg`, the storage layout) and not
 //! fetched again. It is sealed: the cache holds nothing a copy does not.
 
-use std::collections::BTreeMap;
-use std::path::Path;
+use std::collections::{BTreeMap, HashSet};
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::task::Poll;
+use std::time::Duration;
 
 pub use silentsilo_audit::reading::{DeviceTrail, LogEntry, LogRead};
 use silentsilo_audit::{
@@ -32,13 +36,82 @@ pub enum Reader {
     },
 }
 
-/// Reads the open silo's log from this computer and every copy.
+/// How long one copy may take to give its part of the log. One that does
+/// not answer in time is named in `copies_unread` rather than holding the
+/// page; what it gave before then is cached, so the next read carries on.
+pub const COPY_READ_LIMIT: Duration = Duration::from_secs(30);
+
+/// What a read starts from: this computer's part of the log and the keys.
+struct Local {
+    kek: silentsilo_crypto::ContentKek,
+    cache: PathBuf,
+    keys: Vec<(KeyId, Zeroizing<Vec<u8>>)>,
+    segments: BTreeMap<(Uuid, u64), Segment>,
+    pending: Vec<(Uuid, Vec<u8>)>,
+}
+
+/// Reads the open silo's log from this computer only: what was fetched
+/// before and what is waiting to go out. No storage is touched, so it
+/// answers at once; the copies are read by [`read_audit_log`].
+pub fn read_audit_log_local(
+    state: &AppState,
+    silo: &SiloEntry,
+    reader: &Reader,
+) -> Result<LogRead, String> {
+    let local = gather_local(state, silo, reader)?;
+    finish(state, silo, local, Vec::new())
+}
+
+/// Reads the open silo's log from this computer and every copy, the
+/// copies together, each within [`COPY_READ_LIMIT`].
 pub async fn read_audit_log(
     state: &AppState,
     host: &dyn Host,
     silo: &SiloEntry,
-    reader: Reader,
+    reader: &Reader,
 ) -> Result<LogRead, String> {
+    read_audit_log_within(state, host, silo, reader, COPY_READ_LIMIT).await
+}
+
+/// [`read_audit_log`] with each copy given `limit`.
+pub async fn read_audit_log_within(
+    state: &AppState,
+    host: &dyn Host,
+    silo: &SiloEntry,
+    reader: &Reader,
+    limit: Duration,
+) -> Result<LogRead, String> {
+    let mut local = gather_local(state, silo, reader)?;
+    let held: HashSet<(Uuid, u64)> = local.segments.keys().copied().collect();
+    let silo_keys = matches!(reader, Reader::Silo).then_some(&local.kek);
+    let reads: Vec<_> = host
+        .targets(silo.id)
+        .into_iter()
+        .map(|target| read_copy(target, &held, &local.cache, silo_keys, limit))
+        .collect();
+    let copies = join_all(reads).await;
+
+    let mut copies_unread = Vec::new();
+    for copy in copies {
+        for (id, private) in copy.keys {
+            if !local.keys.iter().any(|(known, _)| *known == id) {
+                local.keys.push((id, private));
+            }
+        }
+        for segment in copy.segments {
+            local
+                .segments
+                .entry((segment.device, segment.seq))
+                .or_insert(segment);
+        }
+        if !copy.complete {
+            copies_unread.push(copy.label);
+        }
+    }
+    finish(state, silo, local, copies_unread)
+}
+
+fn gather_local(state: &AppState, silo: &SiloEntry, reader: &Reader) -> Result<Local, String> {
     let (root, kek, this_device) = {
         let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
         let session = sessions.get(&silo.id).ok_or("That silo is not open.")?;
@@ -60,7 +133,7 @@ pub async fn read_audit_log(
             spool.pending().map_err(|e| e.to_string())?,
         )
     };
-    let private = match &reader {
+    let private = match reader {
         Reader::Silo => key.unwrap_with(BY_SILO, kek.as_bytes()),
         Reader::Organisation {
             credential_id,
@@ -72,9 +145,6 @@ pub async fn read_audit_log(
         .public()
         .map(|public| key_id(&public))
         .map_err(|_| "The activity log's key is damaged.".to_string())?;
-    // A personal log may have had an earlier key, from a device that
-    // started it before it heard of this one: its records open with it.
-    let mut keys: Vec<(KeyId, Zeroizing<Vec<u8>>)> = vec![(pinned_id, private)];
 
     let cache = root.join(CACHE_DIR);
     let mut segments: BTreeMap<(Uuid, u64), Segment> = BTreeMap::new();
@@ -84,52 +154,83 @@ pub async fn read_audit_log(
     for segment in outbox {
         segments.insert((segment.device, segment.seq), segment);
     }
+    let pending = pending
+        .into_iter()
+        .map(|(_, record)| (this_device, record))
+        .collect();
+    Ok(Local {
+        kek,
+        cache,
+        // A personal log may have had an earlier key, from a device that
+        // started it before it heard of this one: its records open with
+        // it. Those keys live on the copies.
+        keys: vec![(pinned_id, private)],
+        segments,
+        pending,
+    })
+}
 
-    let mut copies_unread = Vec::new();
-    for target in host.targets(silo.id) {
-        let store = match target.config.open() {
-            Ok(store) => store,
-            Err(_) => {
+/// One copy's part of the log.
+struct CopyRead {
+    label: String,
+    segments: Vec<Segment>,
+    keys: Vec<(KeyId, Zeroizing<Vec<u8>>)>,
+    /// False when the copy did not open, list, answer every fetch, or
+    /// answer in time.
+    complete: bool,
+}
+
+async fn read_copy(
+    target: silentsilo_vault::BackupTarget,
+    held: &HashSet<(Uuid, u64)>,
+    cache: &Path,
+    silo_keys: Option<&silentsilo_crypto::ContentKek>,
+    limit: Duration,
+) -> CopyRead {
+    let store = match target.config.open() {
+        Ok(store) => store,
+        Err(_) => {
+            return CopyRead {
                 // Unnamed and not opened: nothing better to call it by.
-                copies_unread.push(if target.label.is_empty() {
+                label: if target.label.is_empty() {
                     "a copy".to_string()
                 } else {
                     target.label.clone()
-                });
-                continue;
-            }
-        };
-        let label = if target.label.is_empty() {
-            store.describe()
-        } else {
-            target.label.clone()
-        };
-        let listed = match store.list(AUDIT_PREFIX).await {
-            Ok(listed) => listed,
-            Err(_) => {
-                copies_unread.push(label);
-                continue;
-            }
-        };
-        if matches!(reader, Reader::Silo)
-            && let Ok(more) = silentsilo_sync::audit_log::read_silo_keys(&*store, &kek).await
-        {
-            for (id, private) in more {
-                if !keys.iter().any(|(held, _)| *held == id) {
-                    keys.push((id, private));
-                }
-            }
+                },
+                segments: Vec::new(),
+                keys: Vec::new(),
+                complete: false,
+            };
         }
-        let mut failed = false;
+    };
+    let label = if target.label.is_empty() {
+        store.describe()
+    } else {
+        target.label.clone()
+    };
+    let mut segments = Vec::new();
+    let mut keys = Vec::new();
+    // Filled as it goes, so a copy cut off by the limit still gives what
+    // it fetched before then.
+    let complete = tokio::time::timeout(limit, async {
+        let Ok(listed) = store.list(AUDIT_PREFIX).await else {
+            return false;
+        };
+        if let Some(kek) = silo_keys
+            && let Ok(more) = silentsilo_sync::audit_log::read_silo_keys(&*store, kek).await
+        {
+            keys.extend(more);
+        }
+        let mut complete = true;
         for object in listed {
             let Some((device, seq)) = parse_segment_key(&object.key) else {
                 continue;
             };
-            if segments.contains_key(&(device, seq)) || object.size as u64 > MAX_SEGMENT_BYTES {
+            if held.contains(&(device, seq)) || object.size as u64 > MAX_SEGMENT_BYTES {
                 continue;
             }
             let Ok(bytes) = store.get(&object.key).await else {
-                failed = true;
+                complete = false;
                 continue;
             };
             // One that does not parse, or names another place, is left out:
@@ -138,19 +239,28 @@ pub async fn read_audit_log(
                 && segment.device == device
                 && segment.seq == seq
             {
-                keep(&cache, &object.key, &bytes);
-                segments.insert((device, seq), segment);
+                keep(cache, &object.key, &bytes);
+                segments.push(segment);
             }
         }
-        if failed {
-            copies_unread.push(label);
-        }
+        complete
+    })
+    .await
+    .unwrap_or(false);
+    CopyRead {
+        label,
+        segments,
+        keys,
+        complete,
     }
+}
 
-    let unsent: Vec<(Uuid, Vec<u8>)> = pending
-        .into_iter()
-        .map(|(_, record)| (this_device, record))
-        .collect();
+fn finish(
+    state: &AppState,
+    silo: &SiloEntry,
+    local: Local,
+    copies_unread: Vec<String>,
+) -> Result<LogRead, String> {
     // What was opened before is opened again only if its bytes changed.
     let mut opened = state
         .audit_opened
@@ -158,10 +268,10 @@ pub async fn read_audit_log(
         .map_err(|e| e.to_string())?
         .remove(&silo.id)
         .unwrap_or_default();
-    let held: Vec<(KeyId, &[u8])> = keys.iter().map(|(id, k)| (*id, &k[..])).collect();
+    let held: Vec<(KeyId, &[u8])> = local.keys.iter().map(|(id, k)| (*id, &k[..])).collect();
     let mut read = silentsilo_audit::reading::read_log_with(
-        segments.into_values(),
-        &unsent,
+        local.segments.into_values(),
+        &local.pending,
         &held,
         &mut opened,
     );
@@ -176,6 +286,28 @@ pub async fn read_audit_log(
         held.insert(silo.id, opened);
     }
     Ok(read)
+}
+
+/// A future being polled and, once it is done, what it gave.
+type Slot<F> = (Pin<Box<F>>, Option<<F as Future>::Output>);
+
+/// Polls every future on this task until all are done, in order.
+async fn join_all<F: Future>(futures: Vec<F>) -> Vec<F::Output> {
+    let mut slots: Vec<Slot<F>> = futures.into_iter().map(|f| (Box::pin(f), None)).collect();
+    std::future::poll_fn(|cx| {
+        let mut done = true;
+        for (future, out) in slots.iter_mut() {
+            if out.is_none() {
+                match future.as_mut().poll(cx) {
+                    Poll::Ready(value) => *out = Some(value),
+                    Poll::Pending => done = false,
+                }
+            }
+        }
+        if done { Poll::Ready(()) } else { Poll::Pending }
+    })
+    .await;
+    slots.into_iter().filter_map(|(_, out)| out).collect()
 }
 
 /// Segments fetched before. One that will not read is fetched again.
