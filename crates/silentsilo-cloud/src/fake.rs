@@ -50,8 +50,12 @@ pub async fn serve(handler: Handler) -> String {
     let base = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move {
         loop {
+            // An error here is one connection, not the listener: Windows
+            // reports a client that gave up before it was accepted (a
+            // cancelled upload) as a reset. Ending the loop on it left every
+            // later request, retries included, with nobody listening.
             let Ok((mut socket, _)) = listener.accept().await else {
-                return;
+                continue;
             };
             let handler = handler.clone();
             tokio::spawn(async move {
@@ -70,10 +74,26 @@ pub async fn serve(handler: Handler) -> String {
                 head.push_str("\r\n");
                 let _ = socket.write_all(head.as_bytes()).await;
                 let _ = socket.write_all(&reply.body).await;
+                close_gently(socket).await;
             });
         }
     });
     base
+}
+
+/// Ends a connection the way a server should: the reply flushed, the
+/// writing side shut, and whatever the client still sends read off until it
+/// closes too. Dropping the socket outright makes Windows answer the
+/// client's next packet with a reset, which reqwest reports as "forcibly
+/// closed by the remote host" (os error 10054), and under a busy test run
+/// that hit one test in five.
+pub(crate) async fn close_gently(mut socket: tokio::net::TcpStream) {
+    let _ = socket.shutdown().await;
+    let mut sink = [0u8; 4096];
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while matches!(socket.read(&mut sink).await, Ok(n) if n > 0) {}
+    })
+    .await;
 }
 
 async fn read_request(socket: &mut tokio::net::TcpStream) -> Option<Request> {

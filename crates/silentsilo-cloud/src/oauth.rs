@@ -393,8 +393,9 @@ pub(crate) mod tests {
             let (h, b) = (hits.clone(), bodies.clone());
             tokio::spawn(async move {
                 loop {
+                    // One failed accept is one connection (see fake::serve).
                     let Ok((mut socket, _)) = listener.accept().await else {
-                        return;
+                        continue;
                     };
                     let (h, b, answer) = (h.clone(), b.clone(), answer.clone());
                     tokio::spawn(async move {
@@ -409,6 +410,7 @@ pub(crate) mod tests {
                             json.len()
                         );
                         let _ = socket.write_all(reply.as_bytes()).await;
+                        crate::fake::close_gently(socket).await;
                     });
                 }
             });
