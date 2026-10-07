@@ -13,6 +13,11 @@ release notes should say.
 
 ### Added
 
+- The activity log is on by default for a personal silo nobody ever set it
+  for: started at the first sync pass once every copy has answered that
+  none holds a policy, or when opened for a silo with no copies
+  (`AppState::start_audit_by_default`). A choice of off, on any copy, is
+  kept.
 - Reading the activity log opens its records on every core, and keeps what
   it opened while the silo is open, so a second read opens only what is
   new: 100,000 events went from 15 seconds to half a second, then 65 ms.

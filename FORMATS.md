@@ -556,7 +556,10 @@ From core 1.9.0, a silo can keep a log of what was done in it: unlocks,
 entries shown or copied, logins filled, files opened or saved outside,
 imports and exports, key changes, and the changes the operation log also
 records. On a silo an organisation administers it is always on; on any
-other it is a setting. `silentsilo-audit` owns the format.
+other it is on by default and a setting. A silo nobody ever set it for
+starts it at its first sync pass, once every copy has answered that none
+holds a policy, or when opened if it has no copies; a policy that says off,
+here or on any copy, is followed. `silentsilo-audit` owns the format.
 
 **Why its own place.** A record type 1.0.0 does not know is skipped, then
 dropped from its snapshot and pruned from storage. So the log is not in

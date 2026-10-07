@@ -137,19 +137,8 @@ async fn events_reach_every_copy_before_they_leave_the_device() {
         FolderStore::new(b.clone()),
     );
 
-    // No log yet: the first pass learns nothing, so nothing is recorded.
-    run_sync_pass(&device.state, &both, &device.silo)
-        .await
-        .unwrap();
-    assert_eq!(
-        device
-            .spool()
-            .record(Event::new(codes::UNLOCKED, 1))
-            .unwrap(),
-        None
-    );
-
-    // Turned on; the next pass learns of it and pins the key.
+    // Turned on elsewhere, before this device's first pass: the pass learns
+    // of it and pins that key rather than starting a log of its own.
     let keys = turn_on(&device, &store_a).await;
     run_sync_pass(&device.state, &both, &device.silo)
         .await
@@ -252,16 +241,86 @@ async fn a_personal_silo_with_a_broken_queue_is_not_mandatory() {
 }
 
 #[tokio::test]
-async fn a_silo_without_a_log_writes_nothing_under_audit() {
+async fn a_silo_nobody_set_starts_its_log_at_the_first_pass() {
     let a = tempfile::tempdir().unwrap();
     let host = Copies(vec![copy(a.path())], true);
     let device = Device::new(&host);
     run_sync_pass(&device.state, &host, &device.silo)
         .await
         .unwrap();
+    let pinned = device.spool().pinned().cloned().unwrap();
+    assert!(pinned.enabled);
     let store = FolderStore::new(a.path().to_path_buf());
-    assert!(store.list("audit/").await.unwrap().is_empty());
-    assert!(device.spool().pinned().is_none());
+    let policy = silentsilo_sync::audit_log::read_audit_policy(&store, &device.kek())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(policy.enabled);
+    assert!(device.state.audit_status(device.silo.id).unwrap().enabled);
+}
+
+#[tokio::test]
+async fn a_log_turned_off_on_a_copy_stays_off_on_a_device_that_never_set_it() {
+    let a = tempfile::tempdir().unwrap();
+    let host = Copies(vec![copy(a.path())], true);
+    let device = Device::new(&host);
+    let store = FolderStore::new(a.path().to_path_buf());
+    // Another device turned it off: the copy holds a key and "off".
+    let keys = KeyPair::generate();
+    let mut key = AuditKey::new(&keys, Scope::Silo, 1);
+    key.wrap_for(
+        silentsilo_audit::BY_SILO,
+        &keys.private,
+        device.kek().as_bytes(),
+    )
+    .unwrap();
+    let off = AuditPolicy::new(false, &keys.id(), None, Scope::Silo, 5);
+    silentsilo_sync::audit_log::write_audit_key(&store, &key)
+        .await
+        .unwrap();
+    silentsilo_sync::audit_log::write_audit_policy(&store, &device.kek(), &off)
+        .await
+        .unwrap();
+
+    run_sync_pass(&device.state, &host, &device.silo)
+        .await
+        .unwrap();
+    assert!(device.spool().pinned().is_some_and(|p| !p.enabled));
+    let still = silentsilo_sync::audit_log::read_audit_policy(&store, &device.kek())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(still, off, "the copy keeps the choice made elsewhere");
+}
+
+#[tokio::test]
+async fn a_copy_that_cannot_be_read_holds_the_default_back() {
+    let (a, holder) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let b = holder.path().join("b");
+    std::fs::create_dir_all(&b).unwrap();
+    let host = Copies(vec![copy(a.path()), copy(&b)], false);
+    let device = Device::new(&host);
+    unplug(&b);
+    run_sync_pass(&device.state, &host, &device.silo).await.ok();
+    assert!(device.spool().pinned().is_none(), "not started blind");
+    plug_in(&b);
+    run_sync_pass(&device.state, &host, &device.silo).await.ok();
+    assert!(device.spool().pinned().is_some_and(|p| p.enabled));
+}
+
+#[tokio::test]
+async fn a_silo_with_no_copies_starts_when_opened_and_respects_off() {
+    let host = Copies(Vec::new(), true);
+    let device = Device::new(&host);
+    let id = device.silo.id;
+    device.state.start_audit_by_default(&host, id).unwrap();
+    assert!(device.state.audit_status(id).unwrap().enabled);
+    device.state.set_audit_log(id, false).unwrap();
+    device.state.start_audit_by_default(&host, id).unwrap();
+    assert!(
+        !device.state.audit_status(id).unwrap().enabled,
+        "off stays off"
+    );
 }
 
 #[tokio::test]

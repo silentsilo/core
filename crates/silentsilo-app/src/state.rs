@@ -317,6 +317,35 @@ impl AppState {
         Ok(())
     }
 
+    /// The log is on by default. A silo with copies gets it at its first
+    /// sync pass, once every copy has answered that nobody set it; one with
+    /// no copies has nobody to ask, and gets it here, when it is opened.
+    /// Nothing happens once the log was ever set, on or off.
+    pub fn start_audit_by_default(&self, host: &dyn Host, id: Uuid) -> Result<(), String> {
+        if !host.targets(id).is_empty() {
+            return Ok(());
+        }
+        let kek = {
+            let sessions = self.sessions.lock().map_err(|e| e.to_string())?;
+            sessions
+                .get(&id)
+                .ok_or("That silo is not open.")?
+                .kek
+                .clone()
+        };
+        let mut spool = self.audit_spool(id)?;
+        if spool.pinned().is_some() || spool.policy().map_err(|e| e.to_string())?.is_some() {
+            return Ok(());
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        silentsilo_audit::start_silo_log(&mut spool, kek.as_bytes(), now)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
     /// The open silo's queue, noting on the way whether its log is an
     /// organisation's. Opened outside the sessions lock: it may wait for
     /// the sync pass.

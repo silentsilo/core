@@ -357,6 +357,25 @@ async fn deliver_audit(
     }
 }
 
+/// Turns the log on for a silo nobody has set it for: a new key under the
+/// content key, a policy saying on, and the first event. What it returns
+/// is published to the copies by the caller.
+fn start_by_default(
+    host: &dyn Host,
+    kek: &silentsilo_crypto::ContentKek,
+    open: &(dyn Fn() -> Option<silentsilo_audit::Spool> + Sync),
+    now: i64,
+) -> Option<(silentsilo_audit::AuditPolicy, silentsilo_audit::AuditKey)> {
+    let mut spool = open()?;
+    match silentsilo_audit::start_silo_log(&mut spool, kek.as_bytes(), now) {
+        Ok(started) => Some(started),
+        Err(e) => {
+            host.warn("audit", &e.to_string());
+            None
+        }
+    }
+}
+
 /// Takes in the newest policy any copy or this device holds, and writes it
 /// to every copy that has none or an older one: a log turned on with no
 /// copies, or before a copy was added, reaches them this way. A policy
@@ -370,9 +389,11 @@ async fn settle_audit_policy(
 ) {
     use silentsilo_audit::{AuditKey, AuditPolicy, PolicyRead};
 
-    let (local_key, local_policy) = {
+    let (local_key, local_policy, local_policy_absent) = {
         let Some(spool) = open() else { return };
-        (spool.key().ok().flatten(), spool.policy().ok().flatten())
+        let policy = spool.policy();
+        let absent = matches!(policy, Ok(None)) && spool.pinned().is_none();
+        (spool.key().ok().flatten(), policy.ok().flatten(), absent)
     };
     // What each copy that answered holds; one that failed is left alone.
     let mut on_copies: Vec<(&OpenTarget, Option<AuditPolicy>)> = Vec::new();
@@ -406,6 +427,12 @@ async fn settle_audit_policy(
             },
         };
         newest = Some((policy.clone(), key));
+    }
+    // Nobody ever set it, here or on any copy: the log is on by default.
+    // Only when every copy answered, so a device that has not seen a
+    // copy's "off" yet cannot override it with a newer "on".
+    if newest.is_none() && local_policy_absent && on_copies.len() == targets.len() {
+        newest = start_by_default(host, kek, open, now);
     }
     let Some((policy, key)) = newest else { return };
 

@@ -97,7 +97,12 @@ key that touch gave.
 A personal log is turned on and off on the device (`AppState::set_audit_log`),
 copies or not: the queue keeps the key and the policy, and the pass writes
 the newest policy, by `changed_at`, to every copy that lacks it
-(`settle_audit_policy`), so turning it on never waits for storage.
+(`settle_audit_policy`), so turning it on never waits for storage. It is
+on by default: when neither this device nor any copy holds a policy, and
+every copy answered, the pass starts it (`start_silo_log`); a silo with no
+copies starts it when opened (`AppState::start_audit_by_default`, which the
+client calls). Waiting for every copy is what keeps a new device from
+starting a log over a copy's "off" with a newer "on".
 Gathering is the caller's and reading is shared: the app and the extract
 tool both hand their segments to `silentsilo_audit::reading::read_log`.
 Reading (`audit_read::read_audit_log`) takes every segment from the cache

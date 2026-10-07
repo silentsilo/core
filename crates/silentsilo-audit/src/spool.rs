@@ -33,7 +33,9 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{AuditError, AuditKey, AuditPolicy, Event, Scope, Segment, seal_event};
+use crate::{
+    AuditError, AuditKey, AuditPolicy, BY_SILO, Event, KeyPair, Scope, Segment, codes, seal_event,
+};
 
 pub const QUEUE_DIR: &str = "audit-queue";
 const KEY_FILE: &str = "key.json";
@@ -100,6 +102,24 @@ pub enum SpoolError {
     Busy,
     #[error(transparent)]
     Audit(#[from] AuditError),
+}
+
+/// Starts a personal log on this device: a new key, its private half
+/// wrapped under the silo's content key, a policy saying on, and the first
+/// event. For a silo whose log nobody ever set; the caller publishes the
+/// policy and the key to the copies. `now` is in seconds.
+pub fn start_silo_log(
+    spool: &mut Spool,
+    content_key: &[u8; 32],
+    now: i64,
+) -> Result<(AuditPolicy, AuditKey), SpoolError> {
+    let keys = KeyPair::generate();
+    let mut key = AuditKey::new(&keys, Scope::Silo, now);
+    key.wrap_for(BY_SILO, &keys.private, content_key)?;
+    let policy = AuditPolicy::new(true, &keys.id(), None, Scope::Silo, now);
+    spool.apply_policy(&policy, &key, 0)?;
+    spool.record(Event::new(codes::LOG_STARTED, now.saturating_mul(1000)))?;
+    Ok((policy, key))
 }
 
 /// Writes `bytes` to `path` whole or not at all.

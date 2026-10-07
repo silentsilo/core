@@ -25,7 +25,7 @@ pub use segment::{
     AUDIT_PREFIX, ChainReport, MAX_SEGMENT_BYTES, Segment, check_chain, parse_segment_key,
     segment_key,
 };
-pub use spool::{Pinned, PolicyRead, QUEUE_DIR, Spool, SpoolError};
+pub use spool::{Pinned, PolicyRead, QUEUE_DIR, Spool, SpoolError, start_silo_log};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuditError {
