@@ -137,7 +137,7 @@ impl DropboxStore {
         if summary.contains("not_found") {
             StoreError::NotFound(key.to_string())
         } else if summary.contains("insufficient_space") {
-            StoreError::Other("Dropbox is full".into())
+            StoreError::Other(crate::coded!("err.dropbox_full", "Dropbox is full").into())
         } else {
             let code: String = summary
                 .chars()

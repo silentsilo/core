@@ -201,11 +201,17 @@ impl GoogleDriveStore {
                     tokio::time::sleep(Duration::from_millis(500 * 2u64.pow(attempt))).await;
                 }
                 "storageQuotaExceeded" => {
-                    return Err(StoreError::Other("Google Drive is full".into()));
+                    return Err(StoreError::Other(
+                        crate::coded!("err.gdrive_full", "Google Drive is full").into(),
+                    ));
                 }
                 "dailyLimitExceeded" | "uploadLimitExceeded" => {
                     return Err(StoreError::Other(
-                        "Google Drive's daily upload limit is reached; it resumes tomorrow".into(),
+                        crate::coded!(
+                            "err.gdrive_daily_limit",
+                            "Google Drive's daily upload limit is reached; it resumes tomorrow"
+                        )
+                        .into(),
                     ));
                 }
                 _ => return Err(self.http.status_error(StatusCode::FORBIDDEN, key)),

@@ -8,6 +8,15 @@
 #[cfg(all(feature = "test-authenticator", not(debug_assertions)))]
 compile_error!("the test authenticator is for debug builds only");
 
+/// A message a client translates: see `silentsilo_core::coded`. Local,
+/// since this crate does not depend on that one.
+macro_rules! coded {
+    ($code:literal, $english:literal) => {
+        concat!($english, "\u{1f}", $code)
+    };
+}
+pub(crate) use coded;
+
 mod backend;
 #[cfg(feature = "ctap2")]
 pub mod ctap2;

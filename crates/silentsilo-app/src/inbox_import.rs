@@ -250,9 +250,9 @@ impl OpenSilo for Session<'_> {
         f: &mut dyn FnMut(&Vfs<'_>) -> silentsilo_core::CoreResult<()>,
     ) -> Result<(), String> {
         let sessions = self.state.sessions.lock().map_err(|e| e.to_string())?;
-        let session = sessions
-            .get(&self.id)
-            .ok_or_else(|| "The silo was locked.".to_string())?;
+        let session = sessions.get(&self.id).ok_or_else(|| {
+            silentsilo_core::coded!("err.silo_locked", "The silo was locked.").to_string()
+        })?;
         f(&Vfs::new(session)).map_err(|e| e.to_string())
     }
 }

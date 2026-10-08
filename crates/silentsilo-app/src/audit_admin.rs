@@ -44,7 +44,11 @@ impl AppState {
     ) -> Result<(), String> {
         let mut spool = self.audit_spool(id)?;
         if spool.pinned().is_some_and(|p| p.scope == Scope::Org) {
-            return Err("This silo already keeps an activity log for its organisation.".into());
+            return Err(silentsilo_core::coded!(
+                "err.audit_org_already",
+                "This silo already keeps an activity log for its organisation."
+            )
+            .into());
         }
         let now_ms = now_ms();
         let now = now_ms / 1000;
@@ -83,7 +87,12 @@ impl AppState {
         let mut key = org_key(&spool)?;
         let private = key
             .unwrap_with(&by.credential_id, &by.wrap_key)
-            .map_err(|_| "That organisation key does not read this silo's activity log.")?;
+            .map_err(|_| {
+                silentsilo_core::coded!(
+                    "err.audit_org_key_wrong",
+                    "That organisation key does not read this silo's activity log."
+                )
+            })?;
         key.wrap_for(&new.credential_id, &private, &new.wrap_key)
             .map_err(|e| e.to_string())?;
         spool.keep_key(&key).map_err(|e| e.to_string())?;
@@ -119,8 +128,14 @@ impl AppState {
 fn org_key(spool: &silentsilo_audit::Spool) -> Result<AuditKey, String> {
     match spool.key().map_err(|e| e.to_string())? {
         Some(key) if key.scope == Scope::Org => Ok(key),
-        Some(_) => Err("This silo's activity log is not kept for an organisation.".into()),
-        None => Err("This silo keeps no activity log.".into()),
+        Some(_) => Err(silentsilo_core::coded!(
+            "err.audit_not_org",
+            "This silo's activity log is not kept for an organisation."
+        )
+        .into()),
+        None => Err(
+            silentsilo_core::coded!("err.audit_none", "This silo keeps no activity log.").into(),
+        ),
     }
 }
 
@@ -133,11 +148,17 @@ fn republish(
     let key = spool
         .key()
         .map_err(|e| e.to_string())?
-        .ok_or("This silo keeps no activity log.")?;
+        .ok_or(silentsilo_core::coded!(
+            "err.audit_none",
+            "This silo keeps no activity log."
+        ))?;
     let mut policy = spool
         .policy()
         .map_err(|e| e.to_string())?
-        .ok_or("This silo keeps no activity log.")?;
+        .ok_or(silentsilo_core::coded!(
+            "err.audit_none",
+            "This silo keeps no activity log."
+        ))?;
     let now = now_ms() / 1000;
     policy.changed_at = now.max(policy.changed_at + 1);
     if let Some(retention) = retention {
@@ -167,7 +188,10 @@ pub async fn expire_audit_segments(
         .lock()
         .map_err(|e| e.to_string())?
         .get(&silo.id)
-        .ok_or("That silo is not open.")?
+        .ok_or(silentsilo_core::coded!(
+            "err.silo_not_open",
+            "That silo is not open."
+        ))?
         .paths
         .root
         .clone();
@@ -177,7 +201,10 @@ pub async fn expire_audit_segments(
         spool
             .policy()
             .map_err(|e| e.to_string())?
-            .ok_or("This silo keeps no activity log.")?
+            .ok_or(silentsilo_core::coded!(
+                "err.audit_none",
+                "This silo keeps no activity log."
+            ))?
             .retention_days
     };
     let Some(days) = retention else {

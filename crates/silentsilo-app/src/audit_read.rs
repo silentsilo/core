@@ -114,7 +114,10 @@ pub async fn read_audit_log_within(
 fn gather_local(state: &AppState, silo: &SiloEntry, reader: &Reader) -> Result<Local, String> {
     let (root, kek, this_device) = {
         let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
-        let session = sessions.get(&silo.id).ok_or("That silo is not open.")?;
+        let session = sessions.get(&silo.id).ok_or(silentsilo_core::coded!(
+            "err.silo_not_open",
+            "That silo is not open."
+        ))?;
         (
             session.paths.root.clone(),
             session.kek.clone(),
@@ -126,7 +129,10 @@ fn gather_local(state: &AppState, silo: &SiloEntry, reader: &Reader) -> Result<L
         let key = spool
             .key()
             .map_err(|e| e.to_string())?
-            .ok_or("This silo keeps no activity log.")?;
+            .ok_or(silentsilo_core::coded!(
+                "err.audit_none",
+                "This silo keeps no activity log."
+            ))?;
         (
             key,
             spool.outbox().map_err(|e| e.to_string())?,
@@ -140,11 +146,20 @@ fn gather_local(state: &AppState, silo: &SiloEntry, reader: &Reader) -> Result<L
             wrap_key,
         } => key.unwrap_with(credential_id, wrap_key),
     }
-    .map_err(|_| "This key cannot read the activity log.".to_string())?;
-    let pinned_id = key
-        .public()
-        .map(|public| key_id(&public))
-        .map_err(|_| "The activity log's key is damaged.".to_string())?;
+    .map_err(|_| {
+        silentsilo_core::coded!(
+            "err.audit_key_cannot_read",
+            "This key cannot read the activity log."
+        )
+        .to_string()
+    })?;
+    let pinned_id = key.public().map(|public| key_id(&public)).map_err(|_| {
+        silentsilo_core::coded!(
+            "err.audit_key_damaged",
+            "The activity log's key is damaged."
+        )
+        .to_string()
+    })?;
 
     let cache = root.join(CACHE_DIR);
     let mut segments: BTreeMap<(Uuid, u64), Segment> = BTreeMap::new();

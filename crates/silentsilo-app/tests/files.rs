@@ -132,7 +132,10 @@ async fn a_file_on_this_device_or_only_in_storage_reads_back_whole() {
         .await
         .err()
         .unwrap();
-    assert_eq!(err, "This file is too large to show here.");
+    assert_eq!(
+        silentsilo_core::coded::english(&err),
+        "This file is too large to show here."
+    );
 }
 
 #[tokio::test]

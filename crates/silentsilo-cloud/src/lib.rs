@@ -8,6 +8,15 @@
 //! the user's own browser, so the password and second factor never reach the
 //! app.
 
+/// A message a client translates: see `silentsilo_core::coded`. Local,
+/// since this crate does not depend on that one.
+macro_rules! coded {
+    ($code:literal, $english:literal) => {
+        concat!($english, "\u{1f}", $code)
+    };
+}
+pub(crate) use coded;
+
 pub mod dropbox;
 #[cfg(test)]
 mod fake;

@@ -52,10 +52,14 @@ impl RecoveryJoin {
 /// rather than a wrong-code message someone would keep retyping.
 fn code_refused(e: silentsilo_vault::VaultError) -> String {
     if e.to_string().contains("needs a newer SilentSilo") {
-        "This recovery code was made by a newer version of SilentSilo. Update SilentSilo, then try again."
+        silentsilo_core::coded!("err.code_needs_update", "This recovery code was made by a newer version of SilentSilo. Update SilentSilo, then try again.")
             .into()
     } else {
-        "That recovery code does not match this silo.".into()
+        silentsilo_core::coded!(
+            "err.code_wrong",
+            "That recovery code does not match this silo."
+        )
+        .into()
     }
 }
 
@@ -66,11 +70,23 @@ pub async fn recovery_join_begin(
     let manifest = sync::read_manifest(store)
         .await
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| "That backup storage does not hold a silo.".to_string())?;
+        .ok_or_else(|| {
+            silentsilo_core::coded!(
+                "err.storage_no_silo",
+                "That backup storage does not hold a silo."
+            )
+            .to_string()
+        })?;
     let envelope = sync::fetch_recovery_envelope(store)
         .await
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| "No recovery code was set up for this silo.".to_string())?;
+        .ok_or_else(|| {
+            silentsilo_core::coded!(
+                "err.no_recovery_code",
+                "No recovery code was set up for this silo."
+            )
+            .to_string()
+        })?;
 
     // Argon2id takes a second of CPU and memory on purpose, so it runs off
     // the async workers.
@@ -127,13 +143,19 @@ pub async fn key_join_begin(store: &dyn ObjectStore) -> Result<KeyJoinOffer, Str
     let manifest = sync::read_manifest(store)
         .await
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| "That backup storage does not hold a silo.".to_string())?;
+        .ok_or_else(|| {
+            silentsilo_core::coded!(
+                "err.storage_no_silo",
+                "That backup storage does not hold a silo."
+            )
+            .to_string()
+        })?;
     let keys = sync::fetch_key_envelopes(store)
         .await
         .map_err(|e| e.to_string())?;
     if keys.is_empty() {
         return Err(
-            "No keys have been published to this storage yet. Sync once from a device that has the silo."
+            silentsilo_core::coded!("err.no_keys_published", "No keys have been published to this storage yet. Sync once from a device that has the silo.")
                 .into(),
         );
     }
@@ -155,9 +177,20 @@ pub async fn key_join_open(
         .keys
         .iter()
         .find(|k| k.credential_id == credential_id && !k.wrapped_dek.is_empty())
-        .ok_or_else(|| "That security key isn't one of this silo's keys.".to_string())?;
-    let dek = silentsilo_vault::unwrap_dek_hex(&key.wrapped_dek, wrap_key)
-        .map_err(|_| "That security key could not open the silo.".to_string())?;
+        .ok_or_else(|| {
+            silentsilo_core::coded!(
+                "err.key_not_of_silo",
+                "That security key isn't one of this silo's keys."
+            )
+            .to_string()
+        })?;
+    let dek = silentsilo_vault::unwrap_dek_hex(&key.wrapped_dek, wrap_key).map_err(|_| {
+        silentsilo_core::coded!(
+            "err.key_could_not_open",
+            "That security key could not open the silo."
+        )
+        .to_string()
+    })?;
     // A removed key's envelope can come back: a device that had not heard
     // of the removal publishes it again. The revocation marker decides.
     if let Some(sealed) = sync::fetch_content_kek(store)
@@ -172,7 +205,11 @@ pub async fn key_join_open(
             .await
             .map_err(|e| e.to_string())?
         {
-            return Err("That security key was removed from this silo.".into());
+            return Err(silentsilo_core::coded!(
+                "err.key_removed",
+                "That security key was removed from this silo."
+            )
+            .into());
         }
     }
     let envelope = sync::fetch_recovery_envelope(store).await.ok().flatten();
@@ -198,7 +235,11 @@ pub async fn recovery_join_provision(
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| {
-            "This storage has no content key yet, so there is nothing here to recover.".to_string()
+            silentsilo_core::coded!(
+                "err.storage_no_content_key",
+                "This storage has no content key yet, so there is nothing here to recover."
+            )
+            .to_string()
         })?;
     let kek = match silentsilo_vault::unwrap_kek_bytes(&kek_envelope, &join.dek) {
         Ok(kek) => kek,
@@ -290,11 +331,23 @@ pub async fn recovery_envelope_for(
     if silentsilo_vault::has_recovery_code(root) {
         return silentsilo_vault::load_recovery_envelope(root).map_err(|e| e.to_string());
     }
-    let store = store.ok_or_else(|| "No recovery code is set up for this silo.".to_string())?;
+    let store = store.ok_or_else(|| {
+        silentsilo_core::coded!(
+            "err.no_recovery_code",
+            "No recovery code is set up for this silo."
+        )
+        .to_string()
+    })?;
     sync::fetch_recovery_envelope(store)
         .await
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| "No recovery code is set up for this silo.".to_string())
+        .ok_or_else(|| {
+            silentsilo_core::coded!(
+                "err.no_recovery_code",
+                "No recovery code is set up for this silo."
+            )
+            .to_string()
+        })
 }
 
 /// Opens a silo on this device with the recovery code. Disk work: blocking
@@ -308,7 +361,11 @@ pub fn open_with_recovery(
     let dek = unwrap_with_code(envelope, code).map_err(code_refused)?;
     let session = VaultSession::open_with_dek(root, dek).map_err(|e| e.to_string())?;
     if session.vault_id != expected_vault_id {
-        return Err("That recovery code opens a different silo.".into());
+        return Err(silentsilo_core::coded!(
+            "err.code_other_silo",
+            "That recovery code opens a different silo."
+        )
+        .into());
     }
     let vfs = Vfs::new(&session);
     vfs.ensure_initialized().map_err(|e| e.to_string())?;

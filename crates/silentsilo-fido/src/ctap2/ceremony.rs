@@ -115,17 +115,27 @@ fn ask(question: PinAsk) -> Result<Zeroizing<String>, FidoError> {
 /// What a key's refusal means to the person holding it.
 fn failure(error: CtapError, fail: fn(String) -> FidoError) -> FidoError {
     let said = match error {
-        CtapError::NoCredentials => "This security key is not one of this silo's keys.".into(),
-        CtapError::PinAuthBlocked => {
-            "Too many wrong PINs in a row. Unplug the key, plug it in again and try again.".into()
-        }
+        CtapError::NoCredentials => crate::coded!(
+            "err.key_not_of_silo",
+            "This security key is not one of this silo's keys."
+        )
+        .into(),
+        CtapError::PinAuthBlocked => crate::coded!(
+            "err.pin_blocked_temp",
+            "Too many wrong PINs in a row. Unplug the key, plug it in again and try again."
+        )
+        .into(),
         CtapError::PinBlocked => "This key's PIN is blocked. Only resetting the key clears it, \
                                   and a reset erases everything on it."
             .into(),
-        CtapError::PinNotSet => {
-            "This key needs a PIN set before it can be used. Set one with its maker's tool.".into()
+        CtapError::PinNotSet => crate::coded!(
+            "err.key_needs_pin",
+            "This key needs a PIN set before it can be used. Set one with its maker's tool."
+        )
+        .into(),
+        CtapError::Timeout => {
+            crate::coded!("err.key_no_touch", "No touch was received in time.").into()
         }
-        CtapError::Timeout => "No touch was received in time.".into(),
         CtapError::Unsupported(why) => format!("This key cannot open a silo: {why}."),
         other => other.to_string(),
     };

@@ -508,7 +508,11 @@ pub fn derive_unlock_material(
     };
     let hmac = read_assertion_hmac_secret(att).ok_or_else(|| {
         FidoError::UnlockFailed(
-            "Security key did not return hmac-secret. Re-enroll your key.".into(),
+            crate::coded!(
+                "err.key_no_hmac",
+                "Security key did not return hmac-secret. Re-enroll your key."
+            )
+            .into(),
         )
     })?;
     Ok(UnlockMaterial {

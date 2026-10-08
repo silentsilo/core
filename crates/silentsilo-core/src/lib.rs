@@ -1,5 +1,6 @@
 //! Domain types and errors for SilentSilo.
 
+pub mod coded;
 pub mod durable;
 mod error;
 mod types;

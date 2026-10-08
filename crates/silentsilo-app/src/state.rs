@@ -256,22 +256,28 @@ impl AppState {
             let sessions = self.sessions.lock().map_err(|e| e.to_string())?;
             sessions
                 .get(&id)
-                .ok_or("That silo is not open.")?
+                .ok_or(silentsilo_core::coded!(
+                    "err.silo_not_open",
+                    "That silo is not open."
+                ))?
                 .kek
                 .clone()
         };
         let mut spool = self.audit_spool(id)?;
         if spool.pinned().is_some_and(|p| p.scope == Scope::Org) {
-            return Err(
-                "This silo's activity log is kept by its organisation and stays on.".into(),
-            );
+            return Err(silentsilo_core::coded!(
+                "err.audit_org_stays_on",
+                "This silo's activity log is kept by its organisation and stays on."
+            )
+            .into());
         }
         let known = spool.key().map_err(|e| e.to_string())?;
         if spool.pinned().is_some() && known.is_none() {
-            return Err(
+            return Err(silentsilo_core::coded!(
+                "err.audit_key_missing",
                 "This computer has not received the activity log's key yet. Sync, then try again."
-                    .into(),
-            );
+            )
+            .into());
         }
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -293,7 +299,10 @@ impl AppState {
         let key_id: silentsilo_audit::KeyId = hex::decode(&key.key_id)
             .ok()
             .and_then(|b| b.try_into().ok())
-            .ok_or("The activity log's key is damaged.")?;
+            .ok_or(silentsilo_core::coded!(
+                "err.audit_key_damaged",
+                "The activity log's key is damaged."
+            ))?;
         let previous = spool.policy().map_err(|e| e.to_string())?;
         // After the policy it replaces, even on a clock that is behind.
         let changed_at = previous.as_ref().map_or(now, |p| now.max(p.changed_at + 1));
@@ -330,7 +339,10 @@ impl AppState {
             let sessions = self.sessions.lock().map_err(|e| e.to_string())?;
             sessions
                 .get(&id)
-                .ok_or("That silo is not open.")?
+                .ok_or(silentsilo_core::coded!(
+                    "err.silo_not_open",
+                    "That silo is not open."
+                ))?
                 .kek
                 .clone()
         };
@@ -353,7 +365,10 @@ impl AppState {
     pub(crate) fn audit_spool(&self, id: Uuid) -> Result<silentsilo_audit::Spool, String> {
         let (root, device) = {
             let sessions = self.sessions.lock().map_err(|e| e.to_string())?;
-            let session = sessions.get(&id).ok_or("That silo is not open.")?;
+            let session = sessions.get(&id).ok_or(silentsilo_core::coded!(
+                "err.silo_not_open",
+                "That silo is not open."
+            ))?;
             (
                 session.paths.root.clone(),
                 silentsilo_vfs::device_id(&session.conn).map_err(|e| e.to_string())?,

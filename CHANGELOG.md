@@ -13,6 +13,11 @@ release notes should say.
 
 ### Added
 
+- Error messages a person reads carry a translation key after their English
+  (`silentsilo_core::coded`): about 50 of them, in recovery, joining, the
+  activity log, security keys, storage settings and the three clouds. The
+  English comes first, so a client that does not translate shows it as
+  before once it drops the key.
 - Activity log codes 35 to 38: restored from the trash, moved, renamed,
   folder created. A reader that does not know them names them by number.
 - `repair_from`: what a content check finds missing or damaged on a working

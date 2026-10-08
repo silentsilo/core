@@ -174,8 +174,13 @@ fn token_source(provider: Provider, target_id: Uuid) -> Result<Arc<TokenSource>,
     if let Some(held) = sources.get(&target_id) {
         return Ok(held.source.clone());
     }
-    let refresh = load_cloud_token(target_id)
-        .ok_or_else(|| StoreError::Denied(format!("Sign in to {} again", provider.name())))?;
+    let refresh = load_cloud_token(target_id).ok_or_else(|| {
+        StoreError::Denied(silentsilo_core::coded::coded_with(
+            "err.cloud_sign_in_again",
+            format!("Sign in to {} again", provider.name()),
+            &[("provider", &provider.name())],
+        ))
+    })?;
     let oauth = OAuth::new(provider).map_err(|e| StoreError::Other(e.to_string()))?;
     let generation = next_generation();
     let keep = Arc::new(Keep::default());
@@ -328,9 +333,10 @@ pub fn open_with_sign_in(
         .map(|(_, account)| account.id)
         .unwrap_or_default();
     if kind != provider || cloud.account_id != account_id {
-        return Err(StoreError::Denied(format!(
-            "That is a different {} account.",
-            provider.name()
+        return Err(StoreError::Denied(silentsilo_core::coded::coded_with(
+            "err.cloud_other_account",
+            format!("That is a different {} account.", provider.name()),
+            &[("provider", &provider.name())],
         )));
     }
     silentsilo_cloud::open(provider, cloud.clone(), tokens)
@@ -375,9 +381,13 @@ async fn adopt(taken: &Pending, config: &StoreConfig) -> Result<(), StoreError> 
         ));
     }
     if cloud.account_id != taken.account.id {
-        return Err(StoreError::Denied(format!(
-            "That is a different {} account. Sign in with the one this storage uses.",
-            provider.name()
+        return Err(StoreError::Denied(silentsilo_core::coded::coded_with(
+            "err.cloud_other_account_storage",
+            format!(
+                "That is a different {} account. Sign in with the one this storage uses.",
+                provider.name()
+            ),
+            &[("provider", &provider.name())],
         )));
     }
     let target_id = config.target_id();

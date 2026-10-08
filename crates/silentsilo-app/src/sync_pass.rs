@@ -585,9 +585,10 @@ pub async fn run_sync_pass(
     // drawer decide what the bucket is offered.
     let (due, dek, kek, vault_id, applied_through, base, known) = {
         let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
-        let session = sessions
-            .get(&silo.id)
-            .ok_or_else(|| "Unlock the silo before syncing.".to_string())?;
+        let session = sessions.get(&silo.id).ok_or_else(|| {
+            silentsilo_core::coded!("err.unlock_before_sync", "Unlock the silo before syncing.")
+                .to_string()
+        })?;
         let conn = &session.conn;
 
         let mut due = Vec::new();
@@ -1161,9 +1162,13 @@ pub async fn run_sync_pass(
 
     let replayed = {
         let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
-        let session = sessions
-            .get(&silo.id)
-            .ok_or_else(|| "The silo was locked during the sync.".to_string())?;
+        let session = sessions.get(&silo.id).ok_or_else(|| {
+            silentsilo_core::coded!(
+                "err.locked_during_sync",
+                "The silo was locked during the sync."
+            )
+            .to_string()
+        })?;
         let report = replay(&session.conn, incoming).map_err(|e| e.to_string())?;
         if view_complete {
             silentsilo_vfs::snapshot::record_received_through(&session.conn, listed_through)

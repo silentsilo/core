@@ -329,7 +329,11 @@ impl crate::Probe for OneDriveStore {
             && kind != "personal"
         {
             return Err(StoreError::Denied(
-                "OneDrive for work or school accounts is not supported yet".into(),
+                crate::coded!(
+                    "err.onedrive_work_school",
+                    "OneDrive for work or school accounts is not supported yet"
+                )
+                .into(),
             ));
         }
         let id = folder

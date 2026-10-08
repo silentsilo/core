@@ -40,7 +40,11 @@ pub async fn read_file(
             .size_bytes
     };
     if size > max_bytes {
-        return Err("This file is too large to show here.".into());
+        return Err(silentsilo_core::coded!(
+            "err.file_too_large_preview",
+            "This file is too large to show here."
+        )
+        .into());
     }
 
     let dir = open_scratch_dir(&silo.path);
@@ -53,7 +57,11 @@ pub async fn read_file(
         .and_then(|file| {
             let len = std::fs::metadata(&dest).map_err(|e| e.to_string())?.len();
             if len > max_bytes.max(0) as u64 {
-                return Err("This file is too large to show here.".to_string());
+                return Err(silentsilo_core::coded!(
+                    "err.file_too_large_preview",
+                    "This file is too large to show here."
+                )
+                .to_string());
             }
             std::fs::read(&dest)
                 .map(|bytes| (file, bytes))
@@ -104,9 +112,11 @@ pub async fn decrypt_to_file(
             })
             .collect();
         if targets.is_empty() {
-            return Err(
-                "This file isn't on this device, and no backup storage is connected.".into(),
-            );
+            return Err(silentsilo_core::coded!(
+                "err.file_not_here_no_storage",
+                "This file isn't on this device, and no backup storage is connected."
+            )
+            .into());
         }
         let stores: Vec<(Uuid, &dyn ObjectStore)> =
             targets.iter().map(|(id, t)| (*id, &**t)).collect();
@@ -117,8 +127,13 @@ pub async fn decrypt_to_file(
         let _ = silentsilo_vault::settle_blob_delivery(root, &every_target);
     }
 
-    let key = silentsilo_crypto::unwrap_content_key(&wrapped, &kek)
-        .map_err(|_| "This content's key could not be read, so it cannot be opened.".to_string())?;
+    let key = silentsilo_crypto::unwrap_content_key(&wrapped, &kek).map_err(|_| {
+        silentsilo_core::coded!(
+            "err.content_key_unreadable",
+            "This content's key could not be read, so it cannot be opened."
+        )
+        .to_string()
+    })?;
     if let Err(e) = silentsilo_crypto::decrypt_blob(&blob_path, dest, &key, file.blob_id) {
         let _ = std::fs::remove_file(dest);
         return Err(e.to_string());

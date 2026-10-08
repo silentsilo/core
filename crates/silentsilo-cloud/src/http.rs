@@ -138,7 +138,12 @@ impl Http {
 
     pub fn token_error(&self, error: CloudError) -> StoreError {
         match error {
-            CloudError::Revoked => StoreError::Denied(format!("Sign in to {} again", self.name)),
+            // Coded by hand, as `silentsilo_core::coded::coded_with` writes it:
+            // this crate does not depend on that one.
+            CloudError::Revoked => StoreError::Denied(format!(
+                "Sign in to {name} again\u{1f}err.cloud_sign_in_again\u{1f}{{\"provider\":\"{name}\"}}",
+                name = self.name
+            )),
             CloudError::Unreachable(what) => StoreError::Unreachable(what),
             CloudError::Refused(message) => StoreError::Denied(message),
             CloudError::Other(message) => StoreError::Other(message),

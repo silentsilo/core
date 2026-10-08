@@ -8,6 +8,7 @@ use silentsilo_app::flows::{
     open_with_recovery, recovery_envelope_for, recovery_join_begin, recovery_join_provision,
 };
 use silentsilo_app::{AppEvent, AppState, Host, run_sync_pass};
+use silentsilo_core::coded::english;
 use silentsilo_store::{FolderStore, StoreConfig};
 use silentsilo_vault::{BackupTarget, SiloEntry, TargetRole, VaultSession};
 use silentsilo_vfs::Vfs;
@@ -126,14 +127,17 @@ async fn a_wrong_code_leaves_nothing_behind() {
         .await
         .err()
         .unwrap();
-    assert_eq!(err, "That recovery code does not match this silo.");
+    assert_eq!(
+        english(&err),
+        "That recovery code does not match this silo."
+    );
 
     let empty = tempfile::tempdir().unwrap();
     let err = recovery_join_begin(&FolderStore::new(empty.path().to_path_buf()), &origin.code)
         .await
         .err()
         .unwrap();
-    assert_eq!(err, "That backup storage does not hold a silo.");
+    assert_eq!(english(&err), "That backup storage does not hold a silo.");
 }
 
 #[tokio::test]
@@ -188,7 +192,10 @@ async fn the_code_opens_the_joined_silo_and_a_wrong_one_does_not() {
     )
     .err()
     .unwrap();
-    assert_eq!(err, "That recovery code does not match this silo.");
+    assert_eq!(
+        english(&err),
+        "That recovery code does not match this silo."
+    );
 
     let (session, meta) =
         open_with_recovery(root.clone(), &envelope, &origin.code, origin.vault_id).unwrap();
@@ -285,10 +292,12 @@ async fn a_removed_key_whose_envelope_came_back_does_not_join() {
         .unwrap();
 
     assert_eq!(
-        key_join_open(&store, &offer, "aa11", &[7; 32])
-            .await
-            .err()
-            .unwrap(),
+        english(
+            &key_join_open(&store, &offer, "aa11", &[7; 32])
+                .await
+                .err()
+                .unwrap()
+        ),
         "That security key was removed from this silo."
     );
 }

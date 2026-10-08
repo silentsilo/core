@@ -939,5 +939,15 @@ The checklist, in order:
    `silentsilo/desktop` pins one. Say so in the release notes; the client
    moves its pin deliberately, which is the moment the two are tested
    together.
-8. **Update this page and FORMATS.md in the same commit** when behavior they
+8. **Does it write a sentence a person reads?** Give it a key:
+   `silentsilo_core::coded!("err.name", "English.")`, or
+   `coded::coded_with` when it carries values (a crate that does not depend
+   on `silentsilo-core` has a three-line local `coded!`). The error stays a
+   string with its English first, so logs, tests and older clients read a
+   sentence; a client translates by the key after the separator, and the
+   desktop's tests fail on a key it has no text for. Rewording the English
+   then loses no translation. A test that compares the message compares
+   `coded::english(&err)`. These are messages, never stored, so no format
+   moves.
+9. **Update this page and FORMATS.md in the same commit** when behavior they
    describe moves.

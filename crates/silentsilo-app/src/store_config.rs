@@ -113,7 +113,9 @@ fn cloud_folder(folder: &str) -> Result<String, String> {
     let folder = folder.trim();
     let refused = |c: char| c.is_control() || "\"*:<>?/\\|".contains(c);
     if folder.is_empty() {
-        return Err("Give the folder a name.".into());
+        return Err(
+            silentsilo_core::coded!("err.folder_name_needed", "Give the folder a name.").into(),
+        );
     }
     if folder.chars().count() > 100
         || folder.chars().any(refused)
@@ -152,10 +154,20 @@ fn cloud_config(
     match sign_in.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(id) => {
             let id = uuid::Uuid::parse_str(id).map_err(|_| "Sign in again.".to_string())?;
-            let (provider, account) = silentsilo_vault::cloud_sign_in_account(id)
-                .ok_or_else(|| "The sign-in expired. Sign in again.".to_string())?;
+            let (provider, account) =
+                silentsilo_vault::cloud_sign_in_account(id).ok_or_else(|| {
+                    silentsilo_core::coded!(
+                        "err.sign_in_expired",
+                        "The sign-in expired. Sign in again."
+                    )
+                    .to_string()
+                })?;
             if provider != kind {
-                return Err(format!("Sign in to {} first.", kind.name()));
+                return Err(silentsilo_core::coded::coded_with(
+                    "err.sign_in_first",
+                    format!("Sign in to {} first.", kind.name()),
+                    &[("provider", &kind.name())],
+                ));
             }
             Ok(wrap(silentsilo_store::CloudConfig {
                 account_id: account.id,
@@ -172,7 +184,11 @@ fn cloud_config(
             {
                 Ok(stored)
             }
-            _ => Err(format!("Sign in to {} first.", kind.name())),
+            _ => Err(silentsilo_core::coded::coded_with(
+                "err.sign_in_first",
+                format!("Sign in to {} first.", kind.name()),
+                &[("provider", &kind.name())],
+            )),
         },
     }
 }
@@ -252,7 +268,11 @@ impl StoreConfigInput {
             Self::Folder { path } => {
                 let path = path.trim();
                 if path.is_empty() {
-                    return Err("Choose a folder to back up to.".into());
+                    return Err(silentsilo_core::coded!(
+                        "err.choose_backup_folder",
+                        "Choose a folder to back up to."
+                    )
+                    .into());
                 }
                 Ok(StoreConfig::Folder {
                     path: PathBuf::from(path),
@@ -351,7 +371,11 @@ impl StoreConfigInput {
                 let host_fingerprint =
                     or_stored(host_fingerprint, stored.and_then(|c| c.host_fingerprint))
                         .ok_or_else(|| {
-                            "Check the server's fingerprint before connecting to it.".to_string()
+                            silentsilo_core::coded!(
+                                "err.sftp_check_fingerprint",
+                                "Check the server's fingerprint before connecting to it."
+                            )
+                            .to_string()
                         })?;
 
                 Ok(StoreConfig::Sftp(silentsilo_store::SftpConfig {
