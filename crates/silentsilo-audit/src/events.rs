@@ -94,6 +94,14 @@ pub mod codes {
     pub const FILE_ADDED: u16 = 32;
     pub const FILE_TRASHED: u16 = 33;
     pub const FILE_PURGED: u16 = 34;
+    /// From core 1.10: a file or folder taken back out of the trash.
+    pub const FILE_RESTORED: u16 = 35;
+    /// From core 1.10: a file or folder moved to another folder.
+    pub const FILE_MOVED: u16 = 36;
+    /// From core 1.10: a file or folder renamed.
+    pub const FILE_RENAMED: u16 = 37;
+    /// From core 1.10.
+    pub const FOLDER_CREATED: u16 = 38;
 
     pub const PASSWORDS_IMPORTED: u16 = 40;
     pub const PASSWORDS_EXPORTED: u16 = 41;
@@ -137,6 +145,10 @@ pub fn describe(code: u16) -> String {
         FILE_ADDED => "File added",
         FILE_TRASHED => "File moved to the trash",
         FILE_PURGED => "File deleted for good",
+        FILE_RESTORED => "Restored from the trash",
+        FILE_MOVED => "Moved",
+        FILE_RENAMED => "Renamed",
+        FOLDER_CREATED => "Folder created",
         PASSWORDS_IMPORTED => "Passwords imported",
         PASSWORDS_EXPORTED => "Passwords exported",
         KEY_ADDED => "Key added",
@@ -204,6 +216,10 @@ mod tests {
             (FILE_ADDED, 32),
             (FILE_TRASHED, 33),
             (FILE_PURGED, 34),
+            (FILE_RESTORED, 35),
+            (FILE_MOVED, 36),
+            (FILE_RENAMED, 37),
+            (FOLDER_CREATED, 38),
             (PASSWORDS_IMPORTED, 40),
             (PASSWORDS_EXPORTED, 41),
             (KEY_ADDED, 50),

@@ -13,6 +13,8 @@ release notes should say.
 
 ### Added
 
+- Activity log codes 35 to 38: restored from the trash, moved, renamed,
+  folder created. A reader that does not know them names them by number.
 - `repair_from`: what a content check finds missing or damaged on a working
   copy (bit rot, an upload cut short, a lost file, a garbled record) is put
   back from another copy or the local cache, once that source proves it
