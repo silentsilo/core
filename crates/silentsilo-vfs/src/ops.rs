@@ -64,6 +64,17 @@ pub struct AttachmentBlob {
     pub blob_key: String,
 }
 
+/// True, for a file row `fi`, when its content was recorded again under
+/// another file after it: a move (`Vfs::move_file`) records the file anew
+/// over the same blob and trashes the old row, and nothing else gives two
+/// files one blob, since every upload writes a blob of its own. Such a row
+/// is the old place of a move, not something deleted, so the trash leaves
+/// it out; emptying the trash still removes it. Worked out from the kept
+/// content records, so every device and every arrival order agree.
+pub(crate) const MOVED_ON: &str = "SELECT 1 FROM content_versions mv
+    WHERE mv.blob_id = fi.blob_id AND mv.file_id != fi.id
+      AND mv.lamport > fi.content_lamport";
+
 impl<'a> Vfs<'a> {
     pub fn new(session: &'a VaultSession) -> Self {
         Self { session }
@@ -1245,6 +1256,9 @@ impl<'a> Vfs<'a> {
 
     /// Moves a file into another folder.
     ///
+    /// The old row goes to the trash but is not listed there: see
+    /// [`MOVED_ON`].
+    ///
     /// There is no move record, and one would not be safe to add: a record
     /// type 1.0.0 does not know is dropped by its compaction, so a move made
     /// here would come undone for anyone restoring from its snapshot. Built
@@ -1570,7 +1584,13 @@ impl<'a> Vfs<'a> {
             })
             .map_err(|e| CoreError::Database(e.to_string()))?;
         for f in folders {
-            entries.push(f.map_err(|e| CoreError::Database(e.to_string()))?);
+            let item = f.map_err(|e| CoreError::Database(e.to_string()))?;
+            if let VaultEntry::Folder(folder) = &item.entry
+                && self.folder_was_moved(folder)?
+            {
+                continue;
+            }
+            entries.push(item);
         }
 
         // Trashed files: `original_path` is the containing (still-live)
@@ -1578,7 +1598,7 @@ impl<'a> Vfs<'a> {
         // by that folder's own entry above instead, per the NOT IN below.
         let mut file_stmt = self
             .conn()
-            .prepare(
+            .prepare(&format!(
                 "SELECT fi.id, fi.folder_id, fi.name, fi.blob_id, fi.size_bytes, fi.mime_type,
                         fi.content_hash, fi.created_at, fi.updated_at, fi.favorite,
                         fo.path AS original_path
@@ -1586,8 +1606,9 @@ impl<'a> Vfs<'a> {
                  JOIN folders fo ON fo.id = fi.folder_id
                  WHERE fi.deleted_at IS NOT NULL
                    AND fi.folder_id NOT IN (SELECT id FROM folders WHERE deleted_at IS NOT NULL)
-                 ORDER BY fi.updated_at DESC",
-            )
+                   AND NOT EXISTS ({MOVED_ON})
+                 ORDER BY fi.updated_at DESC"
+            ))
             .map_err(|e| CoreError::Database(e.to_string()))?;
         let files = file_stmt
             .query_map([], |row| {
@@ -1622,6 +1643,68 @@ impl<'a> Vfs<'a> {
         });
 
         Ok(entries)
+    }
+
+    /// Whether a trashed folder is the old place of a move rather than
+    /// something the user deleted. See [`MOVED_ON`]: every file it held was
+    /// recorded again elsewhere after it; with no files, a folder of the
+    /// same name was created by the same device just before the trashing.
+    /// A folder holding anything trashed on its own stays listed, since
+    /// that is only restorable through it.
+    fn folder_was_moved(&self, folder: &FolderEntry) -> CoreResult<bool> {
+        let db = |e: rusqlite::Error| CoreError::Database(e.to_string());
+        let subtree = crate::like::subtree(&folder.path);
+        let (files, moved, trashed_alone): (i64, i64, i64) = self
+            .conn()
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*),
+                            COALESCE(SUM(CASE WHEN EXISTS ({MOVED_ON}) THEN 1 ELSE 0 END), 0),
+                            COALESCE(SUM(CASE WHEN fi.deleted_at IS NOT NULL
+                                               AND NOT EXISTS ({MOVED_ON}) THEN 1 ELSE 0 END), 0)
+                       FROM files fi
+                       JOIN folders d ON d.id = fi.folder_id
+                      WHERE d.id = ?1 OR d.path GLOB ?2"
+                ),
+                params![folder.id.to_string(), &subtree],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(db)?;
+        if files > 0 {
+            return Ok(trashed_alone == 0 && moved == files);
+        }
+        let folders: i64 = self
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM folders WHERE id = ?1 OR path GLOB ?2",
+                params![folder.id.to_string(), &subtree],
+                |row| row.get(0),
+            )
+            .map_err(db)?;
+        // An empty tree: the move created one folder per folder in it, the
+        // top one first, then trashed the old top in the next record.
+        let twin: Option<i64> = self
+            .conn()
+            .query_row(
+                "SELECT 1
+                   FROM trash_events t
+                   JOIN name_claims own ON own.entry_id = t.target
+                   JOIN name_claims c ON c.is_folder = 1
+                                     AND c.entry_id != t.target
+                                     AND c.key = own.key
+                                     AND c.device_id = t.device_id
+                                     AND c.lamport < t.lamport
+                                     AND c.lamport >= t.lamport - ?2
+                  WHERE t.target = ?1 AND t.trash = 1
+                    AND t.lamport = (SELECT MAX(lamport) FROM trash_events
+                                      WHERE target = ?1 AND trash = 1)
+                  LIMIT 1",
+                params![folder.id.to_string(), folders],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db)?;
+        Ok(twin.is_some())
     }
 
     pub fn restore_file(&self, file_id: Uuid) -> CoreResult<FileEntry> {
@@ -2965,6 +3048,218 @@ mod tests {
         let trash = vfs.list_trash().unwrap();
         assert_eq!(trash.len(), 1);
         assert!(matches!(&trash[0].entry, VaultEntry::Folder(f) if f.id == parent.id));
+    }
+
+    /// What the trash lists, as (name, original path).
+    fn trash_listing(vfs: &Vfs) -> Vec<(String, String)> {
+        vfs.list_trash()
+            .unwrap()
+            .into_iter()
+            .map(|item| {
+                let name = match &item.entry {
+                    VaultEntry::File(f) => f.name.clone(),
+                    VaultEntry::Folder(f) => f.name.clone(),
+                };
+                (name, item.original_path)
+            })
+            .collect()
+    }
+
+    /// Live files named `name`, as their folder ids.
+    fn live_named(vfs: &Vfs, name: &str) -> Vec<Uuid> {
+        let mut stmt = vfs
+            .conn()
+            .prepare("SELECT folder_id FROM files WHERE name = ?1 AND deleted_at IS NULL")
+            .unwrap();
+        stmt.query_map([name], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|r| Uuid::parse_str(&r.unwrap()).unwrap())
+            .collect()
+    }
+
+    fn rebuilt(vfs: &Vfs, vault: Uuid) {
+        crate::schema::drop_derived_for_test(vfs.conn()).unwrap();
+        crate::schema::init_schema(vfs.conn(), vault).unwrap();
+        crate::oplog::rebuild_derived(vfs.conn()).unwrap();
+    }
+
+    #[test]
+    fn a_moved_file_does_not_show_in_the_trash() {
+        let vault = Uuid::new_v4();
+        let (_dir, session) = session_for(vault);
+        let vfs = Vfs::new(&session);
+        let root = vfs.root_folder_id().unwrap();
+        let docs = vfs.create_folder(root, "Docs").unwrap();
+        let file = vfs
+            .add_file(root, "a.txt", Uuid::new_v4(), 1, "aa", None, "")
+            .unwrap();
+
+        vfs.move_file(file.id, docs.id).unwrap();
+        assert!(trash_listing(&vfs).is_empty());
+        rebuilt(&vfs, vault);
+        assert!(trash_listing(&vfs).is_empty(), "the same after a rebuild");
+    }
+
+    #[test]
+    fn a_file_moved_then_deleted_is_listed_once_where_it_was_deleted() {
+        let vault = Uuid::new_v4();
+        let (_dir, session) = session_for(vault);
+        let vfs = Vfs::new(&session);
+        let root = vfs.root_folder_id().unwrap();
+        let docs = vfs.create_folder(root, "Docs").unwrap();
+        let file = vfs
+            .add_file(root, "a.txt", Uuid::new_v4(), 1, "aa", None, "")
+            .unwrap();
+        let moved = vfs.move_file(file.id, docs.id).unwrap();
+        vfs.trash_file(moved.id).unwrap();
+
+        assert_eq!(
+            trash_listing(&vfs),
+            vec![("a.txt".to_string(), "/Docs".to_string())]
+        );
+        rebuilt(&vfs, vault);
+        assert_eq!(
+            trash_listing(&vfs),
+            vec![("a.txt".to_string(), "/Docs".to_string())]
+        );
+
+        // Restoring everything listed brings it back once, where it was.
+        for item in vfs.list_trash().unwrap() {
+            if let VaultEntry::File(f) = item.entry {
+                vfs.restore_file(f.id).unwrap();
+            }
+        }
+        assert_eq!(live_named(&vfs, "a.txt"), vec![docs.id]);
+        assert!(trash_listing(&vfs).is_empty());
+    }
+
+    #[test]
+    fn a_file_moved_twice_and_deleted_lists_only_its_last_place() {
+        let (_dir, session) = new_session();
+        let vfs = Vfs::new(&session);
+        let root = vfs.root_folder_id().unwrap();
+        let a = vfs.create_folder(root, "A").unwrap();
+        let b = vfs.create_folder(root, "B").unwrap();
+        let file = vfs
+            .add_file(root, "a.txt", Uuid::new_v4(), 1, "aa", None, "")
+            .unwrap();
+        let once = vfs.move_file(file.id, a.id).unwrap();
+        let twice = vfs.move_file(once.id, b.id).unwrap();
+        vfs.trash_file(twice.id).unwrap();
+        assert_eq!(
+            trash_listing(&vfs),
+            vec![("a.txt".to_string(), "/B".to_string())]
+        );
+    }
+
+    #[test]
+    fn an_edit_after_a_move_keeps_the_old_place_out_of_the_trash() {
+        let vault = Uuid::new_v4();
+        let (_dir, session) = session_for(vault);
+        let vfs = Vfs::new(&session);
+        let root = vfs.root_folder_id().unwrap();
+        let docs = vfs.create_folder(root, "Docs").unwrap();
+        let file = vfs
+            .add_file(root, "a.txt", Uuid::new_v4(), 1, "aa", None, "")
+            .unwrap();
+        vfs.move_file(file.id, docs.id).unwrap();
+        // Uploading over it replaces its content with a blob of its own.
+        vfs.add_file(docs.id, "a.txt", Uuid::new_v4(), 2, "bb", None, "")
+            .unwrap();
+        assert!(trash_listing(&vfs).is_empty());
+        rebuilt(&vfs, vault);
+        assert!(trash_listing(&vfs).is_empty());
+    }
+
+    #[test]
+    fn emptying_the_trash_also_removes_the_old_place_of_a_move() {
+        let (_dir, session) = new_session();
+        let vfs = Vfs::new(&session);
+        let root = vfs.root_folder_id().unwrap();
+        let docs = vfs.create_folder(root, "Docs").unwrap();
+        let file = vfs
+            .add_file(root, "a.txt", Uuid::new_v4(), 1, "aa", None, "")
+            .unwrap();
+        let moved = vfs.move_file(file.id, docs.id).unwrap();
+        vfs.empty_trash().unwrap();
+        assert!(matches!(
+            vfs.get_file(file.id).unwrap_err(),
+            CoreError::NotFound(_)
+        ));
+        assert_eq!(vfs.get_file(moved.id).unwrap().folder_id, docs.id);
+    }
+
+    #[test]
+    fn a_deleted_file_with_its_own_content_is_still_listed() {
+        let (_dir, session) = new_session();
+        let vfs = Vfs::new(&session);
+        let root = vfs.root_folder_id().unwrap();
+        let one = vfs
+            .add_file(root, "a.txt", Uuid::new_v4(), 1, "aa", None, "")
+            .unwrap();
+        vfs.add_file(root, "b.txt", Uuid::new_v4(), 1, "aa", None, "")
+            .unwrap();
+        vfs.trash_file(one.id).unwrap();
+        assert_eq!(
+            trash_listing(&vfs),
+            vec![("a.txt".to_string(), "/".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_moved_folder_does_not_show_in_the_trash() {
+        let vault = Uuid::new_v4();
+        let (_dir, session) = session_for(vault);
+        let vfs = Vfs::new(&session);
+        let root = vfs.root_folder_id().unwrap();
+        let target = vfs.create_folder(root, "Target").unwrap();
+        let full = vfs.create_folder(root, "Full").unwrap();
+        let inner = vfs.create_folder(full.id, "Inner").unwrap();
+        vfs.add_file(inner.id, "a.txt", Uuid::new_v4(), 1, "aa", None, "")
+            .unwrap();
+        let empty = vfs.create_folder(root, "Empty").unwrap();
+        vfs.create_folder(empty.id, "Sub").unwrap();
+
+        vfs.move_folder(full.id, target.id).unwrap();
+        vfs.move_folder(empty.id, target.id).unwrap();
+        assert!(trash_listing(&vfs).is_empty());
+        rebuilt(&vfs, vault);
+        assert!(trash_listing(&vfs).is_empty());
+    }
+
+    #[test]
+    fn a_moved_folder_that_held_a_deleted_file_stays_listed() {
+        let (_dir, session) = new_session();
+        let vfs = Vfs::new(&session);
+        let root = vfs.root_folder_id().unwrap();
+        let target = vfs.create_folder(root, "Target").unwrap();
+        let folder = vfs.create_folder(root, "Old").unwrap();
+        let gone = vfs
+            .add_file(folder.id, "gone.txt", Uuid::new_v4(), 1, "aa", None, "")
+            .unwrap();
+        vfs.add_file(folder.id, "kept.txt", Uuid::new_v4(), 1, "bb", None, "")
+            .unwrap();
+        vfs.trash_file(gone.id).unwrap();
+
+        vfs.move_folder(folder.id, target.id).unwrap();
+        // gone.txt is restorable only through the old folder.
+        assert_eq!(
+            trash_listing(&vfs),
+            vec![("Old".to_string(), "/".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_deleted_empty_folder_is_still_listed() {
+        let (_dir, session) = new_session();
+        let vfs = Vfs::new(&session);
+        let root = vfs.root_folder_id().unwrap();
+        let folder = vfs.create_folder(root, "Old").unwrap();
+        vfs.trash_folder(folder.id).unwrap();
+        assert_eq!(
+            trash_listing(&vfs),
+            vec![("Old".to_string(), "/".to_string())]
+        );
     }
 
     #[test]

@@ -21,6 +21,10 @@ release notes should say.
 
 ### Fixed
 
+- The trash no longer lists the old place of a moved file or folder. A
+  move recorded the entry again and trashed the old row, so a moved file
+  showed in the trash at its old path, and a file moved then deleted showed
+  twice; restoring the old one put it back where it had been.
 - Audit L1 is closed by reader checks, with no format change: a sealed
   object's AAD does not bind its name, so every reader now compares the
   name with the content and has a test that moves a real object under

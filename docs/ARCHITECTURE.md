@@ -678,6 +678,17 @@ Read this before "fixing" any of it.
   the markers and drops the edit; the kept file references the content, so
   the sweep here keeps it and `restore_missing_blobs` puts back what a 1.0.0
   sweep deleted.
+- **A move's old row is trashed but not listed.** `move_file` and
+  `move_folder` record the entries again under new ids and trash the old
+  rows, because 1.0.0 knows no move record. The trash leaves out a file
+  whose blob a later content record of another file carries (`MOVED_ON` in
+  `vfs/src/ops.rs`; only a move gives two files one blob, every upload
+  writes its own), and a folder whose files all moved on, or, when empty,
+  whose name a folder created just before its trashing by the same device
+  took. A folder holding something trashed on its own stays listed, since
+  that is restorable only through it. Worked out when listing, from kept
+  records, so arrival order and rebuilds agree; emptying the trash still
+  removes the old rows.
 - **A large purge is several records.** Readers refuse records over their
   size ceiling, so a purge is split files first, then folders deepest first,
   and each record stands on its own for a 1.0.0 reader.
