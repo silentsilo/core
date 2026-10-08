@@ -587,7 +587,7 @@ impl S3Client {
         if len == 0 {
             return Ok(Vec::new());
         }
-        let output = self
+        let output = match self
             .client
             .get_object()
             .bucket(&self.config.bucket)
@@ -595,7 +595,13 @@ impl S3Client {
             .range(format!("bytes=0-{}", len - 1))
             .send()
             .await
-            .map_err(|e| S3Error::from_sdk("download", e))?;
+        {
+            Ok(output) => output,
+            // A range from byte 0 is unsatisfiable only on an empty object:
+            // a missing one answers 404 first.
+            Err(e) if range_says_empty(&e) => return Ok(Vec::new()),
+            Err(e) => return Err(S3Error::from_sdk("download", e)),
+        };
 
         let bytes = output
             .body
@@ -754,6 +760,16 @@ fn head_says_absent<E>(err: &aws_sdk_s3::error::SdkError<E, HttpResponse>) -> bo
 /// Split out from the SDK error so the decision itself can be tested.
 fn status_says_absent(status: u16) -> bool {
     matches!(status, 404 | 403)
+}
+
+/// Whether a ranged GET failed because the object holds no bytes at all.
+fn range_says_empty<E>(err: &aws_sdk_s3::error::SdkError<E, HttpResponse>) -> bool {
+    match err {
+        aws_sdk_s3::error::SdkError::ServiceError(context) => {
+            context.raw().status().as_u16() == 416
+        }
+        _ => false,
+    }
 }
 
 /// The `x-amz-copy-source` key, percent-encoded as S3 requires. Slashes

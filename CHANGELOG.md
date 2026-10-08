@@ -23,6 +23,8 @@ release notes should say.
 
 ### Fixed
 
+- S3: reading the first bytes of an empty object returned an error (416)
+  instead of nothing.
 - The trash no longer lists the old place of a moved file or folder. A
   move recorded the entry again and trashed the old row, so a moved file
   showed in the trash at its old path, and a file moved then deleted showed
