@@ -87,8 +87,16 @@ pub(crate) fn fido_key_present() -> bool {
     hid_api().is_ok_and(|api| !fido_devices(&api).is_empty())
 }
 
+/// Whether this machine can talk to a security key: the HID stack works, and
+/// a key plugged in opens. No key plugged in is still accessible, so the
+/// unlock screen asks for the key rather than calling the system unable; a
+/// key that will not open (Linux without the udev rule) is not.
 pub(crate) fn fido_interface_accessible() -> bool {
-    open_key().is_ok()
+    match open_key() {
+        Ok(_) => true,
+        Err(FidoError::NoDevice) => hid_api().is_ok(),
+        Err(_) => false,
+    }
 }
 
 /// The first key that opens. One plugged in that will not open is, on Linux,
