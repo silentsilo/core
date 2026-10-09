@@ -110,6 +110,18 @@ fn generate(tag: &[u8; TAG_LEN]) -> Result<SecKey, FidoError> {
         .set_label(label_for(tag))
         .set_access_control(access);
     SecKey::new(&options).map_err(|e| {
+        // errSecMissingEntitlement: a build without the Developer ID
+        // signature and profile, which the keychain will not serve.
+        if e.code() == -34018 {
+            return FidoError::EnrollmentFailed(
+                crate::coded!(
+                    "err.touchid_unsigned",
+                    "This copy of SilentSilo is not signed, so macOS does not let it use Touch ID. \
+                     Use a security key, or install SilentSilo from silentsilo.com."
+                )
+                .into(),
+            );
+        }
         FidoError::EnrollmentFailed(format!("the Secure Enclave refused to make a key: {e}"))
     })
 }
@@ -159,18 +171,37 @@ pub fn derive_unlock_material(
     }))
 }
 
+/// Deletes the enclave key behind `credential_id`, for a key removed from
+/// its silo. An id that is not an enclave id, or a key this device does not
+/// hold, is nothing to delete. Only the iPhone calls it so far; a Mac
+/// still leaves the key in its keychain when one is removed.
+#[cfg(target_os = "ios")]
+pub fn remove(credential_id: &[u8]) -> Result<(), FidoError> {
+    let Some((tag, _)) = enclave::split_credential_id(credential_id) else {
+        return Ok(());
+    };
+    match find_key(tag) {
+        Some(key) => key
+            .delete()
+            .map_err(|e| FidoError::UnlockFailed(format!("could not delete the key: {e}"))),
+        None => Ok(()),
+    }
+}
+
 /// The private key filed under `tag`, if this Mac has it. A reference only:
 /// nothing here touches the private half, so nothing prompts.
 fn find_key(tag: &[u8]) -> Option<SecKey> {
-    let results = ItemSearchOptions::new()
+    let mut search = ItemSearchOptions::new();
+    search
         .class(ItemClass::key())
         .key_class(KeyClass::private())
         .label(&label_for(tag))
-        .ignore_legacy_keychains()
         .load_refs(true)
-        .limit(1)
-        .search()
-        .ok()?;
+        .limit(1);
+    // iOS has only the data-protection keychain; a Mac also has the old one.
+    #[cfg(target_os = "macos")]
+    search.ignore_legacy_keychains();
+    let results = search.search().ok()?;
     results.into_iter().find_map(|result| match result {
         SearchResult::Ref(Reference::Key(key)) => Some(key),
         _ => None,

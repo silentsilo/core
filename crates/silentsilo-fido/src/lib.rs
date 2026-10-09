@@ -22,6 +22,16 @@ mod backend;
 pub mod ctap2;
 #[cfg(feature = "enclave")]
 pub mod enclave;
+
+/// The Secure Enclave of an iPhone or iPad, for the mobile client's device
+/// key: the same `secure-enclave` kind and derivation a Mac uses, behind
+/// Face ID or Touch ID.
+#[cfg(all(feature = "enclave", target_os = "ios"))]
+pub mod device_enclave {
+    pub use crate::backend::enclave_mac::{
+        available, derive_unlock_material, enrol, holds_any, remove,
+    };
+}
 #[cfg(feature = "passkey")]
 pub mod passkey;
 // Only the Windows backend builds client data: WebAuthn takes it whole. The

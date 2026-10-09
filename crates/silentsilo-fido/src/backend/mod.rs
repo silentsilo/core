@@ -14,8 +14,8 @@ mod ctap;
 #[cfg(all(feature = "hardware", not(feature = "test-authenticator"), windows))]
 mod win;
 
-#[cfg(all(feature = "enclave", target_os = "macos"))]
-mod enclave_mac;
+#[cfg(all(feature = "enclave", any(target_os = "macos", target_os = "ios")))]
+pub(crate) mod enclave_mac;
 
 #[cfg(all(
     feature = "hardware",

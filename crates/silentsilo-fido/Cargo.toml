@@ -39,8 +39,8 @@ windows = { version = "0.61", features = [
 # not wrap (importing a raw public key), Core Foundation for that call's
 # attribute dictionary, and LocalAuthentication to ask whether Touch ID can
 # answer at all. `OSX_10_15` is the data-protection keychain, the only one
-# an enclave key can live in.
-[target.'cfg(target_os = "macos")'.dependencies]
+# an enclave key can live in. iOS reaches the same chip the same way.
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 security-framework = { version = "3.7", features = ["OSX_10_15"], optional = true }
 security-framework-sys = { version = "2.17", optional = true }
 core-foundation = { version = "0.10", optional = true }

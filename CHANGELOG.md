@@ -13,6 +13,13 @@ release notes should say.
 
 ### Added
 
+- `silentsilo_fido::device_enclave`: the Secure Enclave on iPhone and iPad,
+  the same `secure-enclave` kind and derivation a Mac uses, with `remove` to
+  delete a device's key. Builds for `aarch64-apple-ios`; not yet called by
+  the mobile client.
+- Touch ID refused for want of a signature (`errSecMissingEntitlement`) is
+  said as such, with a translation key (`err.touchid_unsigned`), instead of
+  the raw keychain error.
 - Error messages a person reads carry a translation key after their English
   (`silentsilo_core::coded`): about 50 of them, in recovery, joining, the
   activity log, security keys, storage settings and the three clouds. The
