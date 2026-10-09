@@ -28,6 +28,11 @@ release notes should say.
 
 ### Fixed
 
+- macOS: the app could crash minutes after start when it looked for a
+  security key. hidapi files its device manager on the run loop of the
+  thread that first opens it, and that was a tokio blocking thread which
+  later retired; the first opening now happens on a thread that lives as
+  long as the process. Found on a real Mac.
 - S3: reading the first bytes of an empty object returned an error (416)
   instead of nothing.
 - The trash no longer lists the old place of a moved file or folder. A

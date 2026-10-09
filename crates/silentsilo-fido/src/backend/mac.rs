@@ -20,10 +20,6 @@ pub(crate) fn fido_interface_accessible() -> bool {
     ctap::fido_interface_accessible()
 }
 
-pub fn probe_device() -> Result<(), FidoError> {
-    ctap::probe_device()
-}
-
 pub(crate) fn platform_authenticator_available() -> bool {
     enclave_mac::available()
 }

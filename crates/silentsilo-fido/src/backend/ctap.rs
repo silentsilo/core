@@ -47,6 +47,36 @@ impl Reports for UsbLink {
     }
 }
 
+/// On macOS `hid_init` schedules hidapi's IOHIDManager on the calling
+/// thread's run loop, and nothing undoes it. Done on a tokio blocking thread,
+/// that run loop is freed when the thread retires and the next enumeration
+/// crashes adding a device to it, so the first init runs on a thread that
+/// never ends.
+#[cfg(target_os = "macos")]
+fn hid_api() -> hidapi::HidResult<hidapi::HidApi> {
+    static STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    STARTED.get_or_init(|| {
+        let (done, wait) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("hid-run-loop".into())
+            .spawn(move || {
+                let _ = done.send(hidapi::HidApi::new().is_ok());
+                loop {
+                    std::thread::park();
+                }
+            });
+        if spawned.is_ok() {
+            let _ = wait.recv();
+        }
+    });
+    hidapi::HidApi::new()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn hid_api() -> hidapi::HidResult<hidapi::HidApi> {
+    hidapi::HidApi::new()
+}
+
 fn fido_devices(api: &hidapi::HidApi) -> Vec<&hidapi::DeviceInfo> {
     api.device_list()
         .filter(|d| d.usage_page() == FIDO_USAGE_PAGE && d.usage() == FIDO_USAGE)
@@ -54,7 +84,7 @@ fn fido_devices(api: &hidapi::HidApi) -> Vec<&hidapi::DeviceInfo> {
 }
 
 pub(crate) fn fido_key_present() -> bool {
-    hidapi::HidApi::new().is_ok_and(|api| !fido_devices(&api).is_empty())
+    hid_api().is_ok_and(|api| !fido_devices(&api).is_empty())
 }
 
 pub(crate) fn fido_interface_accessible() -> bool {
@@ -65,7 +95,7 @@ pub(crate) fn fido_interface_accessible() -> bool {
 /// almost always a missing udev rule, and is said as such rather than as no
 /// key at all.
 fn open_key() -> Result<Hid<UsbLink>, FidoError> {
-    let api = hidapi::HidApi::new().map_err(|e| FidoError::UnlockFailed(e.to_string()))?;
+    let api = hid_api().map_err(|e| FidoError::UnlockFailed(e.to_string()))?;
     let devices = fido_devices(&api);
     if devices.is_empty() {
         return Err(FidoError::NoDevice);
@@ -82,7 +112,9 @@ pub fn probe_device() -> Result<(), FidoError> {
     open_key().map(|_| ())
 }
 
-/// Always false here: USB HID reaches removable keys only.
+/// Always false here: USB HID reaches removable keys only. The Mac backend
+/// answers for the enclave itself.
+#[cfg(not(all(feature = "enclave", target_os = "macos")))]
 pub(crate) fn platform_authenticator_available() -> bool {
     false
 }
