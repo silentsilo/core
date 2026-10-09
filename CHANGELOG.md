@@ -35,6 +35,13 @@ release notes should say.
 
 ### Fixed
 
+- iOS: an enclave key was made without its Face ID requirement, so a silo
+  on an iPhone opened without asking. security-framework 3.7 adds the
+  private-key attributes, where the access control lives, only when built
+  for macOS. The attributes are now built in this crate for both, a test
+  holds that the access control rides with the private key (run on macOS in
+  CI), and an enrolment whose key comes out without it is refused. Found
+  before any iPhone release; no released build was affected.
 - macOS: the app could crash minutes after start when it looked for a
   security key. hidapi files its device manager on the run loop of the
   thread that first opens it, and that was a tokio blocking thread which

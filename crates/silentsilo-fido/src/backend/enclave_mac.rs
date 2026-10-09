@@ -22,7 +22,8 @@
 // calls it.
 #![cfg_attr(not(feature = "hardware"), allow(dead_code))]
 
-use core_foundation::base::TCFType;
+use core_foundation::base::{CFType, TCFType, ToVoid};
+use core_foundation::boolean::CFBoolean;
 use core_foundation::data::CFData;
 use core_foundation::dictionary::CFDictionary;
 use core_foundation::error::{CFError, CFErrorRef};
@@ -30,18 +31,17 @@ use core_foundation::number::CFNumber;
 use core_foundation::string::CFString;
 use objc2_local_authentication::{LAContext, LAPolicy};
 use security_framework::access_control::{ProtectionMode, SecAccessControl};
-use security_framework::item::{
-    ItemClass, ItemSearchOptions, KeyClass, Location, Reference, SearchResult,
-};
-use security_framework::key::{Algorithm, GenerateKeyOptions, KeyType, SecKey, Token};
+use security_framework::item::{ItemClass, ItemSearchOptions, KeyClass, Reference, SearchResult};
+use security_framework::key::{Algorithm, SecKey};
 use security_framework_sys::access_control::{
     kSecAccessControlBiometryCurrentSet, kSecAccessControlPrivateKeyUsage,
 };
 use security_framework_sys::item::{
-    kSecAttrKeyClass, kSecAttrKeyClassPublic, kSecAttrKeySizeInBits, kSecAttrKeyType,
-    kSecAttrKeyTypeECSECPrimeRandom,
+    kSecAttrAccessControl, kSecAttrIsPermanent, kSecAttrKeyClass, kSecAttrKeyClassPublic,
+    kSecAttrKeySizeInBits, kSecAttrKeyType, kSecAttrKeyTypeECSECPrimeRandom, kSecAttrLabel,
+    kSecAttrTokenID, kSecAttrTokenIDSecureEnclave, kSecPrivateKeyAttrs,
 };
-use security_framework_sys::key::SecKeyCreateWithData;
+use security_framework_sys::key::{SecKeyCreateRandomKey, SecKeyCreateWithData};
 use zeroize::Zeroizing;
 
 use crate::FidoError;
@@ -101,29 +101,111 @@ fn generate(tag: &[u8; TAG_LEN]) -> Result<SecKey, FidoError> {
         kSecAccessControlBiometryCurrentSet | kSecAccessControlPrivateKeyUsage,
     )
     .map_err(|e| FidoError::EnrollmentFailed(format!("Touch ID access control: {e}")))?;
-    let mut options = GenerateKeyOptions::default();
-    options
-        .set_key_type(KeyType::ec_sec_prime_random())
-        .set_size_in_bits(256)
-        .set_token(Token::SecureEnclave)
-        .set_location(Location::DataProtectionKeychain)
-        .set_label(label_for(tag))
-        .set_access_control(access);
-    SecKey::new(&options).map_err(|e| {
+
+    let attributes = key_attributes(&label_for(tag), &access);
+
+    let mut error: CFErrorRef = std::ptr::null_mut();
+    // SAFETY: `attributes` is a live dictionary for the call, and `error` is
+    // a valid out-pointer.
+    let raw = unsafe { SecKeyCreateRandomKey(attributes.as_concrete_TypeRef(), &mut error) };
+    if raw.is_null() {
+        let why = (!error.is_null())
+            // SAFETY: a non-null error out-param is owned by the caller.
+            .then(|| unsafe { CFError::wrap_under_create_rule(error) });
         // errSecMissingEntitlement: a build without the Developer ID
         // signature and profile, which the keychain will not serve.
-        if e.code() == -34018 {
-            return FidoError::EnrollmentFailed(
+        if why.as_ref().is_some_and(|e| e.code() == -34018) {
+            return Err(FidoError::EnrollmentFailed(
                 crate::coded!(
                     "err.touchid_unsigned",
-                    "This copy of SilentSilo is not signed, so macOS does not let it use Touch ID. \
-                     Use a security key, or install SilentSilo from silentsilo.com."
+                    "This copy of SilentSilo is not signed, so macOS does not let it use Touch ID.                      Use a security key, or install SilentSilo from silentsilo.com."
                 )
                 .into(),
-            );
+            ));
         }
-        FidoError::EnrollmentFailed(format!("the Secure Enclave refused to make a key: {e}"))
-    })
+        return Err(FidoError::EnrollmentFailed(format!(
+            "the Secure Enclave refused to make a key: {}",
+            why.map(|e| e.to_string()).unwrap_or_default()
+        )));
+    }
+    // SAFETY: a non-null return from a Create function is owned by us.
+    let key = unsafe { SecKey::wrap_under_create_rule(raw) };
+
+    // A key without its access control would open the silo with no Face ID
+    // or Touch ID at all. Checked on the key itself rather than trusted to
+    // the call that made it.
+    // SAFETY: as above.
+    let guarded = key
+        .attributes()
+        .contains_key(&unsafe { kSecAttrAccessControl }.to_void());
+    if !guarded {
+        let _ = key.delete();
+        return Err(FidoError::EnrollmentFailed(
+            "the enclave made a key without its Face ID or Touch ID requirement".into(),
+        ));
+    }
+    Ok(key)
+}
+
+/// What `SecKeyCreateRandomKey` gets for an enclave key. Built here, not
+/// through security-framework's `GenerateKeyOptions`: version 3.7 adds the
+/// private-key attributes, where the access control lives, only when built
+/// for macOS, so on iOS the key came out of the enclave usable without
+/// Face ID. `access_control_rides_with_the_private_key` holds this.
+fn key_attributes(label: &str, access: &SecAccessControl) -> CFDictionary<CFString, CFType> {
+    let label = CFString::new(label);
+    // SAFETY: the `kSec*` statics are exported by Security.framework for the
+    // life of the process and are only borrowed here.
+    let private: CFDictionary<CFString, CFType> = unsafe {
+        CFDictionary::from_CFType_pairs(&[
+            (
+                CFString::wrap_under_get_rule(kSecAttrIsPermanent),
+                CFBoolean::true_value().into_CFType(),
+            ),
+            (
+                CFString::wrap_under_get_rule(kSecAttrAccessControl),
+                access.as_CFType(),
+            ),
+        ])
+    };
+    // SAFETY: as above.
+    #[allow(unused_mut)]
+    let mut pairs: Vec<(CFString, CFType)> = unsafe {
+        vec![
+            (
+                CFString::wrap_under_get_rule(kSecAttrKeyType),
+                CFString::wrap_under_get_rule(kSecAttrKeyTypeECSECPrimeRandom).into_CFType(),
+            ),
+            (
+                CFString::wrap_under_get_rule(kSecAttrKeySizeInBits),
+                CFNumber::from(256).into_CFType(),
+            ),
+            (
+                CFString::wrap_under_get_rule(kSecAttrTokenID),
+                CFString::wrap_under_get_rule(kSecAttrTokenIDSecureEnclave).into_CFType(),
+            ),
+            (
+                CFString::wrap_under_get_rule(kSecAttrLabel),
+                label.as_CFType(),
+            ),
+            (
+                CFString::wrap_under_get_rule(kSecPrivateKeyAttrs),
+                private.as_CFType(),
+            ),
+        ]
+    };
+    // A Mac also has the file keychain, which cannot hold an enclave key.
+    #[cfg(target_os = "macos")]
+    pairs.push((
+        // SAFETY: as above.
+        unsafe {
+            CFString::wrap_under_get_rule(
+                security_framework_sys::item::kSecUseDataProtectionKeychain,
+            )
+        },
+        CFBoolean::true_value().into_CFType(),
+    ));
+    CFDictionary::from_CFType_pairs(&pairs)
 }
 
 /// Whether any of `credential_ids` names a key in this Mac's keychain.
@@ -272,4 +354,53 @@ fn import_public(point: &[u8]) -> Result<SecKey, FidoError> {
     }
     // SAFETY: a non-null return from a Create function is owned by us.
     Ok(unsafe { SecKey::wrap_under_create_rule(raw) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bug this guards: the access control left out of the private key's
+    /// attributes, so the enclave made a key any caller could use. Nothing
+    /// here touches the keychain, so it runs wherever this file builds.
+    #[test]
+    fn access_control_rides_with_the_private_key() {
+        let access = SecAccessControl::create_with_protection(
+            Some(ProtectionMode::AccessibleWhenPasscodeSetThisDeviceOnly),
+            kSecAccessControlBiometryCurrentSet | kSecAccessControlPrivateKeyUsage,
+        )
+        .unwrap();
+        let attributes = key_attributes("test", &access);
+        // SAFETY: Security.framework statics, borrowed.
+        let (private_key, access_key, permanent_key, token_key) = unsafe {
+            (
+                CFString::wrap_under_get_rule(kSecPrivateKeyAttrs),
+                CFString::wrap_under_get_rule(kSecAttrAccessControl),
+                CFString::wrap_under_get_rule(kSecAttrIsPermanent),
+                CFString::wrap_under_get_rule(kSecAttrTokenID),
+            )
+        };
+        assert!(
+            attributes.find(&token_key).is_some(),
+            "not made in the enclave"
+        );
+        let private = attributes
+            .find(&private_key)
+            .expect("no private-key attributes")
+            .downcast::<CFDictionary>()
+            .expect("private-key attributes are not a dictionary");
+        // SAFETY: the dictionary holds Core Foundation objects keyed by the
+        // `kSec*` strings looked up here.
+        let private: CFDictionary<CFString, CFType> =
+            unsafe { CFDictionary::wrap_under_get_rule(private.as_concrete_TypeRef()) };
+        assert!(
+            private.find(&access_key).is_some(),
+            "no access control on the private key"
+        );
+        let permanent = private
+            .find(&permanent_key)
+            .and_then(|v| v.downcast::<CFBoolean>())
+            .map(bool::from);
+        assert_eq!(permanent, Some(true), "the private key would not be kept");
+    }
 }

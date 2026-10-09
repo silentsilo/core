@@ -78,6 +78,12 @@ jobs:
           sudo apt-get install -y libdbus-1-dev libudev-dev pkg-config
       - run: cargo check --all --locked
       - run: cargo test -p silentsilo-fixture --locked
+      # The Secure Enclave key's attributes, built by hand because
+      # security-framework drops the private-key ones outside macOS. The
+      # test needs no keychain; it only runs where the enclave code builds.
+      - name: Enclave key attributes
+        if: matrix.os == 'macos-latest'
+        run: cargo test -p silentsilo-fido --locked
 
   # Known advisories in the locked tree. A vulnerability fails the job;
   # unsound and yanked warnings only print. Ignores sit in .cargo/audit.toml,
