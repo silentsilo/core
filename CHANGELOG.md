@@ -35,6 +35,10 @@ release notes should say.
 
 ### Fixed
 
+- macOS and Linux: with no security key plugged in, the unlock screen said
+  the system had no security key support. A missing key now leaves the
+  button on; only a key that will not open (Linux without the udev rule)
+  still counts as unreachable.
 - iOS: an enclave key was made without its Face ID requirement, so a silo
   on an iPhone opened without asking. security-framework 3.7 adds the
   private-key attributes, where the access control lives, only when built
