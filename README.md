@@ -146,3 +146,10 @@ Cryptography specification: [`docs/CRYPTO.md`](docs/CRYPTO.md)
 
 How the pieces fit and which invariants a change must preserve:
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+
+## Licence
+
+Copyright (C) 2026 Software Hive S.R.L.
+
+AGPL-3.0-or-later, see [LICENSE](LICENSE). Contributions are accepted under
+[CLA.md](CLA.md), identical in all four SilentSilo repositories.
