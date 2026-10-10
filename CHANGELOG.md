@@ -13,6 +13,9 @@ release notes should say.
 
 ### Added
 
+- `silentsilo_fido::forget_platform_key`: a Mac's Touch ID key removed from
+  its silo is deleted from the keychain too. A no-op for any other key and
+  platform.
 - `silentsilo_fido::device_enclave`: the Secure Enclave on iPhone and iPad,
   the same `secure-enclave` kind and derivation a Mac uses, with `remove` to
   delete a device's key. Builds for `aarch64-apple-ios`; not yet called by

@@ -199,6 +199,21 @@ pub fn derive_unlock_material(
     }
 }
 
+/// Deletes this device's own platform key behind `credential_id`, once it
+/// has been removed from its silo. Only a Mac's Touch ID key lives where
+/// this can reach; any other id, and any other platform, is a no-op.
+pub fn forget_platform_key(credential_id: &[u8]) -> Result<(), FidoError> {
+    #[cfg(all(feature = "enclave", target_os = "macos"))]
+    {
+        backend::enclave_mac::remove(credential_id)
+    }
+    #[cfg(not(all(feature = "enclave", target_os = "macos")))]
+    {
+        let _ = credential_id;
+        Ok(())
+    }
+}
+
 pub fn dek_salt_for_vault(vault_id: &str) -> String {
     format!("silentsilo-dek-v1:{vault_id}")
 }

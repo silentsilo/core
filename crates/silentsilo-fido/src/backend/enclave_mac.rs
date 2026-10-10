@@ -255,9 +255,7 @@ pub fn derive_unlock_material(
 
 /// Deletes the enclave key behind `credential_id`, for a key removed from
 /// its silo. An id that is not an enclave id, or a key this device does not
-/// hold, is nothing to delete. Only the iPhone calls it so far; a Mac
-/// still leaves the key in its keychain when one is removed.
-#[cfg(target_os = "ios")]
+/// hold, is nothing to delete.
 pub fn remove(credential_id: &[u8]) -> Result<(), FidoError> {
     let Some((tag, _)) = enclave::split_credential_id(credential_id) else {
         return Ok(());
