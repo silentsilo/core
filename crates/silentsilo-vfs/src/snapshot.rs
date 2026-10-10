@@ -1028,19 +1028,25 @@ pub fn compact_covered(conn: &mut Connection, snapshot: &Snapshot) -> CoreResult
 /// again on top, which is why nothing here keeps them.
 pub fn rebootstrap(conn: &mut Connection, snapshot: &Snapshot) -> CoreResult<Uuid> {
     let tx = conn.transaction().map_err(db)?;
+    let device_id = rebootstrap_in(&tx, snapshot)?;
+    tx.commit().map_err(db)?;
+    Ok(device_id)
+}
 
+/// [`rebootstrap`] inside a transaction the caller holds, so that what
+/// follows it (the replay, this device's unsent records written again)
+/// commits with it or not at all.
+pub fn rebootstrap_in(tx: &Connection, snapshot: &Snapshot) -> CoreResult<Uuid> {
     tx.execute("DELETE FROM oplog", []).map_err(db)?;
-    crate::schema::drop_derived(&tx).map_err(db)?;
-    crate::schema::init_derived(&tx, snapshot.vault_id).map_err(db)?;
-    restore(&tx, snapshot)?;
-    write_base(&tx, snapshot)?;
+    crate::schema::drop_derived(tx).map_err(db)?;
+    crate::schema::init_derived(tx, snapshot.vault_id).map_err(db)?;
+    restore(tx, snapshot)?;
+    write_base(tx, snapshot)?;
 
-    let device_id = crate::oplog::set_device_id(&tx, Uuid::new_v4())?;
+    let device_id = crate::oplog::set_device_id(tx, Uuid::new_v4())?;
     // The clock moves up to the horizon, so the next local change sorts after
     // everything the snapshot accounts for rather than colliding with it.
-    crate::oplog::observe_lamport(&tx, snapshot.horizon)?;
-
-    tx.commit().map_err(db)?;
+    crate::oplog::observe_lamport(tx, snapshot.horizon)?;
     Ok(device_id)
 }
 

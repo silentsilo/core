@@ -525,12 +525,20 @@ pub fn apply_rebuild(
     incoming: Vec<OpRecord>,
 ) -> Result<RebootstrapOutcome, SyncError> {
     let fetched = incoming.len();
+    // One transaction for all of it. The unsent records below lived only in
+    // memory between the log's deletion and their writing again, so an app
+    // closed or killed in between lost them; now either everything commits
+    // or the silo stays as it was, unsent records included.
+    let tx = conn
+        .transaction()
+        .map_err(|e| SyncError::Vault(e.to_string()))?;
+    let conn = &*tx;
     // What this device wrote and no copy has yet. A rebuild used to drop it:
     // work done offline, gone because the others compacted meanwhile. Only
     // that: a record some copy holds is in the snapshot or comes back with
     // the fetch, and writing it again replayed old history as new changes.
     let unpushed = silentsilo_vfs::undelivered_own_ops(conn)?;
-    let device_id = silentsilo_vfs::snapshot::rebootstrap(conn, snapshot)?;
+    let device_id = silentsilo_vfs::snapshot::rebootstrap_in(conn, snapshot)?;
     let replay_report = replay(conn, incoming)?;
 
     // Written again, under the new identity and after everything fetched, so
@@ -548,6 +556,7 @@ pub fn apply_rebuild(
             kept_local += 1;
         }
     }
+    tx.commit().map_err(|e| SyncError::Vault(e.to_string()))?;
 
     Ok(RebootstrapOutcome {
         horizon: snapshot.horizon,

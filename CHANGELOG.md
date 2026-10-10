@@ -11,6 +11,15 @@ release notes should say.
 
 ## [Unreleased]
 
+### Fixed
+
+- `apply_rebuild` runs in one transaction: a rebuild stopped part way
+  (the app closed or killed) used to lose this device's changes not sent
+  yet, which lived only in memory between the log's deletion and their
+  writing again. Now it either completes or leaves the silo as it was.
+  `snapshot::rebootstrap_in` does the reset inside the caller's
+  transaction.
+
 ### Added
 
 - `silentsilo_fido::forget_platform_key`: a Mac's Touch ID key removed from
