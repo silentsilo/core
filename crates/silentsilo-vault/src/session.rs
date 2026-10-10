@@ -456,6 +456,7 @@ fn verify_integrity(conn: &Connection) -> Result<(), VaultError> {
 /// in memory and exported straight into a ciphered working copy.
 fn open_database(paths: &VaultPaths, dek: &MasterDek) -> Result<Connection, VaultError> {
     paths.ensure_work_dir()?;
+    crate::cache_store::sweep_partial_blobs(&paths.root);
 
     // A plaintext copy is always the newest: this build removes it before
     // writing a ciphered one, and an older release ignores the ciphered one.

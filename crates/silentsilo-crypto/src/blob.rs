@@ -135,6 +135,35 @@ pub fn encrypt_stream<R: Read>(
     file_id: Uuid,
     blob_id: Uuid,
 ) -> Result<EncryptResult, CryptoError> {
+    // Written beside `dest` and renamed when whole. An import stopped half
+    // way (the app closed during a large file) used to leave a partial blob
+    // under its final name, counted as stored and never deleted.
+    let mut part = dest.as_os_str().to_os_string();
+    part.push(".part");
+    let part = std::path::PathBuf::from(part);
+    let result = encrypt_into(source, &part, key, file_id, blob_id);
+    match result {
+        Ok(result) => match std::fs::rename(&part, dest) {
+            Ok(()) => Ok(result),
+            Err(e) => {
+                let _ = std::fs::remove_file(&part);
+                Err(e.into())
+            }
+        },
+        Err(e) => {
+            let _ = std::fs::remove_file(&part);
+            Err(e)
+        }
+    }
+}
+
+fn encrypt_into<R: Read>(
+    source: &mut R,
+    dest: &Path,
+    key: &ContentKey,
+    file_id: Uuid,
+    blob_id: Uuid,
+) -> Result<EncryptResult, CryptoError> {
     let mut dest_file = File::create(dest)?;
 
     let mut hasher = Hasher::new();
@@ -549,6 +578,31 @@ mod tests {
 
         decrypt_blob(&enc, &out, &key, blob_id).unwrap();
         assert_eq!(std::fs::read(&out).unwrap(), data);
+    }
+
+    #[test]
+    fn an_encrypt_that_fails_half_way_leaves_nothing() {
+        // A source that breaks after a chunk: no blob under the final name
+        // and no partial file beside it.
+        struct Breaks(usize);
+        impl Read for Breaks {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 == 0 {
+                    return Err(std::io::Error::other("gone"));
+                }
+                let n = self.0.min(buf.len());
+                buf[..n].fill(7);
+                self.0 -= n;
+                Ok(n)
+            }
+        }
+        let dir = tempdir().unwrap();
+        let enc = dir.path().join("blob.sslo");
+        let key = generate_content_key();
+        let mut source = Breaks(CHUNK_SIZE + 10);
+        assert!(encrypt_stream(&mut source, &enc, &key, Uuid::new_v4(), Uuid::new_v4()).is_err());
+        assert!(!enc.exists());
+        assert!(!dir.path().join("blob.sslo.part").exists());
     }
 
     #[test]

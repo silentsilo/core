@@ -13,6 +13,16 @@ release notes should say.
 
 ### Fixed
 
+- `encrypt_stream` writes beside the destination and renames when whole. An
+  import stopped half way left a partial blob under its final name, counted
+  as stored and never deleted. Opening a silo deletes `.part` files in its
+  blobs folder older than a day (`cache_store::sweep_partial_blobs`).
+- The sync pass reports three more phases, `applying`, `compacting` and
+  `checking`. They can take minutes on a large silo and reported nothing,
+  so the screen said "synced" while they ran.
+- The extractor says it is reading the history before it starts, instead
+  of printing nothing for minutes.
+
 - `apply_rebuild` runs in one transaction: a rebuild stopped part way
   (the app closed or killed) used to lose this device's changes not sent
   yet, which lived only in memory between the log's deletion and their

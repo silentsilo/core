@@ -104,6 +104,9 @@ fn main() -> ExitCode {
 async fn run(args: Args, from: PathBuf, code: String) -> ExitCode {
     let store = silentsilo_extract::folder_store(&from);
 
+    // Reading and replaying the history comes first and prints nothing of
+    // its own, for minutes on a large silo.
+    println!("Reading the silo's history. A large silo takes a few minutes.");
     let backup = match silentsilo_extract::open(&*store, &code).await {
         Ok(backup) => backup,
         Err(e) => {

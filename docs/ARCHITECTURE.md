@@ -426,6 +426,13 @@ row written concurrently on another device may still need the bytes. All
 transfers stream through disk (`put_from_file`/`get_to_file`); nothing
 holds a whole blob in memory.
 
+A blob is written under `<id>.sslo.part` and renamed when whole, both by an
+import (`encrypt_stream`) and by a download (`fetch_blob`), so nothing reads
+a half-written file as stored content. A `.part` older than a day is what a
+closed app left behind, and opening the silo deletes it
+(`cache_store::sweep_partial_blobs`). The day is for another process that
+opens the silo while the app is still writing one: AutoFill on a phone.
+
 Every backend also answers the same two transfers with a byte count as it
 goes: `put_from_file_reporting` and `get_to_file_reporting` take a callback
 that receives the bytes moved since the last call and answers whether to

@@ -204,6 +204,32 @@ pub fn touch_blob_access(vault_root: &Path, blob_id: Uuid) -> Result<(), VaultEr
     Ok(())
 }
 
+/// Deletes `.part` files in the blobs directory older than a day: what an
+/// encryption or a download left when the app was closed under it. A day,
+/// because another process (AutoFill on a phone) can open the silo while
+/// the app is still writing one.
+pub fn sweep_partial_blobs(vault_root: &Path) {
+    let Ok(entries) = std::fs::read_dir(blobs_dir(vault_root)) else {
+        return;
+    };
+    let day = std::time::Duration::from_secs(24 * 60 * 60);
+    for entry in entries.flatten() {
+        let is_part = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.ends_with(".part"));
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > day);
+        if is_part && old {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Blob ids currently present as encrypted `.sslo` files on local disk.
 /// Filesystem is the ground truth here, not the bookkeeping table.
 pub fn list_local_blob_ids(vault_root: &Path) -> Vec<Uuid> {

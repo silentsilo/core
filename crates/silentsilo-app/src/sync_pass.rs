@@ -94,8 +94,11 @@ pub struct SyncReport {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SyncProgress {
     pub silo_id: String,
-    /// `sending-changes`, `uploading`, `fetching-changes`, `downloading` or
-    /// `importing`.
+    /// `sending-changes`, `uploading`, `fetching-changes`, `downloading`,
+    /// `importing`, `applying`, `compacting` or `checking`. The last three
+    /// can take minutes on a large silo and used to report nothing, so the
+    /// screen said the silo was synced while they ran. A client that does
+    /// not know a phase shows a generic line.
     pub phase: &'static str,
     /// How many of `total` came before this step.
     pub done: usize,
@@ -1160,6 +1163,18 @@ pub async fn run_sync_pass(
         host.warn("sync", &format!("{} could not be read: {}", u.key, u.error));
     }
 
+    if fetched > 0 {
+        report_progress(
+            state,
+            host,
+            silo.id,
+            "applying",
+            ProgressStep::counted(0, fetched),
+            None,
+            &mut None,
+            None,
+        );
+    }
     let replayed = {
         let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
         let session = sessions.get(&silo.id).ok_or_else(|| {
@@ -1293,7 +1308,7 @@ pub async fn run_sync_pass(
     // that fails keeps its whole log, which is safe: it simply has more
     // history than it needs.
     let compacted = if view_complete {
-        run_compaction(state, silo, &targets, &dek, vault_id).await?
+        run_compaction(state, host, silo, &targets, &dek, vault_id).await?
     } else {
         0
     };
@@ -1561,6 +1576,7 @@ const FULL_COPY_FETCH_PER_PASS: usize = 50;
 /// housekeeping and the next pass proposes the same work again.
 async fn run_compaction(
     state: &AppState,
+    host: &dyn Host,
     silo: &SiloEntry,
     targets: &[OpenTarget],
     dek: &silentsilo_crypto::MasterDek,
@@ -1582,6 +1598,16 @@ async fn run_compaction(
     let Ok(Some(snapshot)) = planned else {
         return Ok(0);
     };
+    report_progress(
+        state,
+        host,
+        silo.id,
+        "compacting",
+        ProgressStep::default(),
+        None,
+        &mut None,
+        None,
+    );
 
     // Every target gets the snapshot, and each prunes only after its own
     // copy of it has landed, which `publish_compaction` guarantees for the
@@ -1688,6 +1714,17 @@ async fn run_blob_sweep(
         (referenced, first_seen)
     };
     let (referenced, first_seen) = plan;
+    // Once a day per copy, and it lists everything there.
+    report_progress(
+        state,
+        host,
+        silo.id,
+        "checking",
+        ProgressStep::default(),
+        None,
+        &mut None,
+        None,
+    );
 
     // With the blob sweep because it deletes too, and lists: once a day, and
     // only on a target whose role allows deletes.
