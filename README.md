@@ -25,7 +25,7 @@ from this repository. Mobile clients will do the same.
 | `silentsilo-vfs` | Operation log, folder and file tree, name resolution, snapshots |
 | `silentsilo-sync` | Bucket layout and the transport half of a sync pass |
 | `silentsilo-app` | What every client shares: sessions, the sync pass, the recovery and device-key flows |
-| `silentsilo-store` | Backup storage: bucket, folder, WebDAV or SFTP |
+| `silentsilo-store` | Backup storage: bucket, folder, iCloud Drive, WebDAV or SFTP |
 | `silentsilo-cloud` | OneDrive, Dropbox and Google Drive: sign-in, tokens, stores |
 | `silentsilo-audit` | The activity log: events sealed with HPKE, chained segments, the device queue |
 | `silentsilo-s3` | S3-compatible object storage client |

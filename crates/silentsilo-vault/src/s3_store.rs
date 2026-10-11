@@ -1306,6 +1306,74 @@ mod older_release_tests {
         ));
     }
 
+    fn icloud(folder: &str) -> BackupTarget {
+        BackupTarget {
+            config: StoreConfig::ICloud(silentsilo_store::ICloudConfig {
+                folder: folder.into(),
+            }),
+            label: "iCloud Drive".into(),
+            role: TargetRole::Working,
+        }
+    }
+
+    #[test]
+    fn icloud_goes_where_an_older_release_does_not_look() {
+        let scratch = Scratch::new();
+
+        save_targets(
+            scratch.id(),
+            &[
+                icloud("Silo"),
+                folder("D:/Backups", "Disk", TargetRole::Working),
+            ],
+        )
+        .unwrap();
+
+        // 1.2 sees the folder alone, as its first target.
+        let old = read_as_1_2(scratch.id());
+        assert_eq!(old.len(), 1);
+        assert_eq!(path_of(&old[0]), std::path::Path::new("D:/Backups"));
+
+        // This build sees both, iCloud first.
+        let back = load_targets(scratch.id());
+        assert_eq!(back.len(), 2);
+        assert!(matches!(back[0].config, StoreConfig::ICloud(_)));
+        assert!(matches!(
+            load_s3_config(scratch.id()),
+            Some(StoreConfig::ICloud(_))
+        ));
+    }
+
+    /// What a release that knows the cloud kinds but not iCloud (core 1.8
+    /// and 1.9) does with an iCloud copy: keeps it as written, in its place,
+    /// through a save of its own.
+    #[test]
+    fn a_release_without_icloud_keeps_the_icloud_copy_through_a_save() {
+        let scratch = Scratch::new();
+        let written = serde_json::to_value(icloud("Silo")).unwrap();
+        write_more(
+            scratch.id(),
+            &[MoreEntry {
+                position: 0,
+                target: written.clone(),
+            }],
+        )
+        .unwrap();
+        // Read as a release without the kind would: it is not a target it
+        // can decode, so it travels as raw JSON.
+        let mut unknown = written.clone();
+        unknown["config"]["kind"] = serde_json::json!("not-yet-known");
+        assert!(matches!(Stored::from_value(unknown), Stored::Unknown(_)));
+        assert!(matches!(Stored::from_value(written), Stored::Known(_)));
+
+        save_targets(scratch.id(), &load_targets(scratch.id())).unwrap();
+        let back = load_targets(scratch.id());
+        assert_eq!(back.len(), 1);
+        assert!(matches!(back[0].config, StoreConfig::ICloud(_)));
+
+        clear_s3_config(scratch.id());
+    }
+
     #[test]
     fn forgetting_a_silo_takes_the_newer_targets_too() {
         let scratch = Scratch::new();

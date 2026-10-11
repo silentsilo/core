@@ -24,7 +24,7 @@ confidence and it answers wrong.
 SilentSilo is a local-first encrypted vault. There is no server. Every
 change to the tree is an immutable, encrypted operation record appended to a
 log; devices converge by exchanging records through dumb storage the user
-owns (S3, WebDAV, SFTP, a folder, OneDrive, Dropbox, Google Drive). File content lives beside the log as
+owns (S3, WebDAV, SFTP, a folder, iCloud Drive, OneDrive, Dropbox, Google Drive). File content lives beside the log as
 encrypted blobs, each under a key of its own. Everything a device shows is a
 disposable cache rebuilt from the log; the log and the blobs are the only
 things that matter, and the whole design bends around never losing either.
@@ -40,7 +40,7 @@ flowchart TD
         CRYPTO["silentsilo-crypto<br/>seal/unseal, blob format, keys"]
     end
     subgraph edge["edge crates"]
-        STORE["silentsilo-store<br/>ObjectStore: folder, S3, WebDAV, SFTP"]
+        STORE["silentsilo-store<br/>ObjectStore: folder, iCloud Drive, S3, WebDAV, SFTP"]
         CLOUD["silentsilo-cloud<br/>OneDrive, Dropbox, Google Drive:<br/>sign-in, tokens, stores"]
         S3C["silentsilo-s3"]
         FIDO["silentsilo-fido"]
@@ -824,6 +824,16 @@ Read this before "fixing" any of it.
   cookie, noted in a TEMP table of the same connection when the snapshot is
   written, exported or adopted. Never a timestamp or the revision, which
   sync writes do not bump; the note dies with the connection it counts.
+- **iCloud Drive is a folder, found per platform.** The `icloud` kind holds
+  only a folder name; `silentsilo_store::icloud_documents` finds
+  SilentSilo's container on this device (the user profile on a Mac and on
+  Windows, a locator the iPhone app installs through `set_icloud_locator`,
+  since only Swift can ask iOS), and a `FolderStore` works inside it. A file
+  only in iCloud is brought down by reading it, on all three (checked on
+  devices, `planuri/icloud.md` in the workspace). The container is never
+  created here: a folder made by hand where it should be would not sync and
+  would fill as a copy nobody sees, so without it every call is
+  `Unreachable`. Android and Linux refuse the kind when it is saved.
 - **Cloud targets open through a hook the vault installs.**
   `StoreConfig::open` lives in `silentsilo-store`, which cannot reach the
   keyring, so the three cloud kinds open through `set_cloud_opener`, set by

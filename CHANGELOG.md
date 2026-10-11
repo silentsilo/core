@@ -11,6 +11,18 @@ release notes should say.
 
 ## [Unreleased]
 
+### Added
+
+- iCloud Drive as backup storage, the kind `icloud` with `{folder}`: the
+  silo's folder inside SilentSilo's container in iCloud Drive, which the
+  system syncs. A folder store at a place each platform finds itself
+  (`silentsilo_store::icloud_documents`): on a Mac and on Windows from the
+  user profile, on an iPhone through a locator the app installs
+  (`set_icloud_locator`). The container is never created: without it the
+  copy is unreachable, like an unplugged drive. Android and Linux refuse the
+  kind by name. Stored in `targets.more.config.json`, which core 1.7.2 never
+  opens; core 1.8 and 1.9 keep the entry as written.
+
 ### Fixed
 
 - The activity log could not be written on Android: the standard library

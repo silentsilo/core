@@ -63,6 +63,11 @@ pub enum StoreConfigInput {
         sign_in: Option<String>,
         folder: String,
     },
+    /// No sign-in: the account is the one iCloud uses on the device.
+    #[serde(rename = "icloud")]
+    ICloud {
+        folder: String,
+    },
 }
 
 /// How to prove who we are to an SSH server.
@@ -227,6 +232,20 @@ impl StoreConfigInput {
                 folder,
                 existing,
             ),
+            // Refused where there is no iCloud Drive at all, so a silo is
+            // never set up with a copy this device can never reach.
+            Self::ICloud { folder } => {
+                if !silentsilo_store::icloud_supported() {
+                    return Err(silentsilo_core::coded!(
+                        "err.icloud_not_here",
+                        "iCloud Drive is not available on this device. Open this silo on an iPhone, a Mac or a Windows PC with iCloud, or add another backup copy for this one."
+                    )
+                    .into());
+                }
+                Ok(StoreConfig::ICloud(silentsilo_store::ICloudConfig {
+                    folder: cloud_folder(&folder)?,
+                }))
+            }
             Self::S3 {
                 endpoint,
                 region,
@@ -434,6 +453,10 @@ pub enum StoreConfigView {
         account: String,
         folder: String,
     },
+    #[serde(rename = "icloud")]
+    ICloud {
+        folder: String,
+    },
 }
 
 impl From<&StoreConfig> for StoreConfigView {
@@ -475,6 +498,9 @@ impl From<&StoreConfig> for StoreConfigView {
             },
             StoreConfig::GoogleDrive(c) => Self::GoogleDrive {
                 account: c.account_label.clone(),
+                folder: c.folder.clone(),
+            },
+            StoreConfig::ICloud(c) => Self::ICloud {
                 folder: c.folder.clone(),
             },
         }
@@ -540,6 +566,7 @@ mod deserialisation_tests {
             }),
             serde_json::json!({ "kind": "dropbox", "signIn": null, "folder": "Silo" }),
             serde_json::json!({ "kind": "google-drive", "signIn": null, "folder": "Silo 2" }),
+            serde_json::json!({ "kind": "icloud", "folder": "Silo" }),
         ];
 
         for payload in payloads {
@@ -596,6 +623,26 @@ mod deserialisation_tests {
             panic!("an id the app never issued must not name an account");
         };
         assert!(err.contains("Sign in again"), "got: {err}");
+    }
+
+    #[test]
+    fn an_icloud_target_is_its_folder_on_every_device() {
+        let input = |folder: &str| -> StoreConfigInput {
+            serde_json::from_value(serde_json::json!({ "kind": "icloud", "folder": folder }))
+                .unwrap()
+        };
+        if silentsilo_store::icloud_supported() {
+            let one = input("Silo").into_config(None).unwrap();
+            let again = input(" Silo ").into_config(None).unwrap();
+            assert_eq!(one.target_id(), again.target_id());
+            assert!(input("a/b").into_config(None).is_err());
+        } else {
+            // Android and Linux: never a copy this device cannot reach.
+            let Err(err) = input("Silo").into_config(None) else {
+                panic!("no iCloud Drive here");
+            };
+            assert!(err.contains("err.icloud_not_here"), "got: {err}");
+        }
     }
 
     #[test]

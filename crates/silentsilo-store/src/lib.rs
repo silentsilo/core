@@ -17,11 +17,16 @@ use uuid::Uuid;
 const TARGET_NAMESPACE: Uuid = Uuid::from_u128(0x5115_e175_107a_4e70_0000_0000_0000_0001);
 
 mod folder;
+mod icloud;
 mod s3;
 mod sftp;
 mod webdav;
 
 pub use folder::FolderStore;
+pub use icloud::{
+    CONTAINER_FOLDER as ICLOUD_CONTAINER_FOLDER, ICloudConfig, ICloudLocator, ICloudStatus,
+    icloud_documents, icloud_status, icloud_supported, set_icloud_locator,
+};
 pub use sftp::{SftpAuth, SftpConfig, SftpStore, probe_host_key};
 /// Android only: set up certificate checks for S3 and WebDAV before any sync.
 #[cfg(target_os = "android")]
@@ -329,6 +334,10 @@ pub enum StoreConfig {
     OneDrive(CloudConfig),
     Dropbox(CloudConfig),
     GoogleDrive(CloudConfig),
+    /// Newer than core 1.9: SilentSilo's folder in iCloud Drive, on an
+    /// iPhone, a Mac or a Windows PC with iCloud.
+    #[serde(rename = "icloud")]
+    ICloud(ICloudConfig),
 }
 
 impl StoreConfig {
@@ -377,6 +386,9 @@ impl StoreConfig {
                     c.folder.trim_matches('/')
                 )
             }
+            // No account: the one iCloud signed in on each device, so the
+            // same folder is the same target on every one of them.
+            Self::ICloud(c) => format!("icloud|{}", c.folder.trim_matches('/')),
         };
         Uuid::new_v5(&TARGET_NAMESPACE, location.as_bytes())
     }
@@ -390,6 +402,7 @@ impl StoreConfig {
             Self::Folder { path } => Ok(Box::new(FolderStore::new(path.clone()))),
             Self::WebDav(config) => Ok(Box::new(WebDavStore::new(config.clone())?)),
             Self::Sftp(config) => Ok(Box::new(SftpStore::new(config.clone())?)),
+            Self::ICloud(config) => Ok(Box::new(icloud::open(config)?)),
             Self::OneDrive(_) | Self::Dropbox(_) | Self::GoogleDrive(_) => {
                 match CLOUD_OPENER.get() {
                     Some(open) => open(self),
@@ -425,6 +438,10 @@ mod cloud_config_tests {
         assert_eq!(kind(StoreConfig::OneDrive(cloud())), "onedrive");
         assert_eq!(kind(StoreConfig::Dropbox(cloud())), "dropbox");
         assert_eq!(kind(StoreConfig::GoogleDrive(cloud())), "google-drive");
+        let icloud = StoreConfig::ICloud(ICloudConfig {
+            folder: "Silo".into(),
+        });
+        assert_eq!(kind(icloud), "icloud");
     }
 
     #[test]
