@@ -183,6 +183,27 @@ fn read_pending_with_end(path: &Path) -> std::io::Result<(Records, u64)> {
     Ok((out, at as u64))
 }
 
+/// The standard library has no file lock on Android and answers every try
+/// with `Unsupported`, which left the log unwritable on Android phones. There
+/// it is `flock`, which is what the standard library uses on Linux.
+fn try_lock(file: &File) -> Result<(), fs::TryLockError> {
+    #[cfg(target_os = "android")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: a descriptor this file owns, open for the call.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(());
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() == std::io::ErrorKind::WouldBlock {
+            return Err(fs::TryLockError::WouldBlock);
+        }
+        Err(fs::TryLockError::Error(e))
+    }
+    #[cfg(not(target_os = "android"))]
+    file.try_lock()
+}
+
 /// Takes the spool's lock, waiting up to [`LOCK_WAIT`] for another holder.
 fn take_lock(dir: &Path) -> Result<File, SpoolError> {
     let file = OpenOptions::new()
@@ -192,7 +213,7 @@ fn take_lock(dir: &Path) -> Result<File, SpoolError> {
         .open(dir.join("lock"))?;
     let started = Instant::now();
     loop {
-        match file.try_lock() {
+        match try_lock(&file) {
             Ok(()) => return Ok(file),
             Err(fs::TryLockError::WouldBlock) if started.elapsed() < LOCK_WAIT => {
                 std::thread::sleep(Duration::from_millis(5));

@@ -13,6 +13,10 @@ release notes should say.
 
 ### Fixed
 
+- The activity log could not be written on Android: the standard library
+  has no file lock there and answered every try with `Unsupported`, so the
+  spool never opened and the switch to keep a log did nothing. Android
+  takes the lock with `flock`.
 - `encrypt_stream` writes beside the destination and renames when whole. An
   import stopped half way left a partial blob under its final name, counted
   as stored and never deleted. Opening a silo deletes `.part` files in its

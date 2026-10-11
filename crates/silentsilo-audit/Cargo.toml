@@ -17,5 +17,9 @@ zeroize = { workspace = true }
 hex = "0.4"
 silentsilo-crypto = { workspace = true }
 
+# The spool's file lock on Android, where the standard library has none.
+[target.'cfg(target_os = "android")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = { workspace = true }
