@@ -636,6 +636,12 @@ Read this before "fixing" any of it.
 - **`verify_chains` is never called.** Wiring it naively false-positives on
   every rebootstrapped device, whose new chain legitimately starts above
   zero from the fetcher's point of view. It waits for a checkpoint design.
+  What runs instead is `chain_holes`, after each pass, over the chains that
+  pass added to: it lets a chain start anywhere and reports only holes in
+  the middle, which compaction (it removes a prefix, since a device's
+  Lamport values only grow) and rebuilds never make. They go to the report
+  as `chain_holes` and to the warnings. A tail cut off, or the newest
+  snapshot deleted before a join, still needs the checkpoint.
 - **`derivation` on key envelopes decides more than it looks.** It shipped
   before anything varied, as groundwork for platform authenticators, and the
   macOS build is the first to use it: `ecdh-p256-hkdf-sha256-v1` alongside

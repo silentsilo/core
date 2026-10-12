@@ -356,6 +356,19 @@ a 1.0.0 device is not adopted by a 1.6.0 device, which keeps the older code it
 holds and says so. `crates/silentsilo-fixture/tests/byte_vectors.rs` runs
 1.0.0's own code over an envelope written today, both directions.
 
+From core 1.10.0 the envelope also carries `auth_dek`: the same message,
+keyed by BLAKE3 `derive_key` with the context `silentsilo recovery envelope
+auth v2` over the content KEK followed by the vault DEK. The KEK never
+rotates, so a former holder of it can still make `auth` after a rotation
+retired them; `auth_dek` also takes the current DEK. Once a device's own
+envelope carries a valid `auth_dek`, it adopts a newer stored envelope only
+if that one does too. A device fills in `auth_dek` on its own envelope when
+`auth` verifies, and a rotation remakes the envelope under the new key.
+Absent from the JSON when there is none, so a release before 1.10.0 reads
+the envelope as before and drops the field when it rewrites it; a code
+regenerated there is not adopted by an updated device, which keeps its own
+and says so, as for `auth` above.
+
 ## Who administers a key
 
 Beside `kind` and `derivation`, an enrolled key carries `policy`, in

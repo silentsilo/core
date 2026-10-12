@@ -2755,6 +2755,7 @@ pub struct RecoverySettlement {
 pub async fn settle_recovery_envelope(
     targets: &[(&dyn ObjectStore, bool)],
     kek: &ContentKek,
+    dek: &MasterDek,
     vault_root: &std::path::Path,
 ) -> RecoverySettlement {
     let mut settlement = RecoverySettlement::default();
@@ -2785,6 +2786,11 @@ pub async fn settle_recovery_envelope(
         // A silo whose local envelope carries no tag has not met core 1.6.0
         // yet, so an untagged one in storage is the ordinary case there.
         let require_tag = local.is_authentic(kek);
+        // From core 1.10.0 the tag a former holder of the KEK cannot make
+        // after a rotation. Asked of a newer envelope once this device's
+        // own carries it; one made by an older release then stays out, as
+        // an untagged one does above.
+        let require_current = local.is_authentic_now(kek, dek);
         let mut newest: Option<RecoveryEnvelope> = None;
         for (store, _) in targets {
             if let Ok(Some(found)) = newer_recovery_envelope(*store, local).await
@@ -2793,7 +2799,9 @@ pub async fn settle_recovery_envelope(
                     .is_none_or(|n| found.created_at > n.created_at)
                 && disabled_at.is_none_or(|off| found.created_at > off)
             {
-                if require_tag && !found.is_authentic(kek) {
+                if (require_tag && !found.is_authentic(kek))
+                    || (require_current && !found.is_authentic_now(kek, dek))
+                {
                     settlement.refused_unauthenticated = true;
                     continue;
                 }
@@ -2813,9 +2821,9 @@ pub async fn settle_recovery_envelope(
     // a missing tag is filled in; a tag that does not verify is left alone
     // and reported, because this device is not the one to bless it.
     if let Some(envelope) = recovery.as_mut()
-        && envelope.auth.is_none()
+        && (envelope.auth.is_none() || (envelope.auth_dek.is_none() && envelope.is_authentic(kek)))
     {
-        envelope.authenticate(kek);
+        envelope.authenticate(kek, dek);
         let _ = silentsilo_vault::save_recovery_envelope(vault_root, envelope);
     }
 

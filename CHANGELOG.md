@@ -48,6 +48,12 @@ release notes should say.
   cannot, instead of leaving the silo opening with the device secret alone.
 - `get_small` reads no further than its limit, whatever the size said.
 - A passkey's relying party cannot be a public suffix (`psl`).
+- The recovery envelope carries a second tag, `auth_dek`, keyed by the vault
+  key as well as the content KEK, and a device whose envelope has one adopts
+  only envelopes that do too. `RecoveryEnvelope::authenticate` and
+  `settle_recovery_envelope` take the DEK (FORMATS.md).
+- Each pass looks for holes in the middle of the device chains it added
+  to (`chain_holes`) and reports them in `SyncReport::chain_holes`.
 
 ### Added
 

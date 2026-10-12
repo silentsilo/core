@@ -63,6 +63,12 @@ pub struct SyncReport {
     /// record, so the screen has to name both.
     #[serde(default)]
     pub rotation_unproven: bool,
+    /// Records missing from the middle of a device's chain after this
+    /// pass, or one that does not follow the record before it. Compaction
+    /// and rebuilds only ever remove the start of a chain, so these are
+    /// records storage hid or lost.
+    #[serde(default)]
+    pub chain_holes: Vec<String>,
     /// Records dropped from the bucket by a compaction this pass ran, so the
     /// status line can say the log got shorter rather than leaving the user
     /// wondering what the extra work was.
@@ -976,7 +982,7 @@ pub async fn run_sync_pass(
         .iter()
         .map(|t| (&*t.store, t.role.allows_delete()))
         .collect();
-    let settled = sync::settle_recovery_envelope(&recovery_targets, &kek, &root).await;
+    let settled = sync::settle_recovery_envelope(&recovery_targets, &kek, &dek, &root).await;
     if settled.refused_unauthenticated {
         host.warn(
             "recovery",
@@ -1198,6 +1204,7 @@ pub async fn run_sync_pass(
             None,
         );
     }
+    let chain_holes: Vec<String>;
     let replayed = {
         let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
         let session = sessions.get(&silo.id).ok_or_else(|| {
@@ -1207,7 +1214,17 @@ pub async fn run_sync_pass(
             )
             .to_string()
         })?;
+        let devices: Vec<Uuid> = {
+            let mut seen: Vec<Uuid> = incoming.iter().map(|r| r.device_id).collect();
+            seen.sort();
+            seen.dedup();
+            seen
+        };
         let report = replay(&session.conn, incoming).map_err(|e| e.to_string())?;
+        // Only the chains this pass added to: a whole-log walk on every
+        // pass would cost more than the pass.
+        chain_holes =
+            silentsilo_vfs::chain_holes(&session.conn, &devices).map_err(|e| e.to_string())?;
         if view_complete {
             // The listing's numbers are only names, and one planted far
             // ahead would mark this device as having received changes it
@@ -1246,6 +1263,9 @@ pub async fn run_sync_pass(
         delivery.commit().map_err(|e| e.to_string())?;
         report
     };
+    for hole in &chain_holes {
+        host.warn("sync", hole);
+    }
 
     // `pushed` gates local pruning as well as re-sending, so it may only be
     // set once every configured target holds the record. Compaction dropping
@@ -1378,6 +1398,7 @@ pub async fn run_sync_pass(
         needs_rejoin: false,
         key_material_replaced: false,
         rotation_unproven: false,
+        chain_holes,
         compacted,
         targets: statuses,
         skipped: false,

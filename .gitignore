@@ -5,3 +5,6 @@ private/
 
 # Git history archives
 *.bundle
+
+# Local agent worktrees
+.claude/

@@ -587,7 +587,7 @@ async fn a_device_that_missed_a_new_recovery_code_does_not_put_the_old_one_back(
     old.created_at = 100;
     // The date is covered by the tag, so a test that moves it has to stamp
     // the envelope again or it is asking about a rejected one.
-    old.authenticate(&kek);
+    old.authenticate(&kek, &dek);
     silentsilo_vault::save_recovery_envelope(&a.silo.path, &old).unwrap();
     silentsilo_vault::save_recovery_envelope(&b.silo.path, &old).unwrap();
     a.pass().await;
@@ -595,7 +595,7 @@ async fn a_device_that_missed_a_new_recovery_code_does_not_put_the_old_one_back(
 
     let (_, mut new) = silentsilo_vault::create_recovery_envelope(&dek, &kek).unwrap();
     new.created_at = 200;
-    new.authenticate(&kek);
+    new.authenticate(&kek, &dek);
     silentsilo_vault::save_recovery_envelope(&a.silo.path, &new).unwrap();
     a.pass().await;
     b.pass().await;
@@ -628,7 +628,7 @@ async fn a_recovery_code_turned_off_stays_off_on_a_device_that_had_not_heard() {
 
     let (_, mut old) = silentsilo_vault::create_recovery_envelope(&dek, &kek).unwrap();
     old.created_at = 100;
-    old.authenticate(&kek);
+    old.authenticate(&kek, &dek);
     silentsilo_vault::save_recovery_envelope(&a.silo.path, &old).unwrap();
     silentsilo_vault::save_recovery_envelope(&b.silo.path, &old).unwrap();
     a.pass().await;
@@ -656,7 +656,7 @@ async fn a_recovery_code_turned_off_stays_off_on_a_device_that_had_not_heard() {
     // A code made after that is the silo's code again, everywhere.
     let (_, mut new) = silentsilo_vault::create_recovery_envelope(&dek, &kek).unwrap();
     new.created_at = 200;
-    new.authenticate(&kek);
+    new.authenticate(&kek, &dek);
     silentsilo_vault::save_recovery_envelope(&b.silo.path, &new).unwrap();
     b.pass().await;
     a.pass().await;

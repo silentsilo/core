@@ -5,7 +5,7 @@
 //! what they cannot do is produce a tag, because the content KEK never
 //! leaves a device.
 
-use silentsilo_crypto::{ContentKek, generate_content_kek, generate_dek};
+use silentsilo_crypto::{ContentKek, MasterDek, generate_content_kek, generate_dek};
 use silentsilo_store::{FolderStore, ObjectStore};
 use silentsilo_sync::{push_recovery_envelope, settle_recovery_envelope};
 use silentsilo_vault::{RecoveryEnvelope, load_recovery_envelope, save_recovery_envelope};
@@ -16,6 +16,7 @@ struct Silo {
     root: std::path::PathBuf,
     store: FolderStore,
     kek: ContentKek,
+    dek: MasterDek,
 }
 
 impl Silo {
@@ -29,21 +30,22 @@ impl Silo {
             root,
             store,
             kek: generate_content_kek(),
+            dek: generate_dek(),
         }
     }
 
     /// An envelope of this silo, dated as asked.
     fn envelope(&self, created_at: i64) -> RecoveryEnvelope {
         let (_, mut envelope) =
-            silentsilo_vault::create_recovery_envelope(&generate_dek(), &self.kek).unwrap();
+            silentsilo_vault::create_recovery_envelope(&self.dek, &self.kek).unwrap();
         envelope.created_at = created_at;
-        envelope.authenticate(&self.kek);
+        envelope.authenticate(&self.kek, &self.dek);
         envelope
     }
 
     async fn settle(&self) -> silentsilo_sync::RecoverySettlement {
         let targets: [(&dyn ObjectStore, bool); 1] = [(&self.store, true)];
-        settle_recovery_envelope(&targets, &self.kek, &self.root).await
+        settle_recovery_envelope(&targets, &self.kek, &self.dek, &self.root).await
     }
 }
 
@@ -153,4 +155,23 @@ async fn a_tag_that_does_not_verify_is_left_alone_rather_than_stamped() {
 
     assert_eq!(settled.envelope.unwrap().auth, mine.auth);
     assert_eq!(load_recovery_envelope(&silo.root).unwrap().auth, mine.auth);
+}
+
+#[tokio::test]
+async fn an_envelope_tagged_with_the_content_key_alone_is_not_adopted() {
+    // A former holder of the content key, after a rotation retired their
+    // vault key: they can still make the older tag, not the one that also
+    // takes the current vault key.
+    let silo = Silo::new();
+    save_recovery_envelope(&silo.root, &silo.envelope(100)).unwrap();
+    let retired = generate_dek();
+    let (_, mut forged) = silentsilo_vault::create_recovery_envelope(&retired, &silo.kek).unwrap();
+    forged.created_at = 200;
+    forged.authenticate(&silo.kek, &retired);
+    assert!(forged.is_authentic(&silo.kek));
+    push_recovery_envelope(&silo.store, &forged).await.unwrap();
+
+    let settled = silo.settle().await;
+    assert!(settled.refused_unauthenticated);
+    assert_eq!(load_recovery_envelope(&silo.root).unwrap().created_at, 100);
 }

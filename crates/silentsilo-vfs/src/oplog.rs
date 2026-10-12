@@ -3951,6 +3951,50 @@ pub fn chain_tip(conn: &Connection, device_id: Uuid) -> CoreResult<(u64, Option<
     Ok((last.seq + 1, Some(last.fingerprint()?)))
 }
 
+/// Holes inside the chains of `devices`, as this device's log holds them:
+/// a record missing between two it has, or one that does not follow the
+/// record before it. Unlike [`verify_chains`] a chain may start anywhere:
+/// compaction removes a prefix of each device's chain (its Lamport values
+/// only grow), and a rebuilt device starts above 0, so neither is a hole.
+/// What is left is something storage hid or lost.
+pub fn chain_holes(conn: &Connection, devices: &[Uuid]) -> CoreResult<Vec<String>> {
+    let mut holes = Vec::new();
+    let mut stmt = conn
+        .prepare(
+            "SELECT payload FROM oplog WHERE device_id = ?1
+              ORDER BY CAST(json_extract(payload, '$.seq') AS INTEGER)",
+        )
+        .map_err(db)?;
+    for device in devices {
+        let rows = stmt
+            .query_map([device.to_string()], |row| row.get::<_, String>(0))
+            .map_err(db)?;
+        let mut previous: Option<OpRecord> = None;
+        for row in rows {
+            let record = OpRecord::from_bytes(row.map_err(db)?.as_bytes())?;
+            if let Some(last) = &previous {
+                if record.seq > last.seq + 1 {
+                    holes.push(format!(
+                        "device {device}: {} records missing between {} and {}",
+                        record.seq - last.seq - 1,
+                        last.seq,
+                        record.seq
+                    ));
+                } else if record.seq == last.seq + 1
+                    && record.prev.as_deref() != Some(last.fingerprint()?.as_str())
+                {
+                    holes.push(format!(
+                        "device {device}: record {} does not follow record {}",
+                        record.seq, last.seq
+                    ));
+                }
+            }
+            previous = Some(record);
+        }
+    }
+    Ok(holes)
+}
+
 /// Where each device's chain is broken, if anywhere. A sequence gap means
 /// records once seen are gone; a fingerprint mismatch means a record was
 /// replaced. Neither comes from an honest sync pass. Reports rather than
@@ -4346,6 +4390,45 @@ pub(crate) mod tests {
     use crate::Vfs;
     use silentsilo_vault::VaultSession;
     use tempfile::TempDir;
+
+    #[test]
+    fn a_hole_in_the_middle_of_a_chain_is_found_and_its_start_is_not() {
+        let device = Device::new();
+        let conn = &device.session.conn;
+        let root = device.root();
+        let other = Uuid::new_v4();
+        let mut prev = None;
+        let mut chain = Vec::new();
+        // Starts at 5, as a chain compaction has cut does.
+        for seq in 5..10u64 {
+            let record = OpRecord::authored(
+                Uuid::new_v4(),
+                100 + seq,
+                other,
+                1_700_000_000,
+                seq,
+                prev.clone(),
+                VaultOp::CreateFolder {
+                    id: Uuid::new_v4(),
+                    parent_id: root,
+                    name: format!("f{seq}"),
+                },
+            );
+            prev = Some(record.fingerprint().unwrap());
+            chain.push(record);
+        }
+        let hidden = chain.remove(2);
+        replay(conn, chain).unwrap();
+        let holes = chain_holes(conn, &[other]).unwrap();
+        assert_eq!(holes.len(), 1, "{holes:?}");
+        assert!(
+            holes[0].contains("1 records missing between 6 and 8"),
+            "{holes:?}"
+        );
+
+        replay(conn, vec![hidden]).unwrap();
+        assert!(chain_holes(conn, &[other]).unwrap().is_empty());
+    }
 
     #[test]
     fn a_change_number_at_the_top_cannot_stop_the_clock() {

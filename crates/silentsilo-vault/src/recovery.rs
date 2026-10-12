@@ -18,6 +18,8 @@ const RECOVERY_FILE: &str = "keys/recovery.json";
 /// Separates the tag's key from every other use of the content KEK, so a
 /// value from one is never a value for another.
 const AUTH_CONTEXT: &str = "silentsilo recovery envelope auth v1";
+/// The context for [`RecoveryEnvelope::auth_dek`]'s key.
+const AUTH_DEK_CONTEXT: &str = "silentsilo recovery envelope auth v2";
 
 /// Shape of the stored envelope.
 ///
@@ -57,6 +59,13 @@ pub struct RecoveryEnvelope {
     /// byte for byte. See `FORMATS.md`, "The recovery envelope".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<String>,
+    /// The same tag keyed by the vault key as well (core 1.10.0). The KEK
+    /// never rotates, so anyone who once held it can still make `auth`
+    /// after a rotation retired them, and replace the envelope on every
+    /// device with one that opens nothing. The vault key does rotate. Absent
+    /// from the JSON when there is none, like `auth`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_dek: Option<String>,
 }
 
 impl RecoveryEnvelope {
@@ -87,11 +96,32 @@ impl RecoveryEnvelope {
         blake3::keyed_hash(&key, &self.auth_message())
     }
 
-    /// Stamps the tag. Called where the envelope is made, and on a local
+    fn tag_with_dek(&self, kek: &ContentKek, dek: &MasterDek) -> blake3::Hash {
+        let mut material = zeroize::Zeroizing::new([0u8; 64]);
+        material[..32].copy_from_slice(kek.as_bytes());
+        material[32..].copy_from_slice(dek.as_bytes());
+        let key = zeroize::Zeroizing::new(blake3::derive_key(AUTH_DEK_CONTEXT, material.as_ref()));
+        blake3::keyed_hash(&key, &self.auth_message())
+    }
+
+    /// Stamps both tags. Called where the envelope is made, and on a local
     /// envelope this device already trusts: a silo set up before core 1.6.0
     /// becomes authenticated without asking anyone to write a new code down.
-    pub fn authenticate(&mut self, kek: &ContentKek) {
+    pub fn authenticate(&mut self, kek: &ContentKek, dek: &MasterDek) {
         self.auth = Some(self.tag(kek).to_hex().to_string());
+        self.auth_dek = Some(self.tag_with_dek(kek, dek).to_hex().to_string());
+    }
+
+    /// Whether this envelope carries the tag only a holder of the current
+    /// vault key can make. False without one: core before 1.10.0 wrote none.
+    pub fn is_authentic_now(&self, kek: &ContentKek, dek: &MasterDek) -> bool {
+        let Some(stored) = self.auth_dek.as_deref() else {
+            return false;
+        };
+        let Ok(stored) = blake3::Hash::from_hex(stored) else {
+            return false;
+        };
+        self.tag_with_dek(kek, dek) == stored
     }
 
     /// Whether this envelope carries a tag a device on this silo made.
@@ -218,8 +248,9 @@ fn seal_under_code(
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0),
         auth: None,
+        auth_dek: None,
     };
-    envelope.authenticate(kek);
+    envelope.authenticate(kek, dek);
     Ok(envelope)
 }
 
@@ -487,6 +518,7 @@ mod tests {
         let dek = generate_dek();
         let (code, mut envelope) = create_recovery_envelope(&dek, &kek).unwrap();
         envelope.auth = None;
+        envelope.auth_dek = None;
 
         assert!(!envelope.is_authentic(&kek));
         assert_eq!(
@@ -495,8 +527,10 @@ mod tests {
             "an untagged envelope must still open"
         );
 
-        envelope.authenticate(&kek);
+        envelope.authenticate(&kek, &dek);
         assert!(envelope.is_authentic(&kek));
+        assert!(envelope.is_authentic_now(&kek, &dek));
+        assert!(!envelope.is_authentic_now(&kek, &generate_dek()));
     }
 
     #[test]
@@ -505,13 +539,15 @@ mod tests {
         // rather than null, so the bytes an older client compares against are
         // the bytes it would have produced itself.
         let kek = kek();
-        let (_, mut envelope) = create_recovery_envelope(&generate_dek(), &kek).unwrap();
+        let dek = generate_dek();
+        let (_, mut envelope) = create_recovery_envelope(&dek, &kek).unwrap();
         envelope.auth = None;
+        envelope.auth_dek = None;
 
         let json = serde_json::to_string(&envelope).unwrap();
         assert!(!json.contains("auth"), "got {json}");
 
-        envelope.authenticate(&kek);
+        envelope.authenticate(&kek, &dek);
         assert!(serde_json::to_string(&envelope).unwrap().contains("auth"));
     }
 
