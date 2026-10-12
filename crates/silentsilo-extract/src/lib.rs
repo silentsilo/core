@@ -304,6 +304,7 @@ pub async fn activity_log(
         segments,
         &[],
         &held,
+        &silentsilo_audit::SegmentKey::new(backup.kek.as_bytes()),
     )))
 }
 

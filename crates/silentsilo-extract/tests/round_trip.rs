@@ -393,7 +393,9 @@ async fn put_log(
         prev: [0; 32],
         closed_at: 1,
         records,
-    };
+        tag: None,
+    }
+    .tag_with(&silentsilo_audit::SegmentKey::new(session.kek.as_bytes()));
     store.put(&segment.key(), segment.to_bytes()).await.unwrap();
     device
 }
@@ -425,6 +427,38 @@ async fn a_personal_activity_log_comes_out_with_the_files() {
     let jsonl =
         std::fs::read_to_string(out_dir.path().join("_activity/activity-log.jsonl")).unwrap();
     assert_eq!(jsonl.lines().count(), 2);
+    assert!(read.devices[0].unproven_segments.is_empty(), "tagged");
+}
+
+#[tokio::test]
+async fn a_segment_storage_forged_is_left_out_and_named() {
+    let silo_dir = tempfile::tempdir().unwrap();
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = FolderStore::new(store_dir.path().to_path_buf());
+    let session = silo(silo_dir.path());
+    let code = publish(&session, &store as &dyn ObjectStore, &[]).await;
+    let device = put_log(&session, &store, silentsilo_audit::Scope::Silo).await;
+    // The segment again under its own name, one record changed, tagged with
+    // a key storage made up.
+    let key = silentsilo_audit::segment_key(device, 0);
+    let mut forged =
+        silentsilo_audit::Segment::from_bytes(&store.get(&key).await.unwrap()).unwrap();
+    forged.records.pop();
+    let forged = forged.tag_with(&silentsilo_audit::SegmentKey::new(&[1; 32]));
+    store.put(&key, forged.to_bytes()).await.unwrap();
+
+    let backup = silentsilo_extract::open(&store as &dyn ObjectStore, &code)
+        .await
+        .unwrap();
+    let silentsilo_extract::ActivityLog::Read(read) =
+        silentsilo_extract::activity_log(&backup, &store)
+            .await
+            .unwrap()
+    else {
+        panic!("a personal log is read");
+    };
+    assert!(read.entries.is_empty());
+    assert_eq!(read.devices[0].refused_segments, vec![0]);
 }
 
 #[tokio::test]

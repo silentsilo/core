@@ -33,6 +33,16 @@ over the network beyond reading the backup you named.
 
 const ORGANISATION_LOG: &str = "This silo keeps an activity log for its organisation. Only the organisation's security keys read it, in SilentSilo; this tool does not.";
 
+/// Says how many segments were left out as not written by the silo.
+fn say_refused(log: &silentsilo_audit::reading::LogRead) {
+    let refused: usize = log.devices.iter().map(|d| d.refused_segments.len()).sum();
+    if refused > 0 {
+        println!(
+            "{refused} activity log segments were not written by this silo's devices and are left out."
+        );
+    }
+}
+
 struct Args {
     command: String,
     from: Option<PathBuf>,
@@ -130,6 +140,7 @@ async fn run(args: Args, from: PathBuf, code: String) -> ExitCode {
         match silentsilo_extract::activity_log(&backup, &*store).await {
             Ok(silentsilo_extract::ActivityLog::Read(log)) => {
                 println!("Activity log: {} events", log.entries.len());
+                say_refused(&log);
             }
             Ok(silentsilo_extract::ActivityLog::Organisation) => println!("{ORGANISATION_LOG}"),
             Ok(silentsilo_extract::ActivityLog::None) => {}
@@ -156,10 +167,13 @@ async fn run(args: Args, from: PathBuf, code: String) -> ExitCode {
     .await;
 
     match silentsilo_extract::write_activity_log(&backup, &*store, &dest).await {
-        Ok(silentsilo_extract::ActivityLog::Read(log)) => println!(
-            "The activity log, {} events, is in _activity/ as CSV and JSON lines.",
-            log.entries.len()
-        ),
+        Ok(silentsilo_extract::ActivityLog::Read(log)) => {
+            println!(
+                "The activity log, {} events, is in _activity/ as CSV and JSON lines.",
+                log.entries.len()
+            );
+            say_refused(&log);
+        }
         Ok(silentsilo_extract::ActivityLog::Organisation) => println!("{ORGANISATION_LOG}"),
         Ok(silentsilo_extract::ActivityLog::None) => {}
         Err(e) => eprintln!("The activity log could not be read: {e}"),

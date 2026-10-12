@@ -2,16 +2,19 @@
 //! it, its retention changed, and its old segments removed.
 //!
 //! Each of these belongs to whoever holds one of the organisation's keys.
-//! The client asks for that key's touch first, checks it against the silo
-//! (`OrgProof`), and hands over what the touch gave. Core cannot tell a
-//! touch from a claim: anyone holding the content key can write a policy.
-//! What it can do is keep the log's private key out of reach of everyone
-//! else, which is what the wrapping does.
+//! The client asks for that key's touch first and hands over what the
+//! touch gave; starting the log and adding a reader check it again here
+//! against the silo's enrolled keys (`OrgProof`), so an organisation's log
+//! starts only on a silo an organisation administers. Core cannot tell a
+//! touch from a claim for the rest: anyone holding the content key can
+//! write a policy. What it can do is keep the log's private key out of
+//! reach of everyone else, which is what the wrapping does.
 
 use silentsilo_audit::{
-    AUDIT_PREFIX, AuditKey, AuditPolicy, Event, KeyPair, Scope, Segment, codes, parse_segment_key,
+    AUDIT_PREFIX, AuditKey, AuditPolicy, Event, KeyPair, Proof, Scope, Segment, SegmentKey, codes,
+    parse_segment_key,
 };
-use silentsilo_vault::SiloEntry;
+use silentsilo_vault::{OrgProof, SiloEntry, load_fido_keys};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -42,6 +45,8 @@ impl AppState {
         touch: &OrgKeyTouch,
         retention_days: Option<u32>,
     ) -> Result<(), String> {
+        check_retention(retention_days)?;
+        self.check_org_touch(id, touch)?;
         let mut spool = self.audit_spool(id)?;
         if spool.pinned().is_some_and(|p| p.scope == Scope::Org) {
             return Err(silentsilo_core::coded!(
@@ -57,7 +62,7 @@ impl AppState {
         key.wrap_for(&touch.credential_id, &keys.private, &touch.wrap_key)
             .map_err(|e| e.to_string())?;
         let previous = spool.policy().map_err(|e| e.to_string())?;
-        let changed_at = previous.map_or(now, |p| now.max(p.changed_at + 1));
+        let changed_at = previous.map_or(now, |p| p.next_changed_at(now));
         let policy = AuditPolicy::new(true, &keys.id(), retention_days, Scope::Org, changed_at);
 
         if spool.pinned().is_some_and(|p| p.enabled) {
@@ -83,6 +88,7 @@ impl AppState {
         by: &OrgKeyTouch,
         new: &OrgKeyTouch,
     ) -> Result<(), String> {
+        self.check_org_touch(id, new)?;
         let spool = self.audit_spool(id)?;
         let mut key = org_key(&spool)?;
         let private = key
@@ -100,12 +106,13 @@ impl AppState {
     }
 
     /// Changes how long the organisation's log keeps its segments. `None`
-    /// keeps them.
+    /// keeps them; fewer than [`MIN_RETENTION_DAYS`] is refused.
     pub fn set_org_audit_retention(
         &self,
         id: Uuid,
         retention_days: Option<u32>,
     ) -> Result<(), String> {
+        check_retention(retention_days)?;
         let mut spool = self.audit_spool(id)?;
         org_key(&spool)?;
         let event = Event::new(codes::RETENTION_CHANGED, now_ms());
@@ -121,6 +128,46 @@ impl AppState {
         if let Ok(mut org) = self.audit_org.lock() {
             org.insert(id);
         }
+    }
+
+    /// That `touch` came from one of the open silo's organisation keys: its
+    /// wrap key opens that key's envelope.
+    fn check_org_touch(&self, id: Uuid, touch: &OrgKeyTouch) -> Result<(), String> {
+        let root = self
+            .sessions
+            .lock()
+            .map_err(|e| e.to_string())?
+            .get(&id)
+            .ok_or(silentsilo_core::coded!(
+                "err.silo_not_open",
+                "That silo is not open."
+            ))?
+            .paths
+            .root
+            .clone();
+        let not_org = || {
+            silentsilo_core::coded!(
+                "err.not_org_key",
+                "That is not one of this silo's organisation keys."
+            )
+            .to_string()
+        };
+        let keys = load_fido_keys(&root).map_err(|_| not_org())?;
+        let credential = hex::decode(&touch.credential_id).map_err(|_| not_org())?;
+        OrgProof::verify(&keys, &credential, &touch.wrap_key).map_err(|_| not_org())?;
+        Ok(())
+    }
+}
+
+/// Refuses a retention shorter than [`MIN_RETENTION_DAYS`].
+fn check_retention(retention_days: Option<u32>) -> Result<(), String> {
+    match retention_days {
+        Some(days) if days < MIN_RETENTION_DAYS => Err(silentsilo_core::coded!(
+            "err.audit_retention_short",
+            "An organisation's activity log is kept at least 90 days."
+        )
+        .into()),
+        _ => Ok(()),
     }
 }
 
@@ -160,7 +207,8 @@ fn republish(
             "This silo keeps no activity log."
         ))?;
     let now = now_ms() / 1000;
-    policy.changed_at = now.max(policy.changed_at + 1);
+    policy.changed_at = policy.next_changed_at(now);
+    policy.auth = None;
     if let Some(retention) = retention {
         policy.retention_days = retention;
     }
@@ -170,7 +218,8 @@ fn republish(
         .map_err(|e| e.to_string())
 }
 
-/// The shortest retention the app offers. Expiry never goes below it.
+/// The shortest retention an organisation may set. Expiry never goes below
+/// it, whatever a policy says.
 pub const MIN_RETENTION_DAYS: u32 = 90;
 
 /// Removes the organisation log's segments closed before its retention
@@ -183,18 +232,17 @@ pub async fn expire_audit_segments(
 ) -> Result<usize, String> {
     // The sessions lock first and on its own: opening a silo holds it while
     // it closes another, which opens that one's spool.
-    let root = state
-        .sessions
-        .lock()
-        .map_err(|e| e.to_string())?
-        .get(&silo.id)
-        .ok_or(silentsilo_core::coded!(
+    let (root, tags) = {
+        let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
+        let session = sessions.get(&silo.id).ok_or(silentsilo_core::coded!(
             "err.silo_not_open",
             "That silo is not open."
-        ))?
-        .paths
-        .root
-        .clone();
+        ))?;
+        (
+            session.paths.root.clone(),
+            SegmentKey::new(session.kek.as_bytes()),
+        )
+    };
     let retention = {
         let spool = state.audit_spool(silo.id)?;
         org_key(&spool)?;
@@ -241,11 +289,16 @@ pub async fn expire_audit_segments(
                 },
             };
             // One that names another place is not this segment, and its
-            // age says nothing about the one that belongs here.
+            // age says nothing about the one that belongs here. Nor does a
+            // forged one's: it is left for the reader to name.
             let Ok(segment) = Segment::from_bytes(&bytes) else {
                 continue;
             };
-            if segment.device != device || segment.seq != seq || segment.closed_at >= cutoff {
+            if segment.device != device
+                || segment.seq != seq
+                || segment.closed_at >= cutoff
+                || segment.proof(&tags) == Proof::Forged
+            {
                 continue;
             }
             if store.delete(&object.key).await.is_ok() {

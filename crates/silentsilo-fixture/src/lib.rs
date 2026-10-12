@@ -207,7 +207,8 @@ async fn write_activity_log(store: &dyn ObjectStore, session: &VaultSession) -> 
     let mut key = AuditKey::new(&keys, Scope::Silo, 1_789_000_000);
     key.wrap_for(BY_SILO, &keys.private, session.kek.as_bytes())
         .map_err(err)?;
-    let policy = AuditPolicy::new(true, &keys.id(), None, Scope::Silo, 1_789_000_000);
+    let policy = AuditPolicy::new(true, &keys.id(), None, Scope::Silo, 1_789_000_000)
+        .tagged(&silentsilo_audit::PolicyKey::new(session.dek.as_bytes()));
     silentsilo_sync::audit_log::write_audit_key(store, &key)
         .await
         .map_err(sync)?;
@@ -244,7 +245,9 @@ async fn write_activity_log(store: &dyn ObjectStore, session: &VaultSession) -> 
             prev,
             closed_at: 1_789_000_000_000 + i as i64 * 1000,
             records,
-        };
+            tag: None,
+        }
+        .tag_with(&silentsilo_audit::SegmentKey::new(session.kek.as_bytes()));
         prev = segment.hash();
         store
             .put(&segment.key(), segment.to_bytes())
@@ -285,7 +288,12 @@ async fn activity_lines(
         let bytes = store.get(&object.key).await.map_err(|e| e.to_string())?;
         segments.push(silentsilo_audit::Segment::from_bytes(&bytes).map_err(|e| e.to_string())?);
     }
-    let read = silentsilo_audit::reading::read_log(segments, &[], &held);
+    let read = silentsilo_audit::reading::read_log(
+        segments,
+        &[],
+        &held,
+        &silentsilo_audit::SegmentKey::new(kek.as_bytes()),
+    );
 
     let mut lines = vec![format!(
         "activity policy enabled={} scope={} retention={:?} keys={}",
@@ -316,6 +324,13 @@ async fn activity_lines(
             trail.missing_segments,
             trail.broken_segments
         ));
+        // Only when there are any: the fixtures before tags have none.
+        if !trail.refused_segments.is_empty() {
+            lines.push(format!(
+                "activity refused {} segments={:?}",
+                trail.device, trail.refused_segments
+            ));
+        }
     }
     lines.push(format!("activity unreadable={}", read.unreadable));
     lines.sort();

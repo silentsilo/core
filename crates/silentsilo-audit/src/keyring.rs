@@ -175,10 +175,37 @@ pub struct AuditPolicy {
     /// Segments older than this many days may go; `None` keeps them.
     pub retention_days: Option<u32>,
     pub scope: Scope,
+    /// Seconds. A policy more than [`MAX_POLICY_AHEAD_SECS`] past a
+    /// device's clock is not taken in.
     pub changed_at: i64,
+    /// A tag over the fields above under a key derived from the vault DEK
+    /// ([`PolicyKey`]), hex. From core 1.10; absent before. A release
+    /// before it reads the policy and ignores the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<String>,
 }
 
 pub const POLICY_PATH: &str = "audit/policy.sealed";
+
+/// How far past a device's clock a policy may say it changed, in seconds.
+/// The newest policy wins, so one dated far ahead would win over every
+/// later choice.
+pub const MAX_POLICY_AHEAD_SECS: i64 = 86_400;
+
+/// The key a policy's `auth` is under, derived from the vault DEK. The DEK
+/// changes when a key is removed and the silo key rotated, so whoever held
+/// the silo before that, and still has the content key, cannot write a
+/// policy this tag checks.
+pub struct PolicyKey(Zeroizing<[u8; 32]>);
+
+impl PolicyKey {
+    pub fn new(dek: &[u8; 32]) -> Self {
+        Self(Zeroizing::new(blake3::derive_key(
+            "silentsilo audit policy auth v1",
+            dek,
+        )))
+    }
+}
 
 impl AuditPolicy {
     pub fn new(
@@ -195,7 +222,63 @@ impl AuditPolicy {
             retention_days,
             scope,
             changed_at,
+            auth: None,
         }
+    }
+
+    /// The fields a check covers, in a fixed order, `auth` left out.
+    pub(crate) fn canonical(&self, context: &[u8]) -> Vec<u8> {
+        let mut out = context.to_vec();
+        out.extend_from_slice(&self.version.to_be_bytes());
+        out.push(u8::from(self.enabled));
+        out.extend_from_slice(&(self.key_id.len() as u32).to_be_bytes());
+        out.extend_from_slice(self.key_id.as_bytes());
+        match self.retention_days {
+            Some(days) => {
+                out.push(1);
+                out.extend_from_slice(&days.to_be_bytes());
+            }
+            None => out.push(0),
+        }
+        out.push(match self.scope {
+            Scope::Org => 1,
+            Scope::Silo => 2,
+        });
+        out.extend_from_slice(&self.changed_at.to_be_bytes());
+        out
+    }
+
+    fn tag(&self, key: &PolicyKey) -> String {
+        let body = self.canonical(b"silentsilo audit policy\0");
+        hex::encode(blake3::keyed_hash(&key.0, &body).as_bytes())
+    }
+
+    /// This policy with its `auth` under `key`, as this build writes it to
+    /// storage.
+    pub fn tagged(&self, key: &PolicyKey) -> Self {
+        Self {
+            auth: Some(self.tag(key)),
+            ..self.clone()
+        }
+    }
+
+    /// Whether `auth` checks under `key`: a holder of the current DEK wrote
+    /// it.
+    pub fn is_authentic(&self, key: &PolicyKey) -> bool {
+        self.auth
+            .as_deref()
+            .is_some_and(|auth| crate::same_text(auth, &self.tag(key)))
+    }
+
+    /// Whether `changed_at` is believable at `now`, in seconds.
+    pub fn is_believable_at(&self, now: i64) -> bool {
+        self.changed_at <= now.saturating_add(MAX_POLICY_AHEAD_SECS)
+    }
+
+    /// The `changed_at` of a policy that replaces this one at `now`: after
+    /// it, even on a clock that is behind.
+    pub fn next_changed_at(&self, now: i64) -> i64 {
+        now.max(self.changed_at.saturating_add(1))
     }
 
     pub fn seal(&self, content_key: &[u8; 32]) -> Result<Vec<u8>, AuditError> {
@@ -293,6 +376,41 @@ mod tests {
         key.wrap_for(BY_SILO, &keys.private, &[9; 32]).unwrap();
         let wrapped = hex::decode(&key.wrapped[0].sealed).unwrap();
         assert!(AuditPolicy::open(&wrapped, &[9; 32]).is_err());
+    }
+
+    #[test]
+    fn a_policy_s_tag_checks_under_its_dek_only_and_covers_every_field() {
+        let (key, other) = (PolicyKey::new(&[1; 32]), PolicyKey::new(&[2; 32]));
+        let policy = AuditPolicy::new(true, &[3; 8], Some(365), Scope::Org, 7);
+        assert!(!policy.is_authentic(&key), "untagged");
+        let tagged = policy.tagged(&key);
+        assert!(tagged.is_authentic(&key));
+        assert!(!tagged.is_authentic(&other), "a DEK before a rotation");
+        let back = AuditPolicy::open(&tagged.seal(&[9; 32]).unwrap(), &[9; 32]).unwrap();
+        assert!(back.is_authentic(&key), "survives the seal");
+        let changes: [fn(&mut AuditPolicy); 5] = [
+            |p| p.enabled = false,
+            |p| p.key_id = hex::encode([4u8; 8]),
+            |p| p.retention_days = None,
+            |p| p.scope = Scope::Silo,
+            |p| p.changed_at += 1,
+        ];
+        for change in changes {
+            let mut moved = tagged.clone();
+            change(&mut moved);
+            assert!(!moved.is_authentic(&key), "{moved:?}");
+        }
+    }
+
+    #[test]
+    fn a_policy_dated_far_ahead_is_not_believed_and_never_overflows() {
+        let now = 1_789_000_000;
+        let soon = AuditPolicy::new(true, &[3; 8], None, Scope::Silo, now + 3_600);
+        assert!(soon.is_believable_at(now));
+        let far = AuditPolicy::new(true, &[3; 8], None, Scope::Silo, i64::MAX);
+        assert!(!far.is_believable_at(now));
+        assert_eq!(far.next_changed_at(now), i64::MAX);
+        assert_eq!(soon.next_changed_at(now), now + 3_601);
     }
 
     #[test]

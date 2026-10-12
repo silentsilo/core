@@ -4,6 +4,9 @@
 //! A segment never changes once written, so one fetched is kept beside the
 //! silo (`audit-cache/<device>/<seq>.seg`, the storage layout) and not
 //! fetched again. It is sealed: the cache holds nothing a copy does not.
+//! One that does not read, names another place, or carries a tag that
+//! does not check is not kept, and is removed from the cache if it is
+//! there, so the copies are asked for it again.
 
 use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
@@ -14,7 +17,8 @@ use std::time::Duration;
 
 pub use silentsilo_audit::reading::{DeviceTrail, LogEntry, LogRead};
 use silentsilo_audit::{
-    AUDIT_PREFIX, BY_SILO, KeyId, MAX_SEGMENT_BYTES, Segment, key_id, parse_segment_key,
+    AUDIT_PREFIX, BY_SILO, KeyId, MAX_SEGMENT_BYTES, Proof, Segment, SegmentKey, key_id,
+    parse_segment_key,
 };
 use silentsilo_vault::SiloEntry;
 use uuid::Uuid;
@@ -44,6 +48,8 @@ pub const COPY_READ_LIMIT: Duration = Duration::from_secs(30);
 /// What a read starts from: this computer's part of the log and the keys.
 struct Local {
     kek: silentsilo_crypto::ContentKek,
+    /// Checks who wrote each segment.
+    tags: SegmentKey,
     cache: PathBuf,
     keys: Vec<(KeyId, Zeroizing<Vec<u8>>)>,
     segments: BTreeMap<(Uuid, u64), Segment>,
@@ -87,7 +93,7 @@ pub async fn read_audit_log_within(
     let reads: Vec<_> = host
         .targets(silo.id)
         .into_iter()
-        .map(|target| read_copy(target, &held, &local.cache, silo_keys, limit))
+        .map(|target| read_copy(target, &held, &local.cache, &local.tags, silo_keys, limit))
         .collect();
     let copies = join_all(reads).await;
 
@@ -162,8 +168,9 @@ fn gather_local(state: &AppState, silo: &SiloEntry, reader: &Reader) -> Result<L
     })?;
 
     let cache = root.join(CACHE_DIR);
+    let tags = SegmentKey::new(kek.as_bytes());
     let mut segments: BTreeMap<(Uuid, u64), Segment> = BTreeMap::new();
-    for segment in read_cache(&cache) {
+    for segment in read_cache(&cache, &tags) {
         segments.insert((segment.device, segment.seq), segment);
     }
     for segment in outbox {
@@ -175,6 +182,7 @@ fn gather_local(state: &AppState, silo: &SiloEntry, reader: &Reader) -> Result<L
         .collect();
     Ok(Local {
         kek,
+        tags,
         cache,
         // A personal log may have had an earlier key, from a device that
         // started it before it heard of this one: its records open with
@@ -199,6 +207,7 @@ async fn read_copy(
     target: silentsilo_vault::BackupTarget,
     held: &HashSet<(Uuid, u64)>,
     cache: &Path,
+    tags: &SegmentKey,
     silo_keys: Option<&silentsilo_crypto::ContentKek>,
     limit: Duration,
 ) -> CopyRead {
@@ -249,12 +258,15 @@ async fn read_copy(
                 continue;
             };
             // One that does not parse, or names another place, is left out:
-            // the chain check then reports it missing.
+            // the chain check then reports it missing. A forged one is read
+            // only to be named, and never kept.
             if let Ok(segment) = Segment::from_bytes(&bytes)
                 && segment.device == device
                 && segment.seq == seq
             {
-                keep(cache, &object.key, &bytes);
+                if segment.proof(tags) != Proof::Forged {
+                    keep(cache, &object.key, &bytes);
+                }
                 segments.push(segment);
             }
         }
@@ -288,6 +300,7 @@ fn finish(
         local.segments.into_values(),
         &local.pending,
         &held,
+        &local.tags,
         &mut opened,
     );
     read.copies_unread = copies_unread;
@@ -325,8 +338,9 @@ async fn join_all<F: Future>(futures: Vec<F>) -> Vec<F::Output> {
     slots.into_iter().filter_map(|(_, out)| out).collect()
 }
 
-/// Segments fetched before. One that will not read is fetched again.
-fn read_cache(cache: &Path) -> Vec<Segment> {
+/// Segments fetched before. One that will not read, names another place
+/// or carries a forged tag is removed, and fetched again.
+fn read_cache(cache: &Path, tags: &SegmentKey) -> Vec<Segment> {
     let mut out = Vec::new();
     let Ok(devices) = std::fs::read_dir(cache) else {
         return out;
@@ -344,12 +358,20 @@ fn read_cache(cache: &Path) -> Vec<Segment> {
             let Some((id, seq)) = parse_segment_key(&name) else {
                 continue;
             };
-            if let Ok(bytes) = std::fs::read(file.path())
-                && let Ok(segment) = Segment::from_bytes(&bytes)
-                && segment.device == id
-                && segment.seq == seq
-            {
-                out.push(segment);
+            let Ok(bytes) = std::fs::read(file.path()) else {
+                continue;
+            };
+            match Segment::from_bytes(&bytes) {
+                Ok(segment)
+                    if segment.device == id
+                        && segment.seq == seq
+                        && segment.proof(tags) != Proof::Forged =>
+                {
+                    out.push(segment)
+                }
+                _ => {
+                    let _ = std::fs::remove_file(file.path());
+                }
             }
         }
     }

@@ -305,7 +305,7 @@ impl AppState {
             ))?;
         let previous = spool.policy().map_err(|e| e.to_string())?;
         // After the policy it replaces, even on a clock that is behind.
-        let changed_at = previous.as_ref().map_or(now, |p| now.max(p.changed_at + 1));
+        let changed_at = previous.as_ref().map_or(now, |p| p.next_changed_at(now));
         let retention = previous.and_then(|p| p.retention_days);
 
         let at = |code| Event::new(code, now_ms);
@@ -363,7 +363,7 @@ impl AppState {
     /// organisation's. Opened outside the sessions lock: it may wait for
     /// the sync pass.
     pub(crate) fn audit_spool(&self, id: Uuid) -> Result<silentsilo_audit::Spool, String> {
-        let (root, device) = {
+        let (root, device, kek, unchecked) = {
             let sessions = self.sessions.lock().map_err(|e| e.to_string())?;
             let session = sessions.get(&id).ok_or(silentsilo_core::coded!(
                 "err.silo_not_open",
@@ -372,9 +372,20 @@ impl AppState {
             (
                 session.paths.root.clone(),
                 silentsilo_vfs::device_id(&session.conn).map_err(|e| e.to_string())?,
+                session.kek.clone(),
+                queue_unchecked(session),
             )
         };
-        let spool = silentsilo_audit::Spool::open(&root, device).map_err(|e| e.to_string())?;
+        let spool = silentsilo_audit::Spool::open(&root, device, kek.as_bytes(), unchecked)
+            .map_err(|e| e.to_string())?;
+        // Without waiting: a close holds the sessions lock while it opens
+        // this spool. Missed now, it is noted at the next open.
+        if unchecked == silentsilo_audit::Unchecked::Adopt
+            && let Ok(sessions) = self.sessions.try_lock()
+            && let Some(session) = sessions.get(&id)
+        {
+            queue_checked(session);
+        }
         if spool
             .pinned()
             .is_some_and(|p| p.scope == silentsilo_audit::Scope::Org)
@@ -559,15 +570,46 @@ pub fn record_lock(session: &VaultSession) -> Result<(), String> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    silentsilo_audit::Spool::open(&session.paths.root, device)
-        .and_then(|mut spool| {
-            spool.record(silentsilo_audit::Event::new(
-                silentsilo_audit::codes::LOCKED,
-                now_ms,
-            ))?;
-            spool.close(now_ms).map(|_| ())
-        })
-        .map_err(|e| e.to_string())
+    let unchecked = queue_unchecked(session);
+    let recorded = silentsilo_audit::Spool::open(
+        &session.paths.root,
+        device,
+        session.kek.as_bytes(),
+        unchecked,
+    )
+    .and_then(|mut spool| {
+        spool.record(silentsilo_audit::Event::new(
+            silentsilo_audit::codes::LOCKED,
+            now_ms,
+        ))?;
+        spool.close(now_ms).map(|_| ())
+    })
+    .map_err(|e| e.to_string());
+    if recorded.is_ok() && unchecked == silentsilo_audit::Unchecked::Adopt {
+        queue_checked(session);
+    }
+    recorded
+}
+
+/// Set in the silo's index once this build has opened its activity queue.
+/// The index is under the DEK, out of reach of whoever can write to the
+/// silo folder, so a pin there without a check is not mistaken for one a
+/// release before the check left.
+const QUEUE_CHECKED: &str = "audit_queue_checked";
+
+/// What the queue does with a pin that has no check: taken in until this
+/// build has opened the queue once, refused after.
+pub(crate) fn queue_unchecked(session: &VaultSession) -> silentsilo_audit::Unchecked {
+    match Vfs::new(session).get_meta(QUEUE_CHECKED) {
+        Ok(Some(_)) => silentsilo_audit::Unchecked::Refuse,
+        // An index that cannot say is read as one that has not been told.
+        _ => silentsilo_audit::Unchecked::Adopt,
+    }
+}
+
+/// Notes that the queue has been opened by a build that checks it.
+pub(crate) fn queue_checked(session: &VaultSession) {
+    let _ = Vfs::new(session).set_meta(QUEUE_CHECKED, "1");
 }
 
 /// Where a file goes when the user opens it rather than exporting it.

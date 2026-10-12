@@ -11,6 +11,46 @@ release notes should say.
 
 ## [Unreleased]
 
+### Security
+
+- Activity log segments are tagged. Records are sealed with HPKE base mode
+  to a public key storage holds in clear, so anyone who could write to
+  storage could add records under any device's name or replace a device's
+  segments. A segment is now version 2, ending with a keyed BLAKE3 tag
+  under a key derived from the content KEK. Readers refuse by name a
+  segment whose tag does not check, and an untagged one after a device's
+  first tagged one; untagged segments from 1.9 still read, named unproven
+  unless a tagged one vouches for them through the chain
+  (`DeviceTrail::unproven_segments`, `refused_segments`). 1.9.0 refuses a
+  version 2 segment as newer, keeps it and reports it missing.
+- The activity log's policy carries `auth`, a tag under a key derived from
+  the DEK, which rotates. A device that holds a tagged policy follows no
+  untagged one, and writes its own back over it. A policy dated more than
+  a day ahead is not taken in, nor an organisation's on a silo no
+  organisation administers or naming none of its keys. 1.9 reads the
+  policy and ignores the field.
+- The activity queue in the silo folder carries checks under a key derived
+  from the content KEK: whoever can write to the folder could pin a key of
+  their own and read every event after. A pin without its check is made
+  again from the checked policy, or dropped until the next pass. The first
+  open by this build takes in a queue as 1.9 left it, noted in the index.
+- Starting an organisation's log and adding a reader check each touch
+  against the silo's organisation keys (`OrgProof`), with the error
+  `err.not_org_key`. A retention under 90 days is refused when set
+  (`err.audit_retention_short`) rather than only when segments expire.
+- A huge gap in segment numbers no longer exhausts a reader's memory: at
+  most 10,000 missing numbers are named, the rest counted
+  (`missing_segments_not_named`). A cached segment that does not read or
+  whose tag does not check is removed and fetched again.
+- API: `Spool::open` takes the content key and `Unchecked`;
+  `reading::read_log` and `read_log_with` take a `SegmentKey`; `Segment`
+  has a `tag` field; `Pinned` has `proven`; `DeviceTrail` has
+  `missing_segments_not_named`, `unproven_segments` and
+  `refused_segments`; `ChainReport` has `missing_not_named`;
+  `AuditPolicy` has `auth`. New: `Spool::apply_stored_policy`,
+  `SegmentKey`, `Proof`, `PolicyKey`, `AuditPolicy::tagged`,
+  `is_authentic`, `is_believable_at`, `next_changed_at`.
+
 ### Added
 
 - iCloud Drive as backup storage, the kind `icloud` with `{folder}`: the

@@ -30,9 +30,9 @@ Anything else needs a version discriminator first.
 | Inbox sender | `inbox/senders/….sealed` | `INBOX_VERSION = 1`, sealed under the content KEK | As above |
 | Revocation marker | `keys/revoked/….sealed` | `version: 1` inside a sealed payload under the content KEK, `silentsilo-sync/key_sync.rs` | 1.0.0 lists it with the key envelopes and skips it as unreadable |
 | Inbox item | `inbox/items/….sslo` and `….env` | The blob as in `blobs/`; the envelope carries `INBOX_VERSION = 1` | 1.0.0 never lists `inbox/`. A build with the inbox leaves an item of another version where it is and says to update |
-| Activity log segment | `audit/<device>/<seq>.seg` | `SEGMENT_VERSION = 1` in its header; each record inside carries `RECORD_VERSION = 1` and its HPKE suite, `silentsilo-audit` | No release before core 1.9.0 lists `audit/`. A build with the log names a newer segment, record or suite rather than misreading it |
+| Activity log segment | `audit/<device>/<seq>.seg` | `SEGMENT_VERSION = 2` in its header from core 1.10 (tagged), 1 before (untagged, still read); each record inside carries `RECORD_VERSION = 1` and its HPKE suite, `silentsilo-audit` | No release before core 1.9.0 lists `audit/`. A build with the log names a newer segment, record or suite rather than misreading it: 1.9.0 refuses a version 2 segment by name, leaves it in storage and reports its number missing (`silentsilo-fixture/tests/audit_tags_on_1_9_0.rs`) |
 | Activity log key | `audit/keys/<key id>.json` | `version: 1`, `silentsilo-audit/keyring.rs` | As above; a newer version is refused by name |
-| Activity log policy | `audit/policy.sealed` | `version: 1` inside a sealed payload under the content KEK | As above |
+| Activity log policy | `audit/policy.sealed` | `version: 1` inside a sealed payload under the content KEK, with an optional `auth` from core 1.10 | As above. A release before 1.10 reads the policy and ignores `auth` |
 
 ## Reading a backup from scratch
 
@@ -117,8 +117,8 @@ in this list; that lives on the machine instead, in the table after this one.
 | Index, mid-rotation | `vault.db.enc.next` | Same envelope as `vault.db.enc` | Transient; unlock adopts it, see below |
 | Keys, mid-rotation | `keys/fido.json.next`, `keys/recovery.json.next` | Same as the files they replace | Transient, from core 1.7.0; see below |
 | Base snapshot | `vault_base` table in `vault.db` | `SNAPSHOT_VERSION = 1`, `silentsilo-vfs/snapshot.rs` | Refuses, naming the version |
-| Activity queue | `audit-queue/pending`, `state.json`, `outbox/*.seg`, `key.json`, `policy.json` | **No file version.** `pending` is framed records; `state.json` plain JSON whose added fields read as their defaults; the rest are the storage formats | From core 1.9.0. Not synced. A release before it never opens the folder. See "The activity log" |
-| Segments read before | `audit-cache/<device>/<seq>.seg` | The segment format | From core 1.9.0. A cache: one that does not read is fetched again |
+| Activity queue | `audit-queue/pending`, `state.json`, `outbox/*.seg`, `key.json`, `policy.json` | **No file version.** `pending` is framed records; `state.json` plain JSON whose added fields read as their defaults (`pin_check` and `pinned.proven` from core 1.10); `policy.json` the policy with a `check` beside its fields from 1.10; the rest are the storage formats | From core 1.9.0. Not synced. A release before it never opens the folder. 1.9.0 ignores the checks and drops `pin_check` when it saves. See "The activity log" |
+| Segments read before | `audit-cache/<device>/<seq>.seg` | The segment format | From core 1.9.0. A cache: one that does not read, names another place or carries a forged tag is removed and fetched again |
 
 ## On this machine only
 
@@ -607,14 +607,45 @@ never needs to read one back. A suite this build does not know is refused
 by name, which is what lets a later build move to a post-quantum KEM for
 logs kept for years.
 
-**A segment** is a batch of one device's records: `SSAS`, `SEGMENT_VERSION`
-(1), the device id, `seq` (from 0 per device), `prev` (the BLAKE3 of the
+**A segment** is a batch of one device's records: `SSAS`, `SEGMENT_VERSION`,
+the device id, `seq` (from 0 per device), `prev` (the BLAKE3 of the
 previous segment's bytes, zeros for the first), the time it was closed, and
-the records, each length-prefixed. Its storage key is
+the records, each length-prefixed. From core 1.10 the version is 2 and a
+32-byte tag follows the records: keyed BLAKE3 of every byte before it,
+under `derive_key("silentsilo audit segment v2", content KEK)`. Version 1,
+written by 1.9, is the same without the tag. Its storage key is
 `audit/<device>/<seq, 12 digits>.seg`. A reader checks the run per device:
-a missing number or a `prev` that does not match is named. Segments are
-written once and never rewritten; a seed copies one only where the
+a missing number or a `prev` that does not match is named. At most 10,000
+missing numbers are named one by one; a wider gap is counted, so a number
+written by storage cannot decide how much memory a reader takes. Segments
+are written once and never rewritten; a seed copies one only where the
 destination has none. Nothing larger than 8 MiB is read.
+
+**Who wrote a segment.** HPKE base mode does not say who sealed a record,
+and the public key is in clear in storage, so before the tag anyone who
+could write to storage could add records under any device's name, or
+replace a device's segments with a chain of their own. The tag is under a
+key every device of the silo and every reader holds, and storage does not.
+The content KEK and not the DEK: a segment is never rewritten and has to
+check for years, across key changes. A reader:
+
+- refuses a version 2 segment whose tag does not check, and names it
+  (`refused_segments`), not missing;
+- refuses a version 1 segment numbered after the device's first version 2
+  one: a device that tags never writes an untagged one again. A device put
+  back on a release before 1.10 after this one is the exception, and what it
+  writes then is refused by name too;
+- reads every other version 1 segment, and names those no tagged segment
+  vouches for (`unproven_segments`). A tagged segment names the hash of the
+  one before it, so an unbroken run down from a tagged one is as sure as
+  the tag.
+
+What 1.9.0 does with a version 2 segment, by its own code
+(`silentsilo-fixture/tests/audit_tags_on_1_9_0.rs`): it refuses it as written
+by a newer version, leaves it in storage, never expires it, and reports its
+number missing. In its own outbox, after a downgrade, it renames one to
+`.damaged`; a build from 1.10 sends a `.damaged` segment whose tag checks
+again.
 
 **The key** is a random HPKE key pair, not one derived from any security
 key, so retiring or losing a key never makes old logs unreadable.
@@ -641,12 +672,43 @@ whose scope the policy does not confirm is refused. On an administered silo
 the log is on whatever the policy says; only the retention is read from it.
 The app deletes a segment, whole, only for the holder of an organisation
 key and only once it is past the retention, never below 90 days whatever
-the policy says.
+the policy says, and never one whose tag does not check. A retention under
+90 days is refused when it is set.
 
-An organisation's log is started with one of its keys touched: the device
+From core 1.10 the policy carries `auth`: keyed BLAKE3, hex, under
+`derive_key("silentsilo audit policy auth v1", vault DEK)`, over its other
+fields in a fixed order (the context `silentsilo audit policy` and a zero
+byte, `version` as u32, `enabled` as a byte, `key_id` length-prefixed,
+`retention_days` as a presence byte and u32, the scope as 1 for `org` and 2
+for `silo`, `changed_at` as i64, all big-endian). The content KEK never
+rotates; the DEK does when a key is removed, so whoever held the silo
+before that can still seal a policy but cannot tag one. A device takes in
+a policy from storage only when:
+
+- its `changed_at` is at most a day past the device's clock (the newest
+  wins, so one dated far ahead would win over every later choice);
+- it is an organisation's only on a silo an organisation administers
+  (`StoredFidoKeys::is_org_controlled`), and its key file names one of that
+  silo's organisation keys among its ways in;
+- once the device holds a policy it made or read with a tag that checks
+  (`pinned.proven`), its tag checks under the current DEK.
+
+A device that trusts its policy writes it tagged, and writes it again to a
+copy holding a policy it refused, or the same policy with a tag that does
+not check (written before 1.10, or before a key change). A refused policy
+newer than its own is written over by its own dated after it, so a release
+before 1.10, which follows the newest without checking tags, follows that
+one too. A device that took in an untagged policy on first sight spreads it
+as it came and never tags it. A queue 1.9 left is trusted as it stands, so
+a device that updates tags the policy it already had. A change made on a
+release before 1.10 is not followed by a device that holds a tagged policy.
+
+An organisation's log is started with one of its keys touched, which core
+checks against the silo's enrolled organisation keys (`OrgProof`): the device
 makes the key, wraps the private half for that key alone and pins it. A
 second organisation key is added with the first touched as well, since the
-private half has to be unwrapped to be wrapped again. Copies of the key
+private half has to be unwrapped to be wrapped again, and must be one of the
+silo's organisation keys too. Copies of the key
 file are merged by `by`, kept in that order, so a key added on one device
 reaches every copy and none is written again for nothing. A way in is never
 removed by a merge: a retired organisation key still reads the log until a
@@ -673,25 +735,49 @@ log's key file as storage holds it, and its policy in clear) and `lock`
 takes absent fields as their defaults. A record cut short by a crash is cut
 off the end of `pending` when the queue opens. A close writes as many
 segments as it takes to stay under 8 MiB and 100,000 records each. A
-segment in the outbox that does not read is renamed `.damaged` and no longer
-sent, and the reader names the hole it leaves. A copy that already holds a
-segment under the same number with other bytes (a queue put back from an old
-backup) keeps it; this device keeps its own and says so.
+segment in the outbox that does not read, or whose tag does not check, is
+renamed `.damaged` and no longer sent, and the reader names the hole it
+leaves. A copy that already holds a segment under the same number with
+other bytes (a queue put back from an old backup) keeps it; this device
+keeps its own and says so.
+
+The folder travels with the silo and may sit in a synced directory, so
+from core 1.10 whoever can write there does not choose the key events are
+sealed to. `state.json` carries `pin_check`, keyed BLAKE3 hex under
+`derive_key("silentsilo audit queue check v1", content KEK)` over the pin's
+fields (key id, public key, scope, on or off, retention, `checked_at`,
+`proven`); `policy.json` carries `check` beside the policy's fields, under
+the same key over the same fixed order as `auth`. `key.json` needs none:
+its id is the hash of its public key, and the id is in what is checked. A
+pin whose check does not hold is made again from `policy.json` and
+`key.json` when the policy's check holds, with `checked_at` 0 so the next
+pass reads storage, and dropped otherwise; a `policy.json` whose check does
+not hold is removed. The first time a build from 1.10 opens a silo's queue
+it takes in what 1.9 left without checks, and checks it from then on; it
+notes that in the silo's index (`vault_meta`, `audit_queue_checked`),
+which is under the DEK, so a check taken away later is not mistaken for a
+queue 1.9 left. 1.9.0, run on the folder after, opens the queue, seals to
+the same key and saves `state.json` without `pin_check`; the next 1.10 open
+makes the pin again from the policy (`audit_tags_on_1_9_0.rs`).
 
 **What the log does not protect against.** Whoever holds the content key
-can write a policy, so a member of an organisation can write one; the
-device does not follow it to another key, and expiry never goes below 90
-days. Records are sealed in HPKE base mode, which does not say who sealed
-them: anyone with the public key, which storage holds in clear, can write a
-record under any device's name. Whoever can delete in storage can delete
+can tag a segment under any device's name and seal a policy; whoever holds
+the current DEK can tag a policy. So a member of a silo can write
+another device's records, and a member of an organisation can write a
+policy; the device does not follow that policy to another key, and expiry
+never goes below 90 days. Whoever can delete in storage can delete
 segments, and the newest segments of a device leave no hole when they go.
-The log tells an honest device's story to its readers; it is not proof
-against someone who holds the silo's keys or its storage.
+`pending` in the device's queue is not checked: whoever can write to the
+silo folder can add records there, and this device closes them into a
+tagged segment. Segments written before 1.10 are read and named as
+unproven. The log tells an honest device's story to its readers; it is not
+proof against someone who holds the silo's keys or its storage.
 
 **Segments read before**, `<silo>/audit-cache/<device>/<seq>.seg`, in the
 storage format and layout, not synced: a segment never changes, so a reader
-fetches each one once. One that does not parse, or names another device or
-number than its path, is ignored and fetched again.
+fetches each one once. One that does not parse, names another device or
+number than its path, or carries a tag that does not check, is removed and
+fetched again; a forged one fetched from a copy is never kept.
 
 ## The index is not a format
 
@@ -757,7 +843,10 @@ from the people who will hit it.
 personal key, its sealed policy and two chained segments) and an entry with
 custom fields, history and `ssh_agent`. Their `expected.txt` lists the log
 as read back, one `activity` line each; the silo-folder half of the test
-skips those lines, since the log lives in storage.
+skips those lines, since the log lives in storage. Their segments are
+version 1, untagged, and read the same by a build that tags: the lines
+are unchanged. The release that ships tagged segments and the policy's
+`auth` gets a fixture pair of its own; `create` already writes them.
 
 The one exception, and it expires with this release: while nothing had
 shipped, the formats iterated freely and the fixture was regenerated to match,
