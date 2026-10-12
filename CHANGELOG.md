@@ -11,6 +11,8 @@ release notes should say.
 
 ## [Unreleased]
 
+## [1.10.0] - Trust storage and the device less
+
 ### Security
 
 - SFTP and WebDAV refuse a key with an empty, `.` or `..` part, a backslash
