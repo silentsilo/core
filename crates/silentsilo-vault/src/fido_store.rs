@@ -190,6 +190,17 @@ pub struct StoredFidoCredential {
     /// retries the deletion until storage confirms it.
     #[serde(default)]
     pub revoked: bool,
+    /// Taken in from an envelope in storage and not yet used to unlock on
+    /// this device. Nothing authenticates an envelope, so a key like this
+    /// does not count as one this device can still open the silo with.
+    /// Local only: never part of a published envelope. A release that does
+    /// not know the field drops it, which only makes the key count again.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unconfirmed: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl StoredFidoCredential {
@@ -326,6 +337,21 @@ pub(crate) fn check_authority(
     Ok(())
 }
 
+/// Marks `credential_id` as a key this device has unlocked with, once it
+/// has. Nothing to do for a key enrolled here or already confirmed.
+pub fn confirm_key(vault_root: &Path, credential_id: &str) -> Result<(), VaultError> {
+    let mut keys = load_fido_keys(vault_root)?;
+    let Some(key) = keys
+        .keys
+        .iter_mut()
+        .find(|k| k.credential_id == credential_id && k.unconfirmed)
+    else {
+        return Ok(());
+    };
+    key.unconfirmed = false;
+    save_fido_keys(vault_root, &keys, Authority::Machine)
+}
+
 /// Reads the enrolled keys, first finishing a key change a crash stopped
 /// after its point of no return (see [`crate::rotation`]): until then this
 /// file still holds the envelopes of the key that is no longer in force.
@@ -455,6 +481,7 @@ mod tests {
             wrapped_dek: "deadbeef".into(),
             platform: false,
             revoked: false,
+            unconfirmed: false,
         }
     }
 

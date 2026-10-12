@@ -19,6 +19,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 hex = "0.4"
+blake3 = { workspace = true }
 zeroize = { workspace = true }
 
 tempfile = { workspace = true }

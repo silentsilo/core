@@ -121,7 +121,7 @@ async fn check(store: &FolderStore, silo: &Silo) -> VerifyReport {
         &silo.dek,
         &silo.expected,
         VerifyDepth::Content,
-        &mut move |id| keys.get(&id).cloned(),
+        &mut move |id| keys.get(&id).cloned().map(|k| (k, String::new())),
         &mut |_, _| {},
         &|| false,
     )
@@ -160,7 +160,7 @@ async fn rot_a_cut_upload_a_lost_file_and_a_broken_record_are_put_back() {
         &found,
         &[("copy B", &b as &dyn ObjectStore)],
         &silo.dek,
-        &mut move |id| keys.get(&id).cloned(),
+        &mut move |id| keys.get(&id).cloned().map(|k| (k, String::new())),
         &|| false,
     )
     .await
@@ -197,7 +197,7 @@ async fn nothing_is_written_when_no_source_holds_the_object_whole() {
         &found,
         &[("copy B", &b as &dyn ObjectStore)],
         &silo.dek,
-        &mut move |id| keys.get(&id).cloned(),
+        &mut move |id| keys.get(&id).cloned().map(|k| (k, String::new())),
         &|| false,
     )
     .await
@@ -235,7 +235,7 @@ async fn a_record_moved_under_another_name_is_not_a_source() {
         &found,
         &[("copy B", &b as &dyn ObjectStore)],
         &silo.dek,
-        &mut move |id| keys.get(&id).cloned(),
+        &mut move |id| keys.get(&id).cloned().map(|k| (k, String::new())),
         &|| false,
     )
     .await
@@ -273,7 +273,7 @@ async fn an_object_that_is_sound_again_is_left_alone() {
         &found,
         &[("copy B", &b as &dyn ObjectStore)],
         &silo.dek,
-        &mut move |id| keys.get(&id).cloned(),
+        &mut move |id| keys.get(&id).cloned().map(|k| (k, String::new())),
         &|| false,
     )
     .await

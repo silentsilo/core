@@ -229,9 +229,16 @@ device that cannot open the envelope therefore reads the newest records: when
 they open under its own key, no rotation happened and the object was replaced
 (`KekState::Replaced`), reported as storage having been written to rather
 than as `needs_rejoin`. Rejoining reads the same object, so the old answer
-sent a whole fleet round a loop with no way out. With nothing readable to
-compare against the answer stays `Rotated`. The join flows say the same two
-things (`flows::kek_refusal`).
+sent a whole fleet round a loop with no way out.
+
+When the newest records do not open either, or there are none, the answer is
+`Rotated` only if the proof a rotation leaves first opens under the device's
+key (`keys/rotated/<fingerprint>.sealed`, sealed under the retired key; see
+FORMATS.md). Otherwise it is `RotatedUnproven`, decided like a rotation and
+reported with `rotation_unproven`: a release before core 1.10.0 rotates
+without a proof, and garbage written over the envelope and the newest record
+needs no key at all, so the screen has to name both. The join flows say the
+same things (`flows::kek_refusal`).
 
 With several copies, every copy that answers is asked and the gravest answer
 decides (rotated, then replaced, then current): a copy that missed a rotation
@@ -318,9 +325,21 @@ envelope are copied only when they open under the current key, and key
 envelopes and the manifest only where the destination has none, so an
 append-only copy that missed a rotation cannot undo it on another target.
 Key envelopes go only for keys this device holds as in use: a never-delete
-copy keeps the envelope of a removed key, and once the removal's tombstone
-is gone nothing would delete it from the copy it was seeded into. The pass
-after the seed publishes every key this device knows.
+copy keeps the envelope of a removed key, and nothing would delete it from
+the copy it was seeded into. The pass after the seed publishes every key this
+device knows. Names the source lists that this app could not have written
+(`is_safe_key`) are never copied, and SFTP and WebDAV refuse them outright:
+on a server with real paths, `blobs/../..` from one copy would otherwise be
+written outside the silo of another.
+
+Keys taken in from storage are unconfirmed until this device unlocks with
+one (`confirm_key`), and only confirmed keys this device can use count when
+deciding whether a set of revocation markers may be followed. The markers
+are sealed under the content KEK, which never rotates, so a former holder
+could otherwise plant one envelope, mark every real key and leave each
+device with only the planted one. Tombstones of removed keys are kept for
+the same reason: dropped, the key came back when its envelope was put back
+and its marker deleted.
 
 ## The operation log
 
@@ -339,7 +358,22 @@ each record. A record still stands or falls on its own, and everything
 applied before a record this build refuses is committed before the refusal
 goes up, so a device keeps what it could read rather than meeting the same
 wall from further back every pass. When the caller already holds a
-transaction, that one decides and `replay` adds nothing.
+transaction, that one decides, and each record and each `emit` still gets a
+savepoint inside it: a rebuild that keeps this device's unsent changes
+carries on past one that fails, and without the savepoint it committed half
+of it. A failure that rolls the caller's whole transaction back (a full
+disk) stops the batch rather than carry on in autocommit.
+
+An object that does not open with the silo's key holds back everything at
+or above it for a week from the first pass that met it (dated in
+`vault_meta`, `UNOPENED_HOLD_SECS`), then no longer. Anyone with write access
+to storage can put one at a low number, and holding for good stopped
+incoming changes for good; a week leaves an interrupted upload or a damaged
+record time to be sent again or repaired. One that opens and still cannot be
+used (a newer build's, or a Lamport value above `LAMPORT_CEILING`, 2^53)
+holds back for as long as it is there. Either kind keeps the pass from
+compacting and sweeping, since the device's view of the silo is then
+short.
 
 Name resolution is the subtle part. Uniqueness is per folder,
 case-insensitive and Unicode-composed (`names::fold`). The `name_claims`

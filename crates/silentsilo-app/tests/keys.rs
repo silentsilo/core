@@ -228,8 +228,9 @@ async fn a_drive_unplugged_during_a_removal_does_not_bring_the_key_back() {
         .await
         .unwrap();
 
-    // Removed with the drive unplugged: the working copy confirms it and the
-    // tombstone goes, while the drive keeps the envelope and has no marker.
+    // Removed with the drive unplugged: the working copy confirms it, while
+    // the drive keeps the envelope and has no marker. The tombstone stays,
+    // so storage can never bring the key back.
     let mut keys = desktop.keys();
     keys.keys
         .iter_mut()
@@ -245,7 +246,8 @@ async fn a_drive_unplugged_during_a_removal_does_not_bring_the_key_back() {
     run_sync_pass(&desktop.state, &working_only, &desktop.silo)
         .await
         .unwrap();
-    assert_eq!(desktop.keys().keys.len(), 1, "the tombstone is dropped");
+    assert_eq!(desktop.active_ids(), vec!["aa11"]);
+    assert_eq!(desktop.keys().keys.len(), 2, "the tombstone is kept");
     let on_drive = FolderStore::new(drive.path().to_path_buf());
     assert!(on_drive.head("keys/bb22.env").await.unwrap().is_some());
 

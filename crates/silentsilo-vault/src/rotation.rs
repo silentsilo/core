@@ -272,6 +272,7 @@ mod tests {
                 wrapped_dek: wrapped.into(),
                 platform: false,
                 revoked: false,
+                unconfirmed: false,
             }],
         }
     }

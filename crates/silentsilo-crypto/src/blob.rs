@@ -243,6 +243,60 @@ pub fn decrypt_blob(
     key: &ContentKey,
     expected_blob_id: Uuid,
 ) -> Result<BlobHeader, CryptoError> {
+    decrypt_inner(source, dest, key, expected_blob_id, "")
+}
+
+/// [`decrypt_blob`] for a file the silo has a record of, which is every one
+/// but a test's. `recorded_hash` is the record's `content_hash` (hex).
+///
+/// The header's own hash proves only that the plaintext is what whoever
+/// wrote the header meant. Anyone who can write to storage can put a header
+/// with no chunks after it and the hash of nothing, and the file opens
+/// empty. The record is sealed under the silo's key, so the header has to
+/// agree with it. A record with no hash (none is written that way) leaves
+/// only the header's check.
+pub fn decrypt_file(
+    source: &Path,
+    dest: &Path,
+    key: &ContentKey,
+    expected_blob_id: Uuid,
+    recorded_hash: &str,
+) -> Result<BlobHeader, CryptoError> {
+    decrypt_inner(source, dest, key, expected_blob_id, recorded_hash)
+}
+
+/// [`verify_blob`] against the record, as [`decrypt_file`] is.
+pub fn verify_file(
+    source: &Path,
+    key: &ContentKey,
+    expected_blob_id: Uuid,
+    recorded_hash: &str,
+) -> Result<BlobHeader, CryptoError> {
+    let header = verify_blob(source, key, expected_blob_id)?;
+    check_recorded_hash(&header, recorded_hash)?;
+    Ok(header)
+}
+
+fn check_recorded_hash(header: &BlobHeader, recorded_hash: &str) -> Result<(), CryptoError> {
+    let mut recorded = [0u8; 32];
+    if hex::decode_to_slice(recorded_hash.trim(), &mut recorded).is_err() {
+        return Ok(());
+    }
+    if recorded != header.content_hash {
+        return Err(CryptoError::InvalidHeader(
+            "content is not the file its record describes".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn decrypt_inner(
+    source: &Path,
+    dest: &Path,
+    key: &ContentKey,
+    expected_blob_id: Uuid,
+    recorded_hash: &str,
+) -> Result<BlobHeader, CryptoError> {
     let mut source_file = File::open(source)?;
 
     let mut header_buf = [0u8; HEADER_SIZE];
@@ -255,6 +309,9 @@ pub fn decrypt_blob(
             header.blob_id
         )));
     }
+    // Before any plaintext is written: a header that disagrees with the
+    // record is refused whatever follows it.
+    check_recorded_hash(&header, recorded_hash)?;
 
     // Through a sibling temp file, renamed only once the hash holds: a
     // refused blob must not leave a shortened plaintext where the caller
@@ -405,6 +462,35 @@ fn read_up_to<R: Read>(source: &mut R, buf: &mut [u8]) -> Result<usize, CryptoEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_header_with_nothing_after_it_does_not_pass_for_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("plain");
+        std::fs::write(&plain, vec![7u8; 3 * 1024]).unwrap();
+        let key = crate::generate_content_key();
+        let sealed = dir.path().join("sealed");
+        let blob_id = Uuid::new_v4();
+        let made = encrypt_file(&plain, &sealed, &key, Uuid::new_v4(), blob_id).unwrap();
+        let recorded = hex::encode(made.header.content_hash);
+
+        // What anyone who can write to storage can make without the key:
+        // the header alone, claiming the hash of nothing.
+        let mut empty = made.header.clone();
+        empty.content_hash = *blake3::hash(b"").as_bytes();
+        let forged = dir.path().join("forged");
+        std::fs::write(&forged, empty.to_bytes()).unwrap();
+
+        let out = dir.path().join("out");
+        assert!(
+            decrypt_blob(&forged, &out, &key, blob_id).is_ok(),
+            "the header alone agrees"
+        );
+        assert!(decrypt_file(&forged, &out, &key, blob_id, &recorded).is_err());
+        assert!(verify_file(&forged, &key, blob_id, &recorded).is_err());
+        assert!(decrypt_file(&sealed, &out, &key, blob_id, &recorded).is_ok());
+        assert!(verify_file(&sealed, &key, blob_id, &recorded).is_ok());
+    }
 
     #[test]
     fn a_header_naming_another_chunk_size_is_refused_before_anything_is_read() {

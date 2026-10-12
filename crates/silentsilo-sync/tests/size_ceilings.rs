@@ -65,6 +65,7 @@ fn credential(id: &str) -> StoredFidoCredential {
         wrapped_dek: "cd".repeat(256),
         platform: true,
         revoked: false,
+        unconfirmed: false,
     }
 }
 

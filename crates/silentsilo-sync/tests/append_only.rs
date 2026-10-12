@@ -31,6 +31,7 @@ fn credential(id: &str, revoked: bool) -> StoredFidoCredential {
         wrapped_dek: "deadbeef".into(),
         platform: false,
         revoked,
+        unconfirmed: false,
     }
 }
 

@@ -213,7 +213,11 @@ pub trait ObjectStore: Send + Sync {
         match self.head(key).await? {
             None => Ok(None),
             Some(size) if size < 0 || size as u64 > max => Err(too_large(key, size as u64)),
-            Some(_) => match self.get(key).await {
+            // Read no further than the limit, whatever the size said: the
+            // object can change between the two requests, and a server can
+            // answer the second with something else.
+            Some(_) => match self.get_prefix(key, max.saturating_add(1)).await {
+                Ok(bytes) if bytes.len() as u64 > max => Err(too_large(key, bytes.len() as u64)),
                 Ok(bytes) => Ok(Some(bytes)),
                 Err(StoreError::NotFound(_)) => Ok(None),
                 Err(e) => Err(e),
@@ -263,13 +267,36 @@ pub trait ObjectStore: Send + Sync {
     }
 }
 
-/// The round trip behind [`ObjectStore::check`], for a backend that
-/// prepares something first.
 /// What [`ObjectStore::get_small`] answers for an object over its limit.
 pub fn too_large(key: &str, size: u64) -> StoreError {
     StoreError::Other(format!("{key} is {size} bytes, far larger than it can be"))
 }
 
+/// Whether a key is one this app could have written: relative, split by
+/// `/`, with no empty, `.` or `..` part, no backslash and no control
+/// character. Names come back from listings, and a listing is whatever the
+/// storage says; on a backend with real paths, `blobs/../../.ssh/x` planted
+/// in one copy would otherwise be written outside the silo in another.
+pub fn is_safe_key(key: &str) -> bool {
+    !key.is_empty()
+        && key
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+        && !key.chars().any(|c| c == '\\' || c.is_control())
+}
+
+/// [`is_safe_key`] as an error, for a backend about to turn a key into a
+/// path. The empty key is the root, which a listing may ask for.
+pub(crate) fn checked_key(key: &str) -> Result<&str, StoreError> {
+    if key.is_empty() || is_safe_key(key) {
+        Ok(key)
+    } else {
+        Err(StoreError::Other(format!("refusing unsafe key: {key}")))
+    }
+}
+
+/// The round trip behind [`ObjectStore::check`], for a backend that
+/// prepares something first.
 pub(crate) async fn probe(store: &(impl ObjectStore + ?Sized)) -> Result<(), StoreError> {
     const PROBE: &str = ".silentsilo-write-test";
     store.put(PROBE, b"ok".to_vec()).await?;

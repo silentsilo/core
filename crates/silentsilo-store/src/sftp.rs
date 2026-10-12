@@ -235,12 +235,15 @@ impl SftpStore {
         })
     }
 
-    fn path_for(&self, key: &str) -> String {
-        if self.base.is_empty() {
+    /// Refuses a key that would leave the silo's folder (see
+    /// [`crate::is_safe_key`]): the server resolves `..` like any path.
+    fn path_for(&self, key: &str) -> Result<String, StoreError> {
+        let key = crate::checked_key(key)?;
+        Ok(if self.base.is_empty() {
             key.to_string()
         } else {
             format!("{}/{key}", self.base)
-        }
+        })
     }
 
     /// The connection to use, dialling one if there isn't a live one.
@@ -368,7 +371,7 @@ impl SftpStore {
     /// Like WebDAV and unlike a bucket, directories are real here: writing
     /// `ops/000001.op` into a missing `ops/` fails.
     async fn ensure_parents(&self, sftp: &SftpSession, key: &str) -> Result<(), StoreError> {
-        let full = self.path_for(key);
+        let full = self.path_for(key)?;
         let Some((dir, _)) = full.rsplit_once('/') else {
             return Ok(());
         };
@@ -470,7 +473,7 @@ impl ObjectStore for SftpStore {
                 // device reading the directory never sees a partial object —
                 // the same reasoning as the folder backend, and it matters
                 // more here because the reader is on a different machine.
-                let final_path = self.path_for(key);
+                let final_path = self.path_for(key)?;
                 let temp_path = temp_beside(&final_path);
                 let mut file = sftp
                     .open_with_flags(
@@ -494,7 +497,7 @@ impl ObjectStore for SftpStore {
 
     async fn get(&self, key: &str) -> Result<Vec<u8>, StoreError> {
         self.run(|sftp| async move {
-            let mut file = sftp.open(self.path_for(key)).await.map_err(|e| {
+            let mut file = sftp.open(self.path_for(key)?).await.map_err(|e| {
                 if missing(&e) {
                     StoreError::NotFound(key.to_string())
                 } else {
@@ -515,7 +518,7 @@ impl ObjectStore for SftpStore {
     /// download the whole blob.
     async fn get_prefix(&self, key: &str, len: u64) -> Result<Vec<u8>, StoreError> {
         self.run(|sftp| async move {
-            let file = sftp.open(self.path_for(key)).await.map_err(|e| {
+            let file = sftp.open(self.path_for(key)?).await.map_err(|e| {
                 if missing(&e) {
                     StoreError::NotFound(key.to_string())
                 } else {
@@ -559,7 +562,7 @@ impl ObjectStore for SftpStore {
             // Same temp-and-rename shape as `put`, streamed in pieces so a
             // blob is never held whole in memory, and so a stop leaves the
             // key as it was.
-            let final_path = self.path_for(key);
+            let final_path = self.path_for(key)?;
             let temp_path = temp_beside(&final_path);
             let mut local = tokio::fs::File::open(source)
                 .await
@@ -615,7 +618,7 @@ impl ObjectStore for SftpStore {
         let progress = &progress;
 
         self.run(|sftp| async move {
-            let mut remote = sftp.open(self.path_for(key)).await.map_err(|e| {
+            let mut remote = sftp.open(self.path_for(key)?).await.map_err(|e| {
                 if missing(&e) {
                     StoreError::NotFound(key.to_string())
                 } else {
@@ -664,7 +667,7 @@ impl ObjectStore for SftpStore {
 
     async fn head(&self, key: &str) -> Result<Option<i64>, StoreError> {
         self.run(|sftp| async move {
-            match sftp.metadata(self.path_for(key)).await {
+            match sftp.metadata(self.path_for(key)?).await {
                 Ok(meta) => Ok(Some(meta.size.unwrap_or(0) as i64)),
                 Err(e) if missing(&e) => Ok(None),
                 Err(e) => Err(StoreError::Other(format!("{key}: {e}"))),
@@ -675,7 +678,7 @@ impl ObjectStore for SftpStore {
 
     async fn delete(&self, key: &str) -> Result<(), StoreError> {
         self.run(|sftp| async move {
-            match sftp.remove_file(self.path_for(key)).await {
+            match sftp.remove_file(self.path_for(key)?).await {
                 Ok(()) => Ok(()),
                 // Already gone is the desired end state.
                 Err(e) if missing(&e) => Ok(()),
@@ -691,7 +694,7 @@ impl ObjectStore for SftpStore {
             let mut queue = vec![prefix.trim_end_matches('/').to_string()];
 
             while let Some(relative) = queue.pop() {
-                let dir = self.path_for(&relative);
+                let dir = self.path_for(&relative)?;
                 let entries = match sftp.read_dir(dir).await {
                     Ok(entries) => entries,
                     // A prefix nothing has been written to yet is an empty
@@ -710,6 +713,10 @@ impl ObjectStore for SftpStore {
                     } else {
                         format!("{relative}/{name}")
                     };
+                    // A name this app never writes is not one of its objects.
+                    if !crate::is_safe_key(&key) {
+                        continue;
+                    }
 
                     if entry.metadata().is_dir() {
                         queue.push(key);
@@ -781,7 +788,7 @@ mod tests {
     fn keys_are_placed_under_the_configured_directory() {
         let store = SftpStore::new(config()).unwrap();
         assert_eq!(
-            store.path_for("ops/000001.op"),
+            store.path_for("ops/000001.op").unwrap(),
             "/backups/silo/ops/000001.op"
         );
     }
@@ -791,7 +798,7 @@ mod tests {
         let mut at_root = config();
         at_root.path = String::new();
         let store = SftpStore::new(at_root).unwrap();
-        assert_eq!(store.path_for("ops/000001.op"), "ops/000001.op");
+        assert_eq!(store.path_for("ops/000001.op").unwrap(), "ops/000001.op");
     }
 
     #[test]
@@ -799,7 +806,19 @@ mod tests {
         let mut trailing = config();
         trailing.path = "/backups/silo/".into();
         let store = SftpStore::new(trailing).unwrap();
-        assert_eq!(store.path_for("vault.json"), "/backups/silo/vault.json");
+        assert_eq!(
+            store.path_for("vault.json").unwrap(),
+            "/backups/silo/vault.json"
+        );
+        for planted in [
+            "blobs/../../.ssh/authorized_keys",
+            "../x",
+            "ops//x",
+            "ops/./x",
+            "a\\b",
+        ] {
+            assert!(store.path_for(planted).is_err(), "{planted}");
+        }
     }
 
     #[test]

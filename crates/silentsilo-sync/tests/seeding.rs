@@ -47,6 +47,7 @@ fn keys(ids: &[&str]) -> silentsilo_vault::StoredFidoKeys {
                 wrapped_dek: "deadbeef".into(),
                 platform: false,
                 revoked: false,
+                unconfirmed: false,
             })
             .collect(),
     }
@@ -697,4 +698,68 @@ async fn a_seed_brings_the_activity_log_and_never_writes_over_it() {
     .unwrap();
     assert_eq!(other.get(&first).await.unwrap(), b"kept");
     assert_eq!(other.get(&second).await.unwrap(), b"only here");
+}
+
+/// A source whose listing names an object outside the silo, the way a
+/// bucket anyone could write to might.
+struct Planted(FolderStore);
+
+const PLANTED: &str = "blobs/../../.ssh/authorized_keys";
+
+#[async_trait::async_trait]
+impl ObjectStore for Planted {
+    async fn put(&self, key: &str, body: Vec<u8>) -> Result<(), StoreError> {
+        self.0.put(key, body).await
+    }
+
+    async fn get(&self, key: &str) -> Result<Vec<u8>, StoreError> {
+        assert_ne!(key, PLANTED, "a planted name must never be fetched");
+        self.0.get(key).await
+    }
+
+    async fn head(&self, key: &str) -> Result<Option<i64>, StoreError> {
+        self.0.head(key).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.0.delete(key).await
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<StoredObject>, StoreError> {
+        let mut listed = self.0.list(prefix).await?;
+        if prefix == BLOBS_PREFIX {
+            listed.push(StoredObject {
+                key: PLANTED.into(),
+                size: 16,
+            });
+        }
+        Ok(listed)
+    }
+
+    fn describe(&self) -> String {
+        self.0.describe()
+    }
+}
+
+#[tokio::test]
+async fn a_name_that_climbs_out_of_the_source_is_never_copied() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let dest_dir = tempfile::tempdir().unwrap();
+    let source = Planted(FolderStore::new(source_dir.path().to_path_buf()));
+    let silo = dest_dir.path().join("a").join("silo");
+    std::fs::create_dir_all(&silo).unwrap();
+    let dest = FolderStore::new(silo);
+    populate(&source, &generate_dek(), Uuid::new_v4()).await;
+
+    let outcome = seed_target(&source, &dest, &mut |_| {}, &|| false)
+        .await
+        .unwrap();
+
+    assert!(
+        outcome.failed.iter().any(|(key, _)| key == PLANTED),
+        "{:?}",
+        outcome.failed
+    );
+    assert!(outcome.copied > 0);
+    assert!(!dest_dir.path().join(".ssh").exists());
 }

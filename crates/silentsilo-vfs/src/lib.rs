@@ -13,8 +13,8 @@ pub use activity::{ActivityEntry, ActivityPage};
 pub use digest::{digest, digest_difference};
 pub use names::{MAX_NAME_BYTES, check as check_name, sanitize as sanitize_name};
 pub use oplog::{
-    ApplyOutcome, OpBody, OpRecord, ReplayReport, VaultOp, all_op_ids, all_ops, apply_op,
-    chain_tip, clear_pushed, device_id, emit, highest_applied_lamport, init_delivery,
+    ApplyOutcome, LAMPORT_CEILING, OpBody, OpRecord, ReplayReport, VaultOp, all_op_ids, all_ops,
+    apply_op, chain_tip, clear_pushed, device_id, emit, highest_applied_lamport, init_delivery,
     init_oplog_core, init_oplog_derived, mark_delivered, next_lamport, observe_lamport,
     pending_count, pending_count_for, pending_ops, pending_ops_for, rebuild_derived,
     record_target_failure, record_target_success, replay, reset_target_backoff, settle_delivery,

@@ -134,7 +134,9 @@ pub async fn decrypt_to_file(
         )
         .to_string()
     })?;
-    if let Err(e) = silentsilo_crypto::decrypt_blob(&blob_path, dest, &key, file.blob_id) {
+    let recorded = file.content_hash.as_deref().unwrap_or_default();
+    if let Err(e) = silentsilo_crypto::decrypt_file(&blob_path, dest, &key, file.blob_id, recorded)
+    {
         let _ = std::fs::remove_file(dest);
         return Err(e.to_string());
     }

@@ -11,6 +11,44 @@ release notes should say.
 
 ## [Unreleased]
 
+### Security
+
+- SFTP and WebDAV refuse a key with an empty, `.` or `..` part, a backslash
+  or a control character, and leave such names out of listings. Filling a
+  new copy skips any name the source lists that this app could not have
+  written, so `blobs/../../.ssh/authorized_keys` planted in one copy is
+  never written outside the silo on the server of another.
+- A key taken in from another device's envelope is unconfirmed until this
+  device unlocks with it (`confirm_key`), and revocation markers that would
+  leave this device no confirmed key are not followed. A recovery marker
+  dated more than a day ahead is ignored. Tombstones of removed keys are
+  kept for good. See FORMATS.md.
+- `decrypt_file` and `verify_file` check a blob's header against the
+  content hash in the file's record. A header with nothing after it and the
+  hash of nothing opened as an empty file; anyone with write access to
+  storage could make one. Opening, extracting, verifying and repairing use
+  them; `verify_against` and `repair_from` take the recorded hash from
+  `open`.
+- A rotation writes a proof under the retired key before it re-seals
+  anything. Without one the state is `KekState::RotatedUnproven` and the
+  report carries `rotation_unproven`, so the screen can say that storage
+  may have been written to (FORMATS.md).
+- An object that does not open with the silo's key holds the records above
+  it back for a week from the first pass that met it, then no longer: one
+  planted at a low number stopped incoming changes for good. The pass still
+  neither compacts nor sweeps while it is there.
+- Lamport values above 2^53 are held back like an unreadable record, and
+  the local clock neither advances past that nor overflows.
+- Every operation applied inside a caller's transaction gets a savepoint,
+  so a failure undoes all of it. A rebuild keeping unsent changes could
+  commit half of one.
+- The "received through" mark is no higher than what the device holds,
+  since the listing's numbers are only names.
+- A join reads the key envelopes before it creates anything and fails if it
+  cannot, instead of leaving the silo opening with the device secret alone.
+- `get_small` reads no further than its limit, whatever the size said.
+- A passkey's relying party cannot be a public suffix (`psl`).
+
 ### Added
 
 - iCloud Drive as backup storage, the kind `icloud` with `{folder}`: the

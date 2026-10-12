@@ -83,6 +83,7 @@ fn credential(id: &str, wrapped_dek: &str) -> StoredFidoCredential {
         wrapped_dek: wrapped_dek.into(),
         platform: false,
         revoked: false,
+        unconfirmed: false,
     }
 }
 
@@ -267,6 +268,10 @@ async fn a_record_copied_under_a_newer_name_is_no_witness() {
         );
         store.put(&planted, bytes.clone()).await.unwrap();
     }
+    // The rotation from `old` to `new` left its proof, as every one does.
+    silentsilo_sync::write_rotation_proof(&store, &old)
+        .await
+        .unwrap();
 
     assert_eq!(
         kek_envelope_state(&store, &old).await.unwrap(),

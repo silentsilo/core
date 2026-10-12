@@ -206,6 +206,11 @@ fn check_origin(origin: &str, rp_id: &str) -> Result<(), PasskeyError> {
     if !is_domain(&rp) || !rp.contains('.') {
         return Err(wrong());
     }
+    // A public suffix is shared by everyone under it: a passkey for `co.uk`
+    // would answer to every site that ends in it.
+    if psl::domain(rp.as_bytes()).is_none() {
+        return Err(wrong());
+    }
     if host == rp || host.ends_with(&format!(".{rp}")) {
         Ok(())
     } else {
@@ -478,6 +483,17 @@ mod tests {
     use super::*;
     use p256::ecdsa::VerifyingKey;
     use p256::ecdsa::signature::Verifier;
+
+    #[test]
+    fn a_public_suffix_is_no_relying_party() {
+        assert!(check_origin("https://login.example.co.uk", "example.co.uk").is_ok());
+        for suffix in ["co.uk", "github.io", "com"] {
+            assert!(
+                check_origin(&format!("https://evil.{suffix}"), suffix).is_err(),
+                "{suffix}"
+            );
+        }
+    }
 
     const CREATE: &str = r#"{
         "rp": {"id": "example.com", "name": "Example"},

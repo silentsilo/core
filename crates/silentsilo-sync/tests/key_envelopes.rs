@@ -30,6 +30,7 @@ fn credential(id: &str, slot: u8) -> StoredFidoCredential {
         wrapped_dek: "deadbeef".into(),
         platform: false,
         revoked: false,
+        unconfirmed: false,
     }
 }
 
@@ -535,4 +536,46 @@ async fn a_marker_that_does_not_open_counts_for_nothing() {
         .await
         .unwrap();
     assert!(revocation_marks(&client, &kek).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_recovery_marker_dated_far_ahead_is_not_believed() {
+    // Dated at the end of time, it would kill every recovery code made
+    // from now on, on every device.
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(&dir);
+    let kek = silentsilo_crypto::generate_content_kek();
+    silentsilo_sync::mark_recovery_disabled(&store, &kek, i64::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        silentsilo_sync::revoked_at(&store, &kek, silentsilo_sync::RECOVERY_MARKER_ID)
+            .await
+            .unwrap(),
+        None
+    );
+
+    // An ordinary one is.
+    silentsilo_sync::mark_recovery_disabled(&store, &kek, 1_700_000_000)
+        .await
+        .unwrap();
+    assert_eq!(
+        silentsilo_sync::revoked_at(&store, &kek, silentsilo_sync::RECOVERY_MARKER_ID)
+            .await
+            .unwrap(),
+        Some(1_700_000_000)
+    );
+}
+
+#[tokio::test]
+async fn a_published_envelope_never_says_whether_a_device_used_the_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(&dir);
+    let mut key = credential("aa11", 0);
+    key.unconfirmed = true;
+    publish_key_envelopes(&store, &StoredFidoKeys { keys: vec![key] }, false)
+        .await
+        .unwrap();
+    let raw = store.get("keys/aa11.env").await.unwrap();
+    assert!(!String::from_utf8(raw).unwrap().contains("unconfirmed"));
 }

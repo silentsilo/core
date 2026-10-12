@@ -607,10 +607,21 @@ pub fn drop_oplog_derived(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+/// The highest Lamport value a record may carry. Each change adds one, so
+/// no silo comes near it; the database keeps the value as a signed 64-bit
+/// integer, which tops out 1024 times higher. A record above it was written
+/// to stop this device's clock: at `u64::MAX` the next local change had no
+/// number left, and past `i64::MAX` an order read back from the database
+/// came out negative.
+pub const LAMPORT_CEILING: u64 = 1 << 53;
+
 /// Reserves the next Lamport value for a locally-originated operation.
 pub fn next_lamport(conn: &Connection) -> CoreResult<u64> {
     let current = read_lamport(conn)?;
-    let next = current + 1;
+    let next = current
+        .checked_add(1)
+        .filter(|next| *next <= LAMPORT_CEILING)
+        .ok_or_else(|| CoreError::Database("the change counter is exhausted".into()))?;
     write_lamport(conn, next)?;
     Ok(next)
 }
@@ -618,10 +629,10 @@ pub fn next_lamport(conn: &Connection) -> CoreResult<u64> {
 /// Advances the local clock past everything seen from other devices, so the
 /// next local operation sorts after them. Without this a device that has
 /// been offline would keep emitting low Lamport values and its work would
-/// sort *before* changes it had already seen.
+/// sort *before* changes it had already seen. Never past [`LAMPORT_CEILING`].
 pub fn observe_lamport(conn: &Connection, seen: u64) -> CoreResult<()> {
     let current = read_lamport(conn)?;
-    if seen > current {
+    if seen > current && seen <= LAMPORT_CEILING {
         write_lamport(conn, seen)?;
     }
     Ok(())
@@ -2762,8 +2773,8 @@ pub fn apply_op(conn: &Connection, record: &OpRecord) -> CoreResult<ApplyOutcome
 ///
 /// The effect and the log row land in one transaction: a crash between them
 /// left the tree changed with nothing in the log to say so, and the record
-/// then reapplied on the next fetch. Skipped when the caller already holds
-/// a transaction, as [`emit`] does.
+/// then reapplied on the next fetch. Inside a caller's transaction, a
+/// savepoint of its own (see [`atomically`]).
 fn apply_and_record(
     conn: &Connection,
     record: &OpRecord,
@@ -2772,13 +2783,15 @@ fn apply_and_record(
     if is_applied(conn, record.op_id)? {
         return Ok(ApplyOutcome::AlreadyApplied);
     }
-    let tx = if conn.is_autocommit() {
-        Some(conn.unchecked_transaction().map_err(db)?)
-    } else {
-        None
-    };
+    atomically(conn, || apply_and_record_inner(conn, record, pushed))
+}
 
-    let outcome = match &record.op {
+fn apply_and_record_inner(
+    conn: &Connection,
+    record: &OpRecord,
+    pushed: bool,
+) -> CoreResult<ApplyOutcome> {
+    match &record.op {
         OpBody::Known(_) => {
             let outcome = apply_inner(conn, record)?;
             record_op(conn, record, pushed, true)?;
@@ -2797,17 +2810,47 @@ fn apply_and_record(
         // sees the same wall. That is the intent: the vault is not this
         // build's to interpret until someone updates.
         OpBody::Unknown { op, .. } => Err(CoreError::UnsupportedOperation(op.clone())),
-    };
-
-    match (outcome, tx) {
-        (Ok(outcome), Some(tx)) => {
-            tx.commit().map_err(db)?;
-            Ok(outcome)
-        }
-        (Ok(outcome), None) => Ok(outcome),
-        // Dropping the transaction rolls it back.
-        (Err(e), _) => Err(e),
     }
+}
+
+/// Runs `work` so that it lands whole or not at all: in a transaction when
+/// the connection has none, in a savepoint inside the caller's when it has.
+/// Without the savepoint, a failure inside a caller's transaction left
+/// whatever had run before it, and a caller that carries on past the error
+/// (a rebuild keeping this device's unsent changes does) committed half of
+/// an operation.
+fn atomically<T>(conn: &Connection, work: impl FnOnce() -> CoreResult<T>) -> CoreResult<T> {
+    if conn.is_autocommit() {
+        let tx = conn.unchecked_transaction().map_err(db)?;
+        let out = work()?;
+        tx.commit().map_err(db)?;
+        return Ok(out);
+    }
+    conn.execute_batch("SAVEPOINT silentsilo_one").map_err(db)?;
+    match work() {
+        Ok(out) => {
+            conn.execute_batch("RELEASE silentsilo_one").map_err(db)?;
+            Ok(out)
+        }
+        Err(e) => {
+            rollback_savepoint(conn)?;
+            Err(e)
+        }
+    }
+}
+
+/// Undoes the savepoint `atomically` or `replay` opened. Some failures (a
+/// full disk) make SQLite roll back the caller's whole transaction, and the
+/// savepoint with it; carrying on would then write in autocommit, one
+/// statement at a time, after the caller's earlier work was already gone.
+fn rollback_savepoint(conn: &Connection) -> CoreResult<()> {
+    if conn.is_autocommit() {
+        return Err(CoreError::Database(
+            "the transaction this change was part of was rolled back".into(),
+        ));
+    }
+    let _ = conn.execute_batch("ROLLBACK TO silentsilo_one; RELEASE silentsilo_one");
+    Ok(())
 }
 
 /// Whether `record` is later in the total order than the last change applied
@@ -3773,23 +3816,19 @@ pub fn replay(conn: &Connection, mut records: Vec<OpRecord>) -> CoreResult<Repla
     } else {
         None
     };
-    let one_at_a_time = batch.is_some();
 
     let mut report = ReplayReport::default();
     let mut refused = None;
     for record in &records {
-        let outcome = if one_at_a_time {
-            conn.execute_batch("SAVEPOINT replay_one").map_err(db)?;
-            let outcome = apply_op(conn, record);
-            if outcome.is_ok() {
-                conn.execute_batch("RELEASE replay_one").map_err(db)?;
-            } else {
-                let _ = conn.execute_batch("ROLLBACK TO replay_one; RELEASE replay_one");
-            }
-            outcome
+        // A savepoint inside the caller's transaction too, so a refused
+        // record leaves nothing of itself behind there either.
+        conn.execute_batch("SAVEPOINT silentsilo_one").map_err(db)?;
+        let outcome = apply_op(conn, record);
+        if outcome.is_ok() {
+            conn.execute_batch("RELEASE silentsilo_one").map_err(db)?;
         } else {
-            apply_op(conn, record)
-        };
+            rollback_savepoint(conn)?;
+        }
 
         match outcome {
             Ok(ApplyOutcome::Applied) => report.applied += 1,
@@ -3870,13 +3909,7 @@ pub(crate) fn set_device_id(conn: &Connection, id: Uuid) -> CoreResult<Uuid> {
 /// the Lamport reservation, the chain position, the effect and the log row
 /// either all land or none do.
 pub fn emit(conn: &Connection, op: VaultOp) -> CoreResult<(OpRecord, ApplyOutcome)> {
-    let tx = if conn.is_autocommit() {
-        Some(conn.unchecked_transaction().map_err(db)?)
-    } else {
-        None
-    };
-
-    let result = (|| {
+    atomically(conn, || {
         let me = device_id(conn)?;
         let (seq, prev) = chain_tip(conn, me)?;
         let record = OpRecord::authored(
@@ -3891,16 +3924,7 @@ pub fn emit(conn: &Connection, op: VaultOp) -> CoreResult<(OpRecord, ApplyOutcom
 
         let outcome = apply_and_record(conn, &record, false)?;
         Ok((record, outcome))
-    })();
-
-    match (result, tx) {
-        (Ok(out), Some(tx)) => {
-            tx.commit().map_err(db)?;
-            Ok(out)
-        }
-        (Ok(out), None) => Ok(out),
-        (Err(e), _) => Err(e),
-    }
+    })
 }
 
 /// Where this device's chain currently ends: the sequence number the next
@@ -4322,6 +4346,40 @@ pub(crate) mod tests {
     use crate::Vfs;
     use silentsilo_vault::VaultSession;
     use tempfile::TempDir;
+
+    #[test]
+    fn a_change_number_at_the_top_cannot_stop_the_clock() {
+        let device = Device::new();
+        let conn = &device.session.conn;
+        let before = next_lamport(conn).unwrap();
+        observe_lamport(conn, u64::MAX).unwrap();
+        assert_eq!(next_lamport(conn).unwrap(), before + 1);
+        observe_lamport(conn, LAMPORT_CEILING).unwrap();
+        assert!(next_lamport(conn).is_err(), "nothing above the ceiling");
+    }
+
+    #[test]
+    fn a_failed_change_inside_a_callers_transaction_leaves_nothing() {
+        let device = Device::new();
+        let conn = &device.session.conn;
+        let rows = |conn: &Connection| -> i64 {
+            conn.query_row("SELECT COUNT(*) FROM vault_meta", [], |r| r.get(0))
+                .unwrap()
+        };
+        let tx = conn.unchecked_transaction().unwrap();
+        let before = rows(conn);
+        let failed: CoreResult<()> = atomically(conn, || {
+            conn.execute(
+                "INSERT INTO vault_meta(key, value) VALUES ('half', 'done')",
+                [],
+            )
+            .map_err(db)?;
+            Err(CoreError::Database("stopped half way".into()))
+        });
+        assert!(failed.is_err());
+        assert_eq!(rows(conn), before, "the half that ran was undone");
+        tx.commit().unwrap();
+    }
 
     pub(crate) struct Device {
         _dir: TempDir,

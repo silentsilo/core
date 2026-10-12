@@ -18,6 +18,9 @@ pub struct Entry {
     pub path: String,
     pub blob_id: Uuid,
     pub size_bytes: i64,
+    /// BLAKE3 of the content, hex, as its record holds it. Empty for an
+    /// attachment, whose record has none.
+    pub content_hash: String,
     /// Wrapped under the content KEK. The extractor unwraps it per file.
     pub blob_key: String,
     /// In the trash but not yet purged. Written out under `_trash/` rather
@@ -370,7 +373,8 @@ fn read_passwords(
 fn read_entries(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<Entry>> {
     let mut stmt = conn.prepare(
         "SELECT fo.path, f.name, f.blob_id, f.size_bytes,
-                COALESCE(f.blob_key, ''), f.deleted_at IS NOT NULL
+                COALESCE(f.blob_key, ''), f.deleted_at IS NOT NULL,
+                COALESCE(f.content_hash, '')
            FROM files f JOIN folders fo ON fo.id = f.folder_id
           ORDER BY fo.path, f.name",
     )?;
@@ -391,6 +395,7 @@ fn read_entries(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<Entry>> {
             size_bytes: row.get(3)?,
             blob_key: row.get(4)?,
             trashed: row.get(5)?,
+            content_hash: row.get(6)?,
         })
     })?;
     rows.collect()
@@ -509,6 +514,7 @@ async fn write_attachment(
         path: attachment.name.clone(),
         blob_id: attachment.blob_id,
         size_bytes: 0,
+        content_hash: String::new(),
         blob_key: attachment.blob_key.clone(),
         trashed: false,
     };
@@ -547,8 +553,14 @@ async fn write_one(
         .await
         .map_err(|e| e.to_string())?;
 
-    silentsilo_crypto::decrypt_blob(&sealed_path, target, &key, entry.blob_id)
-        .map_err(|e| e.to_string())?;
+    silentsilo_crypto::decrypt_file(
+        &sealed_path,
+        target,
+        &key,
+        entry.blob_id,
+        &entry.content_hash,
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 

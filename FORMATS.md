@@ -29,6 +29,7 @@ Anything else needs a version discriminator first.
 | Inbox key | `inbox/keys/….sealed` | `INBOX_VERSION = 1` inside a sealed payload under the content KEK, `silentsilo-sync/inbox.rs` | 1.0.0 never lists `inbox/`. A build with the inbox skips a key it cannot read |
 | Inbox sender | `inbox/senders/….sealed` | `INBOX_VERSION = 1`, sealed under the content KEK | As above |
 | Revocation marker | `keys/revoked/….sealed` | `version: 1` inside a sealed payload under the content KEK, `silentsilo-sync/key_sync.rs` | 1.0.0 lists it with the key envelopes and skips it as unreadable |
+| Rotation proof | `keys/rotated/<fingerprint>.sealed` | `version: 1` inside a sealed payload under the vault key a rotation retired, `silentsilo-sync` | From core 1.10.0. Earlier builds skip `keys/` objects that are not envelopes or markers (below) |
 | Inbox item | `inbox/items/….sslo` and `….env` | The blob as in `blobs/`; the envelope carries `INBOX_VERSION = 1` | 1.0.0 never lists `inbox/`. A build with the inbox leaves an item of another version where it is and says to update |
 | Activity log segment | `audit/<device>/<seq>.seg` | `SEGMENT_VERSION = 1` in its header; each record inside carries `RECORD_VERSION = 1` and its HPKE suite, `silentsilo-audit` | No release before core 1.9.0 lists `audit/`. A build with the log names a newer segment, record or suite rather than misreading it |
 | Activity log key | `audit/keys/<key id>.json` | `version: 1`, `silentsilo-audit/keyring.rs` | As above; a newer version is refused by name |
@@ -238,8 +239,10 @@ So the rule for anything reading these:
   marker `keys/revoked/<credential_id>.sealed` (JSON `version`,
   `credential_id`, `revoked_at`, sealed under the content KEK) turns a key
   this device still has into a tombstone, so it is not published again. A
-  device that revokes writes the marker before it deletes the envelope, and
-  drops its tombstone only once the marker is in storage. Three limits, each
+  device that revokes writes the marker before it deletes the envelope.
+  From core 1.10.0 it keeps the tombstone for good: dropped once the marker
+  was in storage, the key came back when anyone with write access put its
+  envelope back and deleted the marker. Three limits, each
   deliberate: an envelope is not authenticated, so a key added this way
   carries no organisation policy on a silo that has none; a silo with no
   keys file is never given one, because it opens with its device secret; and
@@ -249,6 +252,26 @@ So the rule for anything reading these:
   1.9.0 a pass reads the markers on every copy before it takes in any
   envelope: a copy unplugged when a key was removed holds its envelope and
   no marker, and judged on its own markers it put the key back.
+- **A key taken in from storage is unconfirmed** (core 1.10.0) until this
+  device unlocks with it: `"unconfirmed": true` in `keys/fido.json`, absent
+  when false and never in a published envelope. Markers that would leave
+  this device no confirmed key it can use are not followed, so a former
+  holder of the content key cannot plant one envelope, mark every real key
+  and lock every device out. A release that does not know the field drops
+  it on save, which only makes the key count again. A recovery marker dated
+  more than a day ahead of the device's clock is ignored for the same
+  reason: it would kill every code made from then on.
+- **A rotation leaves a proof** (core 1.10.0) before it re-seals anything:
+  `keys/rotated/<fingerprint>.sealed`, JSON `version` and `rotated_at`,
+  sealed under the retired vault key and named by a key derived from it
+  (BLAKE3 `derive_key`, context `silentsilo rotation proof v1`, first 16
+  bytes in hex). A device whose key no longer opens the KEK envelope or the
+  newest records reads a plain "rotated" only when the proof under its key
+  opens. Without it the answer is `RotatedUnproven`: still a rejoin, since a
+  release before 1.10.0 rotates without leaving a proof, and the report says
+  `rotation_unproven` so the screen can also name the other cause, garbage
+  written over the envelope and the newest record, which needs no key and
+  on which a rejoin fails.
 - **A joining device keeps `policy` only where it was proven** (after core
   1.5.0). Joining with the recovery code clears `policy` on every
   envelope it saves; joining with a key keeps `org` on that key alone, since

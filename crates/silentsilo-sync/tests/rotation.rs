@@ -324,10 +324,9 @@ async fn a_rolled_back_content_key_is_told_apart_from_a_rotation() {
 }
 
 #[tokio::test]
-async fn a_silo_with_nothing_to_compare_against_reads_as_a_rotation() {
-    // No records, or none this key opens, means the envelope is the only
-    // evidence there is. The answer stays the careful one rather than
-    // accusing storage on no evidence.
+async fn a_silo_with_nothing_to_compare_against_reads_as_a_rotation_only_with_proof() {
+    // No records, or none this key opens, means the envelope and the proof
+    // a rotation leaves under the retired key are the only evidence.
     let dir = tempfile::tempdir().unwrap();
     let store = FolderStore::new(dir.path().to_path_buf());
     let mine = generate_dek();
@@ -345,10 +344,49 @@ async fn a_silo_with_nothing_to_compare_against_reads_as_a_rotation() {
     )
     .await
     .unwrap();
+    assert_eq!(
+        state(&store, &mine).await,
+        silentsilo_sync::KekState::RotatedUnproven
+    );
 
+    silentsilo_sync::write_rotation_proof(&store as &dyn ObjectStore, &mine)
+        .await
+        .unwrap();
     assert_eq!(
         state(&store, &mine).await,
         silentsilo_sync::KekState::Rotated
+    );
+}
+
+#[tokio::test]
+async fn garbage_where_the_envelope_and_the_newest_record_are_is_no_proven_rotation() {
+    // Needs no key at all: write access to storage is enough. It used to
+    // send every device to a rejoin that then failed on the same envelope.
+    let dir = tempfile::tempdir().unwrap();
+    let store = FolderStore::new(dir.path().to_path_buf());
+    let dek = generate_dek();
+    populate(&store as &dyn ObjectStore, &dek).await;
+    store.put(CONTENT_KEK_KEY, vec![7; 60]).await.unwrap();
+    let planted = format!(
+        "ops/{:020}-{}-{}.op",
+        999_999,
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4()
+    );
+    store.put(&planted, vec![9; 80]).await.unwrap();
+
+    assert_eq!(
+        state(&store, &dek).await,
+        silentsilo_sync::KekState::RotatedUnproven
+    );
+
+    // Nor does a proof sealed under another key count.
+    silentsilo_sync::write_rotation_proof(&store as &dyn ObjectStore, &generate_dek())
+        .await
+        .unwrap();
+    assert_eq!(
+        state(&store, &dek).await,
+        silentsilo_sync::KekState::RotatedUnproven
     );
 }
 

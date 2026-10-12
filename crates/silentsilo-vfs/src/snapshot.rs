@@ -1282,6 +1282,50 @@ pub fn record_received_through(conn: &Connection, lamport: u64) -> CoreResult<()
     Ok(())
 }
 
+const UNOPENED_PREFIX: &str = "unopened:";
+
+/// When this device first found `key` in storage not opening with the
+/// silo's key, noting `now` the first time.
+pub fn first_seen_unopened(conn: &Connection, key: &str, now: i64) -> CoreResult<i64> {
+    let name = format!("{UNOPENED_PREFIX}{key}");
+    conn.execute(
+        "INSERT INTO vault_meta(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO NOTHING",
+        params![name, now.to_string()],
+    )
+    .map_err(db)?;
+    let value: String = conn
+        .query_row(
+            "SELECT value FROM vault_meta WHERE key = ?1",
+            [&name],
+            |row| row.get(0),
+        )
+        .map_err(db)?;
+    Ok(value.parse().unwrap_or(now))
+}
+
+/// Forgets every object noted by [`first_seen_unopened`] that is not in
+/// `still`: gone from storage, or repaired.
+pub fn forget_unopened_except(conn: &Connection, still: &[&str]) -> CoreResult<()> {
+    let keep: std::collections::HashSet<String> = still
+        .iter()
+        .map(|key| format!("{UNOPENED_PREFIX}{key}"))
+        .collect();
+    let noted: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT key FROM vault_meta WHERE key LIKE 'unopened:%'")
+            .map_err(db)?;
+        stmt.query_map([], |row| row.get(0))
+            .map_err(db)?
+            .collect::<Result<_, _>>()
+            .map_err(db)?
+    };
+    for name in noted.iter().filter(|name| !keep.contains(*name)) {
+        conn.execute("DELETE FROM vault_meta WHERE key = ?1", [name])
+            .map_err(db)?;
+    }
+    Ok(())
+}
+
 pub fn record_sweep(conn: &Connection, target: Uuid, now: i64) -> CoreResult<()> {
     conn.execute(
         "INSERT INTO vault_meta(key, value) VALUES (?1, ?2)
@@ -1295,6 +1339,16 @@ pub fn record_sweep(conn: &Connection, target: Uuid, now: i64) -> CoreResult<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unopened_object_keeps_the_date_it_was_first_met() {
+        let device = crate::oplog::tests::Device::new();
+        let conn = &device.session.conn;
+        assert_eq!(first_seen_unopened(conn, "ops/a", 100).unwrap(), 100);
+        assert_eq!(first_seen_unopened(conn, "ops/a", 900).unwrap(), 100);
+        forget_unopened_except(conn, &[]).unwrap();
+        assert_eq!(first_seen_unopened(conn, "ops/a", 900).unwrap(), 900);
+    }
     use crate::oplog::tests::{bare_device, snapshot_of};
     use crate::oplog::{OpRecord, VaultOp, replay};
     use crate::schema::drop_derived_for_test;

@@ -124,6 +124,12 @@ async fn kek_refusal(store: &dyn ObjectStore, dek: &MasterDek) -> String {
              older copy. Restore the storage from a copy, or join from a device that already has \
              the silo."
             .to_string(),
+        Ok(sync::KekState::RotatedUnproven) => "This silo's content key in storage does not \
+             open with the credential that just opened the silo, and nothing in storage shows \
+             that a rotation did that. If you changed the silo's keys on a device with an older \
+             version, use a credential that was kept or the recovery code shown then. If you \
+             did not, the storage was written to: restore it from a copy."
+            .to_string(),
         _ => "This silo's key was rotated after this storage was last written to by a device \
              holding the credential you used. Use a credential that was kept through the \
              rotation, or the recovery code shown when it was done."
@@ -245,6 +251,12 @@ pub async fn recovery_join_provision(
         Ok(kek) => kek,
         Err(_) => return Err(kek_refusal(store, &join.dek).await),
     };
+    // Read before anything is made here. A listing that failed used to count
+    // as no keys at all, which left the new silo opening with this device's
+    // secret alone, the weaker door the envelopes below exist to close.
+    let mut keys = sync::fetch_key_envelopes(store)
+        .await
+        .map_err(|e| e.to_string())?;
     let session = VaultSession::provision_with_dek(
         root.clone(),
         join.vault_id,
@@ -265,7 +277,6 @@ pub async fn recovery_join_provision(
     // Envelopes are not authenticated: only well-formed ones, and none a
     // sealed revocation marker names, so a removed key put back by storage
     // does not become a key of this device.
-    let mut keys = sync::fetch_key_envelopes(store).await.unwrap_or_default();
     let mut usable = Vec::with_capacity(keys.len());
     for mut key in keys.drain(..) {
         if key.revoked || !sync::plausible_credential_id(&key.credential_id) {
@@ -282,6 +293,8 @@ pub async fn recovery_join_provision(
         // Only the key that opened this join, and proved it, keeps it.
         if join.proven_org_key.as_deref() != Some(key.credential_id.as_str()) {
             key.policy.clear();
+            // Nor is any of them proven here until it unlocks this device.
+            key.unconfirmed = true;
         }
         usable.push(key);
     }
@@ -426,6 +439,7 @@ pub fn enrol_device_key(
         // A security key added from a phone travels; the phone's own does not.
         platform: key.kind != silentsilo_vault::KIND_FIDO2,
         revoked: false,
+        unconfirmed: false,
     };
     keys.keys.push(stored.clone());
     if first {
@@ -460,6 +474,8 @@ pub fn open_with_device_key(
     if session.vault_id != expected_vault_id {
         return Err("these credentials belong to a different silo".into());
     }
+    // It opened the silo here, so it is one of this device's keys now.
+    let _ = silentsilo_vault::confirm_key(&session.paths.root, credential_id);
     let vfs = Vfs::new(&session);
     vfs.ensure_initialized().map_err(|e| e.to_string())?;
     let meta = vfs.meta().map_err(|e| e.to_string())?;

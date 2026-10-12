@@ -69,10 +69,48 @@ async fn populate(
     (expected, keys)
 }
 
+/// No recorded hash: these check what the blob says about itself.
 fn opener(
     keys: std::collections::HashMap<Uuid, ContentKey>,
-) -> impl FnMut(Uuid) -> Option<ContentKey> + Send {
-    move |id| keys.get(&id).cloned()
+) -> impl FnMut(Uuid) -> Option<(ContentKey, String)> + Send {
+    move |id| keys.get(&id).cloned().map(|k| (k, String::new()))
+}
+
+#[tokio::test]
+async fn a_blob_that_is_a_header_alone_is_damaged_against_its_record() {
+    // Anyone who can write to storage can replace a file with its header
+    // and the hash of nothing; only the sealed record tells.
+    let dir = tempfile::tempdir().unwrap();
+    let store = FolderStore::new(dir.path().to_path_buf());
+    let dek = generate_dek();
+    let blob_id = Uuid::new_v4();
+    let scratch = tempfile::tempdir().unwrap();
+    let plain = scratch.path().join("p");
+    std::fs::write(&plain, vec![9u8; 5000]).unwrap();
+    let key = generate_content_key();
+    let sealed = scratch.path().join("s");
+    let made = encrypt_file(&plain, &sealed, &key, Uuid::new_v4(), blob_id).unwrap();
+    let recorded = hex::encode(made.header.content_hash);
+    let bytes = std::fs::read(&sealed).unwrap();
+    let mut forged = bytes[..silentsilo_crypto::HEADER_SIZE].to_vec();
+    forged[42..74].copy_from_slice(blake3::hash(b"").as_bytes());
+    store
+        .put(&format!("{BLOBS_PREFIX}{blob_id}.sslo"), forged)
+        .await
+        .unwrap();
+
+    let report = verify_against(
+        &store as &dyn ObjectStore,
+        &dek,
+        &HashSet::from([blob_id]),
+        VerifyDepth::Content,
+        &mut |_| Some((key.clone(), recorded.clone())),
+        &mut |_, _| {},
+        &|| false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.damaged.len(), 1, "{report:?}");
 }
 
 #[tokio::test]

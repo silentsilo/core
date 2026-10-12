@@ -61,8 +61,16 @@ pub async fn is_key_revoked(
         .is_some_and(|m| m.credential_id == credential_id))
 }
 
+/// How far ahead of this device's clock a marker's date may be and still
+/// count: clocks drift, but not by more than a day.
+const MARKER_CLOCK_SLACK_SECS: i64 = 86_400;
+
 /// When storage says the marker for `credential_id` was written, if it
 /// holds one that opens with `kek`.
+///
+/// A date further ahead than [`MARKER_CLOCK_SLACK_SECS`] is ignored: the
+/// recovery code's marker kills every envelope made before it, so one dated
+/// in the far future would also kill every code made from now on.
 pub async fn revoked_at(
     client: &dyn ObjectStore,
     kek: &ContentKek,
@@ -71,11 +79,16 @@ pub async fn revoked_at(
     let Some(bytes) = crate::fetch_small(client, &marker_key(credential_id)).await? else {
         return Ok(None);
     };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     Ok(unseal_with_key(&bytes, kek.as_bytes())
         .ok()
         .and_then(|plain| serde_json::from_slice::<RevocationMarker>(&plain).ok())
         .filter(|m| m.credential_id == credential_id)
-        .map(|m| m.revoked_at))
+        .map(|m| m.revoked_at)
+        .filter(|at| *at <= now.saturating_add(MARKER_CLOCK_SLACK_SECS)))
 }
 
 /// The id the recovery code's marker goes under. Not hex, so no key can
@@ -246,12 +259,14 @@ fn merge(
     // Markers are sealed under the content key, which never rotates: anyone
     // who once held it can write one for every key. Followed blindly, that
     // removes every way into the silo on every device. A set of markers
-    // that would leave no key at all is not followed; the device that
-    // removed its last key did so knowingly and needs no other device's help.
+    // that would leave this device no key it can open the silo with is not
+    // followed; the device that removed its last key did so knowingly and
+    // needs no other device's help. Only keys this device has enrolled or
+    // unlocked with count: an envelope planted in storage would otherwise
+    // be the one key "left" after every real one was marked.
     let would_remain = local
-        .keys
-        .iter()
-        .filter(|key| !key.revoked && !follows(key))
+        .usable()
+        .filter(|key| !key.unconfirmed && !follows(key))
         .count();
     if would_remain > 0 {
         for key in local.keys.iter_mut() {
@@ -283,6 +298,8 @@ fn merge(
         if !org_controlled {
             key.policy.clear();
         }
+        // Until this device unlocks with it, nothing says it is real.
+        key.unconfirmed = true;
         outcome.added.push(key.credential_id.clone());
         local.keys.push(key);
     }
@@ -306,6 +323,7 @@ mod tests {
             wrapped_dek: "ef".into(),
             platform: false,
             revoked: false,
+            unconfirmed: false,
         }
     }
 
@@ -365,6 +383,45 @@ mod tests {
         let only = HashSet::from(["aa11".to_string()]);
         let outcome = merge(&mut local, Vec::new(), &only);
         assert_eq!(outcome.revoked, vec!["aa11".to_string()]);
+    }
+
+    #[test]
+    fn a_planted_key_does_not_let_markers_take_every_real_one() {
+        let mut local = StoredFidoKeys {
+            keys: vec![key("aa11"), key("bb22")],
+        };
+        // A former holder of the content key plants an envelope, then marks
+        // both real keys. The planted key arrives unconfirmed and does not
+        // count as one that would remain.
+        merge(&mut local, vec![key("ff99")], &HashSet::new());
+        assert!(
+            local
+                .keys
+                .iter()
+                .find(|k| k.credential_id == "ff99")
+                .unwrap()
+                .unconfirmed
+        );
+        let marked = HashSet::from(["aa11".to_string(), "bb22".to_string()]);
+        let outcome = merge(&mut local, Vec::new(), &marked);
+        assert!(outcome.revoked.is_empty());
+        assert!(local.keys.iter().all(|k| !k.revoked));
+
+        // Once this device has unlocked with it, it counts like any other.
+        local.keys[2].unconfirmed = false;
+        let outcome = merge(&mut local, Vec::new(), &marked);
+        assert_eq!(outcome.revoked.len(), 2);
+    }
+
+    #[test]
+    fn an_envelope_cannot_arrive_already_confirmed() {
+        let mut local = StoredFidoKeys {
+            keys: vec![key("aa11")],
+        };
+        let mut sent = key("bb22");
+        sent.unconfirmed = false;
+        merge(&mut local, vec![sent], &HashSet::new());
+        assert!(local.keys[1].unconfirmed);
     }
 
     #[test]

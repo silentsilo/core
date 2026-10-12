@@ -57,6 +57,12 @@ pub struct SyncReport {
     /// screen has to say something else entirely.
     #[serde(default)]
     pub key_material_replaced: bool,
+    /// With `needs_rejoin`: no proof of the rotation opened under this
+    /// device's key. A release before core 1.10.0 leaves none, and neither
+    /// does someone who wrote garbage over the content key and the newest
+    /// record, so the screen has to name both.
+    #[serde(default)]
+    pub rotation_unproven: bool,
     /// Records dropped from the bucket by a compaction this pass ran, so the
     /// status line can say the log got shorter rather than leaving the user
     /// wondering what the extra work was.
@@ -778,10 +784,18 @@ pub async fn run_sync_pass(
     // Copies left out of this pass, and what each one's status says.
     let mut retired: std::collections::HashMap<Uuid, &'static str> =
         std::collections::HashMap::new();
+    let mut unproven = false;
     for target in &targets {
         // Unreachable: it has no say, and the push below fails on it.
         let Ok(state) = sync::kek_envelope_state(&*target.store, &dek).await else {
             continue;
+        };
+        // Decided like a rotation; only the wording differs.
+        let state = if state == sync::KekState::RotatedUnproven {
+            unproven = true;
+            sync::KekState::Rotated
+        } else {
+            state
         };
         // Records here open under this key and the content key does not,
         // which no rotation produces.
@@ -856,6 +870,7 @@ pub async fn run_sync_pass(
                 SyncReport {
                     configured: true,
                     needs_rejoin: true,
+                    rotation_unproven: unproven,
                     ..SyncReport::default()
                 },
             ));
@@ -906,7 +921,6 @@ pub async fn run_sync_pass(
     // Other devices' keys in, and this device's revocations out as markers,
     // before the push publishes anything: publishing first would put back a
     // key another device just revoked. Never on a silo with no keys file.
-    let mut marked: std::collections::HashSet<String> = std::collections::HashSet::new();
     if silentsilo_vault::is_fido_enrolled(&root)
         && let Ok(mut local) = load_fido_keys(&root)
     {
@@ -930,10 +944,7 @@ pub async fn run_sync_pass(
             )
             .await
             {
-                Ok(outcome) => {
-                    changed |= outcome.changed();
-                    marked.extend(outcome.marked);
-                }
+                Ok(outcome) => changed |= outcome.changed(),
                 Err(e) => host.warn("keys", &format!("{}: {e}", target.label)),
             }
         }
@@ -975,7 +986,7 @@ pub async fn run_sync_pass(
         );
     }
     let recovery = settled.envelope;
-    let mut keys = load_fido_keys(&root).ok();
+    let keys = load_fido_keys(&root).ok();
 
     let several_copies = targets.len() > 1;
     // Targets that took everything they were owed. Kept apart from the
@@ -1037,21 +1048,11 @@ pub async fn run_sync_pass(
         )
         .await;
 
-        // A revocation storage has now confirmed, with its marker in place
-        // for the other devices: the tombstone has done its job and the local
-        // list can drop it.
-        if !outcome.revoked.is_empty()
-            && let Some(list) = keys.as_mut()
-        {
-            list.keys.retain(|k| {
-                !(outcome.revoked.contains(&k.credential_id) && marked.contains(&k.credential_id))
-            });
-            // Dropping tombstones only. The keys being forgotten here were
-            // already retired, with whatever proof that took at the time, so
-            // this takes nothing away that the silo still had.
-            silentsilo_vault::save_fido_keys(&root, list, silentsilo_vault::Authority::Machine)
-                .map_err(|e| e.to_string())?;
-        }
+        // A tombstone stays after storage has confirmed the revocation. It
+        // used to be dropped then, and a removed key's envelope put back
+        // with its marker deleted, which anyone with write access to
+        // storage can do, came back as a key another device had enrolled.
+        // Kept, the key is known here as removed and is never taken in.
 
         ops_pushed += outcome.ops_pushed;
         blobs_uploaded += outcome.blobs_uploaded;
@@ -1154,6 +1155,28 @@ pub async fn run_sync_pass(
     }
     let fetched_ids: std::collections::HashSet<Uuid> = incoming.iter().map(|r| r.op_id).collect();
     unreadable.retain(|u| u.op_id.is_none_or(|id| !fetched_ids.contains(&id)));
+    // One that has not opened for a week stops holding the rest back (see
+    // `UnreadableOp::holds_back`). Dated from the first pass that met it.
+    {
+        let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
+        if let Some(session) = sessions.get(&silo.id) {
+            for u in unreadable.iter_mut().filter(|u| !u.opened) {
+                let first =
+                    silentsilo_vfs::snapshot::first_seen_unopened(&session.conn, &u.key, now)
+                        .map_err(|e| e.to_string())?;
+                u.holds_back = now - first < sync::UNOPENED_HOLD_SECS;
+            }
+            if !fetch_failed {
+                let still: Vec<&str> = unreadable
+                    .iter()
+                    .filter(|u| !u.opened)
+                    .map(|u| u.key.as_str())
+                    .collect();
+                silentsilo_vfs::snapshot::forget_unopened_except(&session.conn, &still)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+    }
     let (incoming, held_back) = sync::usable_prefix(incoming, &unreadable);
     // Everything every copy holds was read and nothing is held back.
     let view_complete =
@@ -1186,8 +1209,19 @@ pub async fn run_sync_pass(
         })?;
         let report = replay(&session.conn, incoming).map_err(|e| e.to_string())?;
         if view_complete {
-            silentsilo_vfs::snapshot::record_received_through(&session.conn, listed_through)
-                .map_err(|e| e.to_string())?;
+            // The listing's numbers are only names, and one planted far
+            // ahead would mark this device as having received changes it
+            // never saw. No higher than what it holds, applied or folded
+            // into its snapshot: after a complete fetch that covers every
+            // real record listed.
+            let held = silentsilo_vfs::highest_applied_lamport(&session.conn)
+                .map_err(|e| e.to_string())?
+                .max(local_horizon);
+            silentsilo_vfs::snapshot::record_received_through(
+                &session.conn,
+                listed_through.min(held),
+            )
+            .map_err(|e| e.to_string())?;
         }
 
         // Written down per target, after the write and never before: a
@@ -1343,6 +1377,7 @@ pub async fn run_sync_pass(
         needs_rebuild: false,
         needs_rejoin: false,
         key_material_replaced: false,
+        rotation_unproven: false,
         compacted,
         targets: statuses,
         skipped: false,
@@ -1458,7 +1493,7 @@ pub const MISSED_ROTATION: &str = "Missed the change of encryption key made on a
 /// any copy means this device's key is retired, whatever an older copy says.
 fn gravest_kek_state(states: &[sync::KekState]) -> Option<sync::KekState> {
     let rank = |state: &sync::KekState| match state {
-        sync::KekState::Rotated => 3,
+        sync::KekState::Rotated | sync::KekState::RotatedUnproven => 3,
         sync::KekState::Replaced => 2,
         sync::KekState::Current => 1,
         sync::KekState::Absent => 0,

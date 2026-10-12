@@ -119,7 +119,21 @@ pub struct UnreadableOp {
     pub op_id: Option<Uuid>,
     pub lamport: Option<u64>,
     pub error: String,
+    /// It opened with this silo's key and still could not be used: a newer
+    /// build's record, or one beyond the change counter.
+    pub opened: bool,
+    /// Whether it holds the records above it back. True as fetched. The
+    /// pass lets go of one that has not opened for a week
+    /// ([`UNOPENED_HOLD_SECS`]): anyone with write access to storage can put
+    /// such an object at a low number, and holding everything above it
+    /// stopped incoming changes for good. A week leaves an interrupted
+    /// upload or a damaged object time to be sent again or repaired.
+    pub holds_back: bool,
 }
+
+/// How long an object that does not open with the silo's key holds the
+/// records above it back.
+pub const UNOPENED_HOLD_SECS: i64 = 7 * 24 * 60 * 60;
 
 /// What a diffing fetch found.
 #[derive(Debug, Default)]
@@ -194,12 +208,14 @@ pub async fn fetch_missing_ops_reporting(
     progress(0, total);
 
     for (done, entry) in listing.into_iter().enumerate() {
-        let mut unreadable = |key: String, error: String| {
+        let mut unreadable = |key: String, error: String, opened: bool| {
             out.unreadable.push(UnreadableOp {
                 op_id: op_id_from_key(&key),
                 lamport: lamport_from_key(&key),
                 key,
                 error,
+                opened,
+                holds_back: true,
             });
         };
         if entry.size > MAX_OP_BYTES {
@@ -211,6 +227,7 @@ pub async fn fetch_missing_ops_reporting(
                     "{} bytes is far larger than any operation record",
                     entry.size
                 ),
+                false,
             );
         } else {
             let sealed = client.get(&entry.key).await?;
@@ -221,10 +238,21 @@ pub async fn fetch_missing_ops_reporting(
                     // storage made, to replay an old change above a snapshot
                     // or later than it happened: never applied.
                     Ok(record) if op_key(&record) != entry.key => out.misplaced.push(entry.key),
+                    // Held back like an unreadable one: applied, it would
+                    // stop this device's clock.
+                    Ok(record) if record.lamport > silentsilo_vfs::LAMPORT_CEILING => unreadable(
+                        entry.key,
+                        "its change number is beyond any a silo reaches".into(),
+                        true,
+                    ),
                     Ok(record) => out.records.push(record),
-                    Err(e) => unreadable(entry.key, e.to_string()),
+                    Err(e) => unreadable(entry.key, e.to_string(), true),
                 },
-                Err(_) => unreadable(entry.key, "does not open with this silo's key".into()),
+                Err(_) => unreadable(
+                    entry.key,
+                    "does not open with this silo's key".into(),
+                    false,
+                ),
             }
         }
         progress(done + 1, total);
@@ -261,18 +289,24 @@ pub async fn fetch_all_ops_above_reporting(
     Ok(got.records)
 }
 
-/// Cuts fetched records at the first unreadable object, so replay never
-/// applies past a hole in the log: an operation applied while its
-/// prerequisite is stuck behind the hole would resolve as obsolete and never
-/// be retried. Everything at or above the lowest unreadable Lamport value
-/// waits for a later pass; an unreadable object with no parseable Lamport
-/// value holds nothing back. Returns what may be applied and how many
-/// records are waiting.
+/// Cuts fetched records at the first unreadable object that holds back
+/// ([`UnreadableOp::holds_back`]), so replay never applies past a hole in
+/// the log: an operation applied while its prerequisite is stuck behind the
+/// hole would resolve as obsolete and never be retried. Everything at or
+/// above the lowest such Lamport value waits for a later pass; an object
+/// with no parseable Lamport value holds nothing back. One that does not is
+/// still reported, and the pass still neither compacts nor sweeps while it
+/// is there. Returns what may be applied and how many records are waiting.
 pub fn usable_prefix(
     mut records: Vec<OpRecord>,
     unreadable: &[UnreadableOp],
 ) -> (Vec<OpRecord>, usize) {
-    let Some(cutoff) = unreadable.iter().filter_map(|u| u.lamport).min() else {
+    let Some(cutoff) = unreadable
+        .iter()
+        .filter(|u| u.holds_back)
+        .filter_map(|u| u.lamport)
+        .min()
+    else {
         return (records, 0);
     };
     let before = records.len();
@@ -1018,6 +1052,18 @@ async fn seed(
     for prefix in SEED_PREFIXES {
         work.extend(from.list(prefix).await?);
     }
+    // Names come from the source's listing, which is whatever the source
+    // says. One this app could not have written is never carried over, so a
+    // planted `blobs/../..` cannot become a write outside the destination.
+    work.retain(|entry| {
+        let safe = silentsilo_store::is_safe_key(&entry.key);
+        if !safe {
+            outcome
+                .failed
+                .push((entry.key.clone(), "not a name this app writes".into()));
+        }
+        safe
+    });
     // The manifest is one fixed key rather than a prefix, and it goes last.
     let manifest_size = from.head(MANIFEST_KEY).await?;
 
@@ -1258,14 +1304,15 @@ pub enum VerifyDepth {
 
 /// Reads a silo's storage and reports what is wrong with it. `expected` is
 /// what the local index says should be there: storage agreeing with itself
-/// proves nothing. `open` turns a blob id into its content key, passed in
-/// because this crate moves ciphertext and knows no key but the DEK.
+/// proves nothing. `open` turns a blob id into its content key and the
+/// content hash its record holds, passed in because this crate moves
+/// ciphertext and knows no key but the DEK.
 pub async fn verify_against(
     client: &dyn ObjectStore,
     dek: &MasterDek,
     expected: &std::collections::HashSet<Uuid>,
     depth: VerifyDepth,
-    open: &mut (dyn FnMut(Uuid) -> Option<silentsilo_crypto::ContentKey> + Send),
+    open: &mut (dyn FnMut(Uuid) -> Option<(silentsilo_crypto::ContentKey, String)> + Send),
     progress: &mut (dyn FnMut(usize, usize) + Send),
     cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<VerifyReport, SyncError> {
@@ -1345,13 +1392,15 @@ pub async fn verify_against(
                 .push((entry.key.clone(), "the object is empty".to_string()));
         } else if depth == VerifyDepth::Content {
             match open(blob_id) {
-                Some(key) => match verify_one(client, &entry.key, &key, blob_id).await {
-                    Ok(read) => {
-                        report.blobs_checked += 1;
-                        report.bytes_read += read;
+                Some((key, hash)) => {
+                    match verify_one(client, &entry.key, &key, blob_id, &hash).await {
+                        Ok(read) => {
+                            report.blobs_checked += 1;
+                            report.bytes_read += read;
+                        }
+                        Err(e) => report.damaged.push((entry.key.clone(), e)),
                     }
-                    Err(e) => report.damaged.push((entry.key.clone(), e)),
-                },
+                }
                 None => report.damaged.push((
                     entry.key.clone(),
                     "no content key is recorded for this file".to_string(),
@@ -1387,6 +1436,7 @@ async fn verify_one(
     key: &str,
     content_key: &silentsilo_crypto::ContentKey,
     blob_id: Uuid,
+    recorded_hash: &str,
 ) -> Result<u64, String> {
     let dir = tempfile::Builder::new()
         .prefix("silentsilo-verify")
@@ -1399,7 +1449,8 @@ async fn verify_one(
         .map_err(|e| e.to_string())?;
     let read = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
 
-    silentsilo_crypto::verify_blob(&path, content_key, blob_id).map_err(|e| e.to_string())?;
+    silentsilo_crypto::verify_file(&path, content_key, blob_id, recorded_hash)
+        .map_err(|e| e.to_string())?;
     Ok(read)
 }
 
@@ -1435,7 +1486,7 @@ pub async fn repair_from(
     found: &VerifyReport,
     sources: &[(&str, &dyn ObjectStore)],
     dek: &MasterDek,
-    open: &mut (dyn FnMut(Uuid) -> Option<silentsilo_crypto::ContentKey> + Send),
+    open: &mut (dyn FnMut(Uuid) -> Option<(silentsilo_crypto::ContentKey, String)> + Send),
     cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<RepairReport, SyncError> {
     let mut report = RepairReport::default();
@@ -1479,13 +1530,13 @@ pub async fn repair_from(
                 Err(e) => report.unrepaired.push((key, e.to_string())),
             }
         } else if let Some(blob_id) = blob_id_from_key(&key) {
-            let Some(content_key) = open(blob_id) else {
+            let Some((content_key, hash)) = open(blob_id) else {
                 report
                     .unrepaired
                     .push((key, "no content key is recorded for this file".into()));
                 continue;
             };
-            if verify_one(target, &key, &content_key, blob_id)
+            if verify_one(target, &key, &content_key, blob_id, &hash)
                 .await
                 .is_ok()
             {
@@ -1500,7 +1551,7 @@ pub async fn repair_from(
             let mut from = None;
             for (label, source) in sources {
                 if source.get_to_file(&key, &path).await.is_ok()
-                    && silentsilo_crypto::verify_blob(&path, &content_key, blob_id).is_ok()
+                    && silentsilo_crypto::verify_file(&path, &content_key, blob_id, &hash).is_ok()
                 {
                     from = Some(label.to_string());
                     break;
@@ -1514,7 +1565,7 @@ pub async fn repair_from(
             };
             match target.put_from_file(&key, &path).await {
                 Ok(())
-                    if verify_one(target, &key, &content_key, blob_id)
+                    if verify_one(target, &key, &content_key, blob_id, &hash)
                         .await
                         .is_ok() =>
                 {
@@ -1594,6 +1645,10 @@ pub async fn reseal_under_new_key(
     progress: &mut (dyn FnMut(usize, usize) + Send),
 ) -> Result<ResealOutcome, SyncError> {
     let mut outcome = ResealOutcome::default();
+
+    // First, so no device on the old key ever finds records it cannot open
+    // without also finding why.
+    write_rotation_proof(client, old).await?;
 
     let mut work = Vec::new();
     for prefix in SEALED_PREFIXES {
@@ -2178,6 +2233,14 @@ pub enum KekState {
     /// because its records would be sealed under a key nobody else holds and
     /// its stale envelope would overwrite the rotated one.
     Rotated,
+    /// It does not open, nor do the newest records, and no rotation proof
+    /// opens under this device's key. Either a release before core 1.10.0
+    /// rotated the key (it leaves no proof), or someone with write access
+    /// put garbage where the envelope and the newest record are, which
+    /// needs no key at all. Treated as [`KekState::Rotated`] so a real
+    /// rotation still stops the device pushing, and said apart so the
+    /// screen names both possibilities: a rejoin fails on the second.
+    RotatedUnproven,
     /// It does not open, but records here still do. No rotation can leave a
     /// target in that state: `reseal_under_new_key` works through `ops/` and
     /// `snapshots/` first and writes this object last, so an envelope under
@@ -2228,7 +2291,7 @@ pub async fn kek_envelope_state(
             continue;
         };
         if unseal(&sealed, dek).is_err() {
-            return Ok(KekState::Rotated);
+            return Ok(rotated_if_proven(client, dek).await);
         }
         if !record_bytes_are_sound(&sealed, &entry.key, dek) {
             continue;
@@ -2238,9 +2301,75 @@ pub async fn kek_envelope_state(
     // A silo with no readable record to compare against says nothing, so the
     // answer stays the careful one.
     if witnesses == 0 {
-        return Ok(KekState::Rotated);
+        return Ok(rotated_if_proven(client, dek).await);
     }
     Ok(KekState::Replaced)
+}
+
+/// Where a rotation leaves its proof for the devices on the key it retired.
+pub const ROTATION_PROOF_PREFIX: &str = "keys/rotated/";
+
+const ROTATION_PROOF_VERSION: u32 = 1;
+
+/// `keys/rotated/<fingerprint>.sealed`, once opened.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RotationProof {
+    version: u32,
+    rotated_at: i64,
+}
+
+/// A name for a vault key that says nothing about it: a key derived from
+/// it for this one purpose, cut short.
+fn dek_fingerprint(dek: &MasterDek) -> String {
+    let derived = blake3::derive_key("silentsilo rotation proof v1", dek.as_bytes());
+    hex::encode(&derived[..16])
+}
+
+fn rotation_proof_key(old: &MasterDek) -> String {
+    format!("{ROTATION_PROOF_PREFIX}{}.sealed", dek_fingerprint(old))
+}
+
+/// Rotated, when storage holds a proof sealed under `dek`; otherwise
+/// unproven. A garbage envelope beside one garbage record used to read as a
+/// plain rotation, and anyone with write access to storage could send every
+/// device to a rejoin that then failed on the same envelope. Only a holder
+/// of the retired key can write the proof, and a rotation writes it before
+/// it touches anything else.
+async fn rotated_if_proven(client: &dyn ObjectStore, dek: &MasterDek) -> KekState {
+    let proven = matches!(
+        fetch_small(client, &rotation_proof_key(dek)).await,
+        Ok(Some(bytes)) if unseal(&bytes, dek)
+            .ok()
+            .and_then(|plain| serde_json::from_slice::<RotationProof>(&plain).ok())
+            .is_some_and(|p| p.version == ROTATION_PROOF_VERSION)
+    );
+    if proven {
+        KekState::Rotated
+    } else {
+        KekState::RotatedUnproven
+    }
+}
+
+/// Leaves the proof [`kek_envelope_state`] asks for: sealed under the key
+/// being retired, so a device still on it can open it and nobody else can
+/// write one. Releases before 1.5 skip `keys/` objects that are not
+/// envelopes, so it is invisible to them.
+pub async fn write_rotation_proof(
+    client: &dyn ObjectStore,
+    old: &MasterDek,
+) -> Result<(), SyncError> {
+    let proof = RotationProof {
+        version: ROTATION_PROOF_VERSION,
+        rotated_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
+    };
+    let json = serde_json::to_vec(&proof).map_err(|e| SyncError::Vault(e.to_string()))?;
+    client
+        .put(&rotation_proof_key(old), seal(&json, old)?)
+        .await?;
+    Ok(())
 }
 
 /// The Lamport counter of the newest record a target lists, read from the
@@ -2289,7 +2418,7 @@ pub async fn key_still_current(
     Ok(match kek_envelope_state(client, dek).await? {
         KekState::Absent => None,
         KekState::Current => Some(true),
-        KekState::Rotated | KekState::Replaced => Some(false),
+        KekState::Rotated | KekState::RotatedUnproven | KekState::Replaced => Some(false),
     })
 }
 /// Identifies which vault a prefix holds, for a device joining it.
@@ -2419,7 +2548,11 @@ pub async fn publish_key_envelopes(
             // its own, so uploading it would only mislead a joining device.
             continue;
         }
-        let bytes = serde_json::to_vec(key).map_err(|e| SyncError::Vault(e.to_string()))?;
+        // Whether this device has used the key is its own business, and
+        // two devices disagreeing on it would rewrite the envelope forever.
+        let mut public = key.clone();
+        public.unconfirmed = false;
+        let bytes = serde_json::to_vec(&public).map_err(|e| SyncError::Vault(e.to_string()))?;
         let key_path = key_envelope_key(&key.credential_id);
 
         // Written only when the bytes differ, compared by content: a
@@ -2787,7 +2920,21 @@ mod tests {
             op_id: None,
             lamport,
             error: "test".into(),
+            opened: true,
+            holds_back: true,
         }
+    }
+
+    #[test]
+    fn an_object_let_go_of_holds_nothing_back() {
+        // Anyone who can write to storage can put one at a low number.
+        let records = vec![record_at(1), record_at(5), record_at(9)];
+        let mut planted = unreadable_at(Some(2));
+        planted.opened = false;
+        planted.holds_back = false;
+        let (usable, held) = usable_prefix(records, &[planted]);
+        assert_eq!(usable.len(), 3);
+        assert_eq!(held, 0);
     }
 
     #[test]

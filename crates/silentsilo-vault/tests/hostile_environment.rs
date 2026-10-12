@@ -41,6 +41,7 @@ fn credential(id: &str, wrapped: &str) -> StoredFidoCredential {
         wrapped_dek: wrapped.into(),
         platform: false,
         revoked: false,
+        unconfirmed: false,
     }
 }
 
