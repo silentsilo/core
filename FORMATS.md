@@ -936,6 +936,12 @@ version 1, untagged, and read the same by a build that tags: the lines
 are unchanged. The release that ships tagged segments and the policy's
 `auth` gets a fixture pair of its own; `create` already writes them.
 
+`v1.10.0` and its twin are that pair: version 2 segments, a policy with
+`auth` and a recovery envelope with `auth_dek`. Their `expected.txt` reads
+the same as `v1.9.0`'s.
+No rotation runs in them, so `keys/rotated/` has no golden bytes here; its
+older-release behaviour is covered by the rotation tests named above.
+
 The one exception, and it expires with this release: while nothing had
 shipped, the formats iterated freely and the fixture was regenerated to match,
 because no silo written by an older iteration existed outside this repository.
