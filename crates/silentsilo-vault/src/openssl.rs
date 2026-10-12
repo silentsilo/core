@@ -28,8 +28,35 @@ unsafe extern "C" {
 pub fn init_openssl() {
     static ONCE: Once = Once::new();
     // Safety: no settings pointer, and later initialisations keep these options.
-    ONCE.call_once(|| unsafe {
-        OPENSSL_init_crypto(OPENSSL_INIT_NO_LOAD_CONFIG, std::ptr::null());
-        rusqlite::ffi::sqlite3_initialize();
+    ONCE.call_once(|| {
+        unsafe {
+            OPENSSL_init_crypto(OPENSSL_INIT_NO_LOAD_CONFIG, std::ptr::null());
+            rusqlite::ffi::sqlite3_initialize();
+        }
+        // SQLCipher wipes the memory it frees and locks what it holds, so
+        // decrypted pages and keys do not linger in the heap or reach swap.
+        // Off by default since SQLCipher 4.5, and process-wide once set, so
+        // it is set here, before any database holds a page. Its log goes
+        // off first: past Windows' small locked-memory quota every lock
+        // fails and is logged, and the logging allocated its way into a
+        // stack overflow.
+        if let Ok(conn) = rusqlite::Connection::open_in_memory() {
+            let _ = conn.execute_batch(
+                "PRAGMA cipher_log_level = NONE; PRAGMA cipher_memory_security = ON;",
+            );
+        }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn sqlcipher_wipes_what_it_frees() {
+        super::init_openssl();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let on: String = conn
+            .query_row("PRAGMA cipher_memory_security;", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(on, "1");
+    }
 }

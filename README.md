@@ -41,7 +41,8 @@ from this repository. Mobile clients will do the same.
 takes a silo folder or a bucket and a recovery code, and writes out the
 files, the trash to one side, the passwords as CSV, the attachments and a
 personal activity log, if the silo keeps one. No interface, no security key,
-one source that builds on Windows, Linux and macOS.
+one source that builds on Windows, Linux and macOS. It asks for the code
+without showing it, or reads it from standard input; `--help` has the rest.
 
 Binaries for all three ship with every desktop release, on the
 [silentsilo/desktop releases page](https://github.com/silentsilo/desktop/releases),

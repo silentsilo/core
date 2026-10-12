@@ -10,12 +10,12 @@ use std::path::PathBuf;
 use keyring::Entry;
 use silentsilo_store::StoreConfig;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::dpapi;
 use crate::error::VaultError;
 
 const KEYRING_USER: &str = "s3-config";
-const DPAPI_MAGIC: &[u8] = b"SSDPAPI1";
 const S3_CONFIG_FILE: &str = "s3.config.json";
 
 /// Keyed by silo: each one syncs to its own bucket or prefix, and a shared
@@ -23,10 +23,7 @@ const S3_CONFIG_FILE: &str = "s3.config.json";
 /// last. That is the fastest way to have a family silo replaying a work
 /// silo's operation log.
 fn keyring_entry(silo_id: Uuid) -> Result<Entry, keyring::Error> {
-    Entry::new(
-        crate::keychain::service(),
-        &format!("{KEYRING_USER}:{silo_id}"),
-    )
+    Entry::new(crate::keychain::service(), &slot_user(silo_id))
 }
 
 /// Machine-local, for the same reason as the credentials file: this holds the
@@ -52,8 +49,7 @@ pub fn load_s3_config(silo_id: Uuid) -> Option<StoreConfig> {
 
 /// The single slot as stored.
 fn read_slot(silo_id: Uuid) -> Option<StoreConfig> {
-    if let Ok(entry) = keyring_entry(silo_id)
-        && let Ok(json) = entry.get_password()
+    if let Ok(json) = crate::keychain::get_password(&slot_user(silo_id)).map(Zeroizing::new)
         && let Ok(config) =
             crate::format::decode::<StoreConfig>("the storage settings", json.as_bytes())
     {
@@ -63,27 +59,25 @@ fn read_slot(silo_id: Uuid) -> Option<StoreConfig> {
     read_fallback_config(silo_id)
 }
 
+fn slot_user(silo_id: Uuid) -> String {
+    format!("{KEYRING_USER}:{silo_id}")
+}
+
+fn list_user(silo_id: Uuid) -> String {
+    format!("{KEYRING_USER}-list:{silo_id}")
+}
+
 /// The keyring-unavailable path, split out so the per-silo separation can be
 /// tested without depending on whatever the test machine's keyring does.
 fn read_fallback_config(silo_id: Uuid) -> Option<StoreConfig> {
     let raw = std::fs::read(s3_config_path(silo_id)).ok()?;
-    let json_bytes = match raw.strip_prefix(DPAPI_MAGIC) {
-        Some(protected) => dpapi::unprotect(protected)?,
-        None => raw,
-    };
-    crate::format::decode("the storage settings", &json_bytes).ok()
+    crate::format::decode("the storage settings", &dpapi::open_sealed(raw)?).ok()
 }
 
+/// Sealed, or refused: see `dpapi`. It holds the storage's password or key.
 fn write_fallback_config(silo_id: Uuid, config: &StoreConfig) -> Result<(), VaultError> {
-    let json = crate::format::encode(config)?;
-    let to_write = match dpapi::protect(&json) {
-        Some(protected) => {
-            let mut out = DPAPI_MAGIC.to_vec();
-            out.extend_from_slice(&protected);
-            out
-        }
-        None => json,
-    };
+    let json = Zeroizing::new(crate::format::encode(config)?);
+    let to_write = dpapi::seal_secret(&json)?;
     crate::workdir::write_private(&s3_config_path(silo_id), &to_write)?;
     Ok(())
 }
@@ -105,19 +99,18 @@ pub fn save_s3_config(silo_id: Uuid, config: &StoreConfig) -> Result<(), VaultEr
 }
 
 fn write_slot(silo_id: Uuid, config: &StoreConfig) -> Result<(), VaultError> {
-    let json = String::from_utf8(crate::format::encode(config)?)
-        .map_err(|e| VaultError::Crypto(e.to_string()))?;
+    let json = Zeroizing::new(
+        String::from_utf8(crate::format::encode(config)?)
+            .map_err(|e| VaultError::Crypto(e.to_string()))?,
+    );
 
     // Same verify-after-write as device credentials: some Windows Credential
     // Manager setups report success without the entry becoming readable.
-    if crate::keychain::set_password(
-        crate::keychain::service(),
-        &format!("{KEYRING_USER}:{silo_id}"),
-        &json,
-    )
-    .is_ok()
-        && let Ok(verify) = keyring_entry(silo_id)
-        && matches!(verify.get_password(), Ok(stored) if stored == json)
+    if crate::keychain::set_password(crate::keychain::service(), &slot_user(silo_id), &json).is_ok()
+        && matches!(
+            crate::keychain::get_password(&slot_user(silo_id)).map(Zeroizing::new),
+            Ok(stored) if *stored == *json
+        )
     {
         let _ = std::fs::remove_file(s3_config_path(silo_id));
         return Ok(());
@@ -222,10 +215,7 @@ fn targets_path(silo_id: Uuid) -> PathBuf {
 }
 
 fn targets_keyring(silo_id: Uuid) -> Result<Entry, keyring::Error> {
-    Entry::new(
-        crate::keychain::service(),
-        &format!("{KEYRING_USER}-list:{silo_id}"),
-    )
+    Entry::new(crate::keychain::service(), &list_user(silo_id))
 }
 
 // ── Kinds an older release cannot read ──────────────────────────────
@@ -423,17 +413,18 @@ pub fn save_targets(silo_id: Uuid, targets: &[BackupTarget]) -> Result<(), Vault
 /// The list and the single slot, which older releases read: only kinds they
 /// know.
 fn write_list(silo_id: Uuid, targets: &[BackupTarget]) -> Result<(), VaultError> {
-    let json = String::from_utf8(crate::format::encode(&targets.to_vec())?)
-        .map_err(|e| VaultError::Crypto(e.to_string()))?;
+    let json = Zeroizing::new(
+        String::from_utf8(crate::format::encode(&targets.to_vec())?)
+            .map_err(|e| VaultError::Crypto(e.to_string()))?,
+    );
 
-    let stored_in_keyring = crate::keychain::set_password(
-        crate::keychain::service(),
-        &format!("{KEYRING_USER}-list:{silo_id}"),
-        &json,
-    )
-    .ok()
-    .and_then(|()| targets_keyring(silo_id).ok())
-    .is_some_and(|verify| matches!(verify.get_password(), Ok(held) if held == json));
+    let stored_in_keyring =
+        crate::keychain::set_password(crate::keychain::service(), &list_user(silo_id), &json)
+            .is_ok()
+            && matches!(
+                crate::keychain::get_password(&list_user(silo_id)).map(Zeroizing::new),
+                Ok(held) if *held == *json
+            );
 
     // The single slot below holds only the first entry, so a real list keeps
     // the file too: a lost keyring entry would otherwise read as one target
@@ -469,18 +460,13 @@ fn write_list(silo_id: Uuid, targets: &[BackupTarget]) -> Result<(), VaultError>
 /// depending on whatever the test machine's keyring does.
 fn read_fallback_targets(silo_id: Uuid) -> Option<Vec<serde_json::Value>> {
     let raw = std::fs::read(targets_path(silo_id)).ok()?;
-    let json_bytes = match raw.strip_prefix(DPAPI_MAGIC) {
-        Some(protected) => dpapi::unprotect(protected)?,
-        None => raw,
-    };
-    crate::format::decode("the backup targets", &json_bytes).ok()
+    crate::format::decode("the backup targets", &dpapi::open_sealed(raw)?).ok()
 }
 
 /// The list as stored, each entry left as JSON so one entry this build cannot
 /// read does not take the others with it.
 fn read_list(silo_id: Uuid) -> Option<Vec<serde_json::Value>> {
-    if let Ok(entry) = targets_keyring(silo_id)
-        && let Ok(json) = entry.get_password()
+    if let Ok(json) = crate::keychain::get_password(&list_user(silo_id)).map(Zeroizing::new)
         && let Ok(list) = crate::format::decode("the backup targets", json.as_bytes())
     {
         return Some(list);
@@ -499,45 +485,31 @@ fn read_more(silo_id: Uuid) -> Result<Vec<MoreEntry>, VaultError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e.into()),
     };
-    let json_bytes = match raw.strip_prefix(DPAPI_MAGIC) {
-        Some(protected) => dpapi::unprotect(protected).ok_or_else(|| {
-            VaultError::Corrupted(
-                "the list of cloud copies could not be read on this computer, so it was left as it is"
-                    .into(),
-            )
-        })?,
-        None => raw,
-    };
+    let json_bytes = dpapi::open_sealed(raw).ok_or_else(|| {
+        VaultError::Corrupted(
+            "the list of cloud copies could not be read on this computer, so it was left as it is"
+                .into(),
+        )
+    })?;
     crate::format::decode("the list of cloud copies", &json_bytes)
 }
 
+/// Sealed where this device can seal, in the clear otherwise: nothing in it
+/// is a secret.
 fn write_more(silo_id: Uuid, more: &[MoreEntry]) -> Result<(), VaultError> {
     if more.is_empty() {
         let _ = std::fs::remove_file(more_path(silo_id));
         return Ok(());
     }
     let json = crate::format::encode(&more.to_vec())?;
-    let to_write = match dpapi::protect(&json) {
-        Some(protected) => {
-            let mut out = DPAPI_MAGIC.to_vec();
-            out.extend_from_slice(&protected);
-            out
-        }
-        None => json,
-    };
+    let to_write = dpapi::seal_if_possible(&json)?;
     crate::workdir::write_private(&more_path(silo_id), &to_write)?;
     Ok(())
 }
 
+/// Sealed, or refused: see `dpapi`. It holds every target's secrets.
 fn write_fallback_targets(silo_id: Uuid, json: &[u8]) -> Result<(), VaultError> {
-    let to_write = match dpapi::protect(json) {
-        Some(protected) => {
-            let mut out = DPAPI_MAGIC.to_vec();
-            out.extend_from_slice(&protected);
-            out
-        }
-        None => json.to_vec(),
-    };
+    let to_write = dpapi::seal_secret(json)?;
     crate::workdir::write_private(&targets_path(silo_id), &to_write)?;
     Ok(())
 }
@@ -585,6 +557,7 @@ pub(crate) mod tests {
 
     impl Scratch {
         pub(super) fn new() -> Self {
+            crate::dpapi::tests::test_protector();
             Scratch(Uuid::new_v4(), Some(keyring_lock()))
         }
         /// A second silo in a test that already holds the lock.
@@ -610,6 +583,7 @@ pub(crate) mod tests {
     /// Manager under many parallel writers now and then loses one, which is
     /// the machine's behaviour rather than this module's.
     pub(crate) fn keyring_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::dpapi::tests::test_protector();
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -996,10 +970,7 @@ mod older_release_tests {
     }
 
     fn unwrap_file(raw: Vec<u8>) -> Option<Vec<u8>> {
-        match raw.strip_prefix(DPAPI_MAGIC) {
-            Some(protected) => dpapi::unprotect(protected),
-            None => Some(raw),
-        }
+        dpapi::open_sealed(raw).map(|bytes| bytes.to_vec())
     }
 
     /// Desktop 1.2's single slot: the keyring entry, then the file. Read a
@@ -1133,7 +1104,7 @@ mod older_release_tests {
         for unreadable in [
             b"not json at all".to_vec(),
             br#"{"version":99,"data":[]}"#.to_vec(),
-            [DPAPI_MAGIC, b"not a protected blob"].concat(),
+            [dpapi::SEALED, b"not a protected blob"].concat(),
         ] {
             let scratch = Scratch::new();
             std::fs::create_dir_all(more_path(scratch.id()).parent().unwrap()).unwrap();

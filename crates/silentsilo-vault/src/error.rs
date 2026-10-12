@@ -26,6 +26,14 @@ pub enum VaultError {
     )]
     RotationPending,
 
+    /// No keyring took the secret and nothing on this device can seal the
+    /// file it would go to. The app asks the user, and records the answer
+    /// with `allow_unprotected_secrets`.
+    #[error(
+        "This device has no keyring SilentSilo can use, so the secret would be written to a file only your account can read. Allow that, or set up a keyring and try again.\u{1f}err.secrets_unprotected"
+    )]
+    SecretsUnprotected,
+
     #[error("crypto error: {0}")]
     Crypto(String),
 

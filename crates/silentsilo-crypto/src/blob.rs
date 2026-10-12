@@ -143,7 +143,9 @@ pub fn encrypt_stream<R: Read>(
     let part = std::path::PathBuf::from(part);
     let result = encrypt_into(source, &part, key, file_id, blob_id);
     match result {
-        Ok(result) => match std::fs::rename(&part, dest) {
+        // Retried: a scanner holding the file it just saw written for a
+        // few milliseconds fails a plain rename on Windows.
+        Ok(result) => match silentsilo_core::rename_with_retry(&part, dest) {
             Ok(()) => Ok(result),
             Err(e) => {
                 let _ = std::fs::remove_file(&part);

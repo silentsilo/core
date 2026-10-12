@@ -9,8 +9,12 @@
 //! - Windows (iCloud for Windows): `%USERPROFILE%\iCloudDrive\iCloud~com~silentsilo~mobile`,
 //!   which is the same `Documents`, shown without the name.
 //!
-//! A file another device wrote may be only in iCloud at first; reading it
-//! brings it down on all three, so nothing here asks for downloads.
+//! A file another device wrote may be only in iCloud at first. On macOS 14
+//! and later, iOS 17 and later and Windows, reading it brings it down. Before
+//! that, Apple keeps it as a placeholder named `.<name>.icloud` and the file
+//! itself is not there: the store lists the placeholder as the file, and a
+//! read asks iCloud to download it (`startDownloadingUbiquitousItemAtURL`)
+//! and waits for it (see `FolderStore::with_placeholders`).
 //!
 //! The container itself is never created here. It exists once iCloud Drive
 //! is on and the iPhone app has used it; a folder made by hand where it
@@ -137,7 +141,31 @@ pub(crate) fn open(config: &ICloudConfig) -> Result<FolderStore, StoreError> {
             .into(),
         )
     })?;
-    Ok(FolderStore::new(documents.join(&config.folder)))
+    Ok(FolderStore::with_placeholders(
+        documents.join(&config.folder),
+        start_download,
+    ))
+}
+
+/// Asks iCloud to bring down the file a placeholder stands for. Returns
+/// whether the request was taken; the file appears once it is down.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn start_download(path: &std::path::Path) -> bool {
+    use objc2_foundation::{NSFileManager, NSString, NSURL};
+    let Some(text) = path.to_str() else {
+        return false;
+    };
+    let url = NSURL::fileURLWithPath(&NSString::from_str(text));
+    NSFileManager::defaultManager()
+        .startDownloadingUbiquitousItemAtURL_error(&url)
+        .is_ok()
+}
+
+/// Windows brings a file down on the first read; there are no
+/// placeholders to answer for.
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+fn start_download(_: &std::path::Path) -> bool {
+    false
 }
 
 #[cfg(test)]

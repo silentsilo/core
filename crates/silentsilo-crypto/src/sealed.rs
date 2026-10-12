@@ -81,12 +81,16 @@ pub fn wrap_content_key(key: &ContentKey, kek: &ContentKek) -> Result<String, Cr
 pub fn unwrap_content_key(wrapped: &str, kek: &ContentKek) -> Result<ContentKey, CryptoError> {
     let bytes = hex::decode(wrapped)
         .map_err(|_| CryptoError::InvalidHeader("content key is not hex".into()))?;
-    let raw = unseal_with_key(&bytes, kek.as_bytes())?;
-    let sized: [u8; 32] = raw
+    // The content key in the clear on its way into the type that wipes it:
+    // neither copy outlives this function.
+    let raw = zeroize::Zeroizing::new(unseal_with_key(&bytes, kek.as_bytes())?);
+    let mut sized: [u8; 32] = raw
         .as_slice()
         .try_into()
         .map_err(|_| CryptoError::InvalidHeader("content key is the wrong length".into()))?;
-    Ok(ContentKey::from_bytes(sized))
+    let key = ContentKey::from_bytes(sized);
+    zeroize::Zeroize::zeroize(&mut sized);
+    Ok(key)
 }
 
 /// Reverses [`seal`]. Fails on a truncated payload, an unknown format, the

@@ -215,7 +215,7 @@ stateDiagram-v2
     [*] --> Staged: stage_rotation writes .next key files
     Staged --> Resealed: reseal_under_new_key per deletable target (idempotent, resumable)
     Resealed --> Committed: commit_rotation_with (keys and recovery staged, KEK renamed, the rest renamed)
-    Staged --> Staged: crash → resume with any enrolled key
+    Staged --> Staged: crash → resume with any enrolled key, on this machine
     Committed --> [*]: new recovery code shown, silos locked
 ```
 
@@ -236,6 +236,14 @@ old key readable there. An object that opens under neither key does not stop
 it (`ResealOutcome.unreadable`): nobody could read it before either, and one
 corrupt record otherwise blocked every rotation and resume for good. The KEK
 envelope is the exception and still fails it.
+
+The staged key is sealed under the old DEK, so any enrolled key can resume,
+and kept outside the silo folder (`staged/<id>.dek` under the work base):
+the folder's `master.dek.enc.next` only names it. In the folder, or in a
+synced folder's history of it, it would give the new key to whoever still
+holds the old one, which is who a rotation is for. A rotation staged by core
+1.9 or earlier has the key in the folder and is still resumed from there.
+The price: a rotation finishes only on the computer that started it.
 
 The order is forced: the staged key is durable on disk before any object in
 storage is re-sealed, because an object under a key that existed only in
@@ -310,8 +318,14 @@ property:
 - **The local secrets** (outside the folder): device credentials, storage
   settings and the silo list. Kept in the OS keyring where there is one,
   else in files. On Windows those files are DPAPI-wrapped; elsewhere a client
-  may register a `LocalProtector` (Android: a Keystore key), and without one
-  they are plaintext, private to the user or app.
+  may register a `LocalProtector` (Android: a Keystore key, iPhone: a
+  Keychain key). A protector that fails refuses the write. Without one, a
+  secret goes to a plaintext file (0600) only after the user agreed
+  (`allow_unprotected_secrets`); until then the save fails with
+  `VaultError::SecretsUnprotected` (`err.secrets_unprotected`), which the app
+  turns into that question. On an iPhone the keychain entries are "this
+  device only" (`keychain.rs`). The device secret is emptied once a key is
+  enrolled (`retire_device_secret`), the record kept.
   Backup targets of a kind core 1.7.2 does not know live in
   `targets.more.config.json`, never in the list or the single slot an older
   release reads (FORMATS.md). Test runs use the keyring service
@@ -334,6 +348,9 @@ property:
   key `protected.key`), which between them name every mirrored file by its
   full local path and are therefore encrypted, under the content KEK so a
   rotation cannot strand them. Nothing here may ever land in the silo folder.
+  The folder holding every silo's scratch (`open/`) is excluded from Time
+  Machine and iPhone backups (`workdir::exclude_from_backup`). A pending
+  rotation's staged key sits under `staged/`, kept across locks and sweeps.
 - **The bucket** (per target): `vault.json` (the only plaintext object, one
   random UUID), `ops/`, `blobs/`, `snapshots/`, `keys/*.env`,
   `keys/content.kek`, `recovery.env`. Layout and versions are FORMATS.md's
@@ -628,7 +645,7 @@ sealed object, or a new reader of an old kind, comes with that test.
 | `audit/keys/*.json` (wrapped private key inside) | `read_audit_key`, `AuditKey::unwrap_with`, `read_silo_keys` | `key_id == name`; the private key must give the entry's public key | sync `audit_log.rs` `a_log_key_moved_under_another_keys_name_is_refused`, audit `keyring.rs` `a_private_key_moved_under_another_log_keys_entry_is_refused` |
 | `audit/<device>/<seq>.seg` (HPKE, not `sealed.rs`) | app `audit_read`, `expire_audit_segments`, extract, fixture | header `device` and `seq` == name; records bind the device in their AAD; from version 2 the tag covers the header and records | app `audit.rs` `a_segment_moved_under_another_name_is_not_taken_for_it`, audit `segment.rs` `a_changed_byte_or_a_moved_segment_does_not_check` |
 | backup as a whole | `silentsilo-extract::open` | the readers above | extract `round_trip.rs` `objects_moved_under_other_names_in_a_backup_are_not_taken` |
-| `content.kek.enc`, `master.dek.enc.next` (silo folder) | `load_kek`, `load_staged_dek` | both are 32 bytes under the DEK: each refuses a key equal to the other | vault `rotation.rs` `the_kek_and_the_staged_key_copied_over_each_other_are_refused`, `kek_store.rs` `another_object_sealed_under_the_dek_is_not_taken_as_the_kek` |
+| `content.kek.enc` (silo folder), the staged key (`master.dek.enc.next`, or from core 1.10 the machine-local file it names) | `load_kek`, `load_staged_dek` | both are 32 bytes under the DEK: each refuses a key equal to the other | vault `rotation.rs` `the_kek_and_the_staged_key_copied_over_each_other_are_refused`, `kek_store.rs` `another_object_sealed_under_the_dek_is_not_taken_as_the_kek` |
 | `master.dek.enc` and every DEK wrapping | `unwrap_dek_bytes` | each is under a wrap key of its own | vault `dek_store.rs` `a_wrapping_moved_from_another_place_does_not_open_here` |
 | `vault.db.enc` (`.bak`, `.next`), `vault.key` | session open | the image must open as this silo's database, the page key must open the copy; else the shadow copy or a fresh export | vault `session.rs` `a_sealed_object_moved_over_the_snapshot_or_the_page_key_is_not_used` |
 | `protected.enc`, `protected.key` (machine cache) | `load_protected`, `load_seen` | the list must decode, the key must open the ledger; neither reads as empty | vault `protected.rs` `the_list_and_the_ledger_key_swapped_are_both_refused` |
@@ -900,8 +917,13 @@ Read this before "fixing" any of it.
   SilentSilo's container on this device (the user profile on a Mac and on
   Windows, a locator the iPhone app installs through `set_icloud_locator`,
   since only Swift can ask iOS), and a `FolderStore` works inside it. A file
-  only in iCloud is brought down by reading it, on all three (checked on
-  devices, `planuri/icloud.md` in the workspace). The container is never
+  only in iCloud is brought down by reading it on macOS 14, iOS 17 and
+  Windows (checked on devices, `planuri/icloud.md` in the workspace). Before
+  those, Apple leaves `.<name>.icloud` in its place: the store lists it as
+  `<name>`, with the size its property list records, and a read asks for the
+  download (`startDownloadingUbiquitousItemAtURL`) and waits up to a minute,
+  then answers `err.icloud_downloading` for the next pass to retry. A delete
+  removes the placeholder too. The container is never
   created here: a folder made by hand where it should be would not sync and
   would fill as a copy nobody sees, so without it every call is
   `Unreachable`. Android and Linux refuse the kind when it is saved.
@@ -978,6 +1000,34 @@ Read this before "fixing" any of it.
 - **Recovery codes map O→0, I/L→1, U→V on input.** Crockford's alphabet
   excludes those on output precisely because handwriting confuses them;
   strict parsing would reject correct codes.
+- **A retired device secret leaves its record.** `retire_device_secret`
+  writes the credentials back with an empty `device_secret` rather than
+  deleting them: both apps read "credentials load" as "this silo is set up
+  here", and a deleted record sent people to join a silo they had. Opening
+  with a key retires it as a side effect (`open_with_fido_wrapped`), which is
+  how silos enrolled before core 1.10 lose theirs. The device-secret
+  envelope itself stays `master.dek.enc` in the silo folder, where 1.0.0
+  looks for it (fixture `working_copy.rs`); with the secret gone, a copy of
+  it in a synced history opens nothing.
+- **Unsealed secrets need a yes, and nothing else does.** Where a device has
+  no keyring and no protector, credentials, storage settings and tokens are
+  refused until `allow_unprotected_secrets(true)`; `silos.json` and
+  `targets.more.config.json` hold no secret and are written either way. A
+  plaintext file an earlier release left keeps being read, so nobody is
+  locked out of a silo by the update.
+- **Plain `http://` WebDAV only reaches the local network.** Loopback,
+  private and link-local addresses, 100.64/10 (Tailscale and other mesh
+  VPNs), and names that resolve only locally (no dot, `.local`, `.lan`,
+  `.home.arpa`, `.internal`). A redirect is followed only to the same
+  scheme, host and port, five at most; any other is an error naming it
+  (`err.webdav_redirected`), so neither the password nor the silo goes
+  wherever a server points. Errors and `describe()` never show a
+  `user:password@` written into the address.
+- **A folder target does not follow links out of itself.** A symlink or
+  junction inside the root is followed only while it resolves inside the
+  root, for listing, reading and writing alike, and anything that is not a
+  regular file (a FIFO, a device) is not an object. Whoever can write to a
+  shared folder could otherwise point a key at the rest of the disk.
 
 ## Changing things
 

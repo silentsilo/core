@@ -124,19 +124,94 @@ fn finish_committed(root: &Path) -> Result<(), VaultError> {
         }
     }
     // Last, because its absence is what says the rotation is over.
+    let local = local_id(root);
     match std::fs::remove_file(staged_dek_path(root)) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
         _ => {}
     }
+    remove_local_staged(local);
     retire_page_key(root);
     Ok(())
+}
+
+/// What `master.dek.enc.next` in the silo folder holds from core 1.10 on:
+/// not the key, only the name of the file on this machine that holds it.
+///
+/// The key is sealed under the old one so that any credential of the silo
+/// can carry the rotation on. In the folder that also handed it to whoever
+/// the rotation was meant to shut out: a removed key or an old recovery code
+/// opens the old key, and a synced folder keeps every version of the file in
+/// its history. On this machine it stays out of the folder and its history.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StagedHere {
+    local: uuid::Uuid,
+}
+
+/// The machine-local file a rotation's new key is staged in. Kept across
+/// locks and sweeps; only finishing or discarding the rotation removes it.
+fn local_staged_path(id: uuid::Uuid) -> PathBuf {
+    crate::workdir::work_base()
+        .join("staged")
+        .join(format!("{id}.dek"))
+}
+
+/// Where the staged key's sealed bytes are: the file this machine keeps,
+/// or, for a rotation staged by an earlier release, the folder's own file.
+fn staged_location(root: &Path) -> std::io::Result<StagedAt> {
+    let data = std::fs::read(staged_dek_path(root))?;
+    Ok(
+        match crate::format::decode::<StagedHere>("the staged key", &data) {
+            Ok(here) => StagedAt::Local(here.local),
+            Err(_) => StagedAt::Folder(data),
+        },
+    )
+}
+
+enum StagedAt {
+    Local(uuid::Uuid),
+    /// Sealed under the old key, as core 1.9 and earlier wrote it.
+    Folder(Vec<u8>),
+}
+
+/// The staged key's sealed bytes, wherever they are.
+fn staged_sealed(root: &Path) -> Result<Vec<u8>, VaultError> {
+    match staged_location(root)? {
+        StagedAt::Folder(data) => Ok(data),
+        StagedAt::Local(id) => std::fs::read(local_staged_path(id)).map_err(|_| {
+            VaultError::Corrupted(
+                silentsilo_core::coded!(
+                    "err.rotation_other_computer",
+                    "The new encryption key of this unfinished key change is kept on the computer that started it. Finish it there."
+                )
+                .into(),
+            )
+        }),
+    }
+}
+
+/// Removes the machine-local copy of a staged key, after its marker in the
+/// folder is gone. A leftover is sealed under a retired key and names
+/// nothing.
+fn remove_local_staged(id: Option<uuid::Uuid>) {
+    if let Some(id) = id {
+        let _ = std::fs::remove_file(local_staged_path(id));
+    }
+}
+
+fn local_id(root: &Path) -> Option<uuid::Uuid> {
+    match staged_location(root) {
+        Ok(StagedAt::Local(id)) => Some(id),
+        _ => None,
+    }
 }
 
 /// Writes the new key and the re-wrapped KEK without putting either in
 /// force. KEK first, DEK second, because the DEK's presence is what marks
 /// a rotation as pending. The new key is wrapped under the **old** one
 /// rather than a security key, so an interrupted rotation is resumable
-/// from any credential the silo has.
+/// from any credential the silo has, on this machine: the wrapped key is
+/// kept outside the silo folder, and the folder holds only its name (see
+/// [`StagedHere`]).
 ///
 /// Refuses outright when a rotation is already staged. Writing a second key
 /// over the first strands every object the first attempt re-sealed: they
@@ -156,16 +231,26 @@ pub fn stage_rotation(
     crate::workdir::write_private(&staged_kek_path(root), &wrap_kek_bytes(kek, new_dek)?)?;
     let wrapped =
         seal(new_dek.as_bytes(), old_dek).map_err(|e| VaultError::Crypto(e.to_string()))?;
-    crate::workdir::write_private(&staged_dek_path(root), &wrapped)?;
+    // The key first, durably, and the marker that points at it second: a
+    // marker naming a file that was never written would be a pending
+    // rotation nothing can finish.
+    let id = uuid::Uuid::new_v4();
+    crate::workdir::write_private(&local_staged_path(id), &wrapped)?;
+    let marker = crate::format::encode(&StagedHere { local: id })?;
+    if let Err(e) = crate::workdir::write_private(&staged_dek_path(root), &marker) {
+        remove_local_staged(Some(id));
+        return Err(e.into());
+    }
     Ok(())
 }
 
 /// The staged key, for a rotation that has to be carried on.
 ///
 /// Read with the key the silo currently opens under, which is the old one:
-/// committing has not happened, or there would be nothing staged.
+/// committing has not happened, or there would be nothing staged. A rotation
+/// staged by an earlier release, with the key in the folder, reads as well.
 pub fn load_staged_dek(root: &Path, old_dek: &MasterDek) -> Result<MasterDek, VaultError> {
-    let data = std::fs::read(staged_dek_path(root))?;
+    let data = staged_sealed(root)?;
     let plain = Zeroizing::new(unseal(&data, old_dek).map_err(|_| VaultError::InvalidCredentials)?);
     let key: [u8; 32] = plain
         .as_slice()
@@ -184,7 +269,7 @@ pub fn load_staged_dek(root: &Path, old_dek: &MasterDek) -> Result<MasterDek, Va
 
 /// The staged key a pending rotation holds, if `dek` opens it as one.
 pub(crate) fn staged_key_under(root: &Path, dek: &MasterDek) -> Option<Zeroizing<Vec<u8>>> {
-    let data = std::fs::read(staged_dek_path(root)).ok()?;
+    let data = staged_sealed(root).ok()?;
     let plain = Zeroizing::new(unseal(&data, dek).ok()?);
     (plain.len() == 32).then_some(plain)
 }
@@ -211,7 +296,9 @@ pub fn commit_rotation(root: &Path) -> Result<(), VaultError> {
     // Last, because its absence is what says the rotation is over. Removing
     // it before the KEK above is in place would report a finished rotation
     // over a half-applied one.
+    let local = local_id(root);
     std::fs::remove_file(staged_dek_path(root))?;
+    remove_local_staged(local);
     retire_page_key(root);
     Ok(())
 }
@@ -236,7 +323,10 @@ fn retire_page_key(root: &Path) {
 /// re-sealed, the staged key is the only thing that can open it, and
 /// discarding it is the loss this whole module exists to prevent.
 pub fn discard_staged(root: &Path) {
-    let _ = std::fs::remove_file(staged_dek_path(root));
+    let local = local_id(root);
+    if std::fs::remove_file(staged_dek_path(root)).is_ok() {
+        remove_local_staged(local);
+    }
     let _ = std::fs::remove_file(staged_kek_path(root));
     let _ = std::fs::remove_file(staged_keys_path(root));
     let _ = std::fs::remove_file(staged_recovery_path(root));
@@ -275,6 +365,122 @@ mod tests {
                 unconfirmed: false,
             }],
         }
+    }
+
+    /// Every file in the folder, as anything that reads the folder or a
+    /// synced history of it sees them.
+    fn folder_files(dir: &Path) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(folder_files(&path));
+            } else {
+                out.push(std::fs::read(path).unwrap());
+            }
+        }
+        out
+    }
+
+    /// The old key is what a removed key or an old recovery code still
+    /// opens. Nothing in the folder may hand it the new one.
+    #[test]
+    fn the_old_key_finds_no_new_key_in_the_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let (old, kek) = silo(dir.path(), &[3u8; 32]);
+        let new = generate_dek();
+        stage_rotation(dir.path(), &new, &kek, &old).unwrap();
+
+        for file in folder_files(dir.path()) {
+            if let Ok(plain) = unseal(&file, &old) {
+                assert_ne!(&plain[..], &new.as_bytes()[..]);
+            }
+            assert!(
+                !file.windows(32).any(|w| w == &new.as_bytes()[..]),
+                "the new key in the clear"
+            );
+        }
+        assert!(rotation_pending(dir.path()));
+        assert_eq!(
+            load_staged_dek(dir.path(), &old).unwrap().as_bytes(),
+            new.as_bytes()
+        );
+        discard_staged(dir.path());
+    }
+
+    /// Core 1.9 staged the key in the folder, sealed under the old one. A
+    /// rotation it left unfinished is carried on and finished the same way.
+    #[test]
+    fn a_rotation_staged_by_an_earlier_release_still_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (old, kek) = silo(dir.path(), &[3u8; 32]);
+        let new = generate_dek();
+        crate::workdir::write_private(
+            &staged_kek_path(dir.path()),
+            &wrap_kek_bytes(&kek, &new).unwrap(),
+        )
+        .unwrap();
+        crate::workdir::write_private(
+            &staged_dek_path(dir.path()),
+            &seal(new.as_bytes(), &old).unwrap(),
+        )
+        .unwrap();
+
+        assert!(rotation_pending(dir.path()));
+        assert_eq!(
+            load_staged_dek(dir.path(), &old).unwrap().as_bytes(),
+            new.as_bytes()
+        );
+        commit_rotation(dir.path()).unwrap();
+        assert!(!rotation_pending(dir.path()));
+        assert_eq!(
+            load_kek(dir.path(), &new).unwrap().as_bytes(),
+            kek.as_bytes()
+        );
+    }
+
+    /// Finishing takes the machine-local copy with it; discarding too.
+    #[test]
+    fn finishing_or_discarding_leaves_no_staged_key_on_this_machine() {
+        let dir = tempfile::tempdir().unwrap();
+        let (old, kek) = silo(dir.path(), &[3u8; 32]);
+        stage_rotation(dir.path(), &generate_dek(), &kek, &old).unwrap();
+        let first = local_id(dir.path()).unwrap();
+        assert!(local_staged_path(first).is_file());
+        discard_staged(dir.path());
+        assert!(!local_staged_path(first).exists());
+
+        stage_rotation(dir.path(), &generate_dek(), &kek, &old).unwrap();
+        let second = local_id(dir.path()).unwrap();
+        commit_rotation(dir.path()).unwrap();
+        assert!(!local_staged_path(second).exists());
+    }
+
+    /// Opened on a computer that did not start it, the rotation stays
+    /// pending and says where it can be finished; nothing is thrown away.
+    #[test]
+    fn a_rotation_started_elsewhere_says_where_to_finish_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (old, kek) = silo(dir.path(), &[3u8; 32]);
+        stage_rotation(dir.path(), &generate_dek(), &kek, &old).unwrap();
+        let id = local_id(dir.path()).unwrap();
+        let kept = std::fs::read(local_staged_path(id)).unwrap();
+        std::fs::remove_file(local_staged_path(id)).unwrap();
+
+        let err = load_staged_dek(dir.path(), &old).err().unwrap();
+        assert!(
+            err.to_string().contains("err.rotation_other_computer"),
+            "{err}"
+        );
+        assert!(rotation_pending(dir.path()));
+        assert!(matches!(
+            stage_rotation(dir.path(), &generate_dek(), &kek, &old),
+            Err(VaultError::RotationPending)
+        ));
+        // Back on the computer that has it.
+        std::fs::write(local_staged_path(id), kept).unwrap();
+        assert!(load_staged_dek(dir.path(), &old).is_ok());
+        discard_staged(dir.path());
     }
 
     #[test]

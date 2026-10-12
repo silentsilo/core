@@ -84,6 +84,13 @@ impl TokenSource {
         self.oauth.provider()
     }
 
+    /// Whether nothing is using this source right now and nothing in it
+    /// waits to be written, so dropping it loses nothing: the next use
+    /// reads the stored refresh token again.
+    pub fn is_idle(&self) -> bool {
+        self.state.try_lock().is_ok_and(|state| !state.unsaved)
+    }
+
     /// The refresh token held now, to store a fresh sign-in under the
     /// target it ends up belonging to.
     pub async fn refresh_token(&self) -> Zeroizing<String> {

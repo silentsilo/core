@@ -20,6 +20,7 @@ mod kdf;
 mod kek_store;
 mod keychain;
 mod openssl;
+mod process;
 pub mod protected;
 pub mod recovery;
 pub mod registry;
@@ -46,9 +47,13 @@ pub use dek_store::{
     dek_path, load_dek, save_dek, save_wrapped_dek_bytes, unwrap_dek_hex, wrap_dek_bytes,
 };
 pub use device_store::{
-    LocalVaultAuth, clear_credentials, is_provisioned, load_credentials, save_credentials,
+    LocalVaultAuth, clear_credentials, is_provisioned, load_credentials, retire_device_secret,
+    save_credentials,
 };
-pub use dpapi::{LocalProtector, set_local_protector};
+pub use dpapi::{
+    LocalProtector, allow_unprotected_secrets, local_secrets_protected, set_local_protector,
+    unprotected_secrets_allowed,
+};
 pub use error::VaultError;
 pub use fido_store::{
     Authority, DERIVATION_ECDH_P256_V1, DERIVATION_HMAC_V1, DERIVATION_KEYSTORE_AES_GCM_V1,
@@ -59,6 +64,7 @@ pub use fido_store::{
 pub use kdf::derive_vault_key;
 pub use kek_store::{kek_path, load_kek, save_kek, unwrap_kek_bytes, wrap_kek_bytes};
 pub use openssl::init_openssl;
+pub use process::harden_process;
 pub use protected::{
     FileStat, PendingImport, ProtectedFolder, ProtectedFolders, load_protected, plan_scan,
     save_protected,

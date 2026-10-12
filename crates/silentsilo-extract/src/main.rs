@@ -9,19 +9,29 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use zeroize::Zeroizing;
+
+mod prompt;
+
 const USAGE: &str = "\
 silentsilo-extract  ·  read a SilentSilo backup with only a recovery code
 
-  silentsilo-extract list    --from <folder> --code <recovery code>
-  silentsilo-extract extract --from <folder> --code <recovery code> --to <folder>
+  silentsilo-extract list    --from <folder>
+  silentsilo-extract extract --from <folder> --to <folder>
 
   --from   the backup: a folder holding vault.json, recovery.env, keys/,
            snapshots/, ops/ and blobs/. All of them are needed. A bucket
            works too, once mirrored whole to a folder with rclone or the
            like. What is copied down is ciphertext throughout.
-  --code   the 32-character code from your emergency kit. Dashes and case
-           do not matter.
   --to     where to write the files. Created if it is not there.
+
+The recovery code is the 32-character code from your emergency kit. Dashes
+and case do not matter. It is asked for once the tool starts, and is not
+shown as you type it. To pipe it in instead, send it on standard input: the
+first line is read.
+
+--code <recovery code> still works, but warns: on the command line the code
+stays in your shell history and shows in the list of running programs.
 
 A personal activity log, when the silo keeps one, is written to _activity/
 under --to, as CSV and as JSON lines. An organisation's is not: only its
@@ -30,6 +40,8 @@ security keys read it.
 Nothing is written anywhere else, no silo is created, and nothing is sent
 over the network beyond reading the backup you named.
 ";
+
+const CODE_ON_COMMAND_LINE: &str = "Warning: a recovery code given with --code stays in your shell history and shows in the list of running programs. Leave --code out and the code is asked for instead.";
 
 const ORGANISATION_LOG: &str = "This silo keeps an activity log for its organisation. Only the organisation's security keys read it, in SilentSilo; this tool does not.";
 
@@ -46,7 +58,7 @@ fn say_refused(log: &silentsilo_audit::reading::LogRead) {
 struct Args {
     command: String,
     from: Option<PathBuf>,
-    code: Option<String>,
+    code: Option<Zeroizing<String>>,
     to: Option<PathBuf>,
 }
 
@@ -66,7 +78,7 @@ fn parse() -> Result<Args, String> {
         };
         match flag.as_str() {
             "--from" => args.from = Some(PathBuf::from(value()?)),
-            "--code" => args.code = Some(value()?),
+            "--code" => args.code = Some(Zeroizing::new(value()?)),
             "--to" => args.to = Some(PathBuf::from(value()?)),
             other => return Err(format!("I do not know the option {other}")),
         }
@@ -88,8 +100,8 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let (Some(from), Some(code)) = (args.from.clone(), args.code.clone()) else {
-        eprintln!("Both --from and --code are needed.\n\n{USAGE}");
+    let Some(from) = args.from.clone() else {
+        eprintln!("--from is needed.\n\n{USAGE}");
         return ExitCode::FAILURE;
     };
     if !from.is_dir() {
@@ -100,6 +112,19 @@ fn main() -> ExitCode {
         eprintln!("Extracting needs --to, a folder to write into.\n\n{USAGE}");
         return ExitCode::FAILURE;
     }
+    let code = match args.code.clone() {
+        Some(code) => {
+            eprintln!("{CODE_ON_COMMAND_LINE}");
+            code
+        }
+        None => match prompt::read_code() {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
 
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
@@ -111,13 +136,13 @@ fn main() -> ExitCode {
     runtime.block_on(run(args, from, code))
 }
 
-async fn run(args: Args, from: PathBuf, code: String) -> ExitCode {
+async fn run(args: Args, from: PathBuf, code: Zeroizing<String>) -> ExitCode {
     let store = silentsilo_extract::folder_store(&from);
 
     // Reading and replaying the history comes first and prints nothing of
     // its own, for minutes on a large silo.
     println!("Reading the silo's history. A large silo takes a few minutes.");
-    let backup = match silentsilo_extract::open(&*store, &code).await {
+    let backup = match silentsilo_extract::open(&*store, code.as_str()).await {
         Ok(backup) => backup,
         Err(e) => {
             eprintln!("{e}");

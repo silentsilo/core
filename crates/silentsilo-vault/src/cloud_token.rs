@@ -2,7 +2,7 @@
 //! opening those targets with it.
 //!
 //! Kept like the storage settings: in the keyring where it fits, else in a
-//! DPAPI-wrapped file on this machine, never in the silo folder. Keyed by
+//! sealed file on this machine (see `dpapi`), never in the silo folder. Keyed by
 //! target id, which names the account and the folder, so two silos never
 //! share one. The access token lives only in memory, in the one
 //! [`TokenSource`] each target gets for the life of the process.
@@ -23,7 +23,6 @@ use crate::dpapi;
 use crate::error::VaultError;
 
 const KEYRING_USER: &str = "cloud-token";
-const DPAPI_MAGIC: &[u8] = b"SSDPAPI1";
 
 fn keyring_user(target_id: Uuid) -> String {
     format!("{KEYRING_USER}:{target_id}")
@@ -86,8 +85,10 @@ fn write_token(target_id: Uuid, refresh_token: &str) -> Result<(), VaultError> {
         refresh_token,
     )
     .is_ok()
-        && let Ok(entry) = keyring_entry(target_id)
-        && matches!(entry.get_password(), Ok(held) if held == refresh_token)
+        && matches!(
+            crate::keychain::get_password(&keyring_user(target_id)).map(Zeroizing::new),
+            Ok(held) if held.as_str() == refresh_token
+        )
     {
         let _ = std::fs::remove_file(token_path(target_id));
         return Ok(());
@@ -95,16 +96,9 @@ fn write_token(target_id: Uuid, refresh_token: &str) -> Result<(), VaultError> {
 
     // Microsoft's tokens can pass the 1280 characters Credential Manager
     // takes. The file is written first and the stale entry goes after, as
-    // for the target list: reads prefer the entry.
-    let json = Zeroizing::new(refresh_token.as_bytes().to_vec());
-    let to_write = match dpapi::protect(&json) {
-        Some(protected) => {
-            let mut out = DPAPI_MAGIC.to_vec();
-            out.extend_from_slice(&protected);
-            out
-        }
-        None => json.to_vec(),
-    };
+    // for the target list: reads prefer the entry. Sealed, or refused: see
+    // `dpapi`.
+    let to_write = dpapi::seal_secret(refresh_token.as_bytes())?;
     crate::workdir::write_private(&token_path(target_id), &to_write)?;
     if let Ok(entry) = keyring_entry(target_id) {
         let _ = entry.delete_credential();
@@ -118,7 +112,7 @@ pub(crate) fn load_cloud_token(target_id: Uuid) -> Option<Zeroizing<String>> {
     // asks the user to sign in again, which a glitch should not, so every
     // answer but the token is asked twice more before the file is tried.
     for attempt in 0..3 {
-        if let Ok(Ok(token)) = keyring_entry(target_id).map(|entry| entry.get_password()) {
+        if let Ok(token) = crate::keychain::get_password(&keyring_user(target_id)) {
             return Some(Zeroizing::new(token));
         }
         if attempt < 2 {
@@ -126,11 +120,8 @@ pub(crate) fn load_cloud_token(target_id: Uuid) -> Option<Zeroizing<String>> {
         }
     }
     let raw = std::fs::read(token_path(target_id)).ok()?;
-    let bytes = match raw.strip_prefix(DPAPI_MAGIC) {
-        Some(protected) => dpapi::unprotect(protected)?,
-        None => raw,
-    };
-    String::from_utf8(bytes).ok().map(Zeroizing::new)
+    let bytes = dpapi::open_sealed(raw)?;
+    String::from_utf8(bytes.to_vec()).ok().map(Zeroizing::new)
 }
 
 /// Forgets a target's token, on removing the target or the silo. The
@@ -309,13 +300,25 @@ pub async fn cancel_cloud_sign_in(sign_in: Uuid) {
 
 /// Drops every sign-in not adopted yet, on locking: the tokens live only in
 /// memory, and nothing should be able to use them once the silos close.
+///
+/// The targets' own sources go too, with the access tokens they hold, unless
+/// a transfer still uses one or a rotated refresh token in it has not been
+/// written yet: dropping that would lose the only valid copy. The next open
+/// reads the stored refresh token again.
 pub async fn forget_cloud_sign_ins() {
+    forget_idle_sources();
     let dropped: Vec<Pending> = match pending().lock() {
         Ok(mut pending) => pending.drain().map(|(_, p)| p).collect(),
         Err(_) => return,
     };
     for sign_in in dropped {
         let _ = sign_in.tokens.revoke().await;
+    }
+}
+
+fn forget_idle_sources() {
+    if let Ok(mut sources) = sources().lock() {
+        sources.retain(|_, held| Arc::strong_count(&held.source) > 1 || !held.source.is_idle());
     }
 }
 
@@ -667,6 +670,28 @@ pub(crate) mod tests {
         runtime.block_on(cancel_cloud_sign_in(id));
         assert!(cloud_sign_in_account(id).is_none());
         assert!(!pending().lock().unwrap().contains_key(&id));
+    }
+
+    /// The access tokens of targets nothing is using do not outlive a lock;
+    /// a source a transfer still holds stays, so a rotation it makes is
+    /// still written.
+    #[test]
+    fn locking_drops_the_sources_nothing_uses() {
+        let _serial = keyring_lock();
+        let idle = Scratch(Uuid::new_v4());
+        let used = Scratch(Uuid::new_v4());
+        save_cloud_token(idle.0, "rt-idle").unwrap();
+        save_cloud_token(used.0, "rt-used").unwrap();
+        token_source(Provider::OneDrive, idle.0).unwrap();
+        let held = token_source(Provider::OneDrive, used.0).unwrap();
+
+        forget_idle_sources();
+
+        assert!(generation_of(idle.0).is_none());
+        assert!(generation_of(used.0).is_some());
+        drop(held);
+        // Read again from the keyring on the next open.
+        assert!(token_source(Provider::OneDrive, idle.0).is_ok());
     }
 
     #[test]

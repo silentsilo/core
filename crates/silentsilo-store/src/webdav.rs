@@ -63,14 +63,110 @@ pub struct WebDavConfig {
     pub password: String,
 }
 
-/// Never prints the password.
+/// Never prints the password, nor one written into the address.
 impl std::fmt::Debug for WebDavConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WebDavConfig")
-            .field("url", &self.url)
+            .field("url", &without_userinfo(&self.url))
             .field("username", &self.username)
             .finish_non_exhaustive()
     }
+}
+
+/// The address with any `user:password@` taken out, for everything that
+/// shows it: errors, logs, the store's description.
+fn without_userinfo(address: &str) -> String {
+    if let Ok(mut url) = url::Url::parse(address) {
+        if url.username().is_empty() && url.password().is_none() {
+            return address.to_string();
+        }
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
+        return url.to_string();
+    }
+    // Not an address `url` reads: drop everything up to the last `@` of
+    // the part before the path, which is where a credential would be.
+    let (scheme, rest) = match address.find("://") {
+        Some(i) => address.split_at(i + 3),
+        None => ("", address),
+    };
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    match rest[..authority_end].rfind('@') {
+        Some(at) => format!("{scheme}{}", &rest[at + 1..]),
+        None => address.to_string(),
+    }
+}
+
+/// Whether plain `http://` to this host stays on this machine or the local
+/// network: loopback, the private and link-local ranges, the shared range
+/// mesh VPNs such as Tailscale use, and names that only resolve locally
+/// (`localhost`, `.local`, `.lan`, `.home.arpa`, `.internal`, a name with no
+/// dot). Anything else takes the password and the silo in the clear across
+/// networks nobody here controls.
+fn is_local_network(url: &url::Url) -> bool {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    fn v4(ip: Ipv4Addr) -> bool {
+        let [a, b, ..] = ip.octets();
+        ip.is_loopback() || ip.is_private() || ip.is_link_local() || (a == 100 && b & 0xC0 == 64)
+    }
+    fn v6(ip: Ipv6Addr) -> bool {
+        let first = ip.segments()[0];
+        ip.is_loopback()
+            || first & 0xFE00 == 0xFC00
+            || first & 0xFFC0 == 0xFE80
+            || ip.to_ipv4_mapped().is_some_and(v4)
+    }
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => v4(ip),
+        Some(url::Host::Ipv6(ip)) => v6(ip),
+        Some(url::Host::Domain(name)) => {
+            if let Ok(ip) = name.parse::<IpAddr>() {
+                return match ip {
+                    IpAddr::V4(ip) => v4(ip),
+                    IpAddr::V6(ip) => v6(ip),
+                };
+            }
+            let name = name.trim_end_matches('.').to_ascii_lowercase();
+            !name.contains('.')
+                || [".localhost", ".local", ".lan", ".home.arpa", ".internal"]
+                    .iter()
+                    .any(|suffix| name.ends_with(suffix))
+        }
+        None => false,
+    }
+}
+
+/// Follows a redirect only to the same scheme, host and port, with the
+/// credentials it already had: a server sending a request elsewhere, or
+/// from https down to http, is stopped and said.
+fn same_origin_redirects() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let same = attempt
+            .previous()
+            .first()
+            .is_some_and(|first| first.origin() == attempt.url().origin());
+        if same && attempt.previous().len() < 5 {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    })
+}
+
+/// A transfer error without the address in it, which may carry a password,
+/// and with its causes, which say what actually went wrong.
+fn transfer_error(err: &reqwest::Error) -> String {
+    let mut message = err.to_string();
+    if let Some(url) = err.url() {
+        message = message.replace(url.as_str(), &without_userinfo(url.as_str()));
+    }
+    let mut source = std::error::Error::source(err);
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message
 }
 
 pub struct WebDavStore {
@@ -100,6 +196,15 @@ impl WebDavStore {
         }
         let parsed =
             url::Url::parse(&url).map_err(|e| StoreError::Other(format!("bad address: {e}")))?;
+        if parsed.scheme() == "http" && !is_local_network(&parsed) {
+            return Err(StoreError::Denied(
+                silentsilo_core::coded!(
+                    "err.webdav_http_remote",
+                    "Plain http:// is only for a server on this computer or your local network. Use the server's https:// address."
+                )
+                .into(),
+            ));
+        }
 
         Ok(Self {
             // A server that stops answering must not hold a sync pass forever.
@@ -111,6 +216,7 @@ impl WebDavStore {
                 )
                 .connect_timeout(std::time::Duration::from_secs(30))
                 .read_timeout(std::time::Duration::from_secs(120))
+                .redirect(same_origin_redirects())
                 .build()
                 .map_err(|e| StoreError::Other(e.to_string()))?,
             known_collections: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -157,15 +263,26 @@ impl WebDavStore {
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
                 StoreError::Denied(format!("{status} for {what}"))
             }
+            // A redirect to another origin, not followed: see
+            // `same_origin_redirects`.
+            status if status.is_redirection() => {
+                StoreError::Denied(silentsilo_core::coded::coded_with(
+                    "err.webdav_redirected",
+                    format!(
+                        "The server sent {what} to another address ({status}). Enter the address it uses instead."
+                    ),
+                    &[("key", &what), ("status", &status)],
+                ))
+            }
             _ => StoreError::Other(format!("{status} for {what}")),
         }
     }
 
     fn map_send(err: reqwest::Error) -> StoreError {
         if err.is_timeout() || err.is_connect() {
-            StoreError::Unreachable(err.to_string())
+            StoreError::Unreachable(transfer_error(&err))
         } else {
-            StoreError::Other(err.to_string())
+            StoreError::Other(transfer_error(&err))
         }
     }
 
@@ -543,7 +660,7 @@ impl ObjectStore for WebDavStore {
     }
 
     fn describe(&self) -> String {
-        self.base.trim_end_matches('/').to_string()
+        without_userinfo(self.base.trim_end_matches('/'))
     }
 }
 
@@ -688,6 +805,137 @@ mod tests {
         for secret in ["hunter2", "BEGIN KEY", "open sesame"] {
             assert!(!printed.contains(secret), "{printed}");
         }
+    }
+
+    #[test]
+    fn a_password_written_into_the_address_is_never_shown() {
+        let config = WebDavConfig {
+            url: "https://alex:hunter2@dav.example.com/silo".into(),
+            username: String::new(),
+            password: String::new(),
+        };
+        assert!(!format!("{config:?}").contains("hunter2"));
+        let store = WebDavStore::new(config).unwrap();
+        let shown = store.describe();
+        assert!(shown.contains("dav.example.com/silo"), "{shown}");
+        assert!(
+            !shown.contains("hunter2") && !shown.contains("alex"),
+            "{shown}"
+        );
+        assert_eq!(
+            without_userinfo("dav://alex:p@w@host/silo"),
+            "dav://host/silo",
+            "an address `url` does not read loses its credential too"
+        );
+        assert_eq!(
+            without_userinfo("https://dav.example.com/silo"),
+            "https://dav.example.com/silo"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transfer_error_does_not_carry_the_password() {
+        // Nothing listens there once the listener is dropped.
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let store = WebDavStore::new(WebDavConfig {
+            url: format!("http://alex:hunter2@127.0.0.1:{port}/dav"),
+            username: String::new(),
+            password: String::new(),
+        })
+        .unwrap();
+        let err = store.get("vault.json").await.unwrap_err().to_string();
+        assert!(!err.contains("hunter2"), "{err}");
+    }
+
+    #[test]
+    fn plain_http_is_only_for_the_local_network() {
+        let open = |url: &str| {
+            WebDavStore::new(WebDavConfig {
+                url: url.into(),
+                username: "a".into(),
+                password: "b".into(),
+            })
+        };
+        for local in [
+            "http://localhost:8080/dav",
+            "http://127.0.0.1/dav",
+            "http://192.168.1.20:5005/dav",
+            "http://10.0.0.2/dav",
+            "http://172.20.0.5/dav",
+            "http://169.254.3.4/dav",
+            "http://100.101.102.103/dav",
+            "http://[::1]/dav",
+            "http://[fd12:3456::1]/dav",
+            "http://[fe80::1]/dav",
+            "http://nas.local:5005/dav",
+            "http://nas.lan/dav",
+            "http://nas.home.arpa/dav",
+            "http://nas/dav",
+            "https://dav.example.com/dav",
+        ] {
+            assert!(open(local).is_ok(), "{local} should be allowed");
+        }
+        for remote in [
+            "http://dav.example.com/dav",
+            "http://8.8.8.8/dav",
+            "http://100.200.1.1/dav",
+            "http://[2001:db8::1]/dav",
+            "http://localhost.example.com/dav",
+        ] {
+            match open(remote) {
+                Err(StoreError::Denied(message)) => {
+                    assert!(message.contains("err.webdav_http_remote"), "{message}");
+                }
+                Err(other) => panic!("{remote}: {other}"),
+                Ok(_) => panic!("{remote} must be refused"),
+            }
+        }
+    }
+
+    /// A redirect to another address is not followed: the credentials and
+    /// the silo would go wherever the server said.
+    #[tokio::test]
+    async fn a_redirect_elsewhere_is_not_followed() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let elsewhere = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let elsewhere_port = elsewhere.local_addr().unwrap().port();
+        let reached = Arc::new(AtomicBool::new(false));
+        let flag = reached.clone();
+        tokio::spawn(async move {
+            if elsewhere.accept().await.is_ok() {
+                flag.store(true, Ordering::SeqCst);
+            }
+        });
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = server.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = server.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let reply = format!(
+                    "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:{elsewhere_port}/dav/vault.json\r\nContent-Length: 0\r\n\r\n"
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+            }
+        });
+        let store = WebDavStore::new(WebDavConfig {
+            url: format!("http://127.0.0.1:{port}/dav"),
+            username: "a".into(),
+            password: "b".into(),
+        })
+        .unwrap();
+
+        match store.get("vault.json").await {
+            Err(StoreError::Denied(message)) => {
+                assert!(message.contains("err.webdav_redirected"), "{message}")
+            }
+            other => panic!("expected a refusal, got {:?}", other.map(|b| b.len())),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!reached.load(Ordering::SeqCst));
     }
 
     #[test]

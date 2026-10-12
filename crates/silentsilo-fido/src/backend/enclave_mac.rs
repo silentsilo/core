@@ -33,6 +33,10 @@ use objc2_local_authentication::{LAContext, LAPolicy};
 use security_framework::access_control::{ProtectionMode, SecAccessControl};
 use security_framework::item::{ItemClass, ItemSearchOptions, KeyClass, Reference, SearchResult};
 use security_framework::key::{Algorithm, SecKey};
+use security_framework::passwords::{
+    PasswordOptions, delete_generic_password_options, generic_password,
+    set_generic_password_options,
+};
 use security_framework_sys::access_control::{
     kSecAccessControlBiometryCurrentSet, kSecAccessControlPrivateKeyUsage,
 };
@@ -71,6 +75,9 @@ pub fn available() -> bool {
 /// Generates a key in the enclave and enrols it for `vault_id`. One
 /// ceremony: the enclave signs nothing at enrolment, so no Touch ID prompt
 /// appears here. The first prompt is the first unlock.
+///
+/// The ephemeral point is bound to the key here, in this device's keychain
+/// (see [`bind`]), before the envelope exists anywhere else.
 pub fn enrol(vault_id: &str) -> Result<EnrolMaterial, FidoError> {
     let tag = enclave::random_tag();
     let key = generate(&tag)?;
@@ -80,13 +87,88 @@ pub fn enrol(vault_id: &str) -> Result<EnrolMaterial, FidoError> {
         .ok_or_else(|| {
             FidoError::EnrollmentFailed("the enclave did not return its public key".into())
         });
-    let material = public.and_then(|public| enclave::enrol(public.bytes(), vault_id, &tag));
+    let material = public
+        .and_then(|public| enclave::enrol(public.bytes(), vault_id, &tag))
+        .and_then(|material| {
+            bind(&tag, &material.ephemeral_public)
+                .map_err(|e| FidoError::EnrollmentFailed(format!("Touch ID: {e}")))?;
+            Ok(material)
+        });
     if material.is_err() {
         // Nothing references this key; leaving it would only clutter the
         // keychain with a label no envelope names.
         let _ = key.delete();
+        forget_binding(&tag);
     }
     material
+}
+
+/// The keychain service the bindings are filed under, one item per key,
+/// named by the tag in hex.
+const BINDING_SERVICE: &str = "com.silentsilo.enclave-point";
+
+fn binding_options(tag: &[u8]) -> PasswordOptions {
+    #[allow(unused_mut)]
+    let mut options = PasswordOptions::new_generic_password(BINDING_SERVICE, &hex::encode(tag));
+    // Beside the enclave key, in the keychain a Mac's enclave key lives in.
+    #[cfg(target_os = "macos")]
+    options.use_protected_keychain();
+    options
+}
+
+/// Records which ephemeral point this device enrolled the key with.
+///
+/// The point travels in the credential id, unsigned, and the enclave agrees
+/// with any point it is handed. Storage that replaced it with a point of its
+/// own, and the envelope with a DEK of its own wrapped under the agreement it
+/// can then compute from the public key beside it, would have a joining or
+/// unlocking device take that DEK as the silo's. With the point bound here,
+/// a point this device did not enrol is refused before the enclave is asked.
+fn bind(tag: &[u8], point: &[u8]) -> Result<(), security_framework::base::Error> {
+    let mut options = binding_options(tag);
+    let access = SecAccessControl::create_with_protection(
+        Some(ProtectionMode::AccessibleAfterFirstUnlockThisDeviceOnly),
+        0,
+    )?;
+    options.set_access_control(access);
+    set_generic_password_options(&enclave::point_binding(point), options)
+}
+
+/// The point bound to the key filed under `tag`: `None` for a key enrolled
+/// before bindings existed.
+fn bound_point(tag: &[u8]) -> Result<Option<Vec<u8>>, FidoError> {
+    match generic_password(binding_options(tag)) {
+        Ok(digest) => Ok(Some(digest)),
+        Err(e) if e.code() == security_framework_sys::base::errSecItemNotFound => Ok(None),
+        Err(e) => Err(FidoError::UnlockFailed(format!(
+            "Touch ID: the key's record could not be read: {e}"
+        ))),
+    }
+}
+
+fn forget_binding(tag: &[u8]) {
+    let _ = delete_generic_password_options(binding_options(tag));
+}
+
+/// Whether `point` is the one this device enrolled the key under `tag`
+/// with. A key enrolled by an earlier release has no binding: it is bound
+/// to the point it is first used with, which on this device is its own
+/// silo's, and checked from then on.
+fn point_is_ours(tag: &[u8], point: &[u8]) -> Result<(), FidoError> {
+    match bound_point(tag)? {
+        Some(digest) if enclave::binding_matches(&digest, point) => Ok(()),
+        Some(_) => Err(FidoError::UnlockFailed(
+            crate::coded!(
+                "err.touchid_point_changed",
+                "This silo's Touch ID record was changed outside this device, so it was refused. Unlock with another key or the recovery code."
+            )
+            .into(),
+        )),
+        None => {
+            let _ = bind(tag, point);
+            Ok(())
+        }
+    }
 }
 
 fn generate(tag: &[u8; TAG_LEN]) -> Result<SecKey, FidoError> {
@@ -220,11 +302,11 @@ pub fn holds_any(credential_ids: &[Vec<u8>]) -> bool {
 /// Reproduces the wrap key for the first of `credential_ids` this Mac holds
 /// the enclave key for. The Touch ID sheet appears inside the agreement.
 ///
-/// A caveat the caller has to know: success here means the enclave performed
-/// an agreement, not that the wrap key opens anything. The chip agrees with
-/// any point on the curve, so an envelope whose stored point was altered
-/// produces a Touch ID prompt that succeeds and a key that unwraps nothing.
-/// Only the caller, holding the sealed DEK, can tell the two apart.
+/// The chip agrees with any point on the curve, so the point in the id is
+/// checked first against the one this device bound at enrolment
+/// ([`point_is_ours`]): a point storage put there is refused without a
+/// prompt. Success still means only that the agreement ran; whether the
+/// wrap key opens the envelope is for the caller, holding it, to find out.
 pub fn derive_unlock_material(
     credential_ids: &[Vec<u8>],
     vault_id: &str,
@@ -237,6 +319,10 @@ pub fn derive_unlock_material(
         let Some(key) = find_key(tag) else {
             continue; // Another Mac's enrolment on the same silo.
         };
+        if let Err(e) = point_is_ours(tag, point) {
+            last_err = Some(e);
+            continue;
+        }
         match agree(&key, point) {
             Ok(shared) => {
                 let wrap_key = enclave::wrap_key_from_shared(&shared, vault_id);
@@ -261,9 +347,12 @@ pub fn remove(credential_id: &[u8]) -> Result<(), FidoError> {
         return Ok(());
     };
     match find_key(tag) {
-        Some(key) => key
-            .delete()
-            .map_err(|e| FidoError::UnlockFailed(format!("could not delete the key: {e}"))),
+        Some(key) => {
+            key.delete()
+                .map_err(|e| FidoError::UnlockFailed(format!("could not delete the key: {e}")))?;
+            forget_binding(tag);
+            Ok(())
+        }
         None => Ok(()),
     }
 }

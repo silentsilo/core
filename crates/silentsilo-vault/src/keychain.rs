@@ -1,4 +1,10 @@
-//! Writes to the OS keyring. Reads go through `keyring` unchanged.
+//! Writes to the OS keyring. Reads go through `keyring`.
+//!
+//! On an iPhone every entry is written "this device only", so it stays out
+//! of iCloud and computer backups; entries an earlier release wrote are moved
+//! there on their first read. On a Mac `keyring` writes to the login
+//! keychain, which neither syncs to iCloud Keychain nor moves to another Mac
+//! except as a whole, under the login password.
 //!
 //! On Windows `keyring` writes with `CRED_PERSIST_ENTERPRISE`, which roams
 //! with a domain profile to every machine the user signs in on. The device
@@ -27,11 +33,137 @@ pub(crate) fn set_password(service: &str, user: &str, password: &str) -> Result<
     {
         windows_local::write(service, user, password)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "ios")]
+    {
+        ios::write(service, user, password)
+    }
+    #[cfg(not(any(windows, target_os = "ios")))]
     {
         keyring::Entry::new(service, user)
             .and_then(|entry| entry.set_password(password))
             .map_err(|e| e.to_string())
+    }
+}
+
+/// Reads the entry `user` under [`service`].
+///
+/// On an iPhone the first read of an entry in a process also makes it
+/// "this device only": an earlier release wrote it with the default class,
+/// which goes into an iCloud or computer backup and comes back on another
+/// phone restored from it.
+pub(crate) fn get_password(user: &str) -> Result<String, keyring::Error> {
+    let value = keyring::Entry::new(service(), user)?.get_password()?;
+    #[cfg(target_os = "ios")]
+    ios::keep_on_this_device_once(service(), user);
+    Ok(value)
+}
+
+/// The iOS Keychain, written directly rather than through `keyring`, which
+/// takes the default accessibility class. `AfterFirstUnlockThisDeviceOnly`:
+/// readable by a sync started in the background once the phone has been
+/// unlocked since boot, and never restored from a backup onto another
+/// phone. Same class, service and account as `keyring` reads.
+///
+/// Not compiled on the machines this crate is tested on; type-checked
+/// against the macOS SDK bindings, which share every symbol used here.
+#[cfg(target_os = "ios")]
+mod ios {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    use core_foundation::base::{CFType, TCFType};
+    use core_foundation::data::CFData;
+    use core_foundation::dictionary::CFDictionary;
+    use core_foundation::string::{CFString, CFStringRef};
+    use security_framework_sys::access_control::kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly;
+    use security_framework_sys::base::errSecItemNotFound;
+    use security_framework_sys::item::{
+        kSecAttrAccount, kSecAttrService, kSecClass, kSecClassGenericPassword, kSecValueData,
+    };
+    use security_framework_sys::keychain_item::{SecItemAdd, SecItemUpdate};
+
+    // The attribute key itself, which the sys crate does not export.
+    #[link(name = "Security", kind = "framework")]
+    unsafe extern "C" {
+        static kSecAttrAccessible: CFStringRef;
+    }
+
+    fn query(service: &str, user: &str) -> Vec<(CFString, CFType)> {
+        // SAFETY: Security.framework statics, valid for the life of the
+        // process and only borrowed here.
+        unsafe {
+            vec![
+                (
+                    CFString::wrap_under_get_rule(kSecClass),
+                    CFString::wrap_under_get_rule(kSecClassGenericPassword).into_CFType(),
+                ),
+                (
+                    CFString::wrap_under_get_rule(kSecAttrService),
+                    CFString::new(service).into_CFType(),
+                ),
+                (
+                    CFString::wrap_under_get_rule(kSecAttrAccount),
+                    CFString::new(user).into_CFType(),
+                ),
+            ]
+        }
+    }
+
+    fn this_device_only() -> (CFString, CFType) {
+        // SAFETY: as above.
+        unsafe {
+            (
+                CFString::wrap_under_get_rule(kSecAttrAccessible),
+                CFString::wrap_under_get_rule(kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly)
+                    .into_CFType(),
+            )
+        }
+    }
+
+    fn update(service: &str, user: &str, changes: &[(CFString, CFType)]) -> i32 {
+        let query = CFDictionary::from_CFType_pairs(&query(service, user));
+        let changes = CFDictionary::from_CFType_pairs(changes);
+        // SAFETY: both dictionaries are live for the call.
+        unsafe { SecItemUpdate(query.as_concrete_TypeRef(), changes.as_concrete_TypeRef()) }
+    }
+
+    /// Replaces the entry in place, or adds it: never deleted first, so a
+    /// failed write cannot leave the entry gone.
+    pub(super) fn write(service: &str, user: &str, password: &str) -> Result<(), String> {
+        let data = CFData::from_buffer(password.as_bytes());
+        // SAFETY: as above.
+        let value = (
+            unsafe { CFString::wrap_under_get_rule(kSecValueData) },
+            data.into_CFType(),
+        );
+        let changes = [value, this_device_only()];
+        let mut status = update(service, user, &changes);
+        if status == errSecItemNotFound {
+            let mut item = query(service, user);
+            item.extend(changes);
+            let item = CFDictionary::from_CFType_pairs(&item);
+            // SAFETY: the dictionary is live for the call; no result wanted.
+            status = unsafe { SecItemAdd(item.as_concrete_TypeRef(), std::ptr::null_mut()) };
+        }
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(format!("the keychain refused the write ({status})"))
+        }
+    }
+
+    /// Moves an entry an earlier release wrote to this device only. Once per
+    /// entry and process; best effort, the next launch tries again.
+    pub(super) fn keep_on_this_device_once(service: &str, user: &str) {
+        static DONE: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+        let Ok(mut done) = DONE.lock() else { return };
+        let done = done.get_or_insert_with(HashSet::new);
+        if done.contains(user) {
+            return;
+        }
+        if update(service, user, &[this_device_only()]) == 0 {
+            done.insert(user.to_string());
+        }
     }
 }
 

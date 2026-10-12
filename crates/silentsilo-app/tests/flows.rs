@@ -231,6 +231,61 @@ async fn a_phone_key_enrolled_after_joining_opens_the_silo_on_its_own() {
     assert!(open_with_device_key(root, "cc33", &[9; 32], origin.vault_id).is_err());
 }
 
+/// The first key retires the device secret: kept, it and an old copy of
+/// `master.dek.enc` from a synced folder's history would open the silo.
+/// The record stays, so the silo still reads as set up here.
+#[test]
+fn the_first_key_retires_the_device_secret() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("silo");
+    let vault_id = Uuid::new_v4();
+    let creds = silentsilo_vault::LocalVaultAuth {
+        vault_id,
+        device_secret: "secret-c".into(),
+    };
+    silentsilo_vault::save_credentials(&creds).unwrap();
+    let session = VaultSession::provision(root.clone(), vault_id, "secret-c").unwrap();
+    Vfs::new(&session).ensure_initialized().unwrap();
+    let old_envelope = std::fs::read(silentsilo_vault::dek_path(&root)).unwrap();
+
+    enrol_device_key(&session, &key([5; 32], "cc33")).unwrap();
+    drop(session);
+
+    let after = silentsilo_vault::load_credentials(vault_id).unwrap();
+    assert!(after.device_secret.is_empty());
+    assert!(silentsilo_vault::is_provisioned(vault_id));
+    // The envelope as it was before the key, put back from a history.
+    std::fs::write(silentsilo_vault::dek_path(&root), &old_envelope).unwrap();
+    assert!(VaultSession::open_with_device_secret(root.clone(), &after.device_secret).is_err());
+    assert!(open_with_device_key(root, "cc33", &[5; 32], vault_id).is_ok());
+    silentsilo_vault::clear_credentials(vault_id);
+}
+
+/// A silo whose first key an earlier release enrolled still holds its
+/// device secret; the first unlock with a key retires it.
+#[test]
+fn unlocking_with_a_key_retires_a_secret_an_earlier_release_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("silo");
+    let vault_id = Uuid::new_v4();
+    let session = VaultSession::provision(root.clone(), vault_id, "secret-d").unwrap();
+    Vfs::new(&session).ensure_initialized().unwrap();
+    enrol_device_key(&session, &key([6; 32], "dd44")).unwrap();
+    drop(session);
+    // What 1.9 leaves: the secret saved, a key enrolled.
+    silentsilo_vault::save_credentials(&silentsilo_vault::LocalVaultAuth {
+        vault_id,
+        device_secret: "secret-d".into(),
+    })
+    .unwrap();
+
+    open_with_device_key(root, "dd44", &[6; 32], vault_id).unwrap();
+
+    let after = silentsilo_vault::load_credentials(vault_id).unwrap();
+    assert!(after.device_secret.is_empty());
+    silentsilo_vault::clear_credentials(vault_id);
+}
+
 #[tokio::test]
 async fn a_published_key_joins_the_silo_and_a_wrong_wrap_key_leaves_nothing() {
     let origin = origin().await;
