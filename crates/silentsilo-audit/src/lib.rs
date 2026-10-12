@@ -4,7 +4,8 @@
 //!
 //! - [`events`]: what an event says, and the stable codes;
 //! - [`record`]: one event sealed with HPKE to the log's public key;
-//! - [`segment`]: a device's batch of records under `audit/`, chained;
+//! - [`segment`]: a device's batch of records under `audit/`, chained and
+//!   tagged under a key only the silo holds;
 //! - [`keyring`]: the log's key and policy as storage holds them;
 //! - [`spool`]: a device's queue of sealed events until storage holds them;
 //! - [`reading`]: a gathered log opened, checked and written out.
@@ -19,13 +20,26 @@ pub mod segment;
 pub mod spool;
 
 pub use events::{Event, codes, describe};
-pub use keyring::{AuditKey, AuditPolicy, BY_SILO, POLICY_PATH, Scope, audit_key_path};
+pub use keyring::{
+    AuditKey, AuditPolicy, BY_SILO, MAX_POLICY_AHEAD_SECS, POLICY_PATH, PolicyKey, Scope,
+    audit_key_path,
+};
 pub use record::{KeyId, KeyPair, key_id, open_event, record_key, seal_event};
 pub use segment::{
-    AUDIT_PREFIX, ChainReport, MAX_RECORDS, MAX_SEGMENT_BYTES, Segment, check_chain,
-    parse_segment_key, segment_key,
+    AUDIT_PREFIX, ChainReport, MAX_NAMED_MISSING, MAX_RECORDS, MAX_SEGMENT_BYTES, Proof, Segment,
+    SegmentKey, check_chain, parse_segment_key, segment_key,
 };
-pub use spool::{Pinned, PolicyRead, QUEUE_DIR, Spool, SpoolError, start_silo_log};
+pub use spool::{Pinned, PolicyRead, QUEUE_DIR, Spool, SpoolError, Unchecked, start_silo_log};
+
+/// Equal, compared in full whatever the first difference: for checks, so
+/// a forger learns nothing from the time a refusal takes.
+pub(crate) fn same_bytes(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+pub(crate) fn same_text(a: &str, b: &str) -> bool {
+    same_bytes(a.as_bytes(), b.as_bytes())
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuditError {
@@ -147,6 +161,7 @@ mod tests {
             prev: [0; 32],
             closed_at: 200,
             records,
+            tag: None,
         };
         let stored = Segment::from_bytes(&segment.to_bytes()).unwrap();
         let events: Vec<Event> = stored

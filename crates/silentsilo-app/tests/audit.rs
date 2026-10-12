@@ -5,7 +5,8 @@ use std::path::Path;
 
 use silentsilo_app::{AppEvent, AppState, Host, run_sync_pass, sync_now};
 use silentsilo_audit::{
-    AuditKey, AuditPolicy, Event, KeyPair, Scope, Segment, Spool, codes, open_event,
+    AuditKey, AuditPolicy, Event, KeyPair, PolicyKey, Scope, Segment, SegmentKey, Spool, Unchecked,
+    codes, open_event,
 };
 use silentsilo_store::{FolderStore, ObjectStore, StoreConfig};
 use silentsilo_vault::{BackupTarget, SiloEntry, TargetRole, VaultSession};
@@ -90,7 +91,61 @@ impl Device {
     }
 
     fn spool(&self) -> Spool {
-        Spool::open(&self.silo.path, self.id()).unwrap()
+        Spool::open(
+            &self.silo.path,
+            self.id(),
+            self.kek().as_bytes(),
+            Unchecked::Refuse,
+        )
+        .unwrap()
+    }
+
+    /// What tags this silo's policies: a key from its current DEK.
+    fn policy_key(&self) -> PolicyKey {
+        PolicyKey::new(
+            self.state.sessions.lock().unwrap()[&self.silo.id]
+                .dek
+                .as_bytes(),
+        )
+    }
+
+    fn tags(&self) -> SegmentKey {
+        SegmentKey::new(self.kek().as_bytes())
+    }
+
+    /// Makes the silo an organisation's: one enrolled organisation key per
+    /// `(credential id, byte)`, whose wrap key is that byte 32 times.
+    fn administered_by(&self, keys: &[(&str, u8)]) {
+        use silentsilo_vault::{StoredFidoCredential, StoredFidoKeys};
+        let credentials = {
+            let sessions = self.state.sessions.lock().unwrap();
+            let dek = &sessions[&self.silo.id].dek;
+            keys.iter()
+                .enumerate()
+                .map(|(slot, (id, byte))| StoredFidoCredential {
+                    kind: silentsilo_vault::KIND_FIDO2.into(),
+                    derivation: silentsilo_vault::DERIVATION_HMAC_V1.into(),
+                    policy: silentsilo_vault::POLICY_ORG.into(),
+                    credential_id: id.to_string(),
+                    public_key: "3059".into(),
+                    key_slot: slot as u8,
+                    rp_id: "silentsilo.com".into(),
+                    label: "Organisation".into(),
+                    wrapped_dek: hex::encode(
+                        silentsilo_vault::wrap_dek_bytes(dek, &[*byte; 32]).unwrap(),
+                    ),
+                    platform: false,
+                    revoked: false,
+                    unconfirmed: false,
+                })
+                .collect()
+        };
+        silentsilo_vault::save_fido_keys(
+            &self.silo.path,
+            &StoredFidoKeys { keys: credentials },
+            silentsilo_vault::Authority::Machine,
+        )
+        .unwrap();
     }
 }
 
@@ -388,13 +443,19 @@ async fn a_lock_is_the_last_event_and_closes_its_segment() {
     );
     assert!(!device.state.audit_is_mandatory(id), "a personal log");
     let device_id = device.id();
+    let kek = device.kek();
     device.state.close_session(&host, id).unwrap();
 
     // Closed into a segment at the lock, with no pass in between.
-    let outbox = Spool::open(&device.silo.path, device_id)
-        .unwrap()
-        .outbox()
-        .unwrap();
+    let outbox = Spool::open(
+        &device.silo.path,
+        device_id,
+        kek.as_bytes(),
+        Unchecked::Refuse,
+    )
+    .unwrap()
+    .outbox()
+    .unwrap();
     assert_eq!(outbox.len(), 1);
     let codes_written: Vec<u16> = outbox[0]
         .records
@@ -491,6 +552,7 @@ async fn a_newer_policy_on_a_copy_wins_over_this_device_s() {
     let mut later = device.spool().policy().unwrap().unwrap();
     later.enabled = false;
     later.changed_at += 100;
+    let later = later.tagged(&device.policy_key());
     silentsilo_sync::audit_log::write_audit_policy(&store, &device.kek(), &later)
         .await
         .unwrap();
@@ -523,14 +585,186 @@ async fn an_organisation_log_cannot_be_turned_off() {
     assert!(device.state.audit_status(device.silo.id).unwrap().enabled);
 }
 
+/// Read again at the next pass, as it is every ten minutes.
+fn due_again(device: &Device) {
+    let mut spool = device.spool();
+    let (policy, key) = (
+        spool.policy().unwrap().unwrap(),
+        spool.key().unwrap().unwrap(),
+    );
+    spool.apply_policy(&policy, &key, 0).unwrap();
+}
+
+async fn policy_on(device: &Device, store: &FolderStore) -> AuditPolicy {
+    silentsilo_sync::audit_log::read_audit_policy(store, &device.kek())
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_newer_policy_not_signed_with_the_silo_s_key_is_not_followed_and_is_put_right() {
+    let a = tempfile::tempdir().unwrap();
+    let host = Copies(vec![copy(a.path())], true);
+    let device = Device::new(&host);
+    let id = device.silo.id;
+    let store = FolderStore::new(a.path().to_path_buf());
+    device.state.set_audit_log(id, true).unwrap();
+    run_sync_pass(&device.state, &host, &device.silo)
+        .await
+        .unwrap();
+    let on = policy_on(&device, &store).await;
+    assert!(
+        on.is_authentic(&device.policy_key()),
+        "tagged as it is spread"
+    );
+
+    // Someone who held the silo before its key changed, and still has the
+    // content key, turns the log off on the copy.
+    let mut forged = on.clone();
+    forged.enabled = false;
+    forged.changed_at += 100;
+    forged.auth = None;
+    silentsilo_sync::audit_log::write_audit_policy(&store, &device.kek(), &forged)
+        .await
+        .unwrap();
+    due_again(&device);
+    let lenient = Copies(vec![copy(a.path())], false);
+    run_sync_pass(&device.state, &lenient, &device.silo)
+        .await
+        .unwrap();
+    assert!(device.state.audit_status(id).unwrap().enabled);
+    let now_there = policy_on(&device, &store).await;
+    assert!(now_there.enabled);
+    assert!(now_there.is_authentic(&device.policy_key()));
+    assert!(
+        now_there.changed_at > forged.changed_at,
+        "dated after it, for a release that follows the newest"
+    );
+}
+
+#[tokio::test]
+async fn a_policy_tagged_under_an_earlier_silo_key_is_tagged_again() {
+    let a = tempfile::tempdir().unwrap();
+    let host = Copies(vec![copy(a.path())], true);
+    let device = Device::new(&host);
+    let store = FolderStore::new(a.path().to_path_buf());
+    device.state.set_audit_log(device.silo.id, true).unwrap();
+    run_sync_pass(&device.state, &host, &device.silo)
+        .await
+        .unwrap();
+    // The same policy, tagged under the DEK before a rotation.
+    let before = policy_on(&device, &store)
+        .await
+        .tagged(&PolicyKey::new(&[9; 32]));
+    silentsilo_sync::audit_log::write_audit_policy(&store, &device.kek(), &before)
+        .await
+        .unwrap();
+    due_again(&device);
+    run_sync_pass(&device.state, &host, &device.silo)
+        .await
+        .unwrap();
+    let after = policy_on(&device, &store).await;
+    assert_eq!(after.changed_at, before.changed_at);
+    assert!(after.is_authentic(&device.policy_key()));
+}
+
+#[tokio::test]
+async fn a_policy_dated_far_ahead_is_not_taken_in() {
+    let a = tempfile::tempdir().unwrap();
+    let host = Copies(vec![copy(a.path())], false);
+    let device = Device::new(&host);
+    let store = FolderStore::new(a.path().to_path_buf());
+    let keys = turn_on(&device, &store).await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let ahead = AuditPolicy::new(true, &keys.id(), None, Scope::Silo, now + 10 * 86_400);
+    silentsilo_sync::audit_log::write_audit_policy(&store, &device.kek(), &ahead)
+        .await
+        .unwrap();
+    run_sync_pass(&device.state, &host, &device.silo)
+        .await
+        .unwrap();
+    assert!(device.spool().pinned().is_none());
+}
+
+#[tokio::test]
+async fn a_queue_a_release_before_the_check_left_is_taken_in_once_then_checked() {
+    let host = Copies(Vec::new(), true);
+    let device = Device::new(&host);
+    let id = device.silo.id;
+    // A personal log pinned by 1.9: nothing in the queue is checked.
+    let keys = KeyPair::generate();
+    let mut key = AuditKey::new(&keys, Scope::Silo, 1);
+    key.wrap_for(
+        silentsilo_audit::BY_SILO,
+        &keys.private,
+        device.kek().as_bytes(),
+    )
+    .unwrap();
+    let policy = AuditPolicy::new(true, &keys.id(), None, Scope::Silo, 1);
+    let queue = device.silo.path.join(silentsilo_audit::QUEUE_DIR);
+    std::fs::create_dir_all(&queue).unwrap();
+    std::fs::write(queue.join("key.json"), key.to_json().unwrap()).unwrap();
+    std::fs::write(
+        queue.join("policy.json"),
+        serde_json::to_vec(&policy).unwrap(),
+    )
+    .unwrap();
+    let state = serde_json::json!({
+        "next_event": 0, "next_segment": 0, "last_hash": "", "closed_through": 0,
+        "pinned": {
+            "key_id": key.key_id, "public_key": key.public_key, "scope": "silo",
+            "enabled": true, "retention_days": null, "checked_at": 0
+        }
+    });
+    std::fs::write(queue.join("state.json"), state.to_string()).unwrap();
+
+    assert_eq!(
+        device
+            .state
+            .audit_record(id, Event::new(codes::UNLOCKED, 1))
+            .unwrap(),
+        Some(0)
+    );
+    assert_eq!(device.spool().pinned().unwrap().key_id, key.key_id);
+
+    // From now on a pin without its check is someone else's: written into
+    // the folder with a key of their own, it is not sealed to.
+    let theirs = KeyPair::generate();
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(queue.join("state.json")).unwrap()).unwrap();
+    state.as_object_mut().unwrap().remove("pin_check");
+    state["pinned"]["key_id"] = hex::encode(theirs.id()).into();
+    state["pinned"]["public_key"] = hex::encode(&theirs.public).into();
+    std::fs::write(queue.join("state.json"), state.to_string()).unwrap();
+    device
+        .state
+        .audit_record(id, Event::new(codes::SECRET_COPIED, 2))
+        .unwrap();
+    let segment = device.spool().close(3).unwrap().unwrap();
+    for record in &segment.records {
+        assert!(open_event(&keys.private, segment.device, record).is_ok());
+        assert!(open_event(&theirs.private, segment.device, record).is_err());
+    }
+}
+
 mod reading {
     use super::*;
     use silentsilo_app::audit_read::{
         Reader, read_audit_log, read_audit_log_local, read_audit_log_within,
     };
 
-    /// Another device's run of segments, its events numbered from 0.
-    fn their_segments(device: Uuid, public: &[u8], per_segment: &[u16]) -> Vec<Segment> {
+    /// Another device's run of segments, its events numbered from 0, tagged
+    /// as this build writes them.
+    fn their_segments(
+        device: Uuid,
+        public: &[u8],
+        per_segment: &[u16],
+        tags: &SegmentKey,
+    ) -> Vec<Segment> {
         let mut out: Vec<Segment> = Vec::new();
         let mut i = 0;
         for (seq, codes_in) in per_segment.iter().enumerate() {
@@ -542,13 +776,17 @@ mod reading {
                 i += 1;
             }
             let prev = out.last().map_or([0u8; 32], |s| s.hash());
-            out.push(Segment {
-                device,
-                seq: seq as u64,
-                prev,
-                closed_at: 1,
-                records,
-            });
+            out.push(
+                Segment {
+                    device,
+                    seq: seq as u64,
+                    prev,
+                    closed_at: 1,
+                    records,
+                    tag: None,
+                }
+                .tag_with(tags),
+            );
         }
         out
     }
@@ -620,7 +858,7 @@ mod reading {
         let store = FolderStore::new(a.path().to_path_buf());
         let public = device.spool().key().unwrap().unwrap().public().unwrap();
         let other = Uuid::new_v4();
-        for segment in their_segments(other, &public, &[2]) {
+        for segment in their_segments(other, &public, &[2], &device.tags()) {
             store
                 .put(
                     &silentsilo_audit::segment_key(other, segment.seq),
@@ -721,14 +959,14 @@ mod reading {
         // Another device wrote three segments; the middle one is gone.
         let public = device.spool().key().unwrap().unwrap().public().unwrap();
         let other = Uuid::new_v4();
-        for segment in their_segments(other, &public, &[2, 3, 1]) {
+        for segment in their_segments(other, &public, &[2, 3, 1], &device.tags()) {
             if segment.seq != 1 {
                 store.put(&segment.key(), segment.to_bytes()).await.unwrap();
             }
         }
         // And one record sealed to a key that is not the log's.
         let stranger = KeyPair::generate();
-        let mut odd = their_segments(Uuid::new_v4(), &stranger.public, &[1]);
+        let mut odd = their_segments(Uuid::new_v4(), &stranger.public, &[1], &device.tags());
         let odd = odd.remove(0);
         store.put(&odd.key(), odd.to_bytes()).await.unwrap();
 
@@ -756,6 +994,50 @@ mod reading {
                 .events,
             3
         );
+    }
+
+    #[tokio::test]
+    async fn forged_segments_are_refused_and_damaged_ones_leave_the_cache() {
+        let a = tempfile::tempdir().unwrap();
+        let host = Copies(vec![copy(a.path())], true);
+        let device = Device::new(&host);
+        let id = device.silo.id;
+        let store = FolderStore::new(a.path().to_path_buf());
+        device.state.set_audit_log(id, true).unwrap();
+        run_sync_pass(&device.state, &host, &device.silo)
+            .await
+            .unwrap();
+        let public = device.spool().key().unwrap().unwrap().public().unwrap();
+        let other = Uuid::new_v4();
+        let segments = their_segments(other, &public, &[2, 1], &device.tags());
+        for segment in &segments {
+            store.put(&segment.key(), segment.to_bytes()).await.unwrap();
+        }
+        // A third written by storage, which has the public key and not the
+        // silo's: it does not get in.
+        let forged = their_segments(other, &public, &[1, 1, 1], &SegmentKey::new(&[1; 32]))
+            .pop()
+            .unwrap();
+        store.put(&forged.key(), forged.to_bytes()).await.unwrap();
+
+        let read = read_audit_log(&device.state, &host, &device.silo, &Reader::Silo)
+            .await
+            .unwrap();
+        let trail = read.devices.iter().find(|d| d.device == other).unwrap();
+        assert_eq!(trail.events, 3);
+        assert_eq!(trail.refused_segments, vec![2]);
+        let cache = device.silo.path.join(silentsilo_app::audit_read::CACHE_DIR);
+        let cached = |seq: u64| cache.join(other.to_string()).join(format!("{seq:012}.seg"));
+        assert!(!cached(2).exists(), "a forged segment is not kept");
+
+        // A cached segment damaged on this disk is dropped and fetched again.
+        std::fs::write(cached(0), b"noise").unwrap();
+        let again = read_audit_log(&device.state, &host, &device.silo, &Reader::Silo)
+            .await
+            .unwrap();
+        let trail = again.devices.iter().find(|d| d.device == other).unwrap();
+        assert_eq!(trail.events, 3);
+        assert_eq!(std::fs::read(cached(0)).unwrap(), segments[0].to_bytes());
     }
 
     #[tokio::test]
@@ -812,11 +1094,123 @@ mod organisation {
         }
     }
 
+    /// A device on a silo an organisation administers with three keys.
+    fn org_device(host: &Copies) -> Device {
+        let device = Device::new(host);
+        device.administered_by(&[("aa", 1), ("bb", 2), ("cc", 3)]);
+        device
+    }
+
+    #[tokio::test]
+    async fn an_organisation_log_starts_only_with_one_of_the_silo_s_organisation_keys() {
+        let host = Copies(Vec::new(), true);
+        let device = Device::new(&host);
+        let id = device.silo.id;
+        assert!(
+            device
+                .state
+                .start_org_audit_log(id, &touch("aa", 1), None)
+                .is_err(),
+            "a silo no organisation administers"
+        );
+        device.administered_by(&[("aa", 1)]);
+        assert!(
+            device
+                .state
+                .start_org_audit_log(id, &touch("aa", 2), None)
+                .is_err(),
+            "a touch that does not open the key's envelope"
+        );
+        assert!(
+            device
+                .state
+                .start_org_audit_log(id, &touch("bb", 1), None)
+                .is_err(),
+            "a key the silo does not have"
+        );
+        assert!(
+            device
+                .state
+                .start_org_audit_log(id, &touch("aa", 1), Some(30))
+                .is_err(),
+            "kept less than 90 days"
+        );
+        device
+            .state
+            .start_org_audit_log(id, &touch("aa", 1), None)
+            .unwrap();
+        assert!(device.state.audit_status(id).unwrap().organisation);
+        assert!(
+            device
+                .state
+                .add_org_audit_reader(id, &touch("aa", 1), &touch("dd", 4))
+                .is_err(),
+            "a reader the silo does not have"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retention_under_ninety_days_is_refused() {
+        let host = Copies(Vec::new(), true);
+        let device = org_device(&host);
+        let id = device.silo.id;
+        device
+            .state
+            .start_org_audit_log(id, &touch("aa", 1), Some(365))
+            .unwrap();
+        let err = device
+            .state
+            .set_org_audit_retention(id, Some(89))
+            .unwrap_err();
+        assert!(err.contains("err.audit_retention_short"), "{err}");
+        assert_eq!(
+            device.state.audit_status(id).unwrap().retention_days,
+            Some(365)
+        );
+        device.state.set_org_audit_retention(id, Some(90)).unwrap();
+        assert_eq!(
+            device.state.audit_status(id).unwrap().retention_days,
+            Some(90)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_organisation_s_policy_on_a_silo_none_administers_is_not_taken_in() {
+        let a = tempfile::tempdir().unwrap();
+        let host = Copies(vec![copy(a.path())], false);
+        let device = Device::new(&host);
+        let store = FolderStore::new(a.path().to_path_buf());
+        // Written by someone holding the content key: a log for a key of
+        // their own, as an organisation's.
+        let theirs = KeyPair::generate();
+        let mut key = AuditKey::new(&theirs, Scope::Org, 1);
+        key.wrap_for("aa", &theirs.private, &[9; 32]).unwrap();
+        let policy = AuditPolicy::new(true, &theirs.id(), None, Scope::Org, 1);
+        silentsilo_sync::audit_log::write_audit_key(&store, &key)
+            .await
+            .unwrap();
+        silentsilo_sync::audit_log::write_audit_policy(&store, &device.kek(), &policy)
+            .await
+            .unwrap();
+        run_sync_pass(&device.state, &host, &device.silo)
+            .await
+            .unwrap();
+        assert!(device.spool().pinned().is_none());
+
+        // On a silo an organisation does administer, a key naming none of
+        // its keys is not its log either.
+        device.administered_by(&[("bb", 2)]);
+        run_sync_pass(&device.state, &host, &device.silo)
+            .await
+            .unwrap();
+        assert!(device.spool().pinned().is_none());
+    }
+
     #[tokio::test]
     async fn an_organisation_log_replaces_a_personal_one_and_only_its_keys_read_it() {
         let a = tempfile::tempdir().unwrap();
         let host = Copies(vec![copy(a.path())], true);
-        let device = Device::new(&host);
+        let device = org_device(&host);
         let id = device.silo.id;
         device.state.set_audit_log(id, true).unwrap();
         let admin = touch("aa", 1);
@@ -856,7 +1250,7 @@ mod organisation {
     async fn another_organisation_key_reads_it_and_ways_in_reach_every_copy() {
         let a = tempfile::tempdir().unwrap();
         let host = Copies(vec![copy(a.path())], true);
-        let device = Device::new(&host);
+        let device = org_device(&host);
         let id = device.silo.id;
         let store = FolderStore::new(a.path().to_path_buf());
         let (first, second, third) = (touch("aa", 1), touch("bb", 2), touch("cc", 3));
@@ -922,7 +1316,7 @@ mod organisation {
     async fn segments_past_the_retention_are_removed_and_the_rest_kept() {
         let a = tempfile::tempdir().unwrap();
         let host = Copies(vec![copy(a.path())], true);
-        let device = Device::new(&host);
+        let device = org_device(&host);
         let id = device.silo.id;
         let store = FolderStore::new(a.path().to_path_buf());
         let admin = touch("aa", 1);
@@ -942,9 +1336,22 @@ mod organisation {
                 prev: [0; 32],
                 closed_at: now - age_days * 86_400_000,
                 records: vec![silentsilo_audit::seal_event(&public, other, &event).unwrap()],
-            };
+                tag: None,
+            }
+            .tag_with(&device.tags());
             store.put(&segment.key(), segment.to_bytes()).await.unwrap();
         }
+        // An old one storage made up, tagged under a key it does not have.
+        let mut forged = Segment::from_bytes(
+            &store
+                .get(&silentsilo_audit::segment_key(other, 0))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        forged.seq = 3;
+        let forged = forged.tag_with(&SegmentKey::new(&[1; 32]));
+        store.put(&forged.key(), forged.to_bytes()).await.unwrap();
 
         assert_eq!(
             expire_audit_segments(&device.state, &host, &device.silo)
@@ -953,16 +1360,15 @@ mod organisation {
             0,
             "kept for good"
         );
-        // Shorter than any choice the app offers: taken as the shortest.
-        device.state.set_org_audit_retention(id, Some(1)).unwrap();
+        device.state.set_org_audit_retention(id, Some(90)).unwrap();
         assert_eq!(
             expire_audit_segments(&device.state, &host, &device.silo)
                 .await
                 .unwrap(),
             1,
-            "only the one past 90 days"
+            "only the one past 90 days, and not the forged one"
         );
-        assert_eq!(segments_in(&store).await.len(), 2);
+        assert_eq!(segments_in(&store).await.len(), 3);
         let read = read_audit_log(&device.state, &host, &device.silo, &reader(&admin))
             .await
             .unwrap();
@@ -979,7 +1385,7 @@ mod organisation {
     async fn a_segment_moved_under_another_name_is_not_taken_for_it() {
         let a = tempfile::tempdir().unwrap();
         let host = Copies(vec![copy(a.path())], true);
-        let device = Device::new(&host);
+        let device = org_device(&host);
         let id = device.silo.id;
         let store = FolderStore::new(a.path().to_path_buf());
         let admin = touch("aa", 1);
@@ -1000,7 +1406,9 @@ mod organisation {
                 prev: [0; 32],
                 closed_at: now - age_days * 86_400_000,
                 records: vec![silentsilo_audit::seal_event(&public, other, &event).unwrap()],
-            };
+                tag: None,
+            }
+            .tag_with(&device.tags());
             store.put(&segment.key(), segment.to_bytes()).await.unwrap();
             segments.push(segment);
         }
@@ -1016,7 +1424,7 @@ mod organisation {
         let trail = read.devices.iter().find(|d| d.device == other).unwrap();
         assert_eq!(trail.events, 1, "read twice: {trail:?}");
 
-        device.state.set_org_audit_retention(id, Some(1)).unwrap();
+        device.state.set_org_audit_retention(id, Some(90)).unwrap();
         assert_eq!(
             expire_audit_segments(&device.state, &host, &device.silo)
                 .await

@@ -36,6 +36,8 @@ silentsilo-sync-v1_6_1 = { package = "silentsilo-sync", git = "https://github.co
 silentsilo-store-v1_6_1 = { package = "silentsilo-store", git = "https://github.com/silentsilo/core", tag = "v1.6.1" }
 silentsilo-crypto-v1_6_1 = { package = "silentsilo-crypto", git = "https://github.com/silentsilo/core", tag = "v1.6.1" }
 silentsilo-vfs-v1_6_1 = { package = "silentsilo-vfs", git = "https://github.com/silentsilo/core", tag = "v1.6.1" }
+# The activity log as 1.9.0 first shipped it, for what it does with tags.
+silentsilo-audit-v1_9_0 = { package = "silentsilo-audit", git = "https://github.com/silentsilo/core", tag = "v1.9.0" }
 silentsilo-app = { workspace = true }
 hex = "0.4"
 blake3 = { workspace = true }

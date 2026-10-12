@@ -70,7 +70,12 @@ phones send afterwards, and the sender records and revocation markers, which
 it could also write. A client refuses to follow revocation markers that would
 leave no key at all, so a forged set cannot lock every device out; it can
 still remove some keys, or register a sender. Moving these under a key that
-rotates is a format change and is not done in v1.
+rotates is a format change and is not done in v1. The same holder still
+reads a personal activity log, whose private key is wrapped under the KEK,
+and can tag activity segments. The activity log's policy is the exception:
+from core 1.10 it carries a tag under a key derived from the DEK, and a
+device that has seen a tagged policy follows no other (see "The activity
+log" below).
 
 Replacing or disabling the recovery code deletes or replaces its envelope in
 storage but does not rotate the DEK either. Disabling also leaves a marker
@@ -89,12 +94,16 @@ Recovery code ─────────┘
 
 Master DEK [32]  ──► sealed envelope: vault.db.enc, operation records,
                   │    snapshots
-                  └► wraps the content KEK
+                  ├► wraps the content KEK
+                  └► derives the activity log policy's tag key
 
 Content KEK [32] ──► wraps one content key per blob, carried inside the
                   │    operation record that names the blob
-                  └► seals password entries, inbox keys, inbox senders,
-                       revocation markers
+                  ├► seals password entries, inbox keys, inbox senders,
+                  │    revocation markers, the activity log policy
+                  ├► wraps a personal activity log's private key
+                  └► derives the activity segment tag key and the
+                       activity queue's check key
 
 Content key [32] ──► AES-256-GCM chunked blob encryption (.sslo)
 ```
@@ -268,6 +277,35 @@ and cannot be exported.
 A sender is expected to keep each item marked sent until it sees the file in the silo,
 and to send it again when it disappears unimported, because the photo is
 still on the phone.
+
+## The activity log
+
+Devices write the log; only its reader opens it. The layout and every rule
+are in `FORMATS.md`, "The activity log".
+
+| Field | Value |
+|-------|-------|
+| Record | HPKE (RFC 9180) base mode: DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-256-GCM; info `silentsilo audit v1`; AAD the writing device's id and the key id |
+| Log key | A random X25519 pair; the private half wrapped under `derive_key("silentsilo audit private key v1", wrap key)`, once per organisation key's wrap key, or under the content KEK on a personal silo |
+| Segment tag | Keyed BLAKE3 over the whole segment before the tag, key `derive_key("silentsilo audit segment v2", content KEK)`. From core 1.10 |
+| Policy | Sealed payload under the content KEK; `auth` is keyed BLAKE3 over its fields, key `derive_key("silentsilo audit policy auth v1", DEK)`. From core 1.10 |
+| Queue check | Keyed BLAKE3 over the pin and the kept policy in the silo folder, key `derive_key("silentsilo audit queue check v1", content KEK)`. From core 1.10 |
+
+A record alone says nothing about who sealed it: the public key is in
+storage. The segment tag is what does, and every device of the silo holds
+its key, so it proves a segment came from the silo, not from which device.
+It is under the KEK because a segment is never rewritten and has to check
+after a key rotation. The policy's tag is under the DEK because the DEK
+rotates: whoever was removed from the silo keeps the KEK and can seal a
+policy, but cannot tag one. The queue's check keeps whoever can write to
+the silo folder from pinning a key of their own there.
+
+| Who | Can | Cannot |
+|-----|-----|--------|
+| Anyone with write access to storage | Delete segments, the newest leaving no hole; put back an old copy of the policy | Add, change or move a segment without it being named; write a policy that opens |
+| A former member, after a rotation, with storage access | Seal a policy, which devices that hold a tagged one ignore; tag segments under any device's name; read a personal log | Tag a policy; read an organisation's log without one of its keys |
+| A current member | Tag segments under another device's name; tag a policy, which an organisation's devices do not follow to another key | Read an organisation's log without one of its keys |
+| Whoever can write to the silo folder | Add records to this device's queue before they are sealed into a segment | Choose the key this device seals to |
 
 ## Enrolled key records (`keys/fido.json`)
 
@@ -658,6 +696,12 @@ obtains a copy of the bucket, reads all of the following without any key:
 | `recovery.env` | That a recovery code exists, and when it was created |
 | `inbox/items/<item_id>.*` | How many items wait to be imported, their sizes and when they were sent; not which device sent them |
 | `inbox/senders/`, `inbox/keys/` | How many devices may send, and how many inbox keys exist |
+| `snapshots/<horizon>.snap` | That the log was compacted, when, and the Lamport value it was compacted at, which bounds how many operations came before; the snapshot's size |
+| `keys/revoked/<credential_id>.sealed` | The credential id of every key removed from the silo, and when; `keys/revoked/recovery.sealed` says the recovery code was turned off |
+| `keys/content.kek` | When it was last written, which a rotation of the silo key does |
+| `audit/<device>/<seq>.seg` | That the silo keeps an activity log, which device ids write to it, and per segment, in its header: the device id, the number, the hash of the one before, when it was closed to the millisecond, how many events it holds and the length of each. Each record names the 8-byte id of the key it was sealed to and its cipher suite. Not what the events are |
+| `audit/keys/<key id>.json` | The log's public key, its suite, when it was made, whether it is an organisation's or a personal log (`scope`), and on an organisation's the credential ids of the keys that read it (`by`) |
+| `audit/policy.sealed` | That a policy exists, and when it changes; not what it says |
 
 None of this breaks the encryption, and none of it is unusual for a design
 that stores one object per change. It is listed because "the provider sees
@@ -739,3 +783,4 @@ machine](#malware-on-the-users-machine).
 | FIDO hmac-secret (Linux/macOS) | `crates/silentsilo-fido/src/backend/ctap.rs` |
 | Secure Enclave agreement and KDF | `crates/silentsilo-fido/src/enclave.rs` |
 | Secure Enclave calls (macOS) | `crates/silentsilo-fido/src/backend/enclave_mac.rs` |
+| Activity log records, segments, key, policy, queue | `crates/silentsilo-audit/src/` |

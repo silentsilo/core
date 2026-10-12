@@ -148,6 +148,7 @@ mod tests {
             prev: [0; 32],
             closed_at: 1,
             records: vec![seal_event(&keys.public, device, &Event::new(1, 1)).unwrap()],
+            tag: None,
         }
     }
 

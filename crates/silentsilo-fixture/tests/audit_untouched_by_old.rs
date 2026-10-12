@@ -24,7 +24,10 @@ fn storage_with_a_log(root: &Path) -> Vec<(String, Vec<u8>)> {
         prev: [0; 32],
         closed_at: 1,
         records: vec![record],
-    };
+        tag: None,
+    }
+    // As this build writes it: tagged, version 2.
+    .tag_with(&silentsilo_audit::SegmentKey::new(&[3; 32]));
     let key = AuditKey::new(&keys, Scope::Silo, 1);
     let log = vec![
         (segment.key(), segment.to_bytes()),

@@ -91,12 +91,31 @@ and never stops the sync. A policy that later names another key than an
 organisation's pinned one is not followed, and nothing of it is taken in:
 the device goes on sealing to the key it pinned, with the setting, scope and
 retention it had, and says so. A personal log follows the newest policy.
+A policy from a copy is taken in only when it is dated at most a day ahead
+of this computer's clock, is an organisation's only on a silo an
+organisation administers and names one of its keys, and, once the device
+trusts a policy (`Pinned::proven`: made here, or read with an `auth` that
+checks under the current DEK), carries an `auth` that checks. A device that
+trusts its policy writes it tagged, puts it back over a copy holding one it
+refused, dated after that one, and tags again a copy holding it with a tag
+from before a key change. FORMATS.md, "The activity log", has the rules.
 An organisation's log (`audit_admin`) is started and given another reading
 key with the wrap key a touch of one of its keys gave, which the client
-asks for. Changing its retention and removing old segments need the
+asks for; core checks each touch against the silo's enrolled organisation
+keys (`OrgProof`), so the log starts only on a silo an organisation
+administers. Changing its retention and removing old segments need the
 organisation's key pinned on this device; the client asks for a touch
-before either. Removal never goes below 90 days (`MIN_RETENTION_DAYS`),
-since anyone with the content key can write a policy.
+before either. A retention under 90 days (`MIN_RETENTION_DAYS`) is refused
+when set, and removal never goes below it whatever a policy says, since
+anyone with the content key can seal a policy. Removal leaves a segment
+whose tag does not check.
+The queue's pin and kept policy carry a check under a key from the content
+KEK, so whoever can write to the silo folder cannot choose the key events
+are sealed to. The first open by a build that checks takes in a queue as
+1.9 left it, and notes that in the index (`vault_meta`,
+`audit_queue_checked`, `state::queue_unchecked`); after that a pin without
+its check is made again from the checked policy, or dropped until the next
+pass. Segments are tagged as they close.
 A personal log is turned on and off on the device (`AppState::set_audit_log`),
 copies or not: the queue keeps the key and the policy, and the pass writes
 the newest policy, by `changed_at`, to every copy that lacks it
@@ -120,7 +139,13 @@ beside the silo, this device's outbox and its pending records, and every
 copy it can reach, keeping what it fetched. It checks each device's chain
 and event count from the oldest segment present (a retention may have
 removed what came before) and names what is missing, records that do not
-open with the log's key, and copies it could not read. A personal silo's
+open with the log's key, and copies it could not read. It refuses by name a
+segment whose tag does not check under the content KEK, and an untagged one
+after a device's first tagged one; untagged segments no tagged one vouches
+for through an unbroken chain are read and named unproven. A gap in the
+numbering is named up to 10,000 numbers and counted past that. A cached
+segment that does not read or whose tag does not check is removed and
+fetched again; a forged one is never cached. A personal silo's
 log opens with the content key, with every personal key in `audit/keys/`
 it unwraps: two devices that started the log at once each sealed some
 records to their own key. An organisation's opens only with an
@@ -599,9 +624,9 @@ sealed object, or a new reader of an old kind, comes with that test.
 | `inbox/keys/*.sealed` | `load_inbox_keys` | `key_id == name`, version 1 | `inbox.rs` `an_inbox_key_moved_under_another_name_opens_nothing` |
 | `inbox/senders/*.sealed` | `load_senders` | `sender_id == name`, version 1 | `inbox.rs` `a_sender_moved_under_another_name_sends_nothing` |
 | `recovery.env`, `keys/recovery.json` | `unwrap_with_code`, `is_authentic` | the wrapped DEK opens only under the code's key; the tag covers it | vault `recovery.rs` `a_security_keys_wrapping_moved_into_the_envelope_opens_nothing` |
-| `audit/policy.sealed` | `read_audit_policy` | one per silo; other KEK-sealed kinds do not parse and are an error | audit `keyring.rs` `a_sealed_object_of_another_kind_is_not_a_policy` |
+| `audit/policy.sealed` | `read_audit_policy`, `settle_audit_policy` | one per silo; other KEK-sealed kinds do not parse and are an error; `auth` under the DEK covers every field | audit `keyring.rs` `a_sealed_object_of_another_kind_is_not_a_policy`, `a_policy_s_tag_checks_under_its_dek_only_and_covers_every_field` |
 | `audit/keys/*.json` (wrapped private key inside) | `read_audit_key`, `AuditKey::unwrap_with`, `read_silo_keys` | `key_id == name`; the private key must give the entry's public key | sync `audit_log.rs` `a_log_key_moved_under_another_keys_name_is_refused`, audit `keyring.rs` `a_private_key_moved_under_another_log_keys_entry_is_refused` |
-| `audit/<device>/<seq>.seg` (HPKE, not `sealed.rs`) | app `audit_read`, `expire_audit_segments`, extract, fixture | header `device` and `seq` == name; records bind the device in their AAD | app `audit.rs` `a_segment_moved_under_another_name_is_not_taken_for_it` |
+| `audit/<device>/<seq>.seg` (HPKE, not `sealed.rs`) | app `audit_read`, `expire_audit_segments`, extract, fixture | header `device` and `seq` == name; records bind the device in their AAD; from version 2 the tag covers the header and records | app `audit.rs` `a_segment_moved_under_another_name_is_not_taken_for_it`, audit `segment.rs` `a_changed_byte_or_a_moved_segment_does_not_check` |
 | backup as a whole | `silentsilo-extract::open` | the readers above | extract `round_trip.rs` `objects_moved_under_other_names_in_a_backup_are_not_taken` |
 | `content.kek.enc`, `master.dek.enc.next` (silo folder) | `load_kek`, `load_staged_dek` | both are 32 bytes under the DEK: each refuses a key equal to the other | vault `rotation.rs` `the_kek_and_the_staged_key_copied_over_each_other_are_refused`, `kek_store.rs` `another_object_sealed_under_the_dek_is_not_taken_as_the_kek` |
 | `master.dek.enc` and every DEK wrapping | `unwrap_dek_bytes` | each is under a wrap key of its own | vault `dek_store.rs` `a_wrapping_moved_from_another_place_does_not_open_here` |
@@ -648,6 +673,12 @@ Read this before "fixing" any of it.
   `hmac-secret-v1`. Every device reads every other device's envelopes, and a
   device skips the ones whose derivation it cannot perform. Mobile will add
   to the list rather than change it.
+- **Activity segments are tagged under the content KEK, the policy under
+  the DEK.** The DEK rotates and the KEK does not, so a key from the DEK
+  keeps a former holder out. A segment is never rewritten and must check
+  for years, across key changes, so it cannot use one. The policy is
+  rewritten and tagged again after a key change. Untagged segments from 1.9
+  are still read, and named unproven unless a tagged one vouches for them.
 - **Purge does not delete bucket blobs.** The sweep does, two-pass, after
   convergence and a 30-day grace. Deleting at purge time froze "referenced"
   at what one device knew and destroyed content another device still pointed

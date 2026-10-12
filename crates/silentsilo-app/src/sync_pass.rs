@@ -294,43 +294,62 @@ const AUDIT_SEGMENT_EVERY_MS: i64 = 15 * 60 * 1000;
 /// How often the log's policy is read again, in seconds.
 const AUDIT_POLICY_EVERY: i64 = 10 * 60;
 
+/// What the activity log's part of a pass works with.
+struct AuditPass<'a> {
+    root: &'a std::path::Path,
+    device: Uuid,
+    kek: &'a silentsilo_crypto::ContentKek,
+    /// Checks and tags the policy, under the current DEK.
+    policy_key: silentsilo_audit::PolicyKey,
+    unchecked: silentsilo_audit::Unchecked,
+    now: i64,
+}
+
+impl AuditPass<'_> {
+    /// The spool, opened for one local step and closed before the network:
+    /// a command recording an event waits for it.
+    fn open(&self, host: &dyn Host) -> Option<silentsilo_audit::Spool> {
+        match silentsilo_audit::Spool::open(
+            self.root,
+            self.device,
+            self.kek.as_bytes(),
+            self.unchecked,
+        ) {
+            Ok(spool) => Some(spool),
+            Err(e) => {
+                host.warn("audit", &e.to_string());
+                None
+            }
+        }
+    }
+}
+
 /// Reads the log's policy now and then, closes a segment when one is due, and
 /// sends what waits to every copy. A segment leaves this device only once
 /// every copy holds it, as a record does. Failures are reported and tried
 /// again on the next pass; none of this stops the sync.
 async fn deliver_audit(
     host: &dyn Host,
-    root: &std::path::Path,
-    device: Uuid,
-    kek: &silentsilo_crypto::ContentKek,
+    pass: &AuditPass<'_>,
     targets: &[OpenTarget],
     required: &std::collections::HashSet<Uuid>,
-    now: i64,
 ) {
-    use silentsilo_audit::Spool;
-
-    // The spool is opened for each local step and closed before the network:
-    // a command recording an event waits for it.
-    let open = || match Spool::open(root, device) {
-        Ok(spool) => Some(spool),
-        Err(e) => {
-            host.warn("audit", &e.to_string());
-            None
-        }
-    };
-
-    let Some(spool) = open() else { return };
+    let now = pass.now;
+    let Some(spool) = pass.open(host) else { return };
+    // A check dated ahead of the clock is as stale as an old one.
     let stale = spool
         .pinned()
-        .is_none_or(|p| now.saturating_sub(p.checked_at) >= AUDIT_POLICY_EVERY);
+        .is_none_or(|p| !(0..AUDIT_POLICY_EVERY).contains(&now.saturating_sub(p.checked_at)));
     drop(spool);
     if stale {
-        settle_audit_policy(host, kek, targets, required, &open, now).await;
+        settle_audit_policy(host, pass, targets, required).await;
     }
 
     let now_ms = now.saturating_mul(1000);
     let outbox = {
-        let Some(mut spool) = open() else { return };
+        let Some(mut spool) = pass.open(host) else {
+            return;
+        };
         if spool.pinned().is_none() {
             return;
         }
@@ -371,7 +390,7 @@ async fn deliver_audit(
             Err(e) => host.warn("audit", &format!("{}: {e}", target.label)),
         }
     }
-    let Some(spool) = open() else { return };
+    let Some(spool) = pass.open(host) else { return };
     for segment in &outbox {
         let everywhere = holders
             .get(&segment.seq)
@@ -387,16 +406,14 @@ async fn deliver_audit(
 /// is published to the copies by the caller.
 fn start_by_default(
     host: &dyn Host,
-    kek: &silentsilo_crypto::ContentKek,
-    open: &(dyn Fn() -> Option<silentsilo_audit::Spool> + Sync),
-    now: i64,
+    pass: &AuditPass<'_>,
 ) -> Option<(silentsilo_audit::AuditPolicy, silentsilo_audit::AuditKey)> {
-    let mut spool = open()?;
+    let mut spool = pass.open(host)?;
     // Set here while the copies were being read: that choice stands.
     if spool.pinned().is_some() || !matches!(spool.policy(), Ok(None)) {
         return None;
     }
-    match silentsilo_audit::start_silo_log(&mut spool, kek.as_bytes(), now) {
+    match silentsilo_audit::start_silo_log(&mut spool, pass.kek.as_bytes(), pass.now) {
         Ok(started) => Some(started),
         Err(e) => {
             host.warn("audit", &e.to_string());
@@ -409,40 +426,90 @@ fn start_by_default(
 /// to every copy that has none or an older one: a log turned on with no
 /// copies, or before a copy was added, reaches them this way. A policy
 /// naming a key other than the one this device pinned is never spread.
+///
+/// A policy from a copy is not taken in when it is dated more than a day
+/// ahead of this computer's clock, or when it is an organisation's on a
+/// silo no organisation administers, or names none of its organisation
+/// keys. Once this device holds a policy it made or read with a tag that
+/// checks under the current DEK, a policy whose tag does not check is not
+/// taken in either, and the copy holding it gets this device's again,
+/// dated after it, so a release before the tag follows that one too.
 async fn settle_audit_policy(
     host: &dyn Host,
-    kek: &silentsilo_crypto::ContentKek,
+    pass: &AuditPass<'_>,
     targets: &[OpenTarget],
     required: &std::collections::HashSet<Uuid>,
-    open: &(dyn Fn() -> Option<silentsilo_audit::Spool> + Sync),
-    now: i64,
 ) {
-    use silentsilo_audit::{AuditKey, AuditPolicy, PolicyRead};
+    use silentsilo_audit::{AuditKey, AuditPolicy, MAX_POLICY_AHEAD_SECS, PolicyRead, Scope};
 
-    let (local_key, local_policy, local_policy_absent) = {
-        let Some(spool) = open() else { return };
+    let now = pass.now;
+    let (local_key, local_policy, local_policy_absent, pinned) = {
+        let Some(spool) = pass.open(host) else { return };
         let policy = spool.policy();
         let absent = matches!(policy, Ok(None)) && spool.pinned().is_none();
-        (spool.key().ok().flatten(), policy.ok().flatten(), absent)
+        (
+            spool.key().ok().flatten(),
+            policy.ok().flatten(),
+            absent,
+            spool.pinned().cloned(),
+        )
     };
+    let proven = pinned.as_ref().is_some_and(|p| p.proven);
+    // The organisation keys this silo has. An organisation's policy names
+    // its readers in its key file; one naming none of them is not this
+    // silo's organisation.
+    let managed: std::collections::HashSet<String> = load_fido_keys(pass.root)
+        .map(|keys| keys.managed().map(|k| k.credential_id.clone()).collect())
+        .unwrap_or_default();
+    let org_ok = |key: &AuditKey| key.wrapped.iter().any(|w| managed.contains(&w.by));
+
     // What each copy that answered holds; one that failed is left alone.
     let mut on_copies: Vec<(&OpenTarget, Option<AuditPolicy>)> = Vec::new();
     for target in targets {
-        match sync::audit_log::read_audit_policy(&*target.store, kek).await {
+        match sync::audit_log::read_audit_policy(&*target.store, pass.kek).await {
             Ok(policy) => on_copies.push((target, policy)),
             Err(e) => host.warn("audit", &format!("{}: {e}", target.label)),
         }
     }
 
-    let mut newest: Option<(AuditPolicy, AuditKey)> = local_policy
+    let mut newest: Option<(AuditPolicy, AuditKey, bool)> = local_policy
         .zip(local_key.clone())
-        .filter(|(policy, key)| policy.key_id == key.key_id);
+        .filter(|(policy, key)| policy.key_id == key.key_id)
+        .map(|(policy, key)| (policy, key, false));
+    // Copies holding a policy this device does not take in, and the latest
+    // date among those.
+    let mut refused: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+    let mut refused_at: Option<i64> = None;
     for (target, policy) in &on_copies {
         let Some(policy) = policy else { continue };
-        if newest
+        let wins = newest
             .as_ref()
-            .is_some_and(|(n, _)| policy.changed_at <= n.changed_at)
-        {
+            .is_none_or(|(n, _, _)| policy.changed_at > n.changed_at);
+        let mut refuse = |why: &str| {
+            refused.insert(target.id);
+            if policy.is_believable_at(now) {
+                refused_at = refused_at.max(Some(policy.changed_at));
+            }
+            if wins {
+                host.warn(
+                    "audit",
+                    &format!(
+                        "{}: the activity log's policy there {why}; not followed",
+                        target.label
+                    ),
+                );
+            }
+        };
+        if !policy.is_believable_at(now) {
+            refuse("is dated ahead of this computer's clock");
+            continue;
+        }
+        let authentic = policy.is_authentic(&pass.policy_key);
+        if proven && !authentic {
+            refuse("is not signed with this silo's current key");
+            continue;
+        }
+        if !wins {
             continue;
         }
         let key = match local_key.as_ref().filter(|k| k.key_id == policy.key_id) {
@@ -456,7 +523,11 @@ async fn settle_audit_policy(
                 }
             },
         };
-        newest = Some((policy.clone(), key));
+        if policy.scope == Scope::Org && !org_ok(&key) {
+            refuse("is an organisation's this silo does not have");
+            continue;
+        }
+        newest = Some((policy.clone(), key, authentic));
     }
     // Nobody ever set it, here or on any copy: the log is on by default.
     // Only when every copy the silo has answered, those resting after a
@@ -468,12 +539,28 @@ async fn settle_audit_policy(
         .iter()
         .all(|id| on_copies.iter().any(|(target, _)| target.id == *id));
     if newest.is_none() && local_policy_absent && none_held && all_answered {
-        newest = start_by_default(host, kek, open, now);
+        newest = start_by_default(host, pass).map(|(policy, key)| (policy, key, true));
     }
-    let Some((policy, key)) = newest else { return };
+    let Some((mut policy, key, mut authentic)) = newest else {
+        return;
+    };
+    // Dated after a newer policy it refused, so a copy holding that one gets
+    // this one, and a release that follows the newest follows this.
+    if proven
+        && pinned.as_ref().is_some_and(|p| p.key_id == policy.key_id)
+        && let Some(at) = refused_at.filter(|at| *at > policy.changed_at)
+    {
+        policy.changed_at = at
+            .saturating_add(1)
+            .min(now.saturating_add(MAX_POLICY_AHEAD_SECS));
+        policy.auth = None;
+        authentic = true;
+    }
 
-    let read = {
-        let Some(mut spool) = open() else { return };
+    let (read, trusted) = {
+        let Some(mut spool) = pass.open(host) else {
+            return;
+        };
         // Changed on this computer while the copies were read: that is the
         // newer choice, and the next pass spreads it.
         if spool
@@ -484,7 +571,8 @@ async fn settle_audit_policy(
         {
             return;
         }
-        spool.apply_policy(&policy, &key, now)
+        let read = spool.apply_stored_policy(&policy, &key, now, authentic);
+        (read, spool.pinned().is_some_and(|p| p.proven))
     };
     match read {
         Ok(PolicyRead::KeyChanged { pinned, named }) => {
@@ -522,24 +610,38 @@ async fn settle_audit_policy(
         }
     }
     if merged != key
-        && let Some(spool) = open()
+        && let Some(spool) = pass.open(host)
         && let Err(e) = spool.keep_key(&merged)
     {
         host.warn("audit", &e.to_string());
     }
 
+    // Tagged only by a device that trusts it: one taken in on first sight,
+    // untagged, is spread as it came and never given a tag it did not have.
+    let stored = if trusted {
+        policy.tagged(&pass.policy_key)
+    } else {
+        policy.clone()
+    };
     for ((target, held), copy_key) in on_copies.iter().zip(copy_keys) {
         // A copy whose key could not be read is left for the next pass.
         let Some(copy_key) = copy_key else { continue };
-        let policy_behind = held
+        let older = held
             .as_ref()
             .is_none_or(|held| held.changed_at < policy.changed_at);
+        // Refused, or the same policy without a tag that checks now (it
+        // was written before the tag, or before a key change).
+        let put_right = trusted
+            && (refused.contains(&target.id)
+                || held.as_ref().is_some_and(|held| {
+                    held.changed_at == policy.changed_at && !held.is_authentic(&pass.policy_key)
+                }));
         let published = async {
             if copy_key.as_ref() != Some(&merged) {
                 sync::audit_log::write_audit_key(&*target.store, &merged).await?;
             }
-            if policy_behind {
-                sync::audit_log::write_audit_policy(&*target.store, kek, &policy).await?;
+            if older || put_right {
+                sync::audit_log::write_audit_policy(&*target.store, pass.kek, &stored).await?;
             }
             Ok::<(), sync::SyncError>(())
         };
@@ -1089,17 +1191,27 @@ pub async fn run_sync_pass(
     // records: a segment is never what holds them back.
     let audit_device = {
         let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
-        sessions
-            .get(&silo.id)
-            .and_then(|s| silentsilo_vfs::device_id(&s.conn).ok())
+        sessions.get(&silo.id).and_then(|s| {
+            silentsilo_vfs::device_id(&s.conn)
+                .ok()
+                .map(|device| (device, crate::state::queue_unchecked(s)))
+        })
     };
-    if let Some(device) = audit_device {
+    if let Some((device, unchecked)) = audit_device {
         let required: std::collections::HashSet<Uuid> = every_target
             .iter()
             .copied()
             .filter(|id| !retired.contains_key(id))
             .collect();
-        deliver_audit(host, &root, device, &kek, &targets, &required, now).await;
+        let pass = AuditPass {
+            root: &root,
+            device,
+            kek: &kek,
+            policy_key: silentsilo_audit::PolicyKey::new(dek.as_bytes()),
+            unchecked,
+            now,
+        };
+        deliver_audit(host, &pass, &targets, &required).await;
     }
 
     // ── In, from every target ───────────────────────────────────────

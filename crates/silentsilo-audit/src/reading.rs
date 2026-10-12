@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use serde::Serialize;
 use uuid::Uuid;
 
+use crate::segment::{Proof, SegmentKey};
 use crate::{Event, KeyId, Segment, check_chain, counter_gaps, describe, open_event, record_key};
 
 #[derive(Debug, Clone, Serialize)]
@@ -29,9 +30,19 @@ pub struct DeviceTrail {
     pub events: usize,
     /// Runs of event numbers that should be there and are not, inclusive.
     pub missing_events: Vec<(u64, u64)>,
+    /// At most [`crate::MAX_NAMED_MISSING`] of them.
     pub missing_segments: Vec<u64>,
+    /// Missing beyond those named in `missing_segments`.
+    pub missing_segments_not_named: u64,
     /// Segments that do not follow the one before them.
     pub broken_segments: Vec<u64>,
+    /// Segments read that nothing proves this silo wrote: untagged, from a
+    /// release before core 1.10, and not followed by a tagged one through
+    /// an unbroken chain.
+    pub unproven_segments: Vec<u64>,
+    /// Segments not read: their tag does not check, or they are untagged
+    /// where this device already tags. Not written by this silo's devices.
+    pub refused_segments: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -128,12 +139,72 @@ fn open_all(keys: &ReadKeys, jobs: &[(Uuid, &[Vec<u8>])]) -> Vec<Vec<Option<Even
 
 /// Opens and checks `segments`, from anywhere and in any order, one per
 /// device and number. `unsent` are records not in a segment yet, by device.
+/// `tags` checks who wrote each segment.
 pub fn read_log(
     segments: impl IntoIterator<Item = Segment>,
     unsent: &[(Uuid, Vec<u8>)],
     keys: &ReadKeys,
+    tags: &SegmentKey,
 ) -> LogRead {
-    read_log_with(segments, unsent, keys, &mut Opened::default())
+    read_log_with(segments, unsent, keys, tags, &mut Opened::default())
+}
+
+/// One device's segments to read, by number, with what their tag says.
+type Proved = BTreeMap<u64, (Segment, Proof)>;
+
+/// One device's segments sorted into those read, by number, and those
+/// refused. A forged tag is refused; so is an untagged segment after the
+/// device's first tagged one, since a device that tags never writes an
+/// untagged one again.
+fn sort_by_proof(segments: BTreeMap<u64, Segment>, tags: &SegmentKey) -> (Proved, Vec<u64>) {
+    let mut read = BTreeMap::new();
+    let mut refused = Vec::new();
+    for (seq, segment) in segments {
+        match segment.proof(tags) {
+            Proof::Forged => refused.push(seq),
+            proof => {
+                read.insert(seq, (segment, proof));
+            }
+        }
+    }
+    if let Some(first) = read
+        .iter()
+        .find(|(_, (_, proof))| *proof == Proof::Tagged)
+        .map(|(seq, _)| *seq)
+    {
+        let late: Vec<u64> = read
+            .range(first..)
+            .filter(|(_, (_, proof))| *proof == Proof::Untagged)
+            .map(|(seq, _)| *seq)
+            .collect();
+        for seq in late {
+            read.remove(&seq);
+            refused.push(seq);
+        }
+    }
+    refused.sort_unstable();
+    (read, refused)
+}
+
+/// Untagged segments no tagged one vouches for. A tagged segment names the
+/// hash of the one before it, so an unbroken run down from a tagged one is
+/// as sure as the tag.
+fn unproven(read: &Proved) -> Vec<u64> {
+    let mut out = Vec::new();
+    // The segment just above, and whether it is vouched for.
+    let mut above: Option<(u64, [u8; 32], bool)> = None;
+    for (seq, (segment, proof)) in read.iter().rev() {
+        let vouched = *proof == Proof::Tagged
+            || above.is_some_and(|(next, prev, vouched)| {
+                vouched && next == seq + 1 && prev == segment.hash()
+            });
+        if !vouched {
+            out.push(*seq);
+        }
+        above = Some((*seq, segment.prev, vouched));
+    }
+    out.reverse();
+    out
 }
 
 /// [`read_log`], opening only the segments `opened` does not hold yet, and
@@ -142,6 +213,7 @@ pub fn read_log_with(
     segments: impl IntoIterator<Item = Segment>,
     unsent: &[(Uuid, Vec<u8>)],
     keys: &ReadKeys,
+    tags: &SegmentKey,
     opened: &mut Opened,
 ) -> LogRead {
     let key = {
@@ -169,16 +241,20 @@ pub fn read_log_with(
     for (device, _) in unsent {
         by_device.entry(*device).or_default();
     }
+    let by_device: BTreeMap<Uuid, (Proved, Vec<u64>)> = by_device
+        .into_iter()
+        .map(|(device, segments)| (device, sort_by_proof(segments, tags)))
+        .collect();
 
     // What is new: segments not opened before, or whose bytes differ.
     let hashes: HashMap<(Uuid, u64), [u8; 32]> = by_device
         .values()
-        .flat_map(|segments| segments.values())
+        .flat_map(|(read, _)| read.values().map(|(s, _)| s))
         .map(|s| ((s.device, s.seq), *blake3::hash(&s.to_bytes()).as_bytes()))
         .collect();
     let fresh: Vec<&Segment> = by_device
         .values()
-        .flat_map(|segments| segments.values())
+        .flat_map(|(read, _)| read.values().map(|(s, _)| s))
         .filter(|s| {
             opened
                 .segments
@@ -196,10 +272,15 @@ pub fn read_log_with(
     }
 
     let mut read = LogRead::default();
-    for (device, segments) in by_device {
-        let segments: Vec<Segment> = segments.into_values().collect();
+    for (device, (proved, refused_segments)) in by_device {
+        let unproven_segments = unproven(&proved);
+        let segments: Vec<Segment> = proved.into_values().map(|(s, _)| s).collect();
         let from = segments.iter().map(|s| s.seq).min().unwrap_or(0);
-        let chain = check_chain(&segments, from);
+        let mut chain = check_chain(&segments, from);
+        // Named as refused, not as missing too.
+        chain
+            .missing
+            .retain(|seq| refused_segments.binary_search(seq).is_err());
         let mut events = Vec::new();
         let mut seen = HashSet::new();
         let pending: Vec<Option<Event>> = unsent
@@ -220,7 +301,7 @@ pub fn read_log_with(
                 None => read.unreadable += 1,
             }
         }
-        if events.is_empty() && segments.is_empty() {
+        if events.is_empty() && segments.is_empty() && refused_segments.is_empty() {
             continue;
         }
         let first = events.iter().map(|e| e.i).min().unwrap_or(0);
@@ -229,7 +310,10 @@ pub fn read_log_with(
             events: events.len(),
             missing_events: counter_gaps(&events, first),
             missing_segments: chain.missing,
+            missing_segments_not_named: chain.missing_not_named,
             broken_segments: chain.broken,
+            unproven_segments,
+            refused_segments,
         });
         read.entries
             .extend(events.into_iter().map(|event| LogEntry {
@@ -368,8 +452,9 @@ mod tests {
             prev: [0; 32],
             closed_at: 1,
             records: vec![sealed(0, 10), sealed(1, 20)],
+            tag: None,
         };
-        let read = read_log([segment], &[(device, sealed(3, 40))], &one(&keys));
+        let read = read_log([segment], &[(device, sealed(3, 40))], &one(&keys), &tags());
         assert_eq!(read.entries.len(), 3);
         assert_eq!(read.entries[0].event.i, 3, "newest first");
         assert_eq!(read.devices[0].missing_events, vec![(2, 2)]);
@@ -401,9 +486,9 @@ mod tests {
             (first.id(), &first.private[..]),
             (second.id(), &second.private[..]),
         ];
-        let read = read_log(a.clone(), &[], &both);
+        let read = read_log(a.clone(), &[], &both, &tags());
         assert_eq!((read.entries.len(), read.unreadable), (4, 0));
-        let only = read_log(a, &[], &one(&second));
+        let only = read_log(a, &[], &one(&second), &tags());
         assert_eq!((only.entries.len(), only.unreadable), (2, 2));
     }
 
@@ -422,8 +507,89 @@ mod tests {
                         seal_event(&keys.public, device, &event).unwrap()
                     })
                     .collect(),
+                tag: None,
             })
             .collect()
+    }
+
+    fn tags() -> SegmentKey {
+        SegmentKey::new(&[6; 32])
+    }
+
+    /// `log`, chained, with the segments from `tagged_from` on tagged.
+    fn chained(keys: &KeyPair, device: Uuid, segments: u64, tagged_from: u64) -> Vec<Segment> {
+        let mut out: Vec<Segment> = Vec::new();
+        for mut segment in log(keys, device, segments, 1) {
+            segment.prev = out.last().map_or([0; 32], |s| s.hash());
+            if segment.seq >= tagged_from {
+                segment = segment.tag_with(&tags());
+            }
+            out.push(segment);
+        }
+        out
+    }
+
+    #[test]
+    fn a_forged_segment_is_refused_by_name_and_not_read() {
+        let keys = KeyPair::generate();
+        let device = Uuid::new_v4();
+        let mut all = chained(&keys, device, 3, 0);
+        // Storage replaces the middle one, tagged under a key it made up.
+        let forged = log(&keys, device, 3, 2).remove(1);
+        all[1] = Segment {
+            prev: all[0].hash(),
+            ..forged
+        }
+        .tag_with(&SegmentKey::new(&[7; 32]));
+        let read = read_log(all, &[], &one(&keys), &tags());
+        let trail = &read.devices[0];
+        assert_eq!(trail.refused_segments, vec![1]);
+        assert!(trail.missing_segments.is_empty(), "named once");
+        assert_eq!(trail.events, 2);
+        assert_eq!(trail.missing_events, vec![(1, 1)]);
+        assert!(trail.unproven_segments.is_empty());
+    }
+
+    #[test]
+    fn an_untagged_segment_after_a_tagged_one_is_refused() {
+        let keys = KeyPair::generate();
+        let device = Uuid::new_v4();
+        let mut all = chained(&keys, device, 3, 1);
+        // Written in the old format after the device tags: by someone else.
+        all.push(Segment {
+            prev: all[2].hash(),
+            ..log(&keys, device, 4, 1).remove(3)
+        });
+        let read = read_log(all, &[], &one(&keys), &tags());
+        let trail = &read.devices[0];
+        assert_eq!(trail.refused_segments, vec![3]);
+        assert_eq!(trail.events, 3);
+        assert!(trail.unproven_segments.is_empty(), "0 is vouched for by 1");
+    }
+
+    #[test]
+    fn untagged_segments_are_read_and_named_unless_a_tagged_one_vouches_for_them() {
+        let keys = KeyPair::generate();
+        let device = Uuid::new_v4();
+        // 1.9 wrote 0 to 2, then the device moved on and tagged 3 and 4.
+        let all = chained(&keys, device, 5, 3);
+        let read = read_log(all.clone(), &[], &one(&keys), &tags());
+        assert!(read.devices[0].unproven_segments.is_empty());
+        assert_eq!(read.devices[0].events, 5);
+
+        // Segment 1 replaced: the chain breaks there, and what is below it
+        // is no longer vouched for.
+        let mut replaced = all.clone();
+        replaced[1].closed_at = 99;
+        let read = read_log(replaced, &[], &one(&keys), &tags());
+        assert_eq!(read.devices[0].broken_segments, vec![2]);
+        assert_eq!(read.devices[0].unproven_segments, vec![0, 1]);
+
+        // A device that never tagged: all of it read, none of it proven.
+        let old = chained(&keys, Uuid::new_v4(), 2, u64::MAX);
+        let read = read_log(old, &[], &one(&keys), &tags());
+        assert_eq!(read.devices[0].unproven_segments, vec![0, 1]);
+        assert_eq!(read.devices[0].events, 2);
     }
 
     #[test]
@@ -431,7 +597,7 @@ mod tests {
         let keys = KeyPair::generate();
         let device = Uuid::new_v4();
         let all = log(&keys, device, 6, 50);
-        let plain = read_log(all.clone(), &[], &one(&keys));
+        let plain = read_log(all.clone(), &[], &one(&keys), &tags());
         assert_eq!(plain.entries.len(), 300);
         assert_eq!(
             plain.entries[0].event.i, 299,
@@ -439,9 +605,9 @@ mod tests {
         );
 
         let mut opened = Opened::default();
-        let first = read_log_with(all[..4].to_vec(), &[], &one(&keys), &mut opened);
+        let first = read_log_with(all[..4].to_vec(), &[], &one(&keys), &tags(), &mut opened);
         assert_eq!((first.entries.len(), opened.segments()), (200, 4));
-        let second = read_log_with(all.clone(), &[], &one(&keys), &mut opened);
+        let second = read_log_with(all.clone(), &[], &one(&keys), &tags(), &mut opened);
         assert_eq!(opened.segments(), 6);
         let ids = |r: &LogRead| r.entries.iter().map(|e| e.event.i).collect::<Vec<_>>();
         assert_eq!(ids(&second), ids(&plain));
@@ -454,10 +620,10 @@ mod tests {
         let device = Uuid::new_v4();
         let mut all = log(&keys, device, 2, 3);
         let mut opened = Opened::default();
-        read_log_with(all.clone(), &[], &one(&keys), &mut opened);
+        read_log_with(all.clone(), &[], &one(&keys), &tags(), &mut opened);
         // Same place, other records: a copy that does not hold what was read.
         all[1].records.truncate(1);
-        let again = read_log_with(all, &[], &one(&keys), &mut opened);
+        let again = read_log_with(all, &[], &one(&keys), &tags(), &mut opened);
         assert_eq!(again.entries.len(), 4);
     }
 
@@ -468,8 +634,8 @@ mod tests {
         let device = Uuid::new_v4();
         let all = log(&keys, device, 2, 3);
         let mut opened = Opened::default();
-        read_log_with(all.clone(), &[], &one(&keys), &mut opened);
-        let wrong = read_log_with(all, &[], &one(&other), &mut opened);
+        read_log_with(all.clone(), &[], &one(&keys), &tags(), &mut opened);
+        let wrong = read_log_with(all, &[], &one(&other), &tags(), &mut opened);
         assert_eq!((wrong.entries.len(), wrong.unreadable), (0, 6));
     }
 }

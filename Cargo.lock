@@ -3930,7 +3930,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
- "silentsilo-audit",
+ "silentsilo-audit 1.10.0-beta.8",
  "silentsilo-core 1.10.0-beta.8",
  "silentsilo-crypto 1.10.0-beta.8",
  "silentsilo-store 1.10.0-beta.8",
@@ -3940,6 +3940,22 @@ dependencies = [
  "silentsilo-vfs 1.10.0-beta.8",
  "tempfile",
  "tokio",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "silentsilo-audit"
+version = "1.9.0"
+source = "git+https://github.com/silentsilo/core?tag=v1.9.0#15482bf4079bbddbe091c0969e7307782318e026"
+dependencies = [
+ "blake3",
+ "hex",
+ "hpke",
+ "serde",
+ "serde_json",
+ "silentsilo-crypto 1.9.0",
+ "thiserror",
  "uuid",
  "zeroize",
 ]
@@ -4004,6 +4020,16 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-core"
+version = "1.9.0"
+source = "git+https://github.com/silentsilo/core?tag=v1.9.0#15482bf4079bbddbe091c0969e7307782318e026"
+dependencies = [
+ "serde",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "silentsilo-core"
 version = "1.10.0-beta.8"
 dependencies = [
  "serde",
@@ -4047,6 +4073,24 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-crypto"
+version = "1.9.0"
+source = "git+https://github.com/silentsilo/core?tag=v1.9.0#15482bf4079bbddbe091c0969e7307782318e026"
+dependencies = [
+ "aes-gcm 0.10.3",
+ "blake3",
+ "hex",
+ "hkdf 0.12.4",
+ "p256",
+ "rand 0.9.5",
+ "sha2 0.10.9",
+ "silentsilo-core 1.9.0",
+ "thiserror",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "silentsilo-crypto"
 version = "1.10.0-beta.8"
 dependencies = [
  "aes-gcm 0.10.3",
@@ -4071,7 +4115,7 @@ dependencies = [
  "hex",
  "rusqlite",
  "serde_json",
- "silentsilo-audit",
+ "silentsilo-audit 1.10.0-beta.8",
  "silentsilo-core 1.10.0-beta.8",
  "silentsilo-crypto 1.10.0-beta.8",
  "silentsilo-store 1.10.0-beta.8",
@@ -4121,7 +4165,8 @@ dependencies = [
  "serde_json",
  "silentsilo-app 1.10.0-beta.8",
  "silentsilo-app 1.6.1",
- "silentsilo-audit",
+ "silentsilo-audit 1.10.0-beta.8",
+ "silentsilo-audit 1.9.0",
  "silentsilo-core 1.10.0-beta.8",
  "silentsilo-crypto 1.0.0",
  "silentsilo-crypto 1.10.0-beta.8",
@@ -4328,7 +4373,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
- "silentsilo-audit",
+ "silentsilo-audit 1.10.0-beta.8",
  "silentsilo-core 1.10.0-beta.8",
  "silentsilo-crypto 1.10.0-beta.8",
  "silentsilo-s3 1.10.0-beta.8",
