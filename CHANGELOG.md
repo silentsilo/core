@@ -54,6 +54,9 @@ release notes should say.
   `settle_recovery_envelope` take the DEK (FORMATS.md).
 - Each pass looks for holes in the middle of the device chains it added
   to (`chain_holes`) and reports them in `SyncReport::chain_holes`.
+- Two devices editing the same password entry at the same moment no longer
+  lose one edit without a trace: the pass puts it in the entry's history
+  marked `"conflict": true` (`Vfs::keep_lost_edits`, FORMATS.md).
 
 ### Added
 

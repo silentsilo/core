@@ -1220,7 +1220,25 @@ pub async fn run_sync_pass(
             seen.dedup();
             seen
         };
+        let edited: Vec<Uuid> = incoming
+            .iter()
+            .filter_map(|r| match &r.op {
+                silentsilo_vfs::OpBody::Known(silentsilo_vfs::VaultOp::UpsertPassword {
+                    id,
+                    ..
+                }) => Some(*id),
+                _ => None,
+            })
+            .collect();
         let report = replay(&session.conn, incoming).map_err(|e| e.to_string())?;
+        // An entry two devices edited at the same time keeps the edit the
+        // order did not, in its history; the next pass sends that change.
+        let vfs = silentsilo_vfs::Vfs::new(session);
+        for id in &edited {
+            if let Err(e) = vfs.keep_lost_edits(*id) {
+                host.warn("passwords", &format!("{id}: {e}"));
+            }
+        }
         // Only the chains this pass added to: a whole-log walk on every
         // pass would cost more than the pass.
         chain_holes =

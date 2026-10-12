@@ -64,6 +64,51 @@ pub struct AttachmentBlob {
     pub blob_key: String,
 }
 
+/// Fields of a password entry that are not part of a version of it, as
+/// the clients keep history: who it is, where it is filed, how it is
+/// guarded, what is attached, the history itself and a version's own date.
+const NOT_VERSIONED: [&str; 11] = [
+    "id",
+    "history",
+    "saved_at",
+    "conflict",
+    "attachments",
+    "passkey",
+    "favorite",
+    "category",
+    "created_at",
+    "updated_at",
+    "require_reauth",
+];
+
+/// What an entry or a version of it says, empty values left out, so a field
+/// that went from absent to empty is no change.
+fn entry_content(entry: &serde_json::Value) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    if let Some(fields) = entry.as_object() {
+        for (key, value) in fields {
+            let empty = match value {
+                serde_json::Value::Null => true,
+                serde_json::Value::String(s) => s.is_empty(),
+                serde_json::Value::Array(a) => a.is_empty(),
+                _ => false,
+            };
+            if !empty && !NOT_VERSIONED.contains(&key.as_str()) {
+                out.insert(key.clone(), value.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn history_of(entry: &serde_json::Value) -> impl Iterator<Item = &serde_json::Value> {
+    entry
+        .get("history")
+        .and_then(|h| h.as_array())
+        .into_iter()
+        .flatten()
+}
+
 /// True, for a file row `fi`, when its content was recorded again under
 /// another file after it: a move (`Vfs::move_file`) records the file anew
 /// over the same blob and trashes the old row, and nothing else gives two
@@ -347,6 +392,29 @@ impl<'a> Vfs<'a> {
             let (id, key) = row.map_err(|e| CoreError::Database(e.to_string()))?;
             if let Ok(id) = Uuid::parse_str(&id) {
                 out.insert(id, key);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The content hash each file's record holds, by blob, for checking a
+    /// blob against its record rather than against its own header. An
+    /// attachment has none.
+    pub fn blob_hashes(&self) -> CoreResult<std::collections::HashMap<Uuid, String>> {
+        let mut stmt = self
+            .conn()
+            .prepare("SELECT blob_id, content_hash FROM files WHERE content_hash IS NOT NULL")
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        let mut out = std::collections::HashMap::new();
+        for row in rows {
+            let (id, hash) = row.map_err(|e| CoreError::Database(e.to_string()))?;
+            if let Ok(id) = Uuid::parse_str(&id) {
+                out.insert(id, hash);
             }
         }
         Ok(out)
@@ -1517,6 +1585,120 @@ impl<'a> Vfs<'a> {
             .map_err(|e| CoreError::Crypto(format!("password entry is not readable: {e}")))?;
         String::from_utf8(plain)
             .map_err(|e| CoreError::Crypto(format!("password entry is not readable: {e}")))
+    }
+
+    /// Keeps the edits of entry `id` that another device's edit replaced
+    /// without having seen them: two devices changed the entry at the same
+    /// time, and the total order kept one. Each comes back as a version in
+    /// the history of the entry, marked `"conflict": true`, in one new
+    /// change. Returns how many it kept.
+    ///
+    /// An edit counts as lost only when every edit after it in the order
+    /// carries the same Lamport value, which a device that had seen it could
+    /// not have written, and none says the same or holds it in its history.
+    /// A later Lamport value counts as seen: releases before desktop 1.4 and
+    /// Android 1.3 write no history, and judging their edits by it would
+    /// call every one a conflict. Worked out from every edit in the log,
+    /// never from arrival order, so each device writes the same entry and
+    /// the change converges instead of repeating.
+    pub fn keep_lost_edits(&self, id: Uuid) -> CoreResult<usize> {
+        let stored: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT data FROM passwords WHERE id = ?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        let Some(stored) = stored else {
+            return Ok(0);
+        };
+        let current = self.unseal_entry(&stored)?;
+        let mut current: serde_json::Value = serde_json::from_str(&current)
+            .map_err(|e| CoreError::Crypto(format!("password entry is not readable: {e}")))?;
+
+        let mut stmt = self
+            .conn()
+            .prepare(
+                "SELECT payload FROM oplog
+                  WHERE json_extract(payload, '$.op') = 'upsert_password'
+                    AND json_extract(payload, '$.id') = ?1",
+            )
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map([id.to_string()], |row| row.get::<_, String>(0))
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        let mut edits = Vec::new();
+        for row in rows {
+            let payload = row.map_err(|e| CoreError::Database(e.to_string()))?;
+            let record = crate::oplog::OpRecord::from_bytes(payload.as_bytes())?;
+            let crate::oplog::OpBody::Known(crate::oplog::VaultOp::UpsertPassword { data, .. }) =
+                &record.op
+            else {
+                continue;
+            };
+            let Ok(plain) = self.unseal_entry(data) else {
+                continue;
+            };
+            let Ok(entry) = serde_json::from_str::<serde_json::Value>(&plain) else {
+                continue;
+            };
+            edits.push((record.sort_key(), entry));
+        }
+        edits.sort_by_key(|edit| edit.0);
+
+        let mut lost = Vec::new();
+        for (i, (order, edit)) in edits.iter().enumerate() {
+            let said = entry_content(edit);
+            let seen = edits[i + 1..].iter().any(|(later_order, later)| {
+                later_order.0 > order.0
+                    || entry_content(later) == said
+                    || history_of(later).any(|version| entry_content(version) == said)
+            });
+            let kept = entry_content(&current) == said
+                || history_of(&current).any(|version| entry_content(version) == said);
+            if !seen && !kept && !lost.iter().any(|l| entry_content(l) == said) {
+                lost.push(edit.clone());
+            }
+        }
+        if lost.is_empty() {
+            return Ok(0);
+        }
+
+        let kept = lost.len();
+        let Some(object) = current.as_object_mut() else {
+            return Ok(0);
+        };
+        let mut history: Vec<serde_json::Value> = object
+            .get("history")
+            .and_then(|h| h.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for edit in lost.into_iter().rev() {
+            let mut version = serde_json::Map::new();
+            if let Some(fields) = edit.as_object() {
+                for (key, value) in fields {
+                    if !NOT_VERSIONED.contains(&key.as_str()) {
+                        version.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+            let saved_at = edit.get("updated_at").cloned().unwrap_or(0.into());
+            version.insert("saved_at".into(), saved_at);
+            version.insert("conflict".into(), true.into());
+            history.insert(0, serde_json::Value::Object(version));
+        }
+        object.insert("history".into(), serde_json::Value::Array(history));
+        let data =
+            serde_json::to_string(&current).map_err(|e| CoreError::Database(e.to_string()))?;
+        // Too large with it: the edit stays lost rather than the entry
+        // becoming one no device can save.
+        if data.len() > MAX_ENTRY_BYTES {
+            return Ok(0);
+        }
+        self.upsert_password(id, &data)?;
+        Ok(kept)
     }
 
     /// Removes one entry. Deleting something that is already gone is not an
@@ -3781,6 +3963,84 @@ mod tests {
         // not a file at all now, so there is nothing to hide.
         assert!(vfs.list_folder(root).unwrap().is_empty());
         assert!(vfs.search_entries("Bank", 50).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_edit_made_at_the_same_time_as_another_is_kept_in_history() {
+        let (_dir, session) = new_session();
+        let vfs = Vfs::new(&session);
+        let id = Uuid::new_v4();
+        vfs.upsert_password(
+            id,
+            &format!(r#"{{"id":"{id}","password":"first","updated_at":1}}"#),
+        )
+        .unwrap();
+        let base = crate::oplog::highest_applied_lamport(vfs.conn()).unwrap();
+        // This device's edit, with the version it replaced in its history.
+        vfs.upsert_password(
+            id,
+            &format!(
+                r#"{{"id":"{id}","password":"mine","updated_at":2,"history":[{{"password":"first","saved_at":1}}]}}"#
+            ),
+        )
+        .unwrap();
+        // Another device's, made from the same version at the same time.
+        let theirs = format!(
+            r#"{{"id":"{id}","password":"theirs","updated_at":3,"history":[{{"password":"first","saved_at":1}}]}}"#
+        );
+        let sealed =
+            silentsilo_crypto::seal_with_key(theirs.as_bytes(), session.kek.as_bytes()).unwrap();
+        let record = crate::oplog::OpRecord::authored(
+            Uuid::new_v4(),
+            base + 1,
+            Uuid::new_v4(),
+            1_700_000_000,
+            0,
+            None,
+            crate::oplog::VaultOp::UpsertPassword {
+                id,
+                data: BASE64.encode(sealed),
+            },
+        );
+        crate::oplog::replay(vfs.conn(), vec![record]).unwrap();
+
+        assert_eq!(vfs.keep_lost_edits(id).unwrap(), 1);
+        let entry: serde_json::Value =
+            serde_json::from_str(&vfs.list_passwords().unwrap()[0]).unwrap();
+        let shown = entry["password"].as_str().unwrap().to_string();
+        let lost = if shown == "mine" { "theirs" } else { "mine" };
+        let history = entry["history"].as_array().unwrap();
+        assert_eq!(history[0]["password"], lost);
+        assert_eq!(history[0]["conflict"], true);
+        // Nothing more to keep once it is there: the change converges.
+        assert_eq!(vfs.keep_lost_edits(id).unwrap(), 0);
+    }
+
+    #[test]
+    fn edits_one_after_another_lose_nothing() {
+        let (_dir, session) = new_session();
+        let vfs = Vfs::new(&session);
+        let id = Uuid::new_v4();
+        vfs.upsert_password(id, &format!(r#"{{"id":"{id}","password":"a"}}"#))
+            .unwrap();
+        vfs.upsert_password(
+            id,
+            &format!(r#"{{"id":"{id}","password":"b","history":[{{"password":"a"}}]}}"#),
+        )
+        .unwrap();
+        // The third written as a release without history writes it.
+        vfs.upsert_password(
+            id,
+            &format!(r#"{{"id":"{id}","password":"c","history":[]}}"#),
+        )
+        .unwrap();
+        // Starred: same content, no version.
+        vfs.upsert_password(
+            id,
+            &format!(r#"{{"id":"{id}","password":"c","favorite":true}}"#),
+        )
+        .unwrap();
+        assert_eq!(vfs.keep_lost_edits(id).unwrap(), 0);
     }
 
     #[test]

@@ -2,9 +2,17 @@ The minisign public key the SilentSilo updater checks a release against, and
 the key the extraction tool is signed with. The tool is built from this
 repository and published on silentsilo/desktop's release page.
 
-Verify a downloaded extractor with minisign:
+Each file on the release page has a `.sig` beside it: the minisign
+signature, base64 encoded once more, as the updater reads it. Decode it,
+then verify with minisign:
 
-    minisign -Vm silentsilo-extract-linux-x86_64 -P <the key line below>
+    base64 -d silentsilo-extract-linux-x86_64.sig > silentsilo-extract-linux-x86_64.minisig
+    minisign -Vm silentsilo-extract-linux-x86_64 -x silentsilo-extract-linux-x86_64.minisig -P <the key line below>
+
+On Windows, in PowerShell:
+
+    [IO.File]::WriteAllBytes("x.minisig", [Convert]::FromBase64String((Get-Content x.exe.sig -Raw)))
+    minisign -Vm x.exe -x x.minisig -P <the key line below>
 
 untrusted comment: minisign public key: 79E53220B75C79B7
 RWS3eVy3IDLlean9BrZWUaxbTyj+oKfoc4g+IJ6xaAhUwbV8v8WnDbZP

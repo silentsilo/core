@@ -577,6 +577,13 @@ entry itself (`attachment_blobs`, on 1.0.0 too), so a blob referenced from
 history alone would be swept. How many versions a client keeps is its own
 setting; the whole history stays under 256 KB.
 
+From core 1.10.0 a version may carry `"conflict": true`: an edit another
+device made at the same moment (the same Lamport value) as the one the order
+kept, which no later edit says or holds in its history. Core puts it back
+into the history of the entry the order kept, as one new change, the same on
+every device (`Vfs::keep_lost_edits`). It is not part of what a version
+says, so restoring one drops it.
+
 An older client shows neither, and keeps both when it saves the entry, but
 adds no version of its own. That is client code, not core: desktop before
 1.4 and Android before 1.3 edit a copy of the whole entry, so a field they
