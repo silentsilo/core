@@ -11,7 +11,6 @@ use crate::dpapi;
 use crate::error::VaultError;
 
 const REGISTRY_FILE: &str = "silos.json";
-const DPAPI_MAGIC: &[u8] = b"SSDPAPI1";
 
 /// One silo, as this machine knows it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,12 +138,8 @@ pub fn load_registry(app_data: &Path) -> SiloRegistry {
     let Ok(raw) = std::fs::read(registry_path(app_data)) else {
         return SiloRegistry::default();
     };
-    let bytes = match raw.strip_prefix(DPAPI_MAGIC) {
-        Some(protected) => match dpapi::unprotect(protected) {
-            Some(bytes) => bytes,
-            None => return SiloRegistry::default(),
-        },
-        None => raw,
+    let Some(bytes) = dpapi::open_sealed(raw) else {
+        return SiloRegistry::default();
     };
     crate::format::decode("the silo list", &bytes).unwrap_or_default()
 }
@@ -152,17 +147,11 @@ pub fn load_registry(app_data: &Path) -> SiloRegistry {
 /// Names and paths only — but those describe a person, so this gets the
 /// same DPAPI treatment as the credentials file rather than sitting in the
 /// clear next to it. "Divorce", "Second family" is a filename nobody wants
-/// readable by everything that can read their app data.
+/// readable by everything that can read their app data. A protector that
+/// fails refuses the write; with none on the device it is written as is.
 pub fn save_registry(app_data: &Path, registry: &SiloRegistry) -> Result<(), VaultError> {
     let json = crate::format::encode(registry)?;
-    let to_write = match dpapi::protect(&json) {
-        Some(protected) => {
-            let mut out = DPAPI_MAGIC.to_vec();
-            out.extend_from_slice(&protected);
-            out
-        }
-        None => json,
-    };
+    let to_write = dpapi::seal_if_possible(&json)?;
     std::fs::create_dir_all(app_data)?;
     crate::workdir::write_private(&registry_path(app_data), &to_write)?;
     Ok(())

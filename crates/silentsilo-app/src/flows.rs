@@ -392,7 +392,8 @@ impl Drop for DeviceKey {
 
 /// Records a device key on an open silo. The first key on a silo also
 /// re-wraps the local DEK envelope under it, as the desktop's first
-/// enrolment does, so the device secret alone no longer opens the silo.
+/// enrolment does, and retires the device secret
+/// (`silentsilo_vault::retire_device_secret`), so it opens nothing again.
 /// The next sync pass publishes the envelope.
 pub fn enrol_device_key(
     session: &VaultSession,
@@ -432,6 +433,12 @@ pub fn enrol_device_key(
         silentsilo_vault::save_wrapped_dek_bytes(root, &envelope).map_err(|e| e.to_string())?;
     }
     save_fido_keys(root, &keys, silentsilo_vault::Authority::Machine).map_err(|e| e.to_string())?;
+    // The key opens the silo now, so the device secret goes: kept, it and
+    // an old copy of `master.dek.enc` (a synced folder's history) would
+    // still open it. Not fatal: the next unlock with a key tries again.
+    if first {
+        let _ = silentsilo_vault::retire_device_secret(session.vault_id);
+    }
     if let Err(e) = session.backup_locally() {
         return Err(format!(
             "The key was added, but the local snapshot failed: {e}"

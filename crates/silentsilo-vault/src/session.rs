@@ -71,7 +71,13 @@ impl VaultPaths {
     /// Creates the scratch directory, since nothing else will: SQLite does
     /// not make parent directories.
     pub fn ensure_work_dir(&self) -> Result<(), VaultError> {
-        crate::workdir::create_private_dir(&self.work_dir())?;
+        let dir = self.work_dir();
+        crate::workdir::create_private_dir(&dir)?;
+        // The folder every silo's scratch sits in, so one exclusion covers
+        // them all, the ones made later included.
+        if let Some(all) = dir.parent() {
+            crate::workdir::exclude_from_backup(all);
+        }
         Ok(())
     }
 
@@ -264,6 +270,10 @@ impl VaultSession {
         if !paths.exists() {
             return Err(VaultError::NotFound);
         }
+        // Retired once a key was enrolled: there is nothing to derive.
+        if device_secret.is_empty() {
+            return Err(VaultError::InvalidCredentials);
+        }
 
         let salt = std::fs::read(paths.salt_path())?;
         if salt.len() != 16 {
@@ -311,6 +321,11 @@ impl VaultSession {
 
         let vault_id = read_vault_id(&conn).ok_or(VaultError::NotFound)?;
         let kek = load_kek(&paths.root, &dek)?;
+
+        // A key opens this silo, so the device secret earlier releases kept
+        // after enrolment has nothing left to do. Best effort: it opens
+        // nothing on its own once `master.dek.enc` is under a key.
+        let _ = crate::device_store::retire_device_secret(vault_id);
 
         Ok(Self {
             paths,

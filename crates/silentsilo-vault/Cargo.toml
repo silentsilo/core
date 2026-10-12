@@ -45,6 +45,20 @@ windows = { version = "0.61", features = [
     "Win32_Security_Credentials",
 ] }
 
+# Core dumps off (`process::harden_process`). Already in the tree.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Keeping the working folder out of Time Machine and iPhone backups
+# (`workdir`), and on iOS the Keychain written "this device only"
+# (`keychain`). Both already in the tree through the enclave code.
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
+
+[target.'cfg(target_os = "ios")'.dependencies]
+security-framework-sys = "2.17"
+
 [dev-dependencies]
 silentsilo-testkit = { workspace = true }
 tempfile = { workspace = true }

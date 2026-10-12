@@ -3,22 +3,22 @@ use std::path::PathBuf;
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::dpapi;
 use crate::error::VaultError;
 
 const KEYRING_USER: &str = "vault-credentials";
-/// Prefix marking the fallback file's contents as DPAPI-protected rather
-/// than plain JSON. Anything not starting with this is treated as a
-/// pre-existing plaintext file (or a plaintext write on a non-Windows
-/// platform, where DPAPI isn't available and this stays the same as before).
-const DPAPI_MAGIC: &[u8] = b"SSDPAPI1";
 
 /// Identifies this machine's vault and holds the secret that bootstraps it
 /// before a security key is enrolled. `device_secret` is a real
 /// cryptographic input, not an auth token, which is why it lives in the OS
 /// keyring and is wiped on drop. The id beside it is not a secret and is
 /// skipped: `Uuid` has no `Zeroize`.
+///
+/// Once a key opens the silo the secret is emptied
+/// ([`retire_device_secret`]) and the record stays, saying the silo is set
+/// up on this machine.
 #[derive(Clone, Serialize, Deserialize, zeroize::ZeroizeOnDrop)]
 pub struct LocalVaultAuth {
     #[zeroize(skip)]
@@ -45,9 +45,7 @@ fn credentials_path(silo_id: Uuid) -> PathBuf {
 
 /// Whether this particular silo has credentials on this machine.
 pub fn is_provisioned(silo_id: Uuid) -> bool {
-    keyring_entry(silo_id)
-        .and_then(|entry| entry.get_password())
-        .is_ok()
+    crate::keychain::get_password(&keyring_user(silo_id)).is_ok()
         || read_fallback_file(silo_id).is_some_and(|creds| creds.vault_id == silo_id)
 }
 
@@ -56,7 +54,7 @@ pub fn is_provisioned(silo_id: Uuid) -> bool {
 /// treats all three as "no credentials here".
 fn read_fallback_file(silo_id: Uuid) -> Option<LocalVaultAuth> {
     let raw = std::fs::read(credentials_path(silo_id)).ok()?;
-    crate::format::decode("credentials", &unwrap_protected(&raw)?).ok()
+    crate::format::decode("credentials", &dpapi::open_sealed(raw)?).ok()
 }
 
 /// Write to the OS keyring, then immediately read it back with a fresh
@@ -71,15 +69,20 @@ fn keyring_roundtrips(silo_id: Uuid, json: &str) -> bool {
     {
         return false;
     }
-    let Ok(verify_entry) = keyring_entry(silo_id) else {
-        return false;
-    };
-    matches!(verify_entry.get_password(), Ok(stored) if stored == json)
+    matches!(
+        crate::keychain::get_password(&keyring_user(silo_id)).map(Zeroizing::new),
+        Ok(stored) if *stored == json
+    )
+}
+
+fn encoded(creds: &LocalVaultAuth) -> Result<Zeroizing<String>, VaultError> {
+    String::from_utf8(crate::format::encode(creds)?)
+        .map(Zeroizing::new)
+        .map_err(|e| VaultError::Crypto(e.to_string()))
 }
 
 pub fn save_credentials(creds: &LocalVaultAuth) -> Result<(), VaultError> {
-    let json = String::from_utf8(crate::format::encode(creds)?)
-        .map_err(|e| VaultError::Crypto(e.to_string()))?;
+    let json = encoded(creds)?;
 
     if keyring_roundtrips(creds.vault_id, &json) {
         let stale = credentials_path(creds.vault_id);
@@ -105,31 +108,34 @@ pub fn save_credentials(creds: &LocalVaultAuth) -> Result<(), VaultError> {
     Ok(())
 }
 
-/// The keyring-unavailable fallback: DPAPI-wraps (where available) and
-/// writes the credentials file. Split out from `save_credentials` so it's
-/// directly testable without depending on the real OS keyring's behavior on
-/// the test machine.
+/// The keyring-unavailable fallback: seals and writes the credentials file.
+/// Split out from `save_credentials` so it's directly testable without
+/// depending on the real OS keyring's behavior on the test machine.
+///
+/// Sealed with DPAPI on Windows and the client's protector elsewhere, so the
+/// file is useless off this device. Where there is neither, the write is
+/// refused until the user agrees to a file only their account can read
+/// (`dpapi::allow_unprotected_secrets`). A retired record holds no secret
+/// and is written either way.
 fn write_fallback_file(silo_id: Uuid, json: &str) -> Result<(), VaultError> {
-    // Wrap it with DPAPI where available (Windows) so the file isn't usable
-    // outside this specific Windows user's live logon session. Elsewhere the
-    // file is the secret in the clear, which is why it is written private and
-    // kept out of the silo folder.
-    let to_write = match dpapi::protect(json.as_bytes()) {
-        Some(protected) => {
-            let mut out = DPAPI_MAGIC.to_vec();
-            out.extend_from_slice(&protected);
-            out
-        }
-        None => json.as_bytes().to_vec(),
+    let to_write = if holds_a_secret(json) {
+        dpapi::seal_secret(json.as_bytes())?
+    } else {
+        dpapi::seal_if_possible(json.as_bytes())?
     };
     crate::workdir::write_private(&credentials_path(silo_id), &to_write)?;
     Ok(())
 }
 
+/// Whether a credentials record still carries a device secret.
+fn holds_a_secret(json: &str) -> bool {
+    crate::format::decode::<LocalVaultAuth>("credentials", json.as_bytes())
+        .map_or(true, |creds| !creds.device_secret.is_empty())
+}
+
 pub fn load_credentials(silo_id: Uuid) -> Result<LocalVaultAuth, VaultError> {
-    if let Ok(entry) = keyring_entry(silo_id)
-        && let Ok(json) = entry.get_password()
-    {
+    if let Ok(json) = crate::keychain::get_password(&keyring_user(silo_id)) {
+        let json = Zeroizing::new(json);
         return crate::format::decode("credentials", json.as_bytes());
     }
 
@@ -139,11 +145,8 @@ pub fn load_credentials(silo_id: Uuid) -> Result<LocalVaultAuth, VaultError> {
     }
 
     let raw = std::fs::read(&path)?;
-    let json_bytes: Vec<u8> = match raw.strip_prefix(DPAPI_MAGIC) {
-        Some(protected) => dpapi::unprotect(protected)
-            .ok_or_else(|| VaultError::Crypto("failed to unwrap credential file".into()))?,
-        None => raw,
-    };
+    let json_bytes = dpapi::open_sealed(raw)
+        .ok_or_else(|| VaultError::Crypto("failed to unwrap credential file".into()))?;
     let creds: LocalVaultAuth = crate::format::decode("credentials", &json_bytes)?;
 
     // Both lookups are keyed by silo id now, so a mismatch means the file
@@ -160,13 +163,51 @@ pub fn load_credentials(silo_id: Uuid) -> Result<LocalVaultAuth, VaultError> {
     // credentials would be silently lost on a machine where the keyring
     // write never verifiably persists (see `keyring_roundtrips`).
     let _ = save_credentials(&creds);
-    if keyring_entry(silo_id)
-        .and_then(|e| e.get_password())
-        .is_ok()
-    {
+    if crate::keychain::get_password(&keyring_user(silo_id)).is_ok() {
         let _ = std::fs::remove_file(path);
     }
     Ok(creds)
+}
+
+/// Forgets this device's secret for a silo a key now opens, keeping the
+/// record that the silo is set up here, so [`is_provisioned`] and
+/// [`load_credentials`] answer as before with an empty `device_secret`.
+///
+/// Call it once the first key is enrolled and `master.dek.enc` is wrapped
+/// under that key. Until then the secret is the only way in. After it, an
+/// envelope under the secret that survives somewhere (a synced folder's
+/// version history, a backup) opens nothing, because the secret is gone.
+/// Opening a silo with a key ([`crate::VaultSession::open_with_fido_wrapped`])
+/// calls it too, which retires the secrets earlier releases kept.
+///
+/// A silo with no credentials here is nothing to do. An error means the
+/// secret may still be stored.
+pub fn retire_device_secret(silo_id: Uuid) -> Result<(), VaultError> {
+    let creds = match load_credentials(silo_id) {
+        Ok(creds) => creds,
+        Err(VaultError::NotProvisioned) => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if creds.device_secret.is_empty() {
+        return Ok(());
+    }
+    let retired = LocalVaultAuth {
+        vault_id: silo_id,
+        device_secret: String::new(),
+    };
+    let json = encoded(&retired)?;
+    if keyring_roundtrips(silo_id, &json) {
+        let _ = std::fs::remove_file(credentials_path(silo_id));
+    } else {
+        write_fallback_file(silo_id, &json)?;
+        crate::s3_store::forget_keyring_entry(|| keyring_entry(silo_id));
+    }
+    match load_credentials(silo_id) {
+        Ok(after) if after.device_secret.is_empty() => Ok(()),
+        _ => Err(VaultError::Crypto(
+            "this device's secret for the silo could not be removed".into(),
+        )),
+    }
 }
 
 /// Forget this vault's credentials entirely (keyring entry and fallback
@@ -177,15 +218,6 @@ pub fn clear_credentials(silo_id: Uuid) {
         let _ = entry.delete_credential();
     }
     let _ = std::fs::remove_file(credentials_path(silo_id));
-}
-
-/// Unwraps a file this crate wrote with DPAPI protection, if it is
-/// protected; returns it unchanged otherwise.
-fn unwrap_protected(raw: &[u8]) -> Option<Vec<u8>> {
-    match raw.strip_prefix(DPAPI_MAGIC) {
-        Some(protected) => dpapi::unprotect(protected),
-        None => Some(raw.to_vec()),
-    }
 }
 
 /// Keyed by silo, so several silos on one machine don't overwrite each
@@ -211,6 +243,7 @@ mod tests {
 
     impl Scratch {
         fn new() -> Self {
+            crate::dpapi::tests::test_protector();
             Scratch(Uuid::new_v4())
         }
         fn id(&self) -> Uuid {
@@ -262,8 +295,72 @@ mod tests {
         write_fallback_file(scratch.id(), r#"{"second":true}"#).unwrap();
 
         let raw = std::fs::read(credentials_path(scratch.id())).unwrap();
-        let json = unwrap_protected(&raw).unwrap();
-        assert_eq!(String::from_utf8(json).unwrap(), r#"{"second":true}"#);
+        let json = dpapi::open_sealed(raw).unwrap();
+        assert_eq!(
+            String::from_utf8(json.to_vec()).unwrap(),
+            r#"{"second":true}"#
+        );
+    }
+
+    /// Sealed wherever this device can seal: the file is the secret, and
+    /// a copy of it off this device must open nothing.
+    #[test]
+    fn the_fallback_file_is_sealed() {
+        let scratch = Scratch::new();
+        write_fallback_file(scratch.id(), r#"{"fake":"credentials"}"#).unwrap();
+        let raw = std::fs::read(credentials_path(scratch.id())).unwrap();
+        assert!(raw.starts_with(dpapi::SEALED));
+        assert!(!String::from_utf8_lossy(&raw).contains("credentials"));
+    }
+
+    /// Retiring keeps the record and drops the secret, through the same
+    /// file the keyring falls back to.
+    #[test]
+    fn a_retired_record_keeps_the_silo_and_loses_the_secret() {
+        let scratch = Scratch::new();
+        let _serial = crate::s3_store::tests::keyring_lock();
+        write_fallback_file(
+            scratch.id(),
+            &encoded(&LocalVaultAuth {
+                vault_id: scratch.id(),
+                device_secret: "aa".repeat(32),
+            }),
+        )
+        .unwrap();
+
+        retire_device_secret(scratch.id()).unwrap();
+
+        let after = load_credentials(scratch.id()).unwrap();
+        assert_eq!(after.vault_id, scratch.id());
+        assert!(after.device_secret.is_empty());
+        assert!(is_provisioned(scratch.id()));
+        // Twice is nothing more.
+        retire_device_secret(scratch.id()).unwrap();
+        clear_credentials(scratch.id());
+    }
+
+    #[test]
+    fn retiring_on_a_silo_not_set_up_here_does_nothing() {
+        let scratch = Scratch::new();
+        retire_device_secret(scratch.id()).unwrap();
+        assert!(!is_provisioned(scratch.id()));
+    }
+
+    /// A record with no secret holds nothing worth sealing, so it is
+    /// written even where secrets wait for the user's consent.
+    #[test]
+    fn a_retired_record_is_not_a_secret() {
+        let id = Uuid::new_v4();
+        let retired = encoded(&LocalVaultAuth {
+            vault_id: id,
+            device_secret: String::new(),
+        });
+        assert!(!holds_a_secret(&retired));
+        assert!(holds_a_secret(&encoded(&LocalVaultAuth {
+            vault_id: id,
+            device_secret: "aa".into(),
+        })));
+        assert!(holds_a_secret("not json"));
     }
 
     #[cfg(unix)]

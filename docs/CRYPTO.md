@@ -31,11 +31,23 @@ It lives outside the vault directory, under the machine's local application
 data, and so does the fallback file holding the device secret when the OS
 keyring will not take it. Neither travels with the folder. Files the user
 opens are decrypted there too, in the clear, until the lock or the next start
-removes them. On Windows the keyring entries (the device secret and the
-storage settings with their secrets) are written with
-`CRED_PERSIST_LOCAL_MACHINE`, so a roaming domain profile does not copy them
-to other machines; an entry an earlier build wrote with the roaming
-`CRED_PERSIST_ENTERPRISE` is rewritten local on its next save.
+removes them; on a Mac and an iPhone that folder is excluded from Time
+Machine and device backups (`NSURLIsExcludedFromBackupKey`). On Windows the
+keyring entries (the device secret and the storage settings with their
+secrets) are written with `CRED_PERSIST_LOCAL_MACHINE`, so a roaming domain
+profile does not copy them to other machines; an entry an earlier build
+wrote with the roaming `CRED_PERSIST_ENTERPRISE` is rewritten local on its
+next save. On an iPhone they are written
+`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, so an iCloud or computer
+backup does not carry them to another phone; an entry an earlier build wrote
+with the default class is moved to it on its first read.
+
+The fallback files are sealed: DPAPI on Windows, the client's protector on
+a phone (a Keystore key on Android, a Keychain key on an iPhone). A
+protector that fails refuses the write. Where there is none, Linux or a Mac
+without a usable keyring, a secret is written in the clear (0600, outside
+the folder) only after the user agrees to it (`allow_unprotected_secrets`);
+until then the write fails with `err.secrets_unprotected` and the app asks.
 
 Two limits of that sentence, stated here rather than left to be discovered:
 
@@ -110,7 +122,8 @@ Three keys can produce the Master DEK, each wrapping the same value
 independently: the key derived from an enrolled authenticator, the one derived
 from this machine's device secret, and the one derived from the written-down
 recovery code. Any of them opens the vault on its own, and none can be derived
-from another.
+from another. The device secret only until the first key is enrolled: it is
+deleted then (below).
 
 ### Device provisioning secret
 
@@ -126,7 +139,7 @@ Until security-key enrollment completes, the **device secret** (32 bytes of OS r
 
 Salt: 16-byte random per vault (`vault.salt` file). This derived key wraps the Master DEK (it no longer keys `vault.db` directly; see below).
 
-After security-key enrollment, `master.dek.enc` is re-wrapped to the FIDO-derived key; the device secret no longer unlocks the DEK.
+After security-key enrollment, `master.dek.enc` is re-wrapped to the FIDO-derived key, and the device secret is deleted from this machine (`retire_device_secret`): the credentials record stays, with an empty secret, so the silo still reads as set up here. Deleting it matters because the old `master.dek.enc` can outlive the re-wrap: a synced folder keeps earlier versions of a file, and so does a backup. That copy and the secret together would open the silo with no key. Without the secret it opens nothing. A silo whose first key an earlier release enrolled has its secret deleted on the first unlock with a key.
 
 ## Security-key unlock (FIDO2, CTAP2 hmac-secret)
 
@@ -207,14 +220,24 @@ and tested on every platform; only the calls into the enclave are macOS
 code. A client on another platform carries the envelope and skips it,
 exactly as it would any kind it does not know.
 
-What this does not give is authenticity. The stored point is not signed, and
-the enclave will agree with any valid point on the curve, so someone who can
-write to shared storage can replace it. They learn nothing by doing so,
-because the only consumer of the derived key is an AEAD open that either
-works or does not, and there is no oracle in between. What they get is
-denial of service with a Touch ID prompt that appears to succeed. The
-unlock path therefore treats a failed agreement as a reason to fall through
-to an enrolled security key rather than as the end of the attempt.
+The stored point is not signed, and the enclave agrees with any valid point
+on the curve. Before core 1.10 that was a forgery, not only a denial of
+service: storage holds the enclave's public key, so it could put in a point
+of its own, compute the agreement from that public key, and wrap a DEK of its
+choosing under the result. A Mac or an iPhone joining from that storage, or
+unlocking a silo folder someone could write to, would take that DEK as the
+silo's and seal everything new under a key the attacker holds.
+
+So the point is bound on the device. At enrolment the device stores the
+SHA-256 of the ephemeral point in its own keychain, beside the enclave key
+(service `com.silentsilo.enclave-point`, account the tag in hex, "this device
+only"), and before any agreement it checks the point in the credential id
+against it. A point it did not enrol is refused without a prompt
+(`err.touchid_point_changed`), and unlock falls through to another key or the
+recovery code. A key enrolled by an earlier release has no binding: it is
+bound to the point it is first used with after the update, which on that
+device is normally its own silo's, and checked from then on. Removing the key
+removes its binding.
 
 The iOS build uses the same kind and the same scheme, behind Face ID or
 Touch ID.
@@ -348,11 +371,22 @@ rejected or ignored, never applied. The list, with the tests, is in
 [ARCHITECTURE.md](ARCHITECTURE.md), "Sealed objects and their names". A new
 reader of a sealed object comes with the same test.
 
-Two 32-byte keys share the DEK in the silo folder during a rotation: the KEK
-envelope (`content.kek.enc`) and the staged key (`master.dek.enc.next`).
-Nothing in them says which is which, so each reader refuses a key equal to
-the other. Wrapped DEKs need no such rule: each is under a wrap key of its
-own.
+During a rotation the new key is staged sealed under the old one, so any
+credential of the silo can carry an interrupted rotation on. From core 1.10
+that sealed key stays on the machine that started the rotation
+(`staged/<id>.dek` in the local work folder) and the silo folder's
+`master.dek.enc.next` only names it. In the folder it would reach exactly the
+people the rotation is meant to shut out: a removed key or an old recovery
+code still opens the old key, and a synced folder keeps every version of
+every file. A rotation an earlier release staged keeps its key in the folder
+and is still carried on and finished. The cost is that a rotation can only
+be finished on the computer that started it (`err.rotation_other_computer`
+elsewhere).
+
+Two 32-byte keys share the DEK during a rotation: the KEK envelope
+(`content.kek.enc`) and the staged key. Nothing in them says which is which,
+so each reader refuses a key equal to the other. Wrapped DEKs need no such
+rule: each is under a wrap key of its own.
 
 A fixed nonce was used here in a pre-release version and is no longer accepted.
 It offered no protection against a later re-wrap reusing a (key, nonce) pair,
@@ -569,7 +603,7 @@ While a silo is open the database lives in a **working copy** on the machine, ou
 - **A plaintext `vault.db`** left by a crash of a release before 1.5.0 is adopted once the way those releases did, snapshotted, and replaced by a ciphered copy.
 - **Downgrading** to a release before 1.5.0 is safe: those releases look only for `vault.db`, never see the ciphered copy, and open the snapshot. They lose only what a crashed newer session had not yet snapshotted. The ciphered copy is deliberately not called `vault.db`: an older release would decrypt the snapshot over a file of that name while a ciphered WAL still sits beside it, and nothing should depend on SQLite discarding that WAL.
 
-The page key and the SQLCipher pages add no persisted format: the files are local, and rebuilt from `vault.db.enc` whenever they do not open or no longer match it. A kept copy gives someone with the disk what `vault.db.enc` gives them: pages under a random key that only the DEK unseals. With the DEK they read the same index, newer at most by what a crashed session wrote. The copy is deleted with the silo, not at lock. Temporary tables and sorts are kept in memory (`temp_store=MEMORY`), so SQLite writes no plain temporary files either. What stays out of reach is process memory: the decrypted image, the in-memory databases and the page cache are plaintext while the silo is open, and SQLite frees its buffers without wiping them.
+The page key and the SQLCipher pages add no persisted format: the files are local, and rebuilt from `vault.db.enc` whenever they do not open or no longer match it. A kept copy gives someone with the disk what `vault.db.enc` gives them: pages under a random key that only the DEK unseals. With the DEK they read the same index, newer at most by what a crashed session wrote. The copy is deleted with the silo, not at lock. Temporary tables and sorts are kept in memory (`temp_store=MEMORY`), so SQLite writes no plain temporary files either. What stays out of reach is process memory: the decrypted image, the in-memory databases and the page cache are plaintext while the silo is open, and SQLCipher wipes them as it frees them (`cipher_memory_security`, see "Zeroization").
 
 ### The password store
 
@@ -685,17 +719,30 @@ Everything that can open the vault is wiped when it goes out of scope:
 - The buffer `unwrap_dek_bytes` unseals the DEK into on its way to `MasterDek`,
   the decrypted index `decrypt_vault_bytes` returns and the image a snapshot
   serializes. Those two are the whole tree of names. The working copy's page
-  key and the hex literal built from it are wiped too. The copies SQLite and
-  SQLCipher keep (the in-memory database, the page cache, the SQL text a key
-  pragma is sent as) are not.
+  key and the hex literal built from it are wiped too.
+- The `hmac-secret` output Windows hands back, a content key on its way out
+  of its envelope, the recovery code once normalised, the buffers DPAPI
+  returns, and the credentials and storage settings as JSON on their way to
+  and from the keyring.
+- What SQLite and SQLCipher allocate: `cipher_memory_security` is on, so
+  SQLCipher wipes every allocation it frees (the in-memory database, the page
+  cache, the SQL text a key pragma is sent as) and asks the system to keep
+  it out of swap, which a small locked-memory quota can refuse. Its own log
+  is off, since a refused lock would log on every allocation.
+
+`harden_process`, which each app calls at startup, turns off core dumps on
+Linux, macOS and Android and marks the process not dumpable on Linux, so a
+crash while a silo is open does not write its keys to disk. The access tokens
+of cloud targets are dropped when the silos lock, unless a transfer still
+holds one.
 
 A test asserts each of those types still carries `ZeroizeOnDrop`, because what
 happens in practice is a derive disappearing during a refactor, not someone
 deciding to remove it.
 
 What is not covered: plaintext chunk buffers are dropped after write without
-an explicit wipe, and no platform here guarantees the pages never reached
-swap.
+an explicit wipe, strings the keyring crate and the platform APIs copy are
+theirs, and no platform here guarantees the pages never reached swap.
 
 Zeroization is a hardening measure against memory disclosure, not a defence
 against code running as the user: see [Malware on the user's
@@ -739,3 +786,7 @@ machine](#malware-on-the-users-machine).
 | FIDO hmac-secret (Linux/macOS) | `crates/silentsilo-fido/src/backend/ctap.rs` |
 | Secure Enclave agreement and KDF | `crates/silentsilo-fido/src/enclave.rs` |
 | Secure Enclave calls (macOS) | `crates/silentsilo-fido/src/backend/enclave_mac.rs` |
+| Secure Enclave point binding | `crates/silentsilo-fido/src/enclave.rs` (`point_binding`), `backend/enclave_mac.rs` (`bind`) |
+| Local secret files, sealing and consent | `crates/silentsilo-vault/src/dpapi.rs` |
+| Keyring writes (Windows, iOS) | `crates/silentsilo-vault/src/keychain.rs` |
+| Rotation staging | `crates/silentsilo-vault/src/rotation.rs` |

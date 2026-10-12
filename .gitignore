@@ -5,3 +5,19 @@ private/
 
 # Git history archives
 *.bundle
+
+# Editors and operating systems
+.DS_Store
+._*
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Credentials and signing material, never part of the repository
+.env
+.env.*
+*.pem
+*.p12
+*.pfx
+*.key

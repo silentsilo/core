@@ -467,7 +467,7 @@ pub fn complete_enrollment(challenge: &EnrollmentChallenge) -> Result<Enrollment
     // so there is one output there and it is the same one both times.
     let unlock = if platform {
         read_make_cred_hmac_secret(att).map(|hmac| UnlockMaterial {
-            wrap_key: blake3_key(&hmac),
+            wrap_key: blake3_key(&hmac[..]),
             credential_id: credential_id.clone(),
         })
     } else {
@@ -516,7 +516,7 @@ pub fn derive_unlock_material(
         )
     })?;
     Ok(UnlockMaterial {
-        wrap_key: blake3_key(&hmac),
+        wrap_key: blake3_key(&hmac[..]),
         credential_id: used_cred,
     })
 }
@@ -874,7 +874,9 @@ fn read_make_cred_hmac_extension(ext: &WEBAUTHN_EXTENSIONS) -> bool {
 /// Reads a field the `windows` crate does not know about, so the version
 /// check is what makes it sound: before version 7 there is no `pHmacSecret`
 /// and those bytes are something else entirely.
-fn read_make_cred_hmac_secret(att: &WEBAUTHN_CREDENTIAL_ATTESTATION) -> Option<[u8; 32]> {
+fn read_make_cred_hmac_secret(
+    att: &WEBAUTHN_CREDENTIAL_ATTESTATION,
+) -> Option<zeroize::Zeroizing<[u8; 32]>> {
     if att.dwVersion < CREDENTIAL_ATTESTATION_VERSION_7 {
         return None;
     }
@@ -882,24 +884,30 @@ fn read_make_cred_hmac_secret(att: &WEBAUTHN_CREDENTIAL_ATTESTATION) -> Option<[
         &*(att as *const WEBAUTHN_CREDENTIAL_ATTESTATION as *const CredentialAttestationV7)
     };
     let salt = unsafe { extended.p_hmac_secret.as_ref()? };
-    if salt.cbFirst != 32 || salt.pbFirst.is_null() {
-        return None;
-    }
-    copy_bytes(salt.pbFirst, salt.cbFirst).try_into().ok()
+    secret_32(salt.pbFirst, salt.cbFirst)
 }
 
 fn read_assertion_hmac_secret(
     att: &windows::Win32::Networking::WindowsWebServices::WEBAUTHN_ASSERTION,
-) -> Option<[u8; 32]> {
+) -> Option<zeroize::Zeroizing<[u8; 32]>> {
     if att.dwVersion < 3 {
         return None;
     }
     let salt = unsafe { att.pHmacSecret.as_ref()? };
-    if salt.cbFirst != 32 || salt.pbFirst.is_null() {
+    secret_32(salt.pbFirst, salt.cbFirst)
+}
+
+/// The 32-byte `hmac-secret` output, copied once into memory that is wiped
+/// when it goes. It is the wrap key's only input.
+fn secret_32(ptr: *const u8, len: u32) -> Option<zeroize::Zeroizing<[u8; 32]>> {
+    if len != 32 || ptr.is_null() {
         return None;
     }
-    let bytes = copy_bytes(salt.pbFirst, salt.cbFirst);
-    bytes.try_into().ok()
+    let mut out = zeroize::Zeroizing::new([0u8; 32]);
+    // SAFETY: Windows hands back `len` readable bytes at `ptr`, checked
+    // above to be exactly 32, valid until the assertion is freed.
+    out.copy_from_slice(unsafe { slice::from_raw_parts(ptr, 32) });
+    Some(out)
 }
 
 fn wide_to_string(w: PCWSTR) -> String {

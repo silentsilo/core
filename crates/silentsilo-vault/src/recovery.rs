@@ -39,7 +39,7 @@ const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 /// The recovery envelope as stored, locally and in the bucket. The salt is
 /// public by necessity, and `kdf` is stored rather than assumed: a code
 /// written on paper years ago has to keep working after a retuning.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RecoveryEnvelope {
     pub version: u32,
     pub kdf: KdfParams,
@@ -57,6 +57,18 @@ pub struct RecoveryEnvelope {
     /// byte for byte. See `FORMATS.md`, "The recovery envelope".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<String>,
+}
+
+/// The version, the parameters and the date. Not the salt or the wrapped
+/// key: together they are what a guess at the code is tested against.
+impl std::fmt::Debug for RecoveryEnvelope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecoveryEnvelope")
+            .field("version", &self.version)
+            .field("kdf", &self.kdf)
+            .field("created_at", &self.created_at)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RecoveryEnvelope {
@@ -205,7 +217,8 @@ fn seal_under_code(
 ) -> Result<RecoveryEnvelope, VaultError> {
     let salt: [u8; 16] = rand::random();
     let kdf = KdfParams::recovery_code();
-    let key = zeroize::Zeroizing::new(kdf.derive(normalize_code(code).as_bytes(), &salt)?);
+    let code = zeroize::Zeroizing::new(normalize_code(code));
+    let key = zeroize::Zeroizing::new(kdf.derive(code.as_bytes(), &salt)?);
     let wrapped = wrap_dek_bytes(dek, &key)?;
 
     let mut envelope = RecoveryEnvelope {
@@ -235,11 +248,8 @@ pub fn unwrap_with_code(envelope: &RecoveryEnvelope, code: &str) -> Result<Maste
         )));
     }
     let salt = hex::decode(&envelope.salt).map_err(|_| VaultError::InvalidCredentials)?;
-    let key = zeroize::Zeroizing::new(
-        envelope
-            .kdf
-            .derive(normalize_code(code).as_bytes(), &salt)?,
-    );
+    let code = zeroize::Zeroizing::new(normalize_code(code));
+    let key = zeroize::Zeroizing::new(envelope.kdf.derive(code.as_bytes(), &salt)?);
     unwrap_dek_hex(&envelope.wrapped_dek, &key)
 }
 

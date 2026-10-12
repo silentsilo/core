@@ -27,6 +27,13 @@
 //! what lets a Windows build carry a Mac's key across a shared silo
 //! untouched.
 //!
+//! The point in the id is not signed, and the enclave agrees with any point
+//! it is handed. Storage that put in a point of its own would know the
+//! agreement (from the enclave's public key, published beside it) and could
+//! wrap a DEK of its choosing under it. So each device binds the point it
+//! enrolled with, in its own keychain beside the enclave key
+//! ([`point_binding`]), and refuses any other before the enclave is asked.
+//!
 //! Everything here runs on every platform and is tested on every platform;
 //! the enclave itself only enters in `backend/enclave_mac.rs`. The iOS
 //! build uses the same scheme, with its own code reaching the enclave.
@@ -155,6 +162,20 @@ pub fn wrap_key_from_shared(shared_x: &[u8], vault_id: &str) -> Zeroizing<[u8; 3
     out
 }
 
+/// What a device keeps beside its enclave key at enrolment: the SHA-256 of
+/// the ephemeral point it enrolled with. The point travels unsigned in the
+/// credential id, and the enclave agrees with any point it is handed, so a
+/// point is used only when it matches this (see `backend/enclave_mac.rs`).
+pub fn point_binding(point: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    Sha256::digest(point).into()
+}
+
+/// Whether `point` is the one a stored binding was made from.
+pub fn binding_matches(binding: &[u8], point: &[u8]) -> bool {
+    binding == point_binding(point).as_slice()
+}
+
 /// Takes a credential id apart, or says it is not one of ours.
 ///
 /// `None` is the answer for a FIDO2 id on the same allow-list, which is
@@ -225,6 +246,20 @@ mod tests {
             *wrap_key_from_shared(&shared, "vault-a"),
             *wrap_key_from_shared(&shared, "vault-b")
         );
+    }
+
+    /// The forgery the binding stops: storage puts in a point of its own,
+    /// for which it knows the agreement, and a DEK of its own under it.
+    #[test]
+    fn a_point_storage_replaced_does_not_match_the_binding() {
+        let (_, enclave_public) = software_enclave();
+        let enrolled = enrol(&enclave_public, "vault-1", &random_tag()).expect("enrol");
+        let binding = point_binding(&enrolled.ephemeral_public);
+        assert!(binding_matches(&binding, &enrolled.ephemeral_public));
+
+        let (_, planted) = software_enclave();
+        assert!(!binding_matches(&binding, &planted));
+        assert!(!binding_matches(&[], &enrolled.ephemeral_public));
     }
 
     #[test]

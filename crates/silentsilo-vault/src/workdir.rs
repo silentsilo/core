@@ -148,6 +148,69 @@ pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Keeps `dir` and everything in it out of Time Machine on a Mac and out of
+/// iCloud and computer backups on an iPhone, the way `tmutil addexclusion`
+/// does. Nothing to do elsewhere. Best effort: returns whether it took.
+///
+/// The working copy is ciphered, but the files a person opens are
+/// decrypted into this folder until the silo locks, and a backup taken in
+/// between would keep them for as long as the backup lives.
+pub fn exclude_from_backup(dir: &Path) -> bool {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        apple::exclude_from_backup(dir)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    {
+        let _ = dir;
+        true
+    }
+}
+
+/// `NSURLIsExcludedFromBackupKey`, through Core Foundation. A sticky
+/// exclusion: it is an attribute of the folder, so it holds for what is
+/// created inside it later and survives the folder being moved.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+mod apple {
+    use std::path::Path;
+
+    use core_foundation::base::TCFType;
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::url::CFURL;
+    use core_foundation_sys::base::CFRelease;
+    use core_foundation_sys::string::CFStringRef;
+    use core_foundation_sys::url::CFURLSetResourcePropertyForKey;
+
+    // Behind a feature flag in the sys crate; every macOS and iOS this
+    // build supports has it.
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        static kCFURLIsExcludedFromBackupKey: CFStringRef;
+    }
+
+    pub(super) fn exclude_from_backup(dir: &Path) -> bool {
+        let Some(url) = CFURL::from_path(dir, true) else {
+            return false;
+        };
+        let mut error = std::ptr::null_mut();
+        // SAFETY: the URL and the boolean are live for the call, the key is
+        // a framework static, and `error` is a valid out-pointer whose
+        // result, when set, is ours to release.
+        unsafe {
+            let done = CFURLSetResourcePropertyForKey(
+                url.as_concrete_TypeRef(),
+                kCFURLIsExcludedFromBackupKey,
+                CFBoolean::true_value().as_CFTypeRef(),
+                &mut error,
+            ) != 0;
+            if !error.is_null() {
+                CFRelease(error as _);
+            }
+            done
+        }
+    }
+}
+
 /// Marks a file the app just decrypted as read-only.
 ///
 /// Read-only is wanted for one reason: an editor must not save into a copy
@@ -362,6 +425,14 @@ pub fn detect_sync_provider(path: &Path) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Takes on a Mac and an iPhone, and is nothing to do elsewhere; either
+    /// way a silo opens.
+    #[test]
+    fn the_scratch_folder_is_kept_out_of_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(exclude_from_backup(dir.path()));
+    }
 
     #[test]
     fn two_silos_get_separate_scratch_directories() {

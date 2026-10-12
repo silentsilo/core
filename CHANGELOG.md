@@ -11,6 +11,64 @@ release notes should say.
 
 ## [Unreleased]
 
+### Security
+
+- The device secret is deleted once the first key is enrolled
+  (`silentsilo_vault::retire_device_secret(silo_id)`, called by
+  `flows::enrol_device_key`; a client with its own enrolment calls it after
+  `master.dek.enc` is under the key). An old `master.dek.enc` from a synced
+  folder's history opened the silo together with it. The credentials record
+  stays with an empty secret, so `is_provisioned` and `load_credentials`
+  answer as before; `open_with_fido_wrapped` retires a secret an earlier
+  release kept.
+- Secret files are never written in the clear without consent. A protector
+  that fails refuses the write instead of falling back to plaintext. Where
+  there is no keyring and no protector (Linux, a Mac without a keychain), a
+  secret write fails with `VaultError::SecretsUnprotected`
+  (`err.secrets_unprotected`) until the app records the user's agreement
+  with `allow_unprotected_secrets(true)`. New: `local_secrets_protected()`,
+  `unprotected_secrets_allowed()`.
+- iPhone: the keychain entries (device secret, storage passwords and keys,
+  cloud tokens) are written `AfterFirstUnlockThisDeviceOnly`, so they stay
+  out of iCloud and computer backups; entries written before are moved on
+  their first read. Not compiled here: type-checked against the macOS SDK
+  bindings, untested on a device.
+- A key rotation no longer stages the new key in the silo folder sealed
+  under the old one, where a removed key or an old recovery code could read
+  it from the folder's synced history. It stays on this machine and the
+  folder's `master.dek.enc.next` names it (FORMATS.md). A rotation staged by
+  an earlier release is still resumed; one staged here is finished on the
+  computer that started it (`err.rotation_other_computer` elsewhere).
+- Touch ID and Face ID keys bind the ephemeral point at enrolment, in the
+  device's keychain, and refuse a credential id carrying another one
+  (`err.touchid_point_changed`). Storage could otherwise give a joining Mac
+  or iPhone a DEK of its own choosing. Keys enrolled before are bound on
+  first use. CRYPTO.md said the forgery gained nothing; corrected.
+- WebDAV: `http://` only to loopback, private, link-local and 100.64/10
+  addresses and to local names (`err.webdav_http_remote`); redirects only to
+  the same origin (`err.webdav_redirected`); a password written into the
+  address no longer appears in errors, logs or `describe()`.
+- Folder targets do not follow a symlink or junction out of the folder, and
+  skip FIFOs and devices.
+- iCloud Drive on macOS 13 and iOS 16: a file not downloaded yet
+  (`.<name>.icloud`) is listed under its name and downloaded on read
+  (`err.icloud_downloading` if it takes over a minute).
+- The macOS and iPhone working folder is excluded from Time Machine and
+  device backups (`workdir::exclude_from_backup`).
+- `PRAGMA cipher_memory_security = ON` (SQLCipher's own log off), and
+  `silentsilo_vault::harden_process()` for the apps to call first at
+  startup: no core dumps on Linux, macOS and Android, not dumpable on Linux.
+  Locking (`forget_cloud_sign_ins`) also drops the cloud token sources no
+  transfer is using.
+- Secrets wiped from memory: the Windows `hmac-secret` output, DPAPI
+  buffers, credentials JSON, an unwrapped content key, the normalised
+  recovery code. `RecoveryEnvelope`'s `Debug` no longer prints the salt and
+  wrapped key.
+- The extractor asks for the recovery code with echo off, or reads it from
+  standard input. `--code` still works, with a warning.
+- `encrypt_stream` renames with `rename_with_retry`, so a scanner holding
+  the new blob does not fail an import on Windows.
+
 ### Added
 
 - iCloud Drive as backup storage, the kind `icloud` with `{folder}`: the

@@ -116,6 +116,7 @@ in this list; that lives on the machine instead, in the table after this one.
 | Index | `vault.db.enc` | `SCHEMA_VERSION = 5`, `silentsilo-vfs/schema.rs` | Not a format: see below |
 | Index, mid-rotation | `vault.db.enc.next` | Same envelope as `vault.db.enc` | Transient; unlock adopts it, see below |
 | Keys, mid-rotation | `keys/fido.json.next`, `keys/recovery.json.next` | Same as the files they replace | Transient, from core 1.7.0; see below |
+| New key, mid-rotation | `master.dek.enc.next` | From core 1.10: `SILO_FILE_VERSION`, `{local}`, naming the file on this machine that holds the key. Before: the new DEK sealed under the old one | Transient; its presence is what says a rotation is pending. See below |
 | Base snapshot | `vault_base` table in `vault.db` | `SNAPSHOT_VERSION = 1`, `silentsilo-vfs/snapshot.rs` | Refuses, naming the version |
 | Activity queue | `audit-queue/pending`, `state.json`, `outbox/*.seg`, `key.json`, `policy.json` | **No file version.** `pending` is framed records; `state.json` plain JSON whose added fields read as their defaults; the rest are the storage formats | From core 1.9.0. Not synced. A release before it never opens the folder. See "The activity log" |
 | Segments read before | `audit-cache/<device>/<seq>.seg` | The segment format | From core 1.9.0. A cache: one that does not read is fetched again |
@@ -130,14 +131,35 @@ holds a copy.
 
 | What | Where | Version | Notes |
 |---|---|---|---|
-| Credentials | `credentials.json` | `SILO_FILE_VERSION = 1`, `silentsilo-vault/format.rs` | Refuses rather than reading as "no silo here" |
+| Credentials | `credentials.json` | `SILO_FILE_VERSION = 1`, `silentsilo-vault/format.rs` | Refuses rather than reading as "no silo here". From core 1.10 `device_secret` is empty once a key opens the silo (`retire_device_secret`); same shape, so an earlier release reads it, and it only ever uses the secret on a silo with no key |
+| Staged key | `staged/<id>.dek` in the work folder | Sealed payload, the new DEK under the old one | From core 1.10, only while a rotation is pending; `master.dek.enc.next` names it. Removed with that file when the rotation finishes or is discarded |
+| Consent to unsealed secrets | `secrets/allow-unprotected` | **No version.** Its presence is the answer | From core 1.10. Written when the user agrees to keep secrets in files only their account can read, on a device with no keyring and no protector |
 | Storage settings | `s3.config.json` | `SILO_FILE_VERSION` | The one connection a joined or recovered device starts with. Since core 1.8.0 it holds only the kinds core 1.7.2 knows (`s3`, `folder`, `web-dav`, `sftp`): a joined device whose first target is of a newer kind keeps it in `targets.more.config.json` instead |
 | Backup targets | `targets.config.json` | `SILO_FILE_VERSION` | Every copy, in order. Kept as a file as well as in the keychain whenever there is more than one, because the single slot above holds only the first. A keychain that refuses the write (Windows Credential Manager takes 2560 bytes, UTF-16, so 1280 characters) has its entry deleted once the file is written, because reads prefer the entry and a stale one is a target silently gone |
 | More backup targets | `targets.more.config.json` | `SILO_FILE_VERSION` | Since core 1.8.0. Every target of a kind core 1.7.2 does not know, with its position in the whole list. The kinds in 1.8.0 are `onedrive`, `dropbox` and `google-drive`, each `{account_id, account_label, folder}` (`account_label` reads as empty when absent); the target id is derived from the kind, the account id and the folder, so a reconnect to the same account keeps it. Core 1.10.0 adds `icloud`, `{folder}`: no account, since it is the iCloud account of each device, and the target id is derived from the kind and the folder, so the same folder is the same target on every device. A file only, since none of it is secret (the tokens of these kinds are stored apart). Core 1.7.2 never opens it, so the list and the single slot stay readable to it and a save there leaves this file alone; proven by `older_release_tests` in `s3_store.rs`, which decode what this build writes with the 1.7.2 shapes. An entry this build cannot read, from a newer release, is kept as it was and put back at its position on every save, never dropped |
-| Cloud sign-in | `secrets/cloud/<target id>.token` | **No version.** The raw refresh token, DPAPI-wrapped | Since core 1.8.0. One per OneDrive, Dropbox or Google Drive target, keyed by target id, in the keychain as `cloud-token:<target id>` when it fits there (Microsoft's can pass Credential Manager's 1280 characters). Nothing else is in it, so there is nothing a version could describe; an unreadable one reads as "sign in again" |
+| Cloud sign-in | `secrets/cloud/<target id>.token` | **No version.** The raw refresh token, sealed like the files above | Since core 1.8.0. One per OneDrive, Dropbox or Google Drive target, keyed by target id, in the keychain as `cloud-token:<target id>` when it fits there (Microsoft's can pass Credential Manager's 1280 characters). Nothing else is in it, so there is nothing a version could describe; an unreadable one reads as "sign in again" |
 | Silo list | `silos.json` | `SILO_FILE_VERSION` | Where the silos are. Losing it costs the list, not the data |
 | Cache settings | `cache_settings.json` | **No version.** Plain JSON | One number, the local cache ceiling. Unreadable reads as the default, so there is nothing a version could save |
 | Protected folders | `protected.enc` | `SILO_FILE_VERSION`, inside a sealed payload under the content KEK | Which folders on this computer the silo copies from. Absolute local paths, so they describe what someone keeps and where; kept beside the ledger of what has already been imported, and out of a folder that travels. Sealed since core 1.6.0; a plaintext `protected.json` from an earlier release is read once, written back sealed and removed |
+
+The secret files (credentials, storage settings, targets, cloud tokens) are
+sealed where the device can seal: `SSDPAPI1` and the bytes DPAPI returns on
+Windows, the same prefix and the client's `LocalProtector` elsewhere. A file
+without the prefix is JSON in the clear, as releases before 1.10 wrote on a
+device with neither. From core 1.10 a protector that fails refuses the
+write, and with no protector a secret is written in the clear only after
+the user's consent (above), so this release never writes a shape an earlier
+one cannot read. `targets.more.config.json` and `silos.json` hold no secret
+and are written in the clear where there is no protector, as before.
+
+In the keychain only, no file: on an iPhone every entry above is written
+`AfterFirstUnlockThisDeviceOnly` from core 1.10, and one an earlier release
+wrote is moved to that class on its first read (same service, account and
+value, so every release reads it). On a Mac and an iPhone, each Touch ID or
+Face ID key has a binding beside it from core 1.10: service
+`com.silentsilo.enclave-point`, account the credential id's tag in hex, value
+the SHA-256 of the ephemeral point (CRYPTO.md, "Touch ID unlock"). An
+earlier release never reads it; a key it enrolled is bound on first use.
 
 Not formats, and deliberately so: the import ledger of the protected folders
 (`protected.sqlcipher`, ciphered by SQLCipher 4 under `protected.key`, which
@@ -179,6 +201,29 @@ What an older client does with them: ignores them. It can only meet them
 after a crash inside that window on this machine, and then reads the old
 `fido.json`, whose keys open the old KEK, so the unlock fails. Updating
 finishes the renames. Before 1.7.0 the same crash left nothing to finish.
+
+### `master.dek.enc.next`
+
+Until core 1.9 this was the new DEK sealed under the old one, in the silo
+folder, so any credential could carry an interrupted rotation on. It also
+handed the new key to whoever still had the old one, through the folder or
+any synced history of it: the removed key or old recovery code the rotation
+was for. From core 1.10 the sealed key goes to `staged/<id>.dek` in the work
+folder on this machine, written before the marker, and the folder's file is
+`{"version": 1, "data": {"local": "<id>"}}`. A rotation can then be finished
+only on the computer that started it; elsewhere the marker says so
+(`err.rotation_other_computer`) and stays, so nothing is staged over it.
+
+What each release does with the other's file, proven by
+`silentsilo-fixture/tests/rotation_staging.rs` against core 1.6.1's own code:
+
+- A file 1.9 or earlier staged is read in its old form and the rotation
+  finishes here.
+- Core 1.9 or earlier meeting the new marker (a downgrade in the middle of a
+  rotation, on the same machine) sees a rotation pending, so it refuses to
+  stage another over it, and refuses to read a key from it ("cannot be read
+  with this silo's current key"). The silo still opens under the old key and
+  nothing is lost; updating finishes the rotation.
 
 ## The kind of a key
 

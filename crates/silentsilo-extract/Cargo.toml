@@ -28,6 +28,15 @@ tokio = { workspace = true }
 uuid = { workspace = true }
 serde_json = { workspace = true }
 base64 = "0.22"
+zeroize = { workspace = true }
+
+# The recovery code asked for with the terminal's echo off. Both already in
+# the tree; nothing new to trust.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }
 
 [dev-dependencies]
 hex = "0.4"

@@ -4054,6 +4054,7 @@ version = "1.10.0-beta.8"
 dependencies = [
  "base64",
  "hex",
+ "libc",
  "rusqlite",
  "serde_json",
  "silentsilo-audit",
@@ -4066,6 +4067,8 @@ dependencies = [
  "tempfile",
  "tokio",
  "uuid",
+ "windows 0.61.3",
+ "zeroize",
 ]
 
 [[package]]
@@ -4246,6 +4249,7 @@ name = "silentsilo-store"
 version = "1.10.0-beta.8"
 dependencies = [
  "async-trait",
+ "objc2-foundation",
  "percent-encoding",
  "quick-xml",
  "reqwest",
@@ -4383,11 +4387,15 @@ dependencies = [
  "aes-gcm 0.10.3",
  "argon2 0.5.3",
  "blake3",
+ "core-foundation 0.10.1",
+ "core-foundation-sys",
  "hex",
  "keyring",
+ "libc",
  "openssl-sys",
  "rand 0.9.5",
  "rusqlite",
+ "security-framework-sys",
  "serde",
  "serde_json",
  "silentsilo-cloud",

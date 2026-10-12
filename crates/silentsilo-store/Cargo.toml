@@ -26,6 +26,17 @@ tokio = { workspace = true, features = ["rt", "net", "time", "fs", "sync", "macr
 tokio-util = { version = "0.7", features = ["io"] }
 tempfile = { workspace = true }
 
+# Asking iCloud Drive to download a file it keeps only as a placeholder.
+# Already in the tree through the enclave code and Tauri.
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSError",
+    "NSFileManager",
+    "NSString",
+    "NSURL",
+] }
+
 [dev-dependencies]
 serde_json = { workspace = true }
 silentsilo-testkit = { workspace = true }
