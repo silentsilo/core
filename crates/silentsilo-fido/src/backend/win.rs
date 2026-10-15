@@ -566,7 +566,7 @@ pub fn derive_unlock_material(
             } else {
                 crate::coded!(
                     "err.key_no_hmac",
-                    "Security key did not return hmac-secret. Re-enroll your key."
+                    "The security key did not return the secret that opens the silo. Open the silo with another key or your recovery code, then add this key again under Settings, Unlocking."
                 )
             }
             .into(),
@@ -784,8 +784,8 @@ fn map_webauthn_err_impl(err: windows::core::Error, enroll: bool) -> FidoError {
         || lower.contains("invalid")
         || lower.contains("unknown")
     {
-        " Insert the security key before continuing, close other FIDO apps (e.g. Yubico Authenticator), \
-         then try again. Choose Security key (not iPhone/tablet)."
+        " With a security key, plug it in first and close other apps that use it (such as Yubico \
+         Authenticator), then try again."
     } else {
         ""
     };
@@ -801,7 +801,7 @@ fn map_webauthn_err_impl(err: windows::core::Error, enroll: bool) -> FidoError {
         Failure::NotFoundHere => fail(
             crate::coded!(
                 "err.key_not_of_silo_here",
-                "Neither the security key nor Windows Hello on this computer holds a key for this silo. Use another of its keys or your recovery code."
+                "What you used (a security key, a phone or Windows Hello) holds no key for this silo. Use another of its keys or your recovery code."
             )
             .into(),
         ),

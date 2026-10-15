@@ -238,7 +238,7 @@ impl StoreConfigInput {
                 if !silentsilo_store::icloud_supported() {
                     return Err(silentsilo_core::coded!(
                         "err.icloud_not_here",
-                        "iCloud Drive is not available on this device. Open this silo on an iPhone, a Mac or a Windows PC with iCloud, or add another backup copy for this one."
+                        "iCloud Drive is not available on this device. Open this silo on an iPhone, a Mac or a Windows PC with iCloud, or add another backup copy this device can reach."
                     )
                     .into());
                 }

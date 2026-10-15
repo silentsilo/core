@@ -209,7 +209,7 @@ impl GoogleDriveStore {
                     return Err(StoreError::Other(
                         crate::coded!(
                             "err.gdrive_daily_limit",
-                            "Google Drive's daily upload limit is reached; it resumes tomorrow"
+                            "Google Drive's daily upload limit is reached. Uploads resume tomorrow."
                         )
                         .into(),
                     ));

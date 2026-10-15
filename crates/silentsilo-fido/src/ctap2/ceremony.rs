@@ -160,7 +160,7 @@ fn failure(error: CtapError, fail: fn(String) -> FidoError) -> FidoError {
         .into(),
         CtapError::PinAuthBlocked => crate::coded!(
             "err.pin_blocked_temp",
-            "Too many wrong PINs in a row. Unplug the key, plug it in again and try again."
+            "Too many wrong PINs in a row. Unplug the key, plug it back in and try again."
         )
         .into(),
         CtapError::PinBlocked => crate::coded!(

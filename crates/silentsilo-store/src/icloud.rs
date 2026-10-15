@@ -136,7 +136,7 @@ pub(crate) fn open(config: &ICloudConfig) -> Result<FolderStore, StoreError> {
         StoreError::Unreachable(
             silentsilo_core::coded!(
                 "err.icloud_off",
-                "SilentSilo's folder is not in iCloud Drive on this device. Turn iCloud Drive on and sign in with the same Apple account. On a computer, the folder appears once the iPhone app has used iCloud Drive."
+                "SilentSilo's folder is not in iCloud Drive on this device. Turn iCloud Drive on and sign in with the same Apple account. On a computer, the folder appears once the SilentSilo iPhone app has used iCloud Drive."
             )
             .into(),
         )

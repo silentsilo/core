@@ -30,7 +30,7 @@ pub enum VaultError {
     /// file it would go to. The app asks the user, and records the answer
     /// with `allow_unprotected_secrets`.
     #[error(
-        "This device has no keyring SilentSilo can use, so the secret would be written to a file only your account can read. Allow that, or set up a keyring and try again.\u{1f}err.secrets_unprotected"
+        "This device has no keyring SilentSilo can use, so the secret would be written to a file only your account can read. Allow that in Settings, General, or set up a keyring and try again.\u{1f}err.secrets_unprotected"
     )]
     SecretsUnprotected,
 

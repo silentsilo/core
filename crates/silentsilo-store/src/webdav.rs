@@ -277,7 +277,7 @@ impl WebDavStore {
                 StoreError::Denied(silentsilo_core::coded::coded_with(
                     "err.webdav_redirected",
                     format!(
-                        "The server sent {what} to another address ({status}). Enter the address it uses instead."
+                        "The server redirected the request for {what} to another address ({status}). Enter the address it redirects to."
                     ),
                     &[("key", &what), ("status", &status)],
                 ))
