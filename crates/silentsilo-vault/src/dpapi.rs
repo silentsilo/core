@@ -308,6 +308,9 @@ pub(crate) mod tests {
     fn a_sealed_file_carries_the_prefix() {
         let out = seal_with(b"abc", Some(reverses as Seal), false).unwrap();
         assert_eq!(out, [SEALED, b"cba"].concat());
+        // The prefix sealed files carry, taken from release 1.10.x. A change
+        // means every sealed secret file reads as one written in the clear.
+        assert_eq!(out, b"SSDPAPI1cba");
     }
 
     #[test]

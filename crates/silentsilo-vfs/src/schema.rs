@@ -248,3 +248,19 @@ pub fn bump_revision(conn: &Connection) -> rusqlite::Result<i64> {
         |row| row.get(0),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Taken from release 1.10.x and must never change: every operation in
+    /// the top folder names this id, and a change leaves them all orphaned.
+    #[test]
+    fn the_root_folder_id_is_the_one_1_10_derived() {
+        let vault = Uuid::parse_str("0198b7e2-5a3c-7d10-9c1e-3f2a4b5c6d7e").unwrap();
+        assert_eq!(
+            root_folder_id_for(vault).to_string(),
+            "7513e026-394e-51e1-b314-c694e67c4873"
+        );
+    }
+}

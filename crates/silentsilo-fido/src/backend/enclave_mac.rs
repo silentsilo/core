@@ -52,12 +52,6 @@ use crate::FidoError;
 use crate::enclave::{self, EnrolMaterial, TAG_LEN};
 use crate::types::UnlockMaterial;
 
-/// The keychain label an enrolment's key is filed under, tag in hex. What
-/// Keychain Access shows, so it says what it is.
-fn label_for(tag: &[u8]) -> String {
-    format!("SilentSilo Touch ID {}", hex::encode(tag))
-}
-
 /// Whether Touch ID can answer right now: a sensor exists, has fingerprints
 /// enrolled and is not locked out. A Mac mini with no Touch ID keyboard
 /// answers no, and so does a MacBook with the lid closed on an external
@@ -122,13 +116,10 @@ pub fn enrol(vault_id: &str) -> Result<EnrolMaterial, FidoError> {
     material
 }
 
-/// The keychain service the bindings are filed under, one item per key,
-/// named by the tag in hex.
-const BINDING_SERVICE: &str = "com.silentsilo.enclave-point";
-
 fn binding_options(tag: &[u8]) -> PasswordOptions {
     #[allow(unused_mut)]
-    let mut options = PasswordOptions::new_generic_password(BINDING_SERVICE, &hex::encode(tag));
+    let mut options =
+        PasswordOptions::new_generic_password(enclave::BINDING_SERVICE, &hex::encode(tag));
     // Beside the enclave key, in the keychain a Mac's enclave key lives in.
     #[cfg(target_os = "macos")]
     options.use_protected_keychain();
@@ -203,7 +194,7 @@ fn generate(tag: &[u8; TAG_LEN]) -> Result<SecKey, FidoError> {
     )
     .map_err(|e| FidoError::EnrollmentFailed(format!("Touch ID access control: {e}")))?;
 
-    let attributes = key_attributes(&label_for(tag), &access);
+    let attributes = key_attributes(&enclave::keychain_label(tag), &access);
 
     let mut error: CFErrorRef = std::ptr::null_mut();
     // SAFETY: `attributes` is a live dictionary for the call, and `error` is
@@ -385,7 +376,7 @@ fn find_key(tag: &[u8]) -> Option<SecKey> {
     search
         .class(ItemClass::key())
         .key_class(KeyClass::private())
-        .label(&label_for(tag))
+        .label(&enclave::keychain_label(tag))
         .load_refs(true)
         .limit(1);
     // iOS has only the data-protection keychain; a Mac also has the old one.

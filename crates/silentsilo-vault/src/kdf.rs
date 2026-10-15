@@ -115,6 +115,54 @@ mod tests {
         assert!(KdfParams::recovery_code().derive(b"secret", &salt).is_ok());
     }
 
+    // Known answers taken from release 1.10.x, with the real parameters.
+    // They must never change: a change means silos stop opening.
+
+    #[test]
+    fn the_parameters_are_the_ones_every_envelope_was_written_with() {
+        assert_eq!(ARGON2ID, "argon2id");
+        let device = KdfParams::device_secret();
+        assert_eq!(
+            (
+                device.algorithm.as_str(),
+                device.m_cost,
+                device.t_cost,
+                device.p_cost
+            ),
+            ("argon2id", 19_456, 2, 1)
+        );
+        let recovery = KdfParams::recovery_code();
+        assert_eq!(
+            (
+                recovery.algorithm.as_str(),
+                recovery.m_cost,
+                recovery.t_cost,
+                recovery.p_cost
+            ),
+            ("argon2id", 65_536, 3, 1)
+        );
+    }
+
+    #[test]
+    fn a_device_secret_derives_the_wrap_key_it_always_has() {
+        let key = derive_vault_key("silentsilo device secret 0123456789", &[0x11; 16]).unwrap();
+        assert_eq!(
+            hex::encode(key.wrap_key),
+            "e955a8c91e24c73020ef8912e1697b8d7c7b4f6b74845b35703f1b2f37ca390d"
+        );
+    }
+
+    #[test]
+    fn a_recovery_code_derives_the_wrap_key_it_always_has() {
+        let key = KdfParams::recovery_code()
+            .derive(b"0123456789ABCDEFGHJKMNPQRSTVWXYZ", &[0x22; 16])
+            .unwrap();
+        assert_eq!(
+            hex::encode(key),
+            "84debd75ce0eb5c80a8079cbc708b3e5ce96cadcbd38e2ce7530b466992cb97e"
+        );
+    }
+
     #[test]
     fn an_envelope_asking_for_four_terabytes_is_refused_rather_than_attempted() {
         // `recovery.env` comes from storage, and its parameters are chosen by

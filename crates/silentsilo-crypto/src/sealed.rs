@@ -184,6 +184,24 @@ mod tests {
         assert!(unseal(&[0u8; HEADER_SIZE + NONCE_SIZE - 1], &dek).is_err());
     }
 
+    /// A content key as release 1.10.x wrapped it into an operation record:
+    /// 32 bytes of `0x09` under a content KEK of 32 bytes of `0x4b`. It must
+    /// always unwrap: a change means no file in any silo can be read.
+    #[test]
+    fn a_content_key_wrapped_by_1_10_still_unwraps() {
+        let wrapped = "5353454101d64a3e4157bfee122ff8b174d09080a0d9d2eb493f9be99ae45a4c12f675d811e429ad51330c1c89693ca86a122c4ee03b0177dc755f41638b1128a0";
+        let key = unwrap_content_key(wrapped, &ContentKek::from_bytes([0x4b; 32]))
+            .expect("a 1.10 content key no longer unwraps");
+        assert_eq!(key.as_bytes(), &[0x09; 32]);
+    }
+
+    #[test]
+    fn the_seal_header_is_the_one_1_10_wrote() {
+        assert_eq!(SEAL_MAGIC, b"SSEA");
+        assert_eq!(SEAL_VERSION, 1);
+        assert_eq!((NONCE_SIZE, HEADER_SIZE), (12, 5));
+    }
+
     #[test]
     fn the_payload_says_what_wrote_it() {
         let sealed = seal(b"secret", &generate_dek()).unwrap();

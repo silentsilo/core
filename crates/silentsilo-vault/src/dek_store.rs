@@ -107,6 +107,17 @@ mod tests {
         assert!(unwrap_dek_bytes(&legacy, &wrap_key).is_err());
     }
 
+    /// `master.dek.enc` as release 1.10.x wrote it: a DEK of 32 bytes of
+    /// `0x0d` under a wrap key of 32 bytes of `0x2a`. It must always open:
+    /// a change means silos stop opening.
+    #[test]
+    fn a_dek_wrapped_by_1_10_still_unwraps() {
+        let wrapped = "53534541015418d9a484446113a739979ac8c525de52fac395148df0d902e5e3966e492b3a5189c7a13210b48d5a137232675dce05e666073d43276f44dfe2d3f2";
+        let dek = unwrap_dek_hex(wrapped, &[0x2a; 32]).expect("a 1.10 wrapping no longer opens");
+        assert_eq!(dek.as_bytes(), &[0x0d; 32]);
+        assert_eq!(DEK_FILE, "master.dek.enc");
+    }
+
     #[test]
     fn unwrap_rejects_wrong_key() {
         let dek = generate_dek();

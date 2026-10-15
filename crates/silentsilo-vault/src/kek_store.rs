@@ -109,6 +109,18 @@ mod tests {
         );
     }
 
+    /// `content.kek.enc` as release 1.10.x wrote it: a KEK of 32 bytes of
+    /// `0x4b` under a DEK of 32 bytes of `0x0d`. It must always open: a
+    /// change means no content key in the silo can be reached.
+    #[test]
+    fn a_kek_wrapped_by_1_10_still_unwraps() {
+        let wrapped = hex::decode("535345410106e016b2d4f4fb0f85fd3a929809ed87ede3552776bce32d1340934a2f47d83b36e767df72960f9112b578e05d523c47a979b8a2da5b65600bb24767").unwrap();
+        let kek = unwrap_kek_bytes(&wrapped, &MasterDek::from_bytes([0x0d; 32]))
+            .expect("a 1.10 wrapping no longer opens");
+        assert_eq!(kek.as_bytes(), &[0x4b; 32]);
+        assert_eq!(KEK_FILE, "content.kek.enc");
+    }
+
     #[test]
     fn another_object_sealed_under_the_dek_is_not_taken_as_the_kek() {
         // Sealing does not bind the role: a record or snapshot opens under

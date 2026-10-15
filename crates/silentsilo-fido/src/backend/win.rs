@@ -22,7 +22,6 @@ use windows::Win32::Networking::WindowsWebServices::{
     WEBAUTHN_ATTESTATION_CONVEYANCE_PREFERENCE_NONE, WEBAUTHN_AUTHENTICATOR_ATTACHMENT_ANY,
     WEBAUTHN_AUTHENTICATOR_ATTACHMENT_CROSS_PLATFORM, WEBAUTHN_AUTHENTICATOR_ATTACHMENT_PLATFORM,
     WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS,
-    WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS_VERSION_4,
     WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS_VERSION_6,
     WEBAUTHN_AUTHENTICATOR_HMAC_SECRET_VALUES_FLAG, WEBAUTHN_AUTHENTICATOR_MAKE_CREDENTIAL_OPTIONS,
     WEBAUTHN_AUTHENTICATOR_MAKE_CREDENTIAL_OPTIONS_VERSION_7, WEBAUTHN_CLIENT_DATA,
@@ -96,13 +95,24 @@ pub(crate) fn wait_for_ceremony_teardown(timeout_ms: u64) {
     std::thread::sleep(AFTER_FOCUS);
 }
 
-use crate::client_data::{create_client_data_json, get_client_data_json, hmac_salt_from_string};
+use crate::client_data::{create_client_data_json, get_client_data_json};
+use crate::hmac_secret::wrap_key_from_hmac;
 use crate::types::{
     Authenticator, CredentialInfo, Enrollment, EnrollmentChallenge, UnlockMaterial,
 };
-use crate::{FidoError, RP_ID, dek_salt_for_vault};
+use crate::{FidoError, RP_ID};
 
 use super::win_answers::{API_VERSION_8, Failure};
+use super::win_requests;
+
+// What `win_requests` decides, checked against the headers it stands in for.
+const _: () = assert!(
+    win_requests::HMAC_SECRET_VALUES_FLAG == WEBAUTHN_AUTHENTICATOR_HMAC_SECRET_VALUES_FLAG
+);
+const _: () = assert!(
+    win_requests::GET_ASSERTION_OPTIONS_VERSION_6
+        == WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS_VERSION_6
+);
 
 const ES256_ALG: i32 = -7;
 const TIMEOUT_MS: u32 = 120_000;
@@ -274,6 +284,9 @@ pub fn complete_enrollment(challenge: &EnrollmentChallenge) -> Result<Enrollment
     };
 
     let platform = challenge.authenticator == Authenticator::ThisDevice;
+    let api_ver = webauthn_api_version();
+    let use_v8 = api_ver >= API_VERSION_8;
+    let asks = win_requests::enrolment(&challenge.user_id, platform, api_ver);
 
     // Two authenticators, two vocabularies. A removable key is asked in CTAP
     // terms, so the `hmac-secret` extension travels down the wire to the key
@@ -288,11 +301,11 @@ pub fn complete_enrollment(challenge: &EnrollmentChallenge) -> Result<Enrollment
         pvExtension: &mut hmac_secret as *mut _ as *mut c_void,
     };
     let extensions = WEBAUTHN_EXTENSIONS {
-        cExtensions: if platform { 0 } else { 1 },
-        pExtensions: if platform {
-            ptr::null_mut()
-        } else {
+        cExtensions: if asks.hmac_secret_extension { 1 } else { 0 },
+        pExtensions: if asks.hmac_secret_extension {
             &mut extension
+        } else {
+            ptr::null_mut()
         },
     };
 
@@ -302,7 +315,7 @@ pub fn complete_enrollment(challenge: &EnrollmentChallenge) -> Result<Enrollment
     // `pPRFGlobalEval` is the question, and the flag below says these 32 bytes
     // are a raw hmac-secret salt rather than a PRF input for Windows to hash.
     // A removable key answers the CTAP extension instead and needs none of it.
-    let mut prf_salt = hmac_salt_from_string(&dek_salt_for_vault(&challenge.user_id));
+    let mut prf_salt = asks.prf_global_eval.unwrap_or_default();
     let mut prf_global = WEBAUTHN_HMAC_SECRET_SALT {
         cbFirst: prf_salt.len() as u32,
         pbFirst: prf_salt.as_mut_ptr(),
@@ -315,9 +328,6 @@ pub fn complete_enrollment(challenge: &EnrollmentChallenge) -> Result<Enrollment
         cCredentials: 0,
         ppCredentials: ptr::null_mut(),
     };
-
-    let api_ver = webauthn_api_version();
-    let use_v8 = api_ver >= API_VERSION_8;
 
     // Steers the OS picker: without a hint Windows offers phone/hybrid
     // alongside, which is not what either choice means here.
@@ -361,18 +371,14 @@ pub fn complete_enrollment(challenge: &EnrollmentChallenge) -> Result<Enrollment
             WEBAUTHN_USER_VERIFICATION_REQUIREMENT_DISCOURAGED
         },
         dwAttestationConveyancePreference: WEBAUTHN_ATTESTATION_CONVEYANCE_PREFERENCE_NONE,
-        dwFlags: if platform && use_v8 {
-            WEBAUTHN_AUTHENTICATOR_HMAC_SECRET_VALUES_FLAG
-        } else {
-            0
-        },
+        dwFlags: asks.flags,
         pCancellationId: ptr::null_mut(),
         pExcludeCredentialList: &mut exclude_list,
         dwEnterpriseAttestation: 0,
         dwLargeBlobSupport: 0,
         bPreferResidentKey: BOOL::from(platform),
         bBrowserInPrivateMode: BOOL::from(false),
-        bEnablePrf: BOOL::from(true),
+        bEnablePrf: BOOL::from(asks.enable_prf),
         pLinkedDevice: ptr::null_mut(),
         cbJsonExt: 0,
         pbJsonExt: ptr::null_mut(),
@@ -380,7 +386,7 @@ pub fn complete_enrollment(challenge: &EnrollmentChallenge) -> Result<Enrollment
 
     let make_v8 = MakeCredOptionsV8 {
         base: make_base,
-        p_prf_global_eval: if platform && use_v8 {
+        p_prf_global_eval: if asks.prf_global_eval.is_some() {
             &mut prf_global
         } else {
             ptr::null_mut()
@@ -484,7 +490,7 @@ pub fn complete_enrollment(challenge: &EnrollmentChallenge) -> Result<Enrollment
     // so there is one output there and it is the same one both times.
     let unlock = if platform {
         read_make_cred_hmac_secret(att).map(|hmac| UnlockMaterial {
-            wrap_key: blake3_key(&hmac[..]),
+            wrap_key: wrap_key_from_hmac(&hmac[..]),
             credential_id: credential_id.clone(),
             verified: true,
             unverified_wrap_key: None,
@@ -517,9 +523,12 @@ pub fn derive_unlock_material(
     }
     let mut challenge = [0u8; 32];
     rand::rng().fill_bytes(&mut challenge);
-    let salt_str = dek_salt_for_vault(vault_id);
-    let salt = hmac_salt_from_string(&salt_str);
-    let assertion = get_assertion_with_hmac(credential_ids, &challenge, Some(&salt), on)?;
+    let assertion = get_assertion_with_hmac(
+        credential_ids,
+        &challenge,
+        &win_requests::unlock(vault_id),
+        on,
+    )?;
     let att = assertion.as_ref();
     let used_cred = copy_bytes(att.Credential.pbId, att.Credential.cbId);
     let used_cred = if used_cred.is_empty() {
@@ -549,7 +558,7 @@ pub fn derive_unlock_material(
     let auth_data = copy_bytes(att.pbAuthenticatorData, att.cbAuthenticatorData);
     let verified = super::win_answers::user_verified(&auth_data);
     Ok(UnlockMaterial {
-        wrap_key: blake3_key(&hmac[..]),
+        wrap_key: wrap_key_from_hmac(&hmac[..]),
         credential_id: used_cred,
         verified,
         unverified_wrap_key: None,
@@ -587,7 +596,7 @@ impl Drop for AssertionGuard {
 fn get_assertion_with_hmac(
     credential_ids: &[Vec<u8>],
     challenge: &[u8],
-    hmac_salt: Option<&[u8; 32]>,
+    hmac: &win_requests::Unlock,
     on: Option<Authenticator>,
 ) -> Result<AssertionGuard, FidoError> {
     let hwnd = fido_hwnd()?;
@@ -616,36 +625,23 @@ fn get_assertion_with_hmac(
         ppCredentials: cred_ex_ptrs.as_mut_ptr(),
     };
 
-    let mut salt_first = hmac_salt.copied().unwrap_or([0u8; 32]);
+    let mut salt_first = hmac.salt;
     let mut hmac_salt_struct = WEBAUTHN_HMAC_SECRET_SALT {
-        cbFirst: if hmac_salt.is_some() { 32 } else { 0 },
-        pbFirst: if hmac_salt.is_some() {
-            salt_first.as_mut_ptr()
-        } else {
-            ptr::null_mut()
-        },
+        cbFirst: salt_first.len() as u32,
+        pbFirst: salt_first.as_mut_ptr(),
         cbSecond: 0,
         pbSecond: ptr::null_mut(),
     };
     let mut salt_values = WEBAUTHN_HMAC_SECRET_SALT_VALUES {
-        pGlobalHmacSalt: if hmac_salt.is_some() {
-            &mut hmac_salt_struct
-        } else {
-            ptr::null_mut()
-        },
+        pGlobalHmacSalt: &mut hmac_salt_struct,
         cCredWithHmacSecretSaltList: 0,
         pCredWithHmacSecretSaltList: ptr::null_mut(),
     };
 
     let rp_id = to_wide(RP_ID);
-    let opts_version = if hmac_salt.is_some() {
-        WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS_VERSION_6
-    } else {
-        WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS_VERSION_4
-    };
 
     let get_opts = WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS {
-        dwVersion: opts_version,
+        dwVersion: hmac.options_version,
         dwTimeoutMilliseconds: TIMEOUT_MS,
         CredentialList: WEBAUTHN_CREDENTIALS {
             cCredentials: 0,
@@ -668,11 +664,7 @@ fn get_assertion_with_hmac(
             None => WEBAUTHN_AUTHENTICATOR_ATTACHMENT_ANY,
         },
         dwUserVerificationRequirement: WEBAUTHN_USER_VERIFICATION_REQUIREMENT_DISCOURAGED,
-        dwFlags: if hmac_salt.is_some() {
-            WEBAUTHN_AUTHENTICATOR_HMAC_SECRET_VALUES_FLAG
-        } else {
-            0
-        },
+        dwFlags: hmac.flags,
         pwszU2fAppId: PCWSTR::null(),
         pbU2fAppId: ptr::null_mut(),
         pCancellationId: ptr::null_mut(),
@@ -680,11 +672,7 @@ fn get_assertion_with_hmac(
         dwCredLargeBlobOperation: 0,
         cbCredLargeBlob: 0,
         pbCredLargeBlob: ptr::null_mut(),
-        pHmacSecretSaltValues: if hmac_salt.is_some() {
-            &mut salt_values
-        } else {
-            ptr::null_mut()
-        },
+        pHmacSecretSaltValues: &mut salt_values,
         ..Default::default()
     };
 
@@ -952,10 +940,6 @@ fn wide_to_string(w: PCWSTR) -> String {
         return String::new();
     }
     unsafe { w.to_string().unwrap_or_default() }
-}
-
-fn blake3_key(data: &[u8]) -> [u8; 32] {
-    *blake3::hash(data).as_bytes()
 }
 
 #[cfg(test)]

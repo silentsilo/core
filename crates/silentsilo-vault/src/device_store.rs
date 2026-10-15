@@ -264,6 +264,24 @@ mod tests {
         String::from_utf8(crate::format::encode(creds).unwrap()).unwrap()
     }
 
+    /// Taken from release 1.10.x and must never change: a change means the
+    /// device secret is not found and the silo does not open on this machine.
+    #[test]
+    fn the_device_secret_is_looked_up_where_1_10_stored_it() {
+        let id = Uuid::parse_str("0198b7e2-5a3c-7d10-9c1e-3f2a4b5c6d7e").unwrap();
+        assert_eq!(
+            keyring_user(id),
+            "vault-credentials:0198b7e2-5a3c-7d10-9c1e-3f2a4b5c6d7e"
+        );
+        assert_eq!(
+            credentials_path(id),
+            crate::workdir::work_base()
+                .join("secrets")
+                .join("0198b7e2-5a3c-7d10-9c1e-3f2a4b5c6d7e")
+                .join("credentials.json")
+        );
+    }
+
     /// The point of the whole file location. A silo folder is meant to be
     /// carried to another disk and may sit in OneDrive, and this secret
     /// unwraps `master.dek.enc` with the salt that lives in that same folder.

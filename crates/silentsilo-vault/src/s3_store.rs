@@ -518,6 +518,21 @@ fn write_fallback_targets(silo_id: Uuid, json: &[u8]) -> Result<(), VaultError> 
 pub(crate) mod tests {
     use super::*;
 
+    /// Taken from release 1.10.x and must never change: a change means a
+    /// silo's storage secrets are not found and it cannot sync.
+    #[test]
+    fn storage_secrets_are_looked_up_where_1_10_stored_them() {
+        let id = Uuid::parse_str("0198b7e2-5a3c-7d10-9c1e-3f2a4b5c6d7e").unwrap();
+        assert_eq!(
+            slot_user(id),
+            "s3-config:0198b7e2-5a3c-7d10-9c1e-3f2a4b5c6d7e"
+        );
+        assert_eq!(
+            list_user(id),
+            "s3-config-list:0198b7e2-5a3c-7d10-9c1e-3f2a4b5c6d7e"
+        );
+    }
+
     fn sample() -> StoreConfig {
         StoreConfig::S3(silentsilo_core::S3Config {
             endpoint: "https://s3.example.com".into(),

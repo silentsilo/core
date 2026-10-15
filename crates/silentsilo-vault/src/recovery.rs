@@ -570,4 +570,67 @@ mod tests {
             assert!(!envelope.is_authentic(&kek), "{junk:?} was accepted");
         }
     }
+
+    // Known answers taken from release 1.10.x. They must never change: a
+    // change means a recovery code written on paper stops opening its silo.
+
+    /// An envelope 1.10.x wrote: DEK of 32 bytes of `0x0d` under the code
+    /// below, tagged with a content KEK of 32 bytes of `0x4b`. Real Argon2
+    /// parameters, the ones every envelope in a bucket carries.
+    const ENVELOPE: &str = r#"{"version":1,"kdf":{"algorithm":"argon2id","m_cost":65536,"t_cost":3,"p_cost":1},"salt":"49c3cd72cc5b517b078500179b66f1ef","wrapped_dek":"53534541011e65aa623ace124fee0ba32dd3bc27a03d336a54f67620bf245f274ff44179fb7d9dfc152ab3cb2b2e6073706bf80cf169bc3a35316b365d2f5b5976","created_at":1700000000,"auth":"af2bece10a6be37dda77fad9550ddd18b7c25350bfb729d59e0c3bd62ec6fe85","auth_dek":"1481ff7b76f116173d1e074830dedd7448877c6682eb84224c6f9eb9d5dee28b"}"#;
+    const CODE: &str = "0123-4567-89AB-CDEF-GHJK-MNPQ-RSTV-WXYZ";
+
+    #[test]
+    fn a_code_still_opens_the_envelope_1_10_wrote() {
+        let envelope: RecoveryEnvelope = serde_json::from_str(ENVELOPE).unwrap();
+        let dek = unwrap_with_code(&envelope, CODE).expect("the code no longer opens it");
+        assert_eq!(dek.as_bytes(), &[0x0d; 32]);
+    }
+
+    #[test]
+    fn a_code_typed_back_from_paper_still_opens_it() {
+        // Lowercase, O for 0, l for 1, U for V, spaces for dashes.
+        let typed = "Ol23 4567 89ab cdef ghjk mnpq rstu wxyz";
+        assert_eq!(normalize_code(typed), "0123456789ABCDEFGHJKMNPQRSTVWXYZ");
+        assert_eq!(normalize_code(CODE), "0123456789ABCDEFGHJKMNPQRSTVWXYZ");
+        assert_eq!(normalize_code("i-I-l-L-o-O-u-U"), "111100VV");
+
+        let envelope: RecoveryEnvelope = serde_json::from_str(ENVELOPE).unwrap();
+        let dek = unwrap_with_code(&envelope, typed).expect("the retyped code no longer opens it");
+        assert_eq!(dek.as_bytes(), &[0x0d; 32]);
+    }
+
+    #[test]
+    fn both_tags_of_the_envelope_1_10_wrote_still_verify() {
+        let kek = ContentKek::from_bytes([0x4b; 32]);
+        let dek = MasterDek::from_bytes([0x0d; 32]);
+        let envelope: RecoveryEnvelope = serde_json::from_str(ENVELOPE).unwrap();
+        assert!(
+            envelope.is_authentic(&kek),
+            "the KEK tag no longer verifies"
+        );
+        assert!(
+            envelope.is_authentic_now(&kek, &dek),
+            "the vault key tag no longer verifies"
+        );
+
+        // And stamping it again makes the same tags, byte for byte.
+        let mut stamped = envelope.clone();
+        stamped.auth = None;
+        stamped.auth_dek = None;
+        stamped.authenticate(&kek, &dek);
+        assert_eq!(stamped.auth, envelope.auth);
+        assert_eq!(
+            stamped.auth_dek.as_deref(),
+            Some("1481ff7b76f116173d1e074830dedd7448877c6682eb84224c6f9eb9d5dee28b")
+        );
+        assert_eq!(AUTH_CONTEXT, "silentsilo recovery envelope auth v1");
+        assert_eq!(AUTH_DEK_CONTEXT, "silentsilo recovery envelope auth v2");
+    }
+
+    #[test]
+    fn the_code_alphabet_is_crockfords() {
+        assert_eq!(ALPHABET, b"0123456789ABCDEFGHJKMNPQRSTVWXYZ");
+        assert_eq!(RECOVERY_ENVELOPE_VERSION, 1);
+    }
 }

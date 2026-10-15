@@ -39,6 +39,9 @@ pub mod passkey;
 #[cfg(all(feature = "hardware", not(feature = "test-authenticator"), windows))]
 mod client_data;
 mod error;
+// The salt and wrap key every hmac-secret backend shares.
+#[cfg(feature = "ctap2")]
+mod hmac_secret;
 mod types;
 
 pub use error::FidoError;
@@ -305,6 +308,16 @@ mod tests {
         let kept = refuse_unverified_key(material(true), Authenticator::SecurityKey).unwrap();
         assert_eq!(kept.wrap_key, [7; 32]);
         assert_eq!(kept.credential_id, vec![1, 2, 3]);
+    }
+
+    /// Taken from release 1.10.x and must never change: every key's wrap
+    /// key is derived from this string, so a change means silos stop opening.
+    #[test]
+    fn the_dek_salt_string_is_the_one_every_silo_was_wrapped_under() {
+        assert_eq!(
+            dek_salt_for_vault("0198b7e2-5a3c-7d10-9c1e-3f2a4b5c6d7e"),
+            "silentsilo-dek-v1:0198b7e2-5a3c-7d10-9c1e-3f2a4b5c6d7e"
+        );
     }
 
     #[test]

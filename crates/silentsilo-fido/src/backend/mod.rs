@@ -22,6 +22,13 @@ mod win;
 ))]
 mod win_answers;
 
+// What the platform calls send, likewise.
+#[cfg(any(
+    all(test, feature = "ctap2"),
+    all(feature = "hardware", not(feature = "test-authenticator"), windows)
+))]
+mod win_requests;
+
 #[cfg(any(
     test,
     all(feature = "enclave", any(target_os = "macos", target_os = "ios"))

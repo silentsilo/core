@@ -330,6 +330,44 @@ fn a_credential_made_here_unlocks_to_the_wrap_key_every_platform_derives() {
     }
 }
 
+/// Known answers taken from release 1.10.x for one fixed credential, through
+/// both protocols. They must never change: a change means silos wrapped by
+/// a security key stop opening.
+#[test]
+fn a_fixed_credential_unlocks_to_the_wrap_keys_it_always_had() {
+    let hex = |bytes: &[u8]| -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() };
+    let id = vec![0xc1; 48];
+    for protocols in [vec![1], vec![2]] {
+        let mut key = SoftKey::new(&protocols);
+        key.credentials.push((id.clone(), [0x5a; 32]));
+        key.pin = Some("1234".into());
+        // Without the PIN the key's unverified secret answers, with it the
+        // verified one.
+        for (pin, raw, prf) in [
+            (
+                None,
+                "faafe786fdcdf5c2d0fbcfabc854da21cd465ee7ab16d0eda606e7107d8b9b11",
+                "545639bbacd7ad8dae8464f66c6a42a50bcb131f5bd3752ac83eee7e75c4cf16",
+            ),
+            (
+                Some("1234"),
+                "fabaadd5b9318fa2155a72802abfa164a351190b6591e73f11acaee6ee12909b",
+                "a1f703122cf2322d8db8c0f3b6161edc63dade7db72789e7c9c83dbe12d97d9a",
+            ),
+        ] {
+            let found =
+                unlock_candidates(&mut key, std::slice::from_ref(&id), VAULT, pin, true).unwrap();
+            assert_eq!(found.verified, pin.is_some());
+            let shape = |wanted: SaltShape| {
+                let (_, wrap) = found.wrap_keys.iter().find(|(s, _)| *s == wanted).unwrap();
+                hex(&wrap[..])
+            };
+            assert_eq!(shape(SaltShape::Raw), raw, "{protocols:?}, PIN {pin:?}");
+            assert_eq!(shape(SaltShape::Prf), prf, "{protocols:?}, PIN {pin:?}");
+        }
+    }
+}
+
 #[test]
 fn the_allow_list_is_split_to_the_keys_limit_and_a_stranger_is_named() {
     let mut key = SoftKey::new(&[1]);

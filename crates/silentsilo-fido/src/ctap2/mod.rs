@@ -26,7 +26,7 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use crate::dek_salt_for_vault;
+use crate::hmac_secret::{prf_salt, silo_salt, wrap_key_from_hmac};
 use crate::types::UnlockMaterial;
 
 /// What every silo credential is scoped to, on every platform.
@@ -423,11 +423,6 @@ pub fn get_info(dev: &mut dyn Ctap) -> Result<Info, CtapError> {
     })
 }
 
-/// The salt every platform feeds `hmac-secret` for this silo.
-fn silo_salt(vault_id: &str) -> [u8; 32] {
-    sha256(dek_salt_for_vault(vault_id).as_bytes())
-}
-
 /// What was given to `hmac-secret` as the salt when the silo was wrapped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SaltShape {
@@ -497,7 +492,7 @@ pub fn unlock_candidates(
     }
     let protocol = info.protocol()?;
     let raw = silo_salt(vault_id);
-    let prf = sha256(&[b"WebAuthn PRF\x00".as_slice(), &raw].concat());
+    let prf = prf_salt(&raw);
     let salts = [raw.as_slice(), &prf].concat();
     // An id longer than the key takes cannot be one of its own.
     let fitting: Vec<Vec<u8>> = credential_ids
@@ -577,7 +572,7 @@ pub fn unlock_candidates(
         if output.len() < 64 {
             return Err(CtapError::Protocol("hmac-secret output too short".into()));
         }
-        let wrap = |part: &[u8]| Zeroizing::new(*blake3::hash(part).as_bytes());
+        let wrap = |part: &[u8]| Zeroizing::new(wrap_key_from_hmac(part));
         return Ok(UnlockCandidates {
             credential_id,
             verified: token.is_some(),

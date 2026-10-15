@@ -469,6 +469,24 @@ pub(crate) mod tests {
     use super::*;
     use crate::s3_store::tests::keyring_lock;
 
+    /// Taken from release 1.10.x and must never change: a change means a
+    /// cloud silo's sign-in is not found and has to be done again.
+    #[test]
+    fn a_cloud_token_is_looked_up_where_1_10_stored_it() {
+        let id = Uuid::parse_str("0198b7e2-5a3c-7d10-9c1e-3f2a4b5c6d7e").unwrap();
+        assert_eq!(
+            keyring_user(id),
+            "cloud-token:0198b7e2-5a3c-7d10-9c1e-3f2a4b5c6d7e"
+        );
+        assert_eq!(
+            token_path(id),
+            crate::workdir::work_base()
+                .join("secrets")
+                .join("cloud")
+                .join("0198b7e2-5a3c-7d10-9c1e-3f2a4b5c6d7e.token")
+        );
+    }
+
     struct Scratch(Uuid);
 
     impl Drop for Scratch {

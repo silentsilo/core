@@ -4103,6 +4103,23 @@ mod tests {
         assert!(rows[0].contains(secret));
     }
 
+    /// An `UpsertPassword` as release 1.10.x wrote it: the entry sealed under
+    /// a content KEK of 32 bytes of `0x4b`, in standard base64. It must always
+    /// open: a change means every saved password in every silo is lost.
+    #[test]
+    fn a_password_entry_sealed_by_1_10_still_opens() {
+        const RECORD: &str = r#"{"op_id":"aaaaaaaa-1111-4222-8333-444444444444","lamport":11,"device_id":"1a2b3c4d-5e6f-4788-9900-aabbccddeeff","at":1700000000,"skippable":false,"seq":0,"op":"upsert_password","id":"55555555-6666-4777-8888-999999999999","data":"U1NFQQFxHRS6XDytHeDu1mhwOZcxMPE5S81im9tbakaNFiI/j/irK3ShJz8c+rsI61k/arPUMz9hudIdgJJ6UsEkrnrRerInDHZ3Qf+YukFAyxLDQWzv3qoTUp955D1UHhKCRcTAKrpiOFPb4ZIjm1pbbRF81ziiTd5+Q1EgEBquiEka3vpXK4fYQlocN26gKhNjdbmg65gYggWOraqL8QDgE7FOWtSiKvp2KyBSU7SNvA=="}"#;
+        const ENTRY: &str = r#"{"id":"55555555-6666-4777-8888-999999999999","service":"Bank","username":"ana","password":"correct horse battery staple","updated_at":1700000000}"#;
+
+        let (_dir, mut session) = new_session();
+        session.kek = silentsilo_crypto::ContentKek::from_bytes([0x4b; 32]);
+        let vfs = Vfs::new(&session);
+        let record = crate::oplog::OpRecord::from_bytes(RECORD.as_bytes()).unwrap();
+        crate::oplog::replay(vfs.conn(), vec![record]).unwrap();
+
+        assert_eq!(vfs.list_passwords().unwrap(), vec![ENTRY.to_string()]);
+    }
+
     #[test]
     fn a_password_row_that_will_not_open_fails_loudly() {
         // Showing a shorter list with no explanation is the one outcome a

@@ -110,9 +110,7 @@ pub fn enrol(
     let shared = diffie_hellman(ephemeral.to_nonzero_scalar(), enclave_public.as_affine());
     let wrap_key = wrap_key_from_shared(shared.raw_secret_bytes(), vault_id);
 
-    let mut credential_id = Vec::with_capacity(CREDENTIAL_ID_LEN);
-    credential_id.extend_from_slice(tag);
-    credential_id.extend_from_slice(&ephemeral_public);
+    let credential_id = join_credential_id(tag, &ephemeral_public);
 
     Ok(EnrolMaterial {
         credential_id,
@@ -175,6 +173,24 @@ pub fn point_binding(point: &[u8]) -> [u8; 32] {
 pub fn binding_matches(binding: &[u8], point: &[u8]) -> bool {
     binding == point_binding(point).as_slice()
 }
+
+/// A credential id: the keychain tag, then the ephemeral point.
+fn join_credential_id(tag: &[u8; TAG_LEN], point: &[u8]) -> Vec<u8> {
+    let mut id = Vec::with_capacity(CREDENTIAL_ID_LEN);
+    id.extend_from_slice(tag);
+    id.extend_from_slice(point);
+    id
+}
+
+/// The keychain label an enrolment's key is filed under, tag in hex. What
+/// Keychain Access shows, so it says what it is. Unlock finds the key by it.
+pub fn keychain_label(tag: &[u8]) -> String {
+    format!("SilentSilo Touch ID {}", hex::encode(tag))
+}
+
+/// The keychain service the point bindings are filed under, one item per
+/// key, named by the tag in hex.
+pub const BINDING_SERVICE: &str = "com.silentsilo.enclave-point";
 
 /// Takes a credential id apart, or says it is not one of ours.
 ///
@@ -269,6 +285,71 @@ mod tests {
             split_credential_id(&[0u8; CREDENTIAL_ID_LEN]).is_none(),
             "right length, not a point"
         );
+    }
+
+    // Known answers taken from release 1.10.x. They must never change: a
+    // change means every silo enrolled with Touch ID or Face ID stops
+    // opening.
+
+    const VAULT: &str = "0198b7e2-5a3c-7d10-9c1e-3f2a4b5c6d7e";
+    const TAG: &str = "000102030405060708090a0b0c0d0e0f";
+    /// The P-256 base point, uncompressed, as the ephemeral key.
+    const POINT: &str = "046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5";
+    /// `TAG`, then `POINT`.
+    const CREDENTIAL_ID: &str = "000102030405060708090a0b0c0d0e0f046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5";
+
+    #[test]
+    fn the_wrap_key_from_a_shared_secret_is_the_one_every_device_derives() {
+        assert_eq!(HKDF_INFO, b"silentsilo secure-enclave wrap key v1");
+        assert_eq!(
+            hex::encode(*wrap_key_from_shared(&[0x11; 32], VAULT)),
+            "5f0d25cde93fcdcd9b9dc283f901f8d2d416ee0aff8363a935b1f006f705f757"
+        );
+    }
+
+    #[test]
+    fn a_fixed_enclave_key_unlocks_a_literal_credential_id_to_a_fixed_wrap_key() {
+        // The chip's half, with a fixed key standing in for the enclave's.
+        let enclave = SecretKey::from_slice(&[0x42; 32]).expect("a valid scalar");
+        let id = hex::decode(CREDENTIAL_ID).unwrap();
+        let (_, point) = split_credential_id(&id).expect("our own id");
+        let point = PublicKey::from_sec1_bytes(point).expect("the base point");
+        let shared = diffie_hellman(enclave.to_nonzero_scalar(), point.as_affine());
+        assert_eq!(
+            hex::encode(*wrap_key_from_shared(shared.raw_secret_bytes(), VAULT)),
+            "45b22ea18e4f561f4594b12c6e207cfd212b53c4965bb2befb6823bfdd1b6497"
+        );
+    }
+
+    #[test]
+    fn a_credential_id_is_the_sixteen_byte_tag_then_the_point() {
+        assert_eq!((TAG_LEN, POINT_LEN, CREDENTIAL_ID_LEN), (16, 65, 81));
+        let id = hex::decode(CREDENTIAL_ID).unwrap();
+        let (tag, point) = split_credential_id(&id).expect("a literal id of ours");
+        assert_eq!(hex::encode(tag), TAG);
+        assert_eq!(hex::encode(point), POINT);
+
+        let tag: [u8; TAG_LEN] = tag.try_into().unwrap();
+        assert_eq!(hex::encode(join_credential_id(&tag, point)), CREDENTIAL_ID);
+    }
+
+    #[test]
+    fn the_point_binding_is_the_sha256_of_the_point() {
+        let point = hex::decode(POINT).unwrap();
+        assert_eq!(
+            hex::encode(point_binding(&point)),
+            "698bea63dc44a344663ff1429aea10842df27b6b991ef25866b2c6c02cdcc5be"
+        );
+    }
+
+    #[test]
+    fn the_keychain_names_are_the_ones_enrolled_keys_are_filed_under() {
+        let tag = hex::decode(TAG).unwrap();
+        assert_eq!(
+            keychain_label(&tag),
+            "SilentSilo Touch ID 000102030405060708090a0b0c0d0e0f"
+        );
+        assert_eq!(BINDING_SERVICE, "com.silentsilo.enclave-point");
     }
 
     #[test]

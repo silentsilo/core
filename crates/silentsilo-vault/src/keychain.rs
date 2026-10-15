@@ -12,6 +12,9 @@
 //! written here with `CRED_PERSIST_LOCAL_MACHINE`, in the layout `keyring`
 //! reads. An entry written by an earlier build is rewritten on its next save.
 
+/// The keyring service the app's entries are stored under.
+const APP_SERVICE: &str = "com.silentsilo.desktop";
+
 /// The keyring service every entry is stored under.
 ///
 /// Test runs get one of their own, by the same switch that moves their files
@@ -23,7 +26,14 @@ pub(crate) fn service() -> &'static str {
     if std::env::var_os("SILENTSILO_TEST_WORK_BASE").is_some_and(|d| !d.is_empty()) {
         return "com.silentsilo.test";
     }
-    "com.silentsilo.desktop"
+    APP_SERVICE
+}
+
+/// The Credential Manager target `keyring` 3.6 files an entry under on
+/// Windows, and looks it up by.
+#[cfg(any(windows, test))]
+fn credential_target(service: &str, user: &str) -> String {
+    format!("{user}.{service}")
 }
 
 /// What this run has seen of the keyring: 0 nothing yet, 1 it kept a
@@ -250,7 +260,7 @@ mod windows_local {
     /// Same target name, user name, comment and UTF-16 blob as `keyring`
     /// 3.6, so its reads find the entry.
     pub(super) fn write(service: &str, user: &str, password: &str) -> Result<(), String> {
-        let mut target = wide(&format!("{user}.{service}"));
+        let mut target = wide(&super::credential_target(service, user));
         let mut username = wide(user);
         let mut alias = wide("");
         let mut comment = wide("keyring v3.6.3");
@@ -276,6 +286,23 @@ mod windows_local {
         let result = unsafe { CredWriteW(&credential, 0) }.map_err(|e| e.to_string());
         blob.zeroize();
         result
+    }
+}
+
+/// Taken from release 1.10.x and must never change: a change means the
+/// device secret is not found and the silo does not open on this machine.
+#[cfg(test)]
+mod known_answers {
+    #[test]
+    fn entries_are_filed_under_the_service_and_target_1_10_used() {
+        assert_eq!(super::APP_SERVICE, "com.silentsilo.desktop");
+        assert_eq!(
+            super::credential_target(
+                "com.silentsilo.desktop",
+                "vault-credentials:0198b7e2-5a3c-7d10-9c1e-3f2a4b5c6d7e"
+            ),
+            "vault-credentials:0198b7e2-5a3c-7d10-9c1e-3f2a4b5c6d7e.com.silentsilo.desktop"
+        );
     }
 }
 

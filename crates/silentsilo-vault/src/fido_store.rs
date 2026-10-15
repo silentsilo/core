@@ -468,6 +468,28 @@ impl StoredFidoKeys {
 mod tests {
     use super::*;
 
+    /// Taken from release 1.10.x and must never change: every key envelope
+    /// in a bucket names its kind and derivation by these strings, and a
+    /// change means no client recognises the keys that open the silo.
+    #[test]
+    fn kinds_and_derivations_are_the_strings_1_10_wrote() {
+        assert_eq!(KIND_FIDO2, "fido2");
+        assert_eq!(KIND_SECURE_ENCLAVE, "secure-enclave");
+        assert_eq!(KIND_ANDROID_KEYSTORE, "android-keystore");
+        assert_eq!(DERIVATION_HMAC_V1, "hmac-secret-v1");
+        assert_eq!(DERIVATION_ECDH_P256_V1, "ecdh-p256-hkdf-sha256-v1");
+        assert_eq!(DERIVATION_KEYSTORE_AES_GCM_V1, "keystore-aes-256-gcm-v1");
+        assert_eq!(POLICY_ORG, "org");
+        assert_eq!(KEY_SLOT_PRIMARY, 0);
+        assert_eq!(FIDO_KEYS_FILE, "keys/fido.json");
+        // An envelope written before the fields existed reads as these.
+        assert_eq!(default_kind(), "fido2");
+        assert_eq!(default_derivation(), "hmac-secret-v1");
+        // Device key ids: tag and point; tag, nonce, key and GCM tag.
+        assert_eq!(SECURE_ENCLAVE.id_len, 81);
+        assert_eq!(ANDROID_KEYSTORE.id_len, 76);
+    }
+
     fn fido2(id: &str) -> StoredFidoCredential {
         StoredFidoCredential {
             kind: KIND_FIDO2.to_string(),
