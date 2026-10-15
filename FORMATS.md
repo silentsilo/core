@@ -942,6 +942,28 @@ the same as `v1.9.0`'s.
 No rotation runs in them, so `keys/rotated/` has no golden bytes here; its
 older-release behaviour is covered by the rotation tests named above.
 
+`v1.10.1` and its twin change no format. They exist because every fixture
+before them holds stand-ins for content and opens only with its recovery
+code or device secret. Written by `create-rich`, they hold the same corpus
+with real blobs under real content keys (in the silo folder and in
+storage), a password entry with an attachment, `keys/fido.json` with a
+FIDO2, a Secure Enclave and an Android Keystore key (the last marked
+`unconfirmed`) and their published envelopes, `master.dek.enc` under the
+first key as enrolment leaves it, `silo.json`, and an inbox with one item
+waiting. The keys' wrap keys are fixed and documented in
+`silentsilo-fixture/src/lib.rs`, so each one opens the silo in a test.
+`expected-content.txt` beside `expected.txt` holds a BLAKE3 per file,
+entry, attachment and inbox item as decrypted, and whether each key
+envelope opens. `tests/read_by_1_10_0.rs` reads them, and a silo written
+by the current build, with core 1.10.0's own code.
+
+`fixtures/SHA256SUMS` pins every byte of every fixture
+(`tests/fixture_sums.rs`, or `sha256sum -c` in that folder). A new fixture
+directory appends its lines, printed by `cargo run -p silentsilo-fixture --
+sums <directory>`; a changed line is a regenerated fixture and fails. The
+crate's `.gitattributes` marks the fixtures binary, so no checkout rewrites
+their line endings.
+
 The one exception, and it expires with this release: while nothing had
 shipped, the formats iterated freely and the fixture was regenerated to match,
 because no silo written by an older iteration existed outside this repository.
@@ -1007,6 +1029,17 @@ Add a fixture when a release changes anything on this page:
 ```
 cargo run -p silentsilo-fixture -- create crates/silentsilo-fixture/fixtures/v<version>
 ```
+
+From `v1.10.1` on, `create-rich` and `create-rich-compacted` write the
+richer pair described above, and are the ones to use. Then append the new
+directories to the manifest, from Git Bash (PowerShell's `>>` adds a byte
+order mark):
+
+```
+cargo run -q -p silentsilo-fixture -- sums crates/silentsilo-fixture/fixtures/v<version> >> crates/silentsilo-fixture/fixtures/SHA256SUMS
+```
+
+and the same for `v<version>-compacted`.
 
 One per format era rather than one per tag. Ten releases that change nothing
 here share one fixture, named for the release where that format first shipped;

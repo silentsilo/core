@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "data": {
+    "keys": [
+      {
+        "kind": "fido2",
+        "derivation": "hmac-secret-v1",
+        "policy": "",
+        "credential_id": "736f66742d6b65792d30",
+        "public_key": "",
+        "key_slot": 0,
+        "rp_id": "silentsilo.com",
+        "label": "Cheia de test",
+        "wrapped_dek": "53534541013adf1855b5199f68103d813ae418a4eeaedd5987917fee846758bf1ec1f334e271242dd7081adc5a3a9eece529d1456eb498ae2712923e235d843105",
+        "platform": false,
+        "revoked": false
+      },
+      {
+        "kind": "secure-enclave",
+        "derivation": "ecdh-p256-hkdf-sha256-v1",
+        "policy": "",
+        "credential_id": "666978747572652d656e636c6176653104e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5",
+        "public_key": "",
+        "key_slot": 1,
+        "rp_id": "silentsilo.com",
+        "label": "MacBook Touch ID",
+        "wrapped_dek": "535345410101708fb1005b648e182e3f143c9ccbefbc00ca5eea18d69399ac80a6ea47fe8eb5ab3b4761c621075a0d62861bf888b889903a109094d22917ae76ac",
+        "platform": true,
+        "revoked": false
+      },
+      {
+        "kind": "android-keystore",
+        "derivation": "keystore-aes-256-gcm-v1",
+        "policy": "",
+        "credential_id": "666978747572652d6b657973746f7265a5a5a5a5a5a5a5a5a5a5a5a55a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+        "public_key": "",
+        "key_slot": 2,
+        "rp_id": "silentsilo.com",
+        "label": "Telefonul Anei",
+        "wrapped_dek": "53534541010cbd8ff3d5e9e1d907c6ef4ce3961ba178972f00e4ea5d92719a10f75de760e8bbc17266829b1968be16dec8bb1a19e9578b2508813a6fd1c3fc47e8",
+        "platform": true,
+        "revoked": false,
+        "unconfirmed": true
+      }
+    ]
+  }
+}

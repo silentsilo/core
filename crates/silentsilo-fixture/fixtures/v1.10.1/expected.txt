@@ -1,0 +1,26 @@
+folder / deleted=0 fav=0
+folder /Acte deleted=0 fav=1
+folder /Acte/2026 deleted=0 fav=0
+folder /Arhivă deleted=0 fav=0
+folder /Vechituri deleted=1 fav=0
+folder /Ștampile deleted=0 fav=0
+file /::.gitignore deleted=0 fav=0 size=7 hash=783bb08eb1f330fbf4a48905ea0913b45905bc65645a6820690c4a97b4a6b1a0 mime=
+file /::notițe.md deleted=0 fav=0 size=250 hash=25b04860292a9478c83a1407812868a49688ac16e3722c0f08d73de01d4d7068 mime=text/markdown
+file /::șiret.txt deleted=0 fav=0 size=9 hash=5a21deaecd11448c58112292097a15352dee05f445a7101189eaa92ad19bc43a mime=
+file /Acte::contract.pdf deleted=0 fav=1 size=2048 hash=0c7fab80dfcf9845d01518fb6f5fd1e9718ac61ae81fa363b889b2a2df6db382 mime=application/pdf
+file /Acte::final.txt deleted=0 fav=0 size=64 hash=0bb780acb18d5749cfc59a14f5acb06af21638d43e01feac5484cd7b0cc365f8 mime=
+file /Acte/2026::vechi.txt deleted=1 fav=0 size=10 hash=f1f58099608c7611f602071b2d178a02c86be77576faa790fc0bb9c5650051f8 mime=
+file /Vechituri::ruginit.dat deleted=1 fav=0 size=5 hash=4d6f049d284462953866f1c0db3e0eb1c10128a23d2ba5071c586cee55426a1a mime=
+file /Ștampile::gol.bin deleted=0 fav=0 size=0 hash=af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262 mime=
+password 00000000-0000-0000-0000-000000000021
+password 00000000-0000-0000-0000-000000000022
+password 00000000-0000-0000-0000-000000000024
+password 00000000-0000-0000-0000-000000000025
+ops count=33
+activity event 51170000-0000-0000-0000-00000000a0d1 i=0 t=1789000000000 c=60 o= l= x={}
+activity event 51170000-0000-0000-0000-00000000a0d1 i=1 t=1789000001000 c=1 o= l= x={"key":"YubiKey"}
+activity event 51170000-0000-0000-0000-00000000a0d1 i=2 t=1789000002000 c=11 o=00000000-0000-0000-0000-000000000024 l=Ștampile SRL x={"field":"password"}
+activity event 51170000-0000-0000-0000-00000000a0d1 i=3 t=1789000003000 c=2 o= l= x={}
+activity policy enabled=true scope="silo" retention=None keys=1
+activity trail 51170000-0000-0000-0000-00000000a0d1 events=4 missing=[] segments_missing=[] broken=[]
+activity unreadable=0

@@ -1,0 +1,17 @@
+content attachment 00000000-0000-0000-0000-000000000025::scanare.pdf bytes=1500 blake3=bc9a764e7fbe49b63a1c4710944d0efccdb25e7338f4aa4cabee98d5f3124e57
+content file /::.gitignore deleted=0 bytes=7 blake3=783bb08eb1f330fbf4a48905ea0913b45905bc65645a6820690c4a97b4a6b1a0
+content file /::notițe.md deleted=0 bytes=250 blake3=25b04860292a9478c83a1407812868a49688ac16e3722c0f08d73de01d4d7068
+content file /::șiret.txt deleted=0 bytes=9 blake3=5a21deaecd11448c58112292097a15352dee05f445a7101189eaa92ad19bc43a
+content file /Acte/2026::vechi.txt deleted=1 bytes=10 blake3=f1f58099608c7611f602071b2d178a02c86be77576faa790fc0bb9c5650051f8
+content file /Acte::contract.pdf deleted=0 bytes=2048 blake3=0c7fab80dfcf9845d01518fb6f5fd1e9718ac61ae81fa363b889b2a2df6db382
+content file /Acte::final.txt deleted=0 bytes=64 blake3=0bb780acb18d5749cfc59a14f5acb06af21638d43e01feac5484cd7b0cc365f8
+content file /Vechituri::ruginit.dat deleted=1 bytes=5 blake3=4d6f049d284462953866f1c0db3e0eb1c10128a23d2ba5071c586cee55426a1a
+content file /Ștampile::gol.bin deleted=0 bytes=0 blake3=af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262
+content inbox Telefon/Poze::IMG_0001.jpg sender=Telefonul Anei source=photos mime=image/jpeg taken_at=Some(1789000000) bytes=333 blake3=50671970ee1e7506d66352aeae71c0332cdb9329a92515a03a67dce9bcb7334b
+content key android-keystore keystore-aes-256-gcm-v1 slot=2 platform=true label=Telefonul Anei opens=true
+content key fido2 hmac-secret-v1 slot=0 platform=false label=Cheia de test opens=true
+content key secure-enclave ecdh-p256-hkdf-sha256-v1 slot=1 platform=true label=MacBook Touch ID opens=true
+content password 00000000-0000-0000-0000-000000000021 blake3=2e8d77d11cd9c1c828a478a7ea250263603fe36c27ee18885a7f3492ef10e5ae
+content password 00000000-0000-0000-0000-000000000022 blake3=18dbf82e329ea48c312efbba295c164a2443b1688447319247c4131c9817e760
+content password 00000000-0000-0000-0000-000000000024 blake3=26ffd762fd5782ec7bd6c4b96b0dbe19910137996d550021a183def6db3c2b16
+content password 00000000-0000-0000-0000-000000000025 blake3=3e3625d647efd1dc29b2e44c1dd7d321258d04dbe0a8a1f0279dd1e38e33984e

@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "key_id": "01f3b3b0738cd254",
+  "suite": [
+    32,
+    1,
+    2
+  ],
+  "public_key": "bf61a98a5fe1aa9f740e094321f04ab25c9784a42f403b490c80f9bdc03fd84c",
+  "scope": "silo",
+  "created_at": 1789000000,
+  "wrapped": [
+    {
+      "by": "silo",
+      "sealed": "53534541019fca2bfd33df45eccbf15bd7d09d4825412cff103ef1a77ed9faf2ca686c3f5e785a9f706dce5490d192a06e5036477b2ca9896f140f12ac0daf807b"
+    }
+  ]
+}

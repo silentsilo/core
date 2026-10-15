@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "kdf": {
+    "algorithm": "argon2id",
+    "m_cost": 65536,
+    "t_cost": 3,
+    "p_cost": 1
+  },
+  "salt": "92158e8b6edcf4749efdaf262ba8ec45",
+  "wrapped_dek": "5353454101e2f1bc688d3dd4ebe00d1fbff87f6669f623de84897a19cf92793665b83572bb727c8139225dd5d3dd9dc3a64308c33d1cf1227405fc82b08203b5d0",
+  "created_at": 1792074652,
+  "auth": "ae5933f857e823d9ddc0f88a344a0b10ce6cc56833bae8035820e8dd38b5fe92",
+  "auth_dek": "04007002244fd559d9e508ff7cb48edc08e8f8a75192b6f063faa5dd158ef56d"
+}

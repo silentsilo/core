@@ -1,0 +1,3 @@
+# The fixtures are the released formats, byte for byte, and SHA256SUMS
+# pins every byte. No checkout may rewrite a line ending in them.
+fixtures/** -text
