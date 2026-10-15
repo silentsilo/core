@@ -46,6 +46,12 @@ pub enum Authenticator {
     SecurityKey,
     /// Windows Hello, Touch ID — whatever this machine has built in.
     ThisDevice,
+    /// A phone's passkey, reached through the QR code and Bluetooth
+    /// (hybrid). Windows only, since Windows runs that flow itself from
+    /// WebAuthn API 6 on. To the silo it is a security key: not tied to this
+    /// computer, stored and unlocked as one. Only enrolment differs, where
+    /// Windows is asked for the QR code first.
+    Phone,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

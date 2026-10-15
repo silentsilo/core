@@ -11,6 +11,21 @@ release notes should say.
 
 ## [Unreleased]
 
+### Added
+
+- `Authenticator::Phone` and `phone_available()`: a phone over the QR code
+  on Windows 11 22H2 and later (WebAuthn API 6), stored and unlocked as a
+  security key. Enrolment asks Windows for the QR code first. Android with
+  Google Password Manager and iPhone with iCloud Keychain both work.
+- `android_keystore`: the Android key layout with a vector computed apart
+  from the code. Known answers for the activity log keys and the rotation
+  proof name.
+
+### Fixed
+
+- A phone that cannot give the silo's secret is refused with a coded
+  message naming the passkey apps that can.
+
 ## [1.10.1-beta.3] - The other secret on demand
 
 ### Fixed

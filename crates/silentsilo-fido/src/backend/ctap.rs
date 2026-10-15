@@ -136,7 +136,9 @@ pub fn begin_enrollment(
     key_slot: u8,
     authenticator: Authenticator,
 ) -> Result<EnrollmentChallenge, FidoError> {
-    if authenticator == Authenticator::ThisDevice {
+    // Only a key on the wire: Touch ID has its own path, and no phone is
+    // reached from here.
+    if authenticator != Authenticator::SecurityKey {
         return Err(FidoError::NotAvailable);
     }
     probe_device()?;

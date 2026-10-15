@@ -165,6 +165,14 @@ fn webauthn_api_version() -> u32 {
     unsafe { WebAuthNGetApiVersionNumber() }
 }
 
+/// WebAuthn API 6 added the hybrid transport: from there Windows shows the
+/// QR code and talks to the phone itself (Windows 11 22H2 with KB5030310).
+const API_VERSION_HYBRID: u32 = 6;
+
+pub fn phone_available() -> bool {
+    webauthn_api_version() >= API_VERSION_HYBRID
+}
+
 pub fn probe_device() -> Result<(), FidoError> {
     if !webauthn_api_available() {
         return Err(FidoError::NotAvailable);
@@ -180,6 +188,15 @@ pub fn begin_enrollment(
     probe_device()?;
     if authenticator == Authenticator::ThisDevice && !platform_authenticator_available() {
         return Err(FidoError::NotAvailable);
+    }
+    if authenticator == Authenticator::Phone && !phone_available() {
+        return Err(FidoError::EnrollmentFailed(
+            crate::coded!(
+                "err.phone_needs_windows_11",
+                "This Windows cannot use a phone as the key. It needs Windows 11, version 22H2 or later, with its updates. Use a security key here instead."
+            )
+            .into(),
+        ));
     }
     let mut challenge = [0u8; 32];
     rand::rng().fill_bytes(&mut challenge);
@@ -331,10 +348,10 @@ pub fn complete_enrollment(challenge: &EnrollmentChallenge) -> Result<Enrollment
 
     // Steers the OS picker: without a hint Windows offers phone/hybrid
     // alongside, which is not what either choice means here.
-    let hint = to_wide(if platform {
-        "client-device"
-    } else {
-        "security-key"
+    let hint = to_wide(match challenge.authenticator {
+        Authenticator::ThisDevice => "client-device",
+        Authenticator::Phone => "hybrid",
+        Authenticator::SecurityKey => "security-key",
     });
     let hint_list: [PCWSTR; 1] = [PCWSTR(hint.as_ptr())];
 
@@ -452,11 +469,11 @@ pub fn complete_enrollment(challenge: &EnrollmentChallenge) -> Result<Enrollment
         // the person did not ask: the problem is the phone, not their key.
         let via_phone = att.dwVersion >= 3 && att.dwUsedTransport == WEBAUTHN_CTAP_TRANSPORT_HYBRID;
         return Err(FidoError::EnrollmentFailed(if via_phone {
-            "This phone's passkey did not provide the hmac-secret extension the silo \
-             key is derived from, so it cannot unlock a silo. A phone with a newer \
-             passkey provider may work; otherwise plug a FIDO2 key into this computer, \
-             or use Windows Hello."
-                .into()
+            crate::coded!(
+                "err.phone_no_secret",
+                "The passkey app on this phone cannot give the secret a silo is opened with. Keep the passkey in Google Password Manager on Android, or in iCloud Keychain on an iPhone with iOS 18 or later, or use a security key."
+            )
+            .into()
         } else if platform && !tpm_present() {
             // Windows 11 installed past its own hardware check is common, and
             // Hello enrols there quite happily with its keys in software. It
@@ -660,7 +677,9 @@ fn get_assertion_with_hmac(
         // by earlier releases.
         dwAuthenticatorAttachment: match on {
             Some(Authenticator::ThisDevice) => WEBAUTHN_AUTHENTICATOR_ATTACHMENT_PLATFORM,
-            Some(Authenticator::SecurityKey) => WEBAUTHN_AUTHENTICATOR_ATTACHMENT_CROSS_PLATFORM,
+            Some(Authenticator::SecurityKey | Authenticator::Phone) => {
+                WEBAUTHN_AUTHENTICATOR_ATTACHMENT_CROSS_PLATFORM
+            }
             None => WEBAUTHN_AUTHENTICATOR_ATTACHMENT_ANY,
         },
         dwUserVerificationRequirement: WEBAUTHN_USER_VERIFICATION_REQUIREMENT_DISCOURAGED,

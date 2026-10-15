@@ -47,6 +47,7 @@ fn credential_id(challenge: &EnrollmentChallenge) -> Vec<u8> {
     let kind = match challenge.authenticator {
         Authenticator::SecurityKey => "key",
         Authenticator::ThisDevice => "device",
+        Authenticator::Phone => "phone",
     };
     [PREFIX, format!("{kind}-{}", challenge.key_slot).as_bytes()].concat()
 }
@@ -108,10 +109,12 @@ mod tests {
             std::slice::from_ref(&enrolled.credential.credential_id),
             "vault",
             None,
+            None,
         )
         .unwrap();
         assert_eq!(enrolled.unlock.unwrap().wrap_key, unlocked.wrap_key);
-        let other = derive_unlock_material(&[enrolled.credential.credential_id], "other", None);
+        let other =
+            derive_unlock_material(&[enrolled.credential.credential_id], "other", None, None);
         assert_ne!(other.unwrap().wrap_key, unlocked.wrap_key);
     }
 }

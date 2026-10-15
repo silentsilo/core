@@ -34,7 +34,9 @@ pub fn begin_enrollment(
     authenticator: Authenticator,
 ) -> Result<EnrollmentChallenge, FidoError> {
     match authenticator {
-        Authenticator::SecurityKey => ctap::begin_enrollment(vault_id, key_slot, authenticator),
+        Authenticator::SecurityKey | Authenticator::Phone => {
+            ctap::begin_enrollment(vault_id, key_slot, authenticator)
+        }
         Authenticator::ThisDevice => {
             if !enclave_mac::available() {
                 return Err(FidoError::NotAvailable);
@@ -55,7 +57,7 @@ pub fn begin_enrollment(
 
 pub fn complete_enrollment(challenge: &EnrollmentChallenge) -> Result<Enrollment, FidoError> {
     match challenge.authenticator {
-        Authenticator::SecurityKey => ctap::complete_enrollment(challenge),
+        Authenticator::SecurityKey | Authenticator::Phone => ctap::complete_enrollment(challenge),
         Authenticator::ThisDevice => {
             let material = enclave_mac::enrol(&challenge.user_id)?;
             // One ceremony, like Hello: the wrap key is known at enrolment,
@@ -105,7 +107,7 @@ pub fn derive_unlock_material(
     // answer is a property of this moment, not of this machine.
     let touch_id_ready = !enclave_ids.is_empty() && enclave_mac::available();
 
-    if on == Some(Authenticator::SecurityKey) {
+    if matches!(on, Some(Authenticator::SecurityKey | Authenticator::Phone)) {
         return ctap::derive_unlock_material(&fido2_ids, vault_id, on, opens);
     }
 

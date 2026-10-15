@@ -151,6 +151,27 @@ pub fn platform_authenticator_available() -> bool {
     platform_status() == PlatformStatus::Ready
 }
 
+/// Whether this system can use a phone as the key (Android or iPhone, over
+/// the QR code and Bluetooth). Windows 11 22H2 and later with WebAuthn API
+/// 6; nowhere else, since no other backend runs the hybrid flow.
+pub fn phone_available() -> bool {
+    #[cfg(all(feature = "hardware", not(feature = "test-authenticator"), windows))]
+    {
+        backend::phone_available()
+    }
+    #[cfg(all(feature = "hardware", feature = "test-authenticator"))]
+    {
+        true
+    }
+    #[cfg(not(any(
+        all(feature = "hardware", not(feature = "test-authenticator"), windows),
+        all(feature = "hardware", feature = "test-authenticator")
+    )))]
+    {
+        false
+    }
+}
+
 /// The built-in authenticator's state, with the reason when it cannot be
 /// used, so the app can say what to do rather than only hide the option.
 pub fn platform_status() -> PlatformStatus {
@@ -249,7 +270,7 @@ fn refuse_unverified_key(
     material: UnlockMaterial,
     on: Authenticator,
 ) -> Result<UnlockMaterial, FidoError> {
-    if on == Authenticator::SecurityKey && !material.verified {
+    if on != Authenticator::ThisDevice && !material.verified {
         return Err(FidoError::EnrollmentFailed(
             coded!(
                 "err.key_needs_pin",
@@ -325,5 +346,23 @@ mod tests {
         for verified in [true, false] {
             assert!(refuse_unverified_key(material(verified), Authenticator::ThisDevice).is_ok());
         }
+    }
+
+    #[test]
+    fn a_phone_is_held_to_the_rule_for_a_security_key() {
+        // A phone always verifies, so this only matters if one ever says it
+        // did not: then its secret would change the day it does.
+        assert!(refuse_unverified_key(material(false), Authenticator::Phone).is_err());
+        assert!(refuse_unverified_key(material(true), Authenticator::Phone).is_ok());
+    }
+
+    #[test]
+    fn a_phone_is_named_phone_on_the_wire() {
+        assert_eq!(
+            serde_json::to_string(&Authenticator::Phone).unwrap(),
+            "\"phone\""
+        );
+        let parsed: Authenticator = serde_json::from_str("\"phone\"").unwrap();
+        assert_eq!(parsed, Authenticator::Phone);
     }
 }

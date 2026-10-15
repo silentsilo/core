@@ -160,9 +160,14 @@ added to Windows 11 25H2 in February 2026). On Windows the app goes through
 `webauthn.dll`, the same service the browsers use, so transports and PIN
 prompts are the OS's business. U2F-only keys do not work: they have no
 `hmac-secret`. Phones reached over the QR-code flow work when their
-passkey provider offers the extension over hybrid transport, which recent
-Android phones with Google Password Manager do; a phone that does not is
-refused at enrollment with a message saying why. The gate is the
+passkey provider offers the extension over hybrid transport: Android with
+Google Password Manager and iPhone with iCloud Keychain both do (tested on
+Windows 11 on 15 October 2026); a phone that does not is refused at
+enrollment with a message saying why. Windows runs that flow itself from
+WebAuthn API 6 (Windows 11 22H2 with KB5030310), and `Authenticator::Phone`
+asks it for the QR code first; Windows 10 has no such flow, and no other
+backend reaches a phone. A phone is stored and unlocked as a security key
+(`platform: false`). The gate is the
 capability, checked in the attestation, never the device type. Note the
 trust model: a phone passkey syncs with the account behind it rather than
 staying pinned to the hardware, and every unlock runs the Bluetooth
