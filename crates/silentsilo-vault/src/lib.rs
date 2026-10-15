@@ -63,6 +63,7 @@ pub use fido_store::{
 };
 pub use kdf::derive_vault_key;
 pub use kek_store::{kek_path, load_kek, save_kek, unwrap_kek_bytes, wrap_kek_bytes};
+pub use keychain::keyring_keeps_secrets;
 pub use openssl::init_openssl;
 pub use process::harden_process;
 pub use protected::{

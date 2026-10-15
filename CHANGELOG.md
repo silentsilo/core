@@ -11,6 +11,38 @@ release notes should say.
 
 ## [Unreleased]
 
+### Fixed
+
+- A security key without a PIN is no longer enrolled. `hmac-secret` gives
+  one secret with the PIN verified and another without, and every platform
+  verifies once a key has a PIN, so a silo wrapped under the unverified one
+  stopped opening the day its key got a PIN (Windows 11 asks for one at the
+  first passkey on any site). Unlocking over CTAP2 (Linux, macOS) also asks
+  the key for its unverified secret, so a silo enrolled before that still
+  opens there. `UnlockMaterial` says whether the person was verified and
+  carries that second secret; `derive_enrolment_material` refuses an
+  unverified security key on Windows.
+- `platform_status` says why the built-in authenticator cannot be used: not
+  set up, no TPM 2.0, a Windows build without Hello's PRF secret, Touch ID
+  locked out or out of reach, or no sensor. Windows Hello is no longer
+  offered on a TPM 1.2 or a Windows build before API version 8.
+- Touch ID refusals say what to do (locked out, no fingerprints, a key that
+  stopped working after fingerprints changed). Windows WebAuthn errors are
+  told apart by HRESULT: a cancel is a cancel, a credential not held here
+  says so, and no device is `NoDevice`. On a Windows whose WebAuthn API is
+  older than version 4 a security key is said to need a Windows update.
+- A U2F-only key, a blocked PIN and an unsupported key give coded messages.
+- Cloud storage and WebDAV follow the system proxy (reqwest `system-proxy`).
+  S3 still reads only the `HTTPS_PROXY` environment variable.
+- `keyring_keeps_secrets` says whether the OS keyring kept the last secret
+  written to it, so a client can ask about a plain file only where there is
+  no keyring.
+- iCloud Drive is recognised by its folder on a Mac
+  (`Library/Mobile Documents`).
+- The Windows extractor links the Visual C++ runtime statically and no
+  longer needs `VCRUNTIME140.dll`. Started by a double-click, it shows its
+  usage and waits for Enter instead of closing at once.
+
 ## [1.10.0] - Trust storage and the device less
 
 ### Security

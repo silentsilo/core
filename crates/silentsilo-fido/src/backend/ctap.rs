@@ -123,8 +123,8 @@ pub fn probe_device() -> Result<(), FidoError> {
 /// Always false here: USB HID reaches removable keys only. The Mac backend
 /// answers for the enclave itself.
 #[cfg(not(all(feature = "enclave", target_os = "macos")))]
-pub(crate) fn platform_authenticator_available() -> bool {
-    false
+pub(crate) fn platform_status() -> crate::PlatformStatus {
+    crate::PlatformStatus::Absent
 }
 
 /// Nothing to wait for: no dialog of the platform's own stands between two

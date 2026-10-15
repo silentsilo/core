@@ -207,6 +207,17 @@ USB) and ask through the prompt the client registers with
 `set_pin_prompt`. A silo made by a Linux build before core 1.9.0 on a key
 with a PIN holds the unverified secret, and has to enrol that key again.
 
+The same split is why a key without a PIN is not enrolled (core 1.10.1):
+the day it gets one, every platform verifies and derives the other secret,
+and Windows 11 asks for a PIN at the first passkey on any site. On Windows
+`derive_enrolment_material` refuses the second ceremony when it was not
+verified; over CTAP2 `enrol_on` refuses a key with no PIN set. A silo
+enrolled before that still opens over CTAP2: after a verified assertion the
+ceremony asks the key for its unverified secret too, without a second touch,
+and the client tries it when the verified one does not open the envelope.
+Windows cannot ask for it, so there the client says to use another key or
+the recovery code and enrol the key again.
+
 Rotation state machine (`silentsilo-vault/rotation.rs`, driven by the
 client application):
 

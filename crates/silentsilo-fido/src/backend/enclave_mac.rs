@@ -63,12 +63,44 @@ fn label_for(tag: &[u8]) -> String {
 /// answers no, and so does a MacBook with the lid closed on an external
 /// display, which is why this is asked at ceremony time and not cached.
 pub fn available() -> bool {
+    status() == crate::PlatformStatus::Ready
+}
+
+/// [`available`], with the reason when the answer is no, from the
+/// `LAError` code: each one is a different thing for the person to do.
+pub fn status() -> crate::PlatformStatus {
+    use crate::PlatformStatus;
     // SAFETY: LAContext has no preconditions; the policy is a documented
     // constant and the result is read once.
+    let answer = unsafe {
+        LAContext::new().canEvaluatePolicy_error(LAPolicy::DeviceOwnerAuthenticationWithBiometrics)
+    };
+    match answer {
+        Ok(()) => PlatformStatus::Ready,
+        Err(error) => match error.code() {
+            // passcodeNotSet, biometryNotEnrolled
+            -5 | -7 => PlatformStatus::NotSetUp,
+            // biometryLockout
+            -8 => PlatformStatus::Unavailable,
+            // biometryNotAvailable: no sensor, or one out of reach for now.
+            // Told apart by whether this Mac has ever had biometry at all.
+            -6 if has_sensor() => PlatformStatus::Unavailable,
+            _ => PlatformStatus::Absent,
+        },
+    }
+}
+
+/// Whether this Mac has a Touch ID sensor, even one it cannot reach right
+/// now: `biometryType` is set by `canEvaluatePolicy` on a Mac that has one,
+/// lid closed or not.
+fn has_sensor() -> bool {
+    use objc2_local_authentication::LABiometryType;
+    // SAFETY: as in `status`; `biometryType` is read after the evaluation
+    // that sets it.
     unsafe {
-        LAContext::new()
-            .canEvaluatePolicy_error(LAPolicy::DeviceOwnerAuthenticationWithBiometrics)
-            .is_ok()
+        let context = LAContext::new();
+        let _ = context.canEvaluatePolicy_error(LAPolicy::DeviceOwnerAuthenticationWithBiometrics);
+        context.biometryType() != LABiometryType::None
     }
 }
 
@@ -329,6 +361,8 @@ pub fn derive_unlock_material(
                 return Ok(UnlockMaterial {
                     wrap_key: *wrap_key,
                     credential_id: credential_id.clone(),
+                    verified: true,
+                    unverified_wrap_key: None,
                 });
             }
             Err(e) => last_err = Some(e),

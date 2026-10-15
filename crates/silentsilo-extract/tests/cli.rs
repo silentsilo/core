@@ -47,3 +47,15 @@ fn a_code_on_the_command_line_still_works_and_warns() {
     assert!(err.contains("shell history"), "{err}");
     assert!(!err.contains("No recovery code"), "{err}");
 }
+
+#[test]
+fn no_arguments_prints_the_usage_and_returns() {
+    // Started from a terminal, so the window is not ours to hold open: the
+    // tool must not sit waiting for Enter.
+    let out = run(&[], "");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success());
+    assert!(text.contains("silentsilo-extract list"), "{text}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.contains("Press Enter"), "{err}");
+}

@@ -281,7 +281,7 @@ impl SoftKey {
     }
 
     /// What the silo's wrap key must be for this credential, by definition.
-    fn expected_wrap_key(&self, id: &[u8]) -> [u8; 32] {
+    pub(crate) fn expected_wrap_key(&self, id: &[u8]) -> [u8; 32] {
         self.expected(id, false, false)
     }
 

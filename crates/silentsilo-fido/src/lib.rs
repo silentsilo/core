@@ -77,7 +77,8 @@ pub(crate) fn ask_pin(question: PinAsk) -> Option<zeroize::Zeroizing<String>> {
     slot.as_ref()?(question)
 }
 pub use types::{
-    Authenticator, CredentialInfo, Enrollment, EnrollmentChallenge, FidoStatus, UnlockMaterial,
+    Authenticator, CredentialInfo, Enrollment, EnrollmentChallenge, FidoStatus, PlatformStatus,
+    UnlockMaterial,
 };
 
 #[cfg(all(feature = "hardware", not(feature = "test-authenticator")))]
@@ -144,13 +145,19 @@ pub fn begin_enrollment(
 /// not locked out. Offering the option on a machine that would fail halfway
 /// through the ceremony is worse than not offering it.
 pub fn platform_authenticator_available() -> bool {
+    platform_status() == PlatformStatus::Ready
+}
+
+/// The built-in authenticator's state, with the reason when it cannot be
+/// used, so the app can say what to do rather than only hide the option.
+pub fn platform_status() -> PlatformStatus {
     #[cfg(feature = "hardware")]
     {
-        backend::platform_authenticator_available()
+        backend::platform_status()
     }
     #[cfg(not(feature = "hardware"))]
     {
-        false
+        PlatformStatus::Absent
     }
 }
 
@@ -197,6 +204,32 @@ pub fn derive_unlock_material(
         let _ = (credential_ids, vault_id, on);
         Err(FidoError::NotAvailable)
     }
+}
+
+/// The second ceremony of an enrolment, where the platform did not hand the
+/// wrap key back with the credential (a security key on Windows).
+///
+/// Refuses a security key that was not verified, which on Windows means one
+/// without a PIN. `hmac-secret` keeps a secret for verified assertions and
+/// another for the rest, and Windows verifies every ceremony on a key with a
+/// PIN: a silo wrapped under the unverified one stops opening the day the key
+/// gets a PIN, and Windows 11 asks for one at the first passkey on any site.
+pub fn derive_enrolment_material(
+    credential_ids: &[Vec<u8>],
+    vault_id: &str,
+    on: Authenticator,
+) -> Result<UnlockMaterial, FidoError> {
+    let material = derive_unlock_material(credential_ids, vault_id, Some(on))?;
+    if on == Authenticator::SecurityKey && !material.verified {
+        return Err(FidoError::EnrollmentFailed(
+            coded!(
+                "err.key_needs_pin",
+                "This key needs a PIN before it can open a silo. Set one with its maker's app or in Chrome's security key settings, then add it again."
+            )
+            .into(),
+        ));
+    }
+    Ok(material)
 }
 
 /// Deletes this device's own platform key behind `credential_id`, once it

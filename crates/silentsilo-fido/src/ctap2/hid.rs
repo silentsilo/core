@@ -95,10 +95,14 @@ impl<R: Reports> Hid<R> {
                 data.extend_from_slice(&more[5..5 + take]);
             }
             if cmd == CMD_ERROR {
-                return Err(CtapError::Protocol(format!(
-                    "CTAPHID error {:#04x}",
-                    data.first().copied().unwrap_or(0)
-                )));
+                let code = data.first().copied().unwrap_or(0);
+                // ERR_INVALID_CMD to a CBOR command: a U2F-only key.
+                if code == 0x01 {
+                    return Err(CtapError::Unsupported(
+                        "it speaks only U2F, not FIDO2".into(),
+                    ));
+                }
+                return Err(CtapError::Protocol(format!("CTAPHID error {code:#04x}")));
             }
             return Ok((cmd, data));
         }

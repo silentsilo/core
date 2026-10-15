@@ -26,6 +26,31 @@ pub(crate) fn service() -> &'static str {
     "com.silentsilo.desktop"
 }
 
+/// What this run has seen of the keyring: 0 nothing yet, 1 it kept a
+/// secret, 2 it refused or lost one.
+static SEEN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Records whether the keyring kept a secret just written to it.
+pub(crate) fn note(kept: bool) {
+    SEEN.store(
+        if kept { 1 } else { 2 },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// Whether the OS keyring kept the last secret written to it in this run,
+/// or `None` before the first write. On Linux this is what tells a desktop
+/// with a working Secret Service from one without (a bare window manager,
+/// KWallet without its Secret Service API), where secrets need a file and
+/// the user's consent to one.
+pub fn keyring_keeps_secrets() -> Option<bool> {
+    match SEEN.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => Some(true),
+        2 => Some(false),
+        _ => None,
+    }
+}
+
 /// Stores `password` under the entry `keyring::Entry::new(service, user)`
 /// names.
 pub(crate) fn set_password(service: &str, user: &str, password: &str) -> Result<(), String> {

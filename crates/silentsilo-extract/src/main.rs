@@ -87,6 +87,13 @@ fn parse() -> Result<Args, String> {
 }
 
 fn main() -> ExitCode {
+    // Double-clicked in Explorer: say how it is used and keep the window
+    // open, instead of a console that flashes and closes.
+    if std::env::args().len() == 1 {
+        println!("{USAGE}");
+        prompt::wait_before_closing();
+        return ExitCode::FAILURE;
+    }
     let args = match parse() {
         Ok(args) => args,
         Err(e) => {

@@ -20,8 +20,8 @@ pub(crate) fn fido_interface_accessible() -> bool {
     ctap::fido_interface_accessible()
 }
 
-pub(crate) fn platform_authenticator_available() -> bool {
-    enclave_mac::available()
+pub(crate) fn platform_status() -> crate::PlatformStatus {
+    enclave_mac::status()
 }
 
 pub(crate) fn wait_for_ceremony_teardown(timeout_ms: u64) {
@@ -71,6 +71,8 @@ pub fn complete_enrollment(challenge: &EnrollmentChallenge) -> Result<Enrollment
                 unlock: Some(UnlockMaterial {
                     wrap_key: *material.wrap_key,
                     credential_id: material.credential_id.clone(),
+                    verified: true,
+                    unverified_wrap_key: None,
                 }),
             })
         }
@@ -120,22 +122,32 @@ pub fn derive_unlock_material(
     // The user named Touch ID, so a security key is not what they were
     // asked for. Say why it did not work rather than sending them to a
     // drawer for hardware they did not mention.
-    if on == Some(Authenticator::ThisDevice) {
-        return Err(enclave_err.unwrap_or_else(|| {
-            FidoError::UnlockFailed(
-                "Touch ID cannot answer right now, and this Mac holds no Touch ID key for this \
-                 silo. Use an enrolled security key."
-                    .into(),
-            )
-        }));
-    }
-
-    if fido2_ids.is_empty() {
-        return Err(enclave_err.unwrap_or_else(|| {
-            FidoError::UnlockFailed(
-                "No Touch ID key for this silo on this Mac, and no security key enrolled".into(),
-            )
-        }));
+    if on == Some(Authenticator::ThisDevice) || fido2_ids.is_empty() {
+        return Err(enclave_err.unwrap_or_else(|| touch_id_refusal(&enclave_ids)));
     }
     ctap::derive_unlock_material(&fido2_ids, vault_id, on)
+}
+
+/// Why Touch ID could not open the silo, in words that say what to do.
+fn touch_id_refusal(enclave_ids: &[Vec<u8>]) -> FidoError {
+    use crate::PlatformStatus;
+    let said = match enclave_mac::status() {
+        PlatformStatus::Unavailable => crate::coded!(
+            "err.touchid_unavailable",
+            "Touch ID cannot answer right now. After too many failed tries, lock the Mac and sign in with your password. With the lid closed or the Touch ID keyboard unplugged, open the lid or plug the keyboard in."
+        ),
+        PlatformStatus::NotSetUp => crate::coded!(
+            "err.touchid_not_set_up",
+            "Touch ID has no fingerprints on this Mac. Add one in System Settings, Touch ID & Password, or use a security key or your recovery code."
+        ),
+        PlatformStatus::Ready if !enclave_ids.is_empty() => crate::coded!(
+            "err.touchid_key_gone",
+            "This Mac has no working Touch ID key for this silo. A Touch ID key stops working when fingerprints are added or removed, and does not move to another Mac. Open the silo with a security key or your recovery code, then add Touch ID again."
+        ),
+        _ => crate::coded!(
+            "err.touchid_absent",
+            "This Mac has no Touch ID key for this silo. Use a security key or your recovery code."
+        ),
+    };
+    FidoError::UnlockFailed(said.into())
 }

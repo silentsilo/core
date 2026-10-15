@@ -105,6 +105,8 @@ const TIMEOUT_MS: u32 = 120_000;
 /// webauthn.h — not yet in windows crate 0.61.
 const MAKE_CRED_OPTIONS_VERSION_8: u32 = 8;
 const API_VERSION_8: u32 = 8;
+/// The first WebAuthn API that returns a security key's hmac-secret.
+const API_VERSION_4: u32 = 4;
 /// The attestation version that first carries `pHmacSecret`. The crate knows
 /// up to 6.
 const CREDENTIAL_ATTESTATION_VERSION_7: u32 = 7;
@@ -185,12 +187,32 @@ fn hello_enrolled() -> bool {
         .unwrap_or(false)
 }
 
-/// Whether this machine can enrol Windows Hello for a silo, which takes both
-/// facts: Hello set up, and a TPM to derive from. Either one alone gets
-/// somebody to the end of a ceremony that then fails.
+/// Whether this machine can enrol Windows Hello for a silo, which takes
+/// three facts: a TPM 2.0 to derive from, a Windows whose Hello gives a PRF
+/// secret, and Hello set up. Any one missing gets somebody to the end of a
+/// ceremony that then fails.
 pub(crate) fn platform_authenticator_available() -> bool {
-    hello_enrolled() && tpm_present()
+    platform_status() == crate::PlatformStatus::Ready
 }
+
+/// [`platform_authenticator_available`], with the reason. The TPM first:
+/// without one, neither an update nor setting up Hello would help.
+pub(crate) fn platform_status() -> crate::PlatformStatus {
+    use crate::PlatformStatus;
+    if tpm_version() != Some(TPM_VERSION_20) {
+        PlatformStatus::NoTpm
+    } else if webauthn_api_version() < API_VERSION_8 {
+        PlatformStatus::UpdateWindows
+    } else if !hello_enrolled() {
+        PlatformStatus::NotSetUp
+    } else {
+        PlatformStatus::Ready
+    }
+}
+
+/// `TPM_DEVICE_INFO::tpmVersion` of a TPM 2.0; 1 is a TPM 1.2, which Hello
+/// cannot derive a PRF secret from either.
+const TPM_VERSION_20: u8 = 2;
 
 /// Whether this machine has a TPM at all.
 ///
@@ -205,6 +227,11 @@ pub(crate) fn platform_authenticator_available() -> bool {
 /// reports the same as one that is absent, which is correct here: neither can
 /// derive anything.
 pub(crate) fn tpm_present() -> bool {
+    tpm_version().is_some()
+}
+
+/// The TPM's major version, or `None` without one.
+fn tpm_version() -> Option<u8> {
     let mut info = TPM_DEVICE_INFO::default();
     let rc = unsafe {
         Tbsi_GetDeviceInfo(
@@ -212,7 +239,7 @@ pub(crate) fn tpm_present() -> bool {
             &mut info as *mut _ as *mut core::ffi::c_void,
         )
     };
-    rc == 0
+    (rc == 0).then(|| u8::try_from(info.tpmVersion).unwrap_or(0))
 }
 
 pub fn complete_enrollment(challenge: &EnrollmentChallenge) -> Result<Enrollment, FidoError> {
@@ -469,6 +496,8 @@ pub fn complete_enrollment(challenge: &EnrollmentChallenge) -> Result<Enrollment
         read_make_cred_hmac_secret(att).map(|hmac| UnlockMaterial {
             wrap_key: blake3_key(&hmac[..]),
             credential_id: credential_id.clone(),
+            verified: true,
+            unverified_wrap_key: None,
         })
     } else {
         None
@@ -508,16 +537,31 @@ pub fn derive_unlock_material(
     };
     let hmac = read_assertion_hmac_secret(att).ok_or_else(|| {
         FidoError::UnlockFailed(
-            crate::coded!(
-                "err.key_no_hmac",
-                "Security key did not return hmac-secret. Re-enroll your key."
-            )
+            // Windows hands a security key's hmac-secret back only from API
+            // version 4. Before that no key can work here, and re-enrolling
+            // would only fail the same way.
+            if webauthn_api_version() < API_VERSION_4 {
+                crate::coded!(
+                    "err.windows_update_for_keys",
+                    "This version of Windows cannot take the secret a security key gives, which is what opens a silo. Install the latest Windows updates, then try again."
+                )
+            } else {
+                crate::coded!(
+                    "err.key_no_hmac",
+                    "Security key did not return hmac-secret. Re-enroll your key."
+                )
+            }
             .into(),
         )
     })?;
+    // Flags follow the 32-byte rpIdHash; bit 2 is UV.
+    let auth_data = copy_bytes(att.pbAuthenticatorData, att.cbAuthenticatorData);
+    let verified = auth_data.get(32).is_some_and(|flags| flags & 0x04 != 0);
     Ok(UnlockMaterial {
         wrap_key: blake3_key(&hmac[..]),
         credential_id: used_cred,
+        verified,
+        unverified_wrap_key: None,
     })
 }
 
@@ -736,14 +780,45 @@ fn map_webauthn_err_impl(err: windows::core::Error, enroll: bool) -> FidoError {
     let code = err.code().0 as u32;
     let name = webauthn_error_name(&err);
     let lower = name.to_lowercase();
-    let tip = if code == 0x80070057 || lower.contains("invalid") || lower.contains("unknown") {
+    let tip = if code == 0x80070057
+        || code == 0x8009_0027
+        || lower.contains("invalid")
+        || lower.contains("unknown")
+    {
         " Insert the security key before continuing, close other FIDO apps (e.g. Yubico Authenticator), \
          then try again. Choose Security key (not iPhone/tablet)."
     } else {
         ""
     };
     let text = format!("{name}{tip}");
-    if lower.contains("cancel") || code == 0x800704C7 {
+    let fail = |t: String| {
+        if enroll {
+            FidoError::EnrollmentFailed(t)
+        } else {
+            FidoError::UnlockFailed(t)
+        }
+    };
+    // WebAuthn reports most of these as "NotAllowedError"; the HRESULT says
+    // which one it was.
+    match code {
+        // NTE_NOT_FOUND: no credential of this silo on what was offered,
+        // such as a Hello key gone with a reset TPM, or one held by the
+        // computer at the other end of a remote desktop.
+        0x8009_0011 if !enroll => {
+            return fail(
+                crate::coded!(
+                    "err.key_not_of_silo_here",
+                    "Neither the security key nor Windows Hello on this computer holds a key for this silo. Use another of its keys or your recovery code."
+                )
+                .into(),
+            );
+        }
+        // NTE_DEVICE_NOT_FOUND
+        0x8009_0035 => return FidoError::NoDevice,
+        _ => {}
+    }
+    // NTE_USER_CANCELLED alongside ERROR_CANCELLED.
+    if lower.contains("cancel") || code == 0x800704C7 || code == 0x8009_0036 {
         let t = "Security key operation cancelled".to_string();
         return if enroll {
             FidoError::EnrollmentFailed(t)

@@ -465,6 +465,8 @@ pub fn derive_unlock_material(
     Ok(UnlockMaterial {
         wrap_key: **key,
         credential_id: found.credential_id,
+        verified: false,
+        unverified_wrap_key: None,
     })
 }
 

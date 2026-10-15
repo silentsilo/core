@@ -12,7 +12,7 @@ silentsilo-s3 = { workspace = true }
 # All three are already in the tree via Tauri and its updater plugin, so the
 # WebDAV backend costs no new compilation. `stream` lets a PUT read from a
 # file instead of a buffer.
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "system-proxy"] }
 quick-xml = "0.41"
 percent-encoding = "2"
 url = "2"

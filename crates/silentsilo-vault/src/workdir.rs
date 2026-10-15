@@ -409,6 +409,8 @@ pub fn detect_sync_provider(path: &Path) -> Option<&'static str> {
         ("googledrive", "Google Drive"),
         ("g:\\my drive", "Google Drive"),
         ("icloud", "iCloud Drive"),
+        // Where a Mac keeps iCloud Drive: ~/Library/Mobile Documents.
+        ("mobile documents", "iCloud Drive"),
         ("nextcloud", "Nextcloud"),
         ("mega\\", "MEGA"),
         ("pcloud", "pCloud"),
@@ -432,6 +434,12 @@ mod tests {
     fn the_scratch_folder_is_kept_out_of_backups() {
         let dir = tempfile::tempdir().unwrap();
         assert!(exclude_from_backup(dir.path()));
+    }
+
+    #[test]
+    fn icloud_drive_is_seen_by_its_folder_on_a_mac() {
+        let path = Path::new("/Users/alex/Library/Mobile Documents/com~apple~CloudDocs/Silos");
+        assert_eq!(detect_sync_provider(path), Some("iCloud Drive"));
     }
 
     #[test]

@@ -23,6 +23,37 @@ pub fn read_code() -> Result<Zeroizing<String>, String> {
     code
 }
 
+/// Whether this process has a console window of its own: on Windows, one
+/// started by a double-click in Explorer, whose window closes the moment the
+/// process ends. Elsewhere a terminal outlives the tool.
+pub fn console_closes_on_exit() -> bool {
+    #[cfg(windows)]
+    {
+        let mut ids = [0u32; 2];
+        // SAFETY: the buffer is ours and its length is passed with it.
+        let attached = unsafe { windows::Win32::System::Console::GetConsoleProcessList(&mut ids) };
+        attached == 1
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Holds a window that would close on exit until Enter is pressed, so what
+/// was printed can be read.
+pub fn wait_before_closing() {
+    if console_closes_on_exit() {
+        eprint!(
+            "
+Press Enter to close this window."
+        );
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        let _ = std::io::stdin().lock().read_line(&mut line);
+    }
+}
+
 fn first_line(input: &mut impl BufRead) -> Result<Zeroizing<String>, String> {
     let mut line = Zeroizing::new(String::new());
     input

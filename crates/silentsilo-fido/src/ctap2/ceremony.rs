@@ -1,9 +1,11 @@
 //! A security key's ceremonies with its PIN, over any link: make a
 //! credential and derive the wrap key, or derive it to unlock. A key with a
 //! PIN is always asked for it, as Windows does, since `hmac-secret` gives
-//! another secret without it. Used by the desktop's USB backend on Linux
-//! and macOS; kept here, apart from the transport, so it is tested
-//! everywhere.
+//! another secret without it. A key without one is not enrolled: the day it
+//! gets a PIN, every platform starts verifying and derives the other secret,
+//! and the silo would no longer open with it. Used by the desktop's USB
+//! backend on Linux and macOS; kept here, apart from the transport, so it is
+//! tested everywhere.
 
 #![cfg_attr(
     any(windows, not(feature = "hardware"), feature = "test-authenticator"),
@@ -24,6 +26,10 @@ pub(crate) fn enrol_on(
     challenge: &EnrollmentChallenge,
 ) -> Result<Enrollment, FidoError> {
     let vault_id = challenge.user_id.as_str();
+    let info = super::get_info(dev).map_err(|e| failure(e, FidoError::EnrollmentFailed))?;
+    if !info.pin_set {
+        return Err(failure(CtapError::PinNotSet, FidoError::EnrollmentFailed));
+    }
     let (made, pin) = with_pin(dev, FidoError::EnrollmentFailed, |dev, pin| {
         super::make_credential(dev, vault_id, pin)
     })?;
@@ -43,7 +49,7 @@ pub(crate) fn enrol_on(
             rp_id: challenge.rp_id.clone(),
             authenticator: challenge.authenticator,
         },
-        unlock: Some(raw_material(found)?),
+        unlock: Some(raw_material(found, None)?),
     })
 }
 
@@ -55,20 +61,48 @@ pub(crate) fn unlock_on(
     let (found, _) = with_pin(dev, FidoError::UnlockFailed, |dev, pin| {
         super::unlock_candidates(dev, credential_ids, vault_id, pin, true)
     })?;
-    raw_material(found)
+    // A silo enrolled before the key had a PIN is wrapped under the
+    // unverified secret. Asked for without a second touch, which the key
+    // does not need for it; a key that refuses (one that always verifies)
+    // simply has none to give.
+    let unverified = if found.verified {
+        super::unlock_candidates(
+            dev,
+            std::slice::from_ref(&found.credential_id),
+            vault_id,
+            None,
+            false,
+        )
+        .ok()
+        .and_then(|c| raw_key(&c))
+    } else {
+        None
+    };
+    raw_material(found, unverified)
+}
+
+/// The raw-salt wrap key of an assertion.
+fn raw_key(found: &super::UnlockCandidates) -> Option<[u8; 32]> {
+    found
+        .wrap_keys
+        .iter()
+        .find(|(shape, _)| *shape == SaltShape::Raw)
+        .map(|(_, key)| **key)
 }
 
 /// The wrap key every platform derives: the raw salt, verified exactly when
 /// the key has a PIN.
-fn raw_material(found: super::UnlockCandidates) -> Result<UnlockMaterial, FidoError> {
-    let (_, key) = found
-        .wrap_keys
-        .iter()
-        .find(|(shape, _)| *shape == SaltShape::Raw)
+fn raw_material(
+    found: super::UnlockCandidates,
+    unverified_wrap_key: Option<[u8; 32]>,
+) -> Result<UnlockMaterial, FidoError> {
+    let wrap_key = raw_key(&found)
         .ok_or_else(|| FidoError::UnlockFailed("the key gave no hmac-secret output".into()))?;
     Ok(UnlockMaterial {
-        wrap_key: **key,
+        wrap_key,
         credential_id: found.credential_id,
+        verified: found.verified,
+        unverified_wrap_key,
     })
 }
 
@@ -125,18 +159,25 @@ fn failure(error: CtapError, fail: fn(String) -> FidoError) -> FidoError {
             "Too many wrong PINs in a row. Unplug the key, plug it in again and try again."
         )
         .into(),
-        CtapError::PinBlocked => "This key's PIN is blocked. Only resetting the key clears it, \
-                                  and a reset erases everything on it."
-            .into(),
+        CtapError::PinBlocked => crate::coded!(
+            "err.pin_blocked",
+            "This key's PIN is blocked. Only resetting the key clears it, and a reset erases everything on it."
+        )
+        .into(),
         CtapError::PinNotSet => crate::coded!(
             "err.key_needs_pin",
-            "This key needs a PIN set before it can be used. Set one with its maker's tool."
+            "This key needs a PIN before it can open a silo. Set one with its maker's app or in Chrome's security key settings, then add it again."
         )
         .into(),
         CtapError::Timeout => {
             crate::coded!("err.key_no_touch", "No touch was received in time.").into()
         }
-        CtapError::Unsupported(why) => format!("This key cannot open a silo: {why}."),
+        // Whatever is missing, the answer is the same: what kind of key works.
+        CtapError::Unsupported(_) => crate::coded!(
+            "err.key_unsupported",
+            "This key cannot open a silo. It needs FIDO2 with the hmac-secret extension, as on a YubiKey 5, a Nitrokey 3 or a SoloKey."
+        )
+        .into(),
         other => other.to_string(),
     };
     fail(said)
@@ -180,20 +221,47 @@ mod tests {
     }
 
     #[test]
-    fn a_key_without_a_pin_enrols_and_unlocks_without_asking() {
+    fn a_key_without_a_pin_is_not_enrolled() {
         let _turn = PROMPT.lock().unwrap_or_else(|e| e.into_inner());
         let asked = answer_with(&[]);
         let mut key = SoftKey::new(&[2]);
-        let enrolled = enrol_on(&mut key, &challenge()).unwrap();
-        let first = enrolled.unlock.as_ref().unwrap().wrap_key;
-        let again = unlock_on(
-            &mut key,
-            std::slice::from_ref(&enrolled.credential.credential_id),
-            VAULT,
-        )
-        .unwrap();
-        assert_eq!(again.wrap_key, first);
+        let Err(FidoError::EnrollmentFailed(why)) = enrol_on(&mut key, &challenge()) else {
+            panic!("a key without a PIN was enrolled");
+        };
+        assert!(why.contains("err.key_needs_pin"), "{why}");
         assert!(asked.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_key_enrolled_without_a_pin_unlocks_without_asking() {
+        let _turn = PROMPT.lock().unwrap_or_else(|e| e.into_inner());
+        let asked = answer_with(&[]);
+        let mut key = SoftKey::new(&[2]);
+        // Enrolled by an earlier release, which took keys without a PIN.
+        let made = super::super::make_credential(&mut key, VAULT, None).unwrap();
+        let opened = unlock_on(&mut key, std::slice::from_ref(&made.credential_id), VAULT).unwrap();
+        assert_eq!(opened.wrap_key, key.expected_wrap_key(&made.credential_id));
+        assert!(!opened.verified);
+        assert!(opened.unverified_wrap_key.is_none());
+        assert!(asked.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_pin_set_after_enrolment_still_reaches_the_old_secret() {
+        let _turn = PROMPT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut key = SoftKey::new(&[2]);
+        let made = super::super::make_credential(&mut key, VAULT, None).unwrap();
+        let enrolled_under = key.expected_wrap_key(&made.credential_id);
+
+        key.pin = Some("1234".into());
+        answer_with(&["1234"]);
+        let opened = unlock_on(&mut key, std::slice::from_ref(&made.credential_id), VAULT).unwrap();
+        assert!(opened.verified);
+        assert_ne!(
+            opened.wrap_key, enrolled_under,
+            "the PIN reaches the other secret"
+        );
+        assert_eq!(opened.unverified_wrap_key, Some(enrolled_under));
     }
 
     #[test]
@@ -213,6 +281,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(again.wrap_key, first, "the verified secret both times");
+        assert!(again.verified);
         let asked = asked.lock().unwrap();
         assert!(matches!(asked[0], PinAsk::Enter { .. }));
         assert!(matches!(asked[1], PinAsk::Wrong { .. }));

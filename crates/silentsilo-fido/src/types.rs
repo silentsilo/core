@@ -8,6 +8,27 @@ pub struct FidoStatus {
     pub fido_accessible: bool,
 }
 
+/// Whether this machine's built-in authenticator can hold a silo's key now,
+/// and if not, why: each answer is something different for the person to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformStatus {
+    Ready,
+    /// None this build can use: Linux, or a Mac without a Touch ID sensor.
+    Absent,
+    /// There, but not set up: no Windows Hello, no fingerprint in Touch ID,
+    /// or no login password.
+    NotSetUp,
+    /// Windows: no TPM 2.0, which Hello derives the silo key from.
+    NoTpm,
+    /// Windows: a build before Hello gave a PRF secret (Windows 11 25H2,
+    /// February 2026).
+    UpdateWindows,
+    /// Touch ID locked after failed attempts, until the login password is
+    /// typed; or out of reach for now (lid closed, keyboard unplugged).
+    Unavailable,
+}
+
 /// Which kind of authenticator an enrollment targets.
 ///
 /// Neither is cryptographically weaker than the other, but they no longer
@@ -79,6 +100,15 @@ pub struct UnlockMaterial {
     /// Credential that produced the wrap key (hex-capable bytes).
     #[zeroize(skip)]
     pub credential_id: Vec<u8>,
+    /// The authenticator verified the person (PIN, fingerprint, Hello), so
+    /// `wrap_key` comes from `hmac-secret`'s verified secret.
+    #[zeroize(skip)]
+    pub verified: bool,
+    /// The same credential's unverified secret, when `wrap_key` is the
+    /// verified one and the key would give it. A silo enrolled before the
+    /// key had a PIN is wrapped under this one. Only a CTAP2 ceremony can
+    /// ask for it; Windows verifies every ceremony on a key with a PIN.
+    pub unverified_wrap_key: Option<[u8; 32]>,
 }
 
 #[cfg(test)]

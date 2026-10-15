@@ -67,12 +67,15 @@ fn keyring_roundtrips(silo_id: Uuid, json: &str) -> bool {
     if crate::keychain::set_password(crate::keychain::service(), &keyring_user(silo_id), json)
         .is_err()
     {
+        crate::keychain::note(false);
         return false;
     }
-    matches!(
+    let kept = matches!(
         crate::keychain::get_password(&keyring_user(silo_id)).map(Zeroizing::new),
         Ok(stored) if *stored == json
-    )
+    );
+    crate::keychain::note(kept);
+    kept
 }
 
 fn encoded(creds: &LocalVaultAuth) -> Result<Zeroizing<String>, VaultError> {

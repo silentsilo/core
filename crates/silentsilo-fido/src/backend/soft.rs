@@ -25,8 +25,8 @@ pub(crate) fn fido_interface_accessible() -> bool {
     true
 }
 
-pub(crate) fn platform_authenticator_available() -> bool {
-    true
+pub(crate) fn platform_status() -> crate::PlatformStatus {
+    crate::PlatformStatus::Ready
 }
 
 pub fn begin_enrollment(
@@ -64,6 +64,8 @@ pub fn complete_enrollment(challenge: &EnrollmentChallenge) -> Result<Enrollment
         unlock: Some(UnlockMaterial {
             wrap_key: wrap_key(&id, &challenge.user_id),
             credential_id: id.clone(),
+            verified: true,
+            unverified_wrap_key: None,
         }),
         credential: CredentialInfo {
             credential_id: id,
@@ -87,6 +89,8 @@ pub fn derive_unlock_material(
     Ok(UnlockMaterial {
         wrap_key: wrap_key(id, vault_id),
         credential_id: id.clone(),
+        verified: true,
+        unverified_wrap_key: None,
     })
 }
 
