@@ -11,6 +11,8 @@ release notes should say.
 
 ## [Unreleased]
 
+## [1.10.1-beta.2] - Review fixes
+
 ### Fixed
 
 - WebDAV on this computer or the local network is reached directly, not
