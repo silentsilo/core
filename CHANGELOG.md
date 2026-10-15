@@ -11,6 +11,8 @@ release notes should say.
 
 ## [Unreleased]
 
+## [1.10.1-beta.3] - The other secret on demand
+
 ### Fixed
 
 - The unverified secret is asked for only when the verified one opens
