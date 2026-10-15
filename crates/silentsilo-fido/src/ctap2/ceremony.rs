@@ -288,6 +288,31 @@ mod tests {
     }
 
     #[test]
+    fn a_key_that_will_not_give_the_other_secret_still_unlocks() {
+        let _turn = PROMPT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut key = SoftKey::new(&[2]);
+        key.pin = Some("1234".into());
+        key.always_uv = true;
+        answer_with(&["1234"]);
+        let enrolled = enrol_on(&mut key, &challenge()).unwrap();
+        let first = enrolled.unlock.as_ref().unwrap().wrap_key;
+
+        answer_with(&["1234"]);
+        let opened = unlock_on(
+            &mut key,
+            std::slice::from_ref(&enrolled.credential.credential_id),
+            VAULT,
+        )
+        .unwrap();
+        assert_eq!(opened.wrap_key, first);
+        assert!(opened.verified);
+        assert!(
+            opened.unverified_wrap_key.is_none(),
+            "the refusal is swallowed"
+        );
+    }
+
+    #[test]
     fn a_cancelled_pin_is_a_cancel() {
         let _turn = PROMPT.lock().unwrap_or_else(|e| e.into_inner());
         let mut key = SoftKey::new(&[2]);

@@ -11,6 +11,19 @@ release notes should say.
 
 ## [Unreleased]
 
+### Fixed
+
+- WebDAV on this computer or the local network is reached directly, not
+  through the system proxy, whose exceptions are only partly read.
+- NTE_USER_CANCELLED is no longer read as the person cancelling, so the
+  second ceremony of an enrolment is still retried as before.
+- Touch ID with its keyboard unplugged or not paired is "unavailable", not
+  "absent".
+- The extractor waits for Enter only when a person started it with a
+  double-click; piped input never waits.
+- `keyring_keeps_secrets` is documented as what it is: the last device
+  secret written.
+
 ## [1.10.1-beta.1] - Keys, platforms and proxies
 
 ### Fixed

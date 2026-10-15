@@ -80,8 +80,9 @@ pub fn status() -> crate::PlatformStatus {
         Err(error) => match error.code() {
             // passcodeNotSet, biometryNotEnrolled
             -5 | -7 => PlatformStatus::NotSetUp,
-            // biometryLockout
-            -8 => PlatformStatus::Unavailable,
+            // biometryLockout; biometryNotPaired and biometryDisconnected,
+            // a Touch ID keyboard not paired or unplugged.
+            -8 | -12 | -13 => PlatformStatus::Unavailable,
             // biometryNotAvailable: no sensor, or one out of reach for now.
             // Told apart by whether this Mac has ever had biometry at all.
             -6 if has_sensor() => PlatformStatus::Unavailable,

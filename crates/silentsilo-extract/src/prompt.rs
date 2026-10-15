@@ -41,9 +41,10 @@ pub fn console_closes_on_exit() -> bool {
 }
 
 /// Holds a window that would close on exit until Enter is pressed, so what
-/// was printed can be read.
+/// was printed can be read. Only at a keyboard: piped or redirected input
+/// means another program started it, and it must not wait.
 pub fn wait_before_closing() {
-    if console_closes_on_exit() {
+    if console_closes_on_exit() && std::io::stdin().is_terminal() {
         eprint!(
             "
 Press Enter to close this window."

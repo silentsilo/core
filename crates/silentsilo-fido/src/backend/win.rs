@@ -3,7 +3,9 @@
 //! MakeCredential mirrors Chromium's `win/webauthn_api.cc`:
 //! - cross-platform attachment
 //! - hmac-secret BOOL extension **and** `bEnablePrf`
-//! - non-resident key, UV discouraged (touch, no PIN required)
+//! - non-resident key, UV discouraged: a key without a PIN is only touched,
+//!   and Windows still asks a key that has one for it, so every assertion
+//!   on such a key is verified (the enrolment refuses a key without one)
 //! - empty exclude-credential list pointer (non-null)
 //! - API v8+ credential hint `"security-key"` to prefer USB keys over phone/hybrid
 
@@ -668,8 +670,9 @@ fn get_assertion_with_hmac(
         // vault's credentials. Pinned during enrolment, or Windows offers
         // the whole menu again and step two lands on a QR code. Verification
         // stays discouraged either way: a platform authenticator performs it
-        // regardless, and asking explicitly drags removable keys into the
-        // PIN flow.
+        // regardless, and Windows asks a removable key for its PIN whenever
+        // it has one. Required would refuse the keys enrolled without a PIN
+        // by earlier releases.
         dwAuthenticatorAttachment: match on {
             Some(Authenticator::ThisDevice) => WEBAUTHN_AUTHENTICATOR_ATTACHMENT_PLATFORM,
             Some(Authenticator::SecurityKey) => WEBAUTHN_AUTHENTICATOR_ATTACHMENT_CROSS_PLATFORM,
@@ -817,8 +820,10 @@ fn map_webauthn_err_impl(err: windows::core::Error, enroll: bool) -> FidoError {
         0x8009_0035 => return FidoError::NoDevice,
         _ => {}
     }
-    // NTE_USER_CANCELLED alongside ERROR_CANCELLED.
-    if lower.contains("cancel") || code == 0x800704C7 || code == 0x8009_0036 {
+    // NTE_USER_CANCELLED (0x80090036) is left out: it is not known whether
+    // the second ceremony of an enrolment, started while the first dialog
+    // closes, fails with it, and that failure is retried.
+    if lower.contains("cancel") || code == 0x800704C7 {
         let t = "Security key operation cancelled".to_string();
         return if enroll {
             FidoError::EnrollmentFailed(t)

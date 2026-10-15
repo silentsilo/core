@@ -206,11 +206,19 @@ impl WebDavStore {
             ));
         }
 
+        // A server on this computer or the local network is reached directly.
+        // The system proxy's exceptions are read only in part (Windows'
+        // `<local>` and `192.168.*` are not), and a NAS behind a company
+        // proxy is not reachable through it.
+        let mut builder = Client::builder();
+        if is_local_network(&parsed) {
+            builder = builder.no_proxy();
+        }
         Ok(Self {
             // A server that stops answering must not hold a sync pass forever.
             // Per read, not per request, so a large upload is not cut off.
             // The same platform verifier as S3, and on Android its readiness check.
-            client: Client::builder()
+            client: builder
                 .tls_backend_preconfigured(
                     silentsilo_s3::tls::client_config().map_err(StoreError::Other)?,
                 )

@@ -19,7 +19,7 @@ pub(crate) struct SoftKey {
     agreement: Option<SecretKey>,
     token: [u8; 32],
     /// Verification demanded whether or not a PIN is set.
-    always_uv: bool,
+    pub(crate) always_uv: bool,
 }
 
 impl SoftKey {
@@ -225,6 +225,11 @@ impl SoftKey {
                     }
                     None => false,
                 };
+                // A key set to always verify (CTAP 2.1 `alwaysUv`) gives
+                // nothing without the PIN once it has one.
+                if self.always_uv && self.pin.is_some() && !verified {
+                    return Err(0x36);
+                }
                 let found = allow.iter().find_map(|c| {
                     let id = entry(c, &text("id")).and_then(Value::as_bytes)?;
                     self.credentials

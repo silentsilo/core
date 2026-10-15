@@ -205,7 +205,9 @@ its own dialog; Linux and macOS speak CTAP2 over USB HID through
 `silentsilo_fido::ctap2` (`ceremony.rs`, the code Android uses over NFC and
 USB) and ask through the prompt the client registers with
 `set_pin_prompt`. A silo made by a Linux build before core 1.9.0 on a key
-with a PIN holds the unverified secret, and has to enrol that key again.
+with a PIN holds the unverified secret: over CTAP2 it opens through the
+second secret described below, and on Windows the key has to be enrolled
+again.
 
 The same split is why a key without a PIN is not enrolled (core 1.10.1):
 the day it gets one, every platform verifies and derives the other secret,

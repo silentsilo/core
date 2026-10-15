@@ -38,8 +38,11 @@ pub(crate) fn note(kept: bool) {
     );
 }
 
-/// Whether the OS keyring kept the last secret written to it in this run,
-/// or `None` before the first write. On Linux this is what tells a desktop
+/// Whether the OS keyring kept the last device secret written to it in this
+/// run (`save_credentials`, the write every new silo makes), or `None`
+/// before the first. Storage settings and cloud tokens are not counted:
+/// Credential Manager refuses a large one by size, which says nothing about
+/// the keyring. On Linux this is what tells a desktop
 /// with a working Secret Service from one without (a bare window manager,
 /// KWallet without its Secret Service API), where secrets need a file and
 /// the user's consent to one.
