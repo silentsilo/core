@@ -11,6 +11,8 @@ release notes should say.
 
 ## [Unreleased]
 
+## [1.10.1-beta.1] - Keys, platforms and proxies
+
 ### Fixed
 
 - A security key without a PIN is no longer enrolled. `hmac-secret` gives
