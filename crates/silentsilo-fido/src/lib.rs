@@ -29,7 +29,7 @@ pub mod enclave;
 #[cfg(all(feature = "enclave", target_os = "ios"))]
 pub mod device_enclave {
     pub use crate::backend::enclave_mac::{
-        available, derive_unlock_material, enrol, holds_any, remove,
+        available, derive_unlock_material, enrol, holds_any, remove, status,
     };
 }
 #[cfg(feature = "passkey")]
@@ -195,13 +195,31 @@ pub fn derive_unlock_material(
     vault_id: &str,
     on: Option<Authenticator>,
 ) -> Result<UnlockMaterial, FidoError> {
+    derive_unlock_material_opening(credential_ids, vault_id, on, None)
+}
+
+/// Says whether a secret opens the envelope of the credential it came from:
+/// the silo's own check, which the ceremony cannot make itself.
+pub type Opens<'a> = &'a (dyn Fn(&[u8], &[u8; 32]) -> bool + Sync);
+
+/// [`derive_unlock_material`], told how to check a secret against the silo's
+/// envelopes. When the verified secret opens nothing, a CTAP2 ceremony (Linux,
+/// macOS) asks the key, in the same touch, for the secret it gives without
+/// its PIN, which a silo enrolled before the key had a PIN is wrapped under
+/// (`UnlockMaterial::unverified_wrap_key`). Without `opens` it never asks.
+pub fn derive_unlock_material_opening(
+    credential_ids: &[Vec<u8>],
+    vault_id: &str,
+    on: Option<Authenticator>,
+    opens: Option<Opens>,
+) -> Result<UnlockMaterial, FidoError> {
     #[cfg(feature = "hardware")]
     {
-        backend::derive_unlock_material(credential_ids, vault_id, on)
+        backend::derive_unlock_material(credential_ids, vault_id, on, opens)
     }
     #[cfg(not(feature = "hardware"))]
     {
-        let _ = (credential_ids, vault_id, on);
+        let _ = (credential_ids, vault_id, on, opens);
         Err(FidoError::NotAvailable)
     }
 }

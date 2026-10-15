@@ -57,15 +57,19 @@ pub(crate) fn unlock_on(
     dev: &mut dyn Ctap,
     credential_ids: &[Vec<u8>],
     vault_id: &str,
+    opens: Option<crate::Opens>,
 ) -> Result<UnlockMaterial, FidoError> {
     let (found, _) = with_pin(dev, FidoError::UnlockFailed, |dev, pin| {
         super::unlock_candidates(dev, credential_ids, vault_id, pin, true)
     })?;
     // A silo enrolled before the key had a PIN is wrapped under the
-    // unverified secret. Asked for without a second touch, which the key
-    // does not need for it; a key that refuses (one that always verifies)
-    // simply has none to give.
-    let unverified = if found.verified {
+    // unverified secret. Asked for only when the verified one opens nothing,
+    // so every other unlock is the single assertion it always was, and
+    // without a second touch, which the key does not need for it; a key that
+    // refuses (one that always verifies) simply has none to give.
+    let verified_opens =
+        |opens: crate::Opens| raw_key(&found).is_some_and(|key| opens(&found.credential_id, &key));
+    let unverified = if found.verified && opens.is_some_and(|opens| !verified_opens(opens)) {
         super::unlock_candidates(
             dev,
             std::slice::from_ref(&found.credential_id),
@@ -240,7 +244,13 @@ mod tests {
         let mut key = SoftKey::new(&[2]);
         // Enrolled by an earlier release, which took keys without a PIN.
         let made = super::super::make_credential(&mut key, VAULT, None).unwrap();
-        let opened = unlock_on(&mut key, std::slice::from_ref(&made.credential_id), VAULT).unwrap();
+        let opened = unlock_on(
+            &mut key,
+            std::slice::from_ref(&made.credential_id),
+            VAULT,
+            None,
+        )
+        .unwrap();
         assert_eq!(opened.wrap_key, key.expected_wrap_key(&made.credential_id));
         assert!(!opened.verified);
         assert!(opened.unverified_wrap_key.is_none());
@@ -256,13 +266,61 @@ mod tests {
 
         key.pin = Some("1234".into());
         answer_with(&["1234"]);
-        let opened = unlock_on(&mut key, std::slice::from_ref(&made.credential_id), VAULT).unwrap();
+        // The silo's envelope opens only under the secret enrolled.
+        let opens = move |_: &[u8], secret: &[u8; 32]| *secret == enrolled_under;
+        let opened = unlock_on(
+            &mut key,
+            std::slice::from_ref(&made.credential_id),
+            VAULT,
+            Some(&opens),
+        )
+        .unwrap();
         assert!(opened.verified);
         assert_ne!(
             opened.wrap_key, enrolled_under,
             "the PIN reaches the other secret"
         );
         assert_eq!(opened.unverified_wrap_key, Some(enrolled_under));
+    }
+
+    #[test]
+    fn a_key_whose_verified_secret_opens_is_asked_once() {
+        let _turn = PROMPT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut key = SoftKey::new(&[2]);
+        key.pin = Some("1234".into());
+        answer_with(&["1234"]);
+        let enrolled = enrol_on(&mut key, &challenge()).unwrap();
+        let first = enrolled.unlock.as_ref().unwrap().wrap_key;
+
+        answer_with(&["1234"]);
+        key.assertions = 0;
+        let opens = move |_: &[u8], secret: &[u8; 32]| *secret == first;
+        let opened = unlock_on(
+            &mut key,
+            std::slice::from_ref(&enrolled.credential.credential_id),
+            VAULT,
+            Some(&opens),
+        )
+        .unwrap();
+        assert_eq!(opened.wrap_key, first);
+        assert!(opened.unverified_wrap_key.is_none());
+        assert_eq!(
+            key.assertions, 1,
+            "no second assertion when the first opens"
+        );
+
+        // Without a way to check, the other secret is never asked for.
+        answer_with(&["1234"]);
+        key.assertions = 0;
+        let opened = unlock_on(
+            &mut key,
+            std::slice::from_ref(&enrolled.credential.credential_id),
+            VAULT,
+            None,
+        )
+        .unwrap();
+        assert!(opened.unverified_wrap_key.is_none());
+        assert_eq!(key.assertions, 1);
     }
 
     #[test]
@@ -279,6 +337,7 @@ mod tests {
             &mut key,
             std::slice::from_ref(&enrolled.credential.credential_id),
             VAULT,
+            Some(&|_: &[u8], _: &[u8; 32]| false),
         )
         .unwrap();
         assert_eq!(again.wrap_key, first, "the verified secret both times");
@@ -303,6 +362,7 @@ mod tests {
             &mut key,
             std::slice::from_ref(&enrolled.credential.credential_id),
             VAULT,
+            Some(&|_: &[u8], _: &[u8; 32]| false),
         )
         .unwrap();
         assert_eq!(opened.wrap_key, first);
@@ -334,7 +394,8 @@ mod tests {
             panic!("a U2F-only key was enrolled");
         };
         assert!(why.contains("err.key_unsupported"), "{why}");
-        let Err(FidoError::UnlockFailed(why)) = unlock_on(&mut key, &[vec![1; 16]], VAULT) else {
+        let Err(FidoError::UnlockFailed(why)) = unlock_on(&mut key, &[vec![1; 16]], VAULT, None)
+        else {
             panic!("a U2F-only key unlocked");
         };
         assert!(why.contains("err.key_unsupported"), "{why}");

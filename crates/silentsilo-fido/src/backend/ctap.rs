@@ -161,10 +161,11 @@ pub fn derive_unlock_material(
     vault_id: &str,
     // USB has one kind of authenticator, so there is nothing to pin.
     _on: Option<Authenticator>,
+    opens: Option<crate::Opens>,
 ) -> Result<UnlockMaterial, FidoError> {
     if credential_ids.is_empty() {
         return Err(FidoError::UnlockFailed("No enrolled security keys".into()));
     }
     let mut key = open_key()?;
-    unlock_on(&mut key, credential_ids, vault_id)
+    unlock_on(&mut key, credential_ids, vault_id, opens)
 }

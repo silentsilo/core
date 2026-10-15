@@ -20,6 +20,8 @@ pub(crate) struct SoftKey {
     token: [u8; 32],
     /// Verification demanded whether or not a PIN is set.
     pub(crate) always_uv: bool,
+    /// Assertions answered, for tests that count them.
+    pub(crate) assertions: usize,
 }
 
 impl SoftKey {
@@ -32,6 +34,7 @@ impl SoftKey {
             agreement: None,
             token: random_bytes(),
             always_uv: false,
+            assertions: 0,
         }
     }
 
@@ -198,6 +201,7 @@ impl SoftKey {
                 ]))
             }
             CMD_GET_ASSERTION => {
+                self.assertions += 1;
                 assert_eq!(get(1).and_then(Value::as_text), Some(RP_ID));
                 let allow = get(3).and_then(Value::as_array).unwrap();
                 assert!(

@@ -11,6 +11,16 @@ release notes should say.
 
 ## [Unreleased]
 
+### Fixed
+
+- The unverified secret is asked for only when the verified one opens
+  nothing: `derive_unlock_material_opening` takes the client's check
+  against its envelopes, and `derive_unlock_material` never asks. Ordinary
+  unlocks are one assertion again.
+- `device_enclave::status` is exported for the iPhone app.
+- A Mac that holds the Touch ID key but reports no sensor (lid closed) says
+  Touch ID cannot answer for now, not that it has no key.
+
 ## [1.10.1-beta.2] - Review fixes
 
 ### Fixed

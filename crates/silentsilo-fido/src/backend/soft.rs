@@ -81,6 +81,8 @@ pub fn derive_unlock_material(
     credential_ids: &[Vec<u8>],
     vault_id: &str,
     _on: Option<Authenticator>,
+    // Only a CTAP2 ceremony can ask for the other secret.
+    _opens: Option<crate::Opens>,
 ) -> Result<UnlockMaterial, FidoError> {
     let id = credential_ids
         .iter()

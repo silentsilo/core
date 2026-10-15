@@ -94,6 +94,7 @@ pub fn derive_unlock_material(
     credential_ids: &[Vec<u8>],
     vault_id: &str,
     on: Option<Authenticator>,
+    opens: Option<crate::Opens>,
 ) -> Result<UnlockMaterial, FidoError> {
     let (enclave_ids, fido2_ids): (Vec<Vec<u8>>, Vec<Vec<u8>>) = credential_ids
         .iter()
@@ -105,7 +106,7 @@ pub fn derive_unlock_material(
     let touch_id_ready = !enclave_ids.is_empty() && enclave_mac::available();
 
     if on == Some(Authenticator::SecurityKey) {
-        return ctap::derive_unlock_material(&fido2_ids, vault_id, on);
+        return ctap::derive_unlock_material(&fido2_ids, vault_id, on, opens);
     }
 
     let enclave_err = if touch_id_ready
@@ -125,7 +126,7 @@ pub fn derive_unlock_material(
     if on == Some(Authenticator::ThisDevice) || fido2_ids.is_empty() {
         return Err(enclave_err.unwrap_or_else(|| touch_id_refusal(&enclave_ids)));
     }
-    ctap::derive_unlock_material(&fido2_ids, vault_id, on)
+    ctap::derive_unlock_material(&fido2_ids, vault_id, on, opens)
 }
 
 /// Why Touch ID could not open the silo, in words that say what to do.
@@ -143,6 +144,12 @@ fn touch_id_refusal(enclave_ids: &[Vec<u8>]) -> FidoError {
         PlatformStatus::Ready if !enclave_ids.is_empty() => crate::coded!(
             "err.touchid_key_gone",
             "This Mac has no working Touch ID key for this silo. A Touch ID key stops working when fingerprints are added or removed, and does not move to another Mac. Open the silo with a security key or your recovery code, then add Touch ID again."
+        ),
+        // No sensor reported, yet this Mac holds the key: a sensor it cannot
+        // reach for now (lid closed) that macOS did not name as one.
+        _ if enclave_mac::holds_any(enclave_ids) => crate::coded!(
+            "err.touchid_unavailable",
+            "Touch ID cannot answer right now. After too many failed tries, lock the Mac and sign in with your password. With the lid closed or the Touch ID keyboard unplugged, open the lid or plug the keyboard in."
         ),
         _ => crate::coded!(
             "err.touchid_absent",
