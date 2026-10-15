@@ -386,3 +386,22 @@ mod tests {
         }
     }
 }
+
+/// Literal values from 1.10: segments written years ago must still check.
+#[cfg(test)]
+mod known_answers {
+    use super::*;
+
+    #[test]
+    fn the_segment_key_and_its_tag_are_fixed() {
+        let key = SegmentKey::new(&[0x03; 32]);
+        assert_eq!(
+            hex::encode(*key.0),
+            "c93150d6c6d1050526d7ecb02b4952866fc0b1aab5a5da66c7b42fc5ce6507c3"
+        );
+        assert_eq!(
+            hex::encode(key.tag(b"segment body")),
+            "43578e4a247c3578564dcfe4777015213bb33cbf21485b1915a78d3d5dda7795"
+        );
+    }
+}

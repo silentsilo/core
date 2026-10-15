@@ -3117,3 +3117,20 @@ pub async fn push_everything_to_reporting(
 
     outcome
 }
+
+/// Literal values from 1.10: a proof another device wrote must be found
+/// under the same name, or the rotation reads as unproven.
+#[cfg(test)]
+mod known_answers {
+    use super::*;
+
+    #[test]
+    fn the_rotation_proof_name_is_fixed() {
+        let dek = MasterDek::from_bytes([0x05; 32]);
+        assert_eq!(dek_fingerprint(&dek), "84c0cd6e7542b224cf784d8989ad928b");
+        assert_eq!(
+            rotation_proof_key(&dek),
+            "keys/rotated/84c0cd6e7542b224cf784d8989ad928b.sealed"
+        );
+    }
+}

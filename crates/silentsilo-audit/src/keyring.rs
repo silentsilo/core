@@ -421,3 +421,22 @@ mod tests {
         assert!(AuditPolicy::open(&sealed, &[8; 32]).is_err());
     }
 }
+
+/// Literal values from 1.10: a change to a context string or to how these
+/// keys are derived would leave every log written so far unreadable.
+#[cfg(test)]
+mod known_answers {
+    use super::*;
+
+    #[test]
+    fn the_private_key_wrap_and_policy_key_are_fixed() {
+        assert_eq!(
+            hex::encode(wrapping(&[0x01; 32])),
+            "68d787af43966ac901908e2431e662af7ed4e519a3a1842b789f39eb3364d4b4"
+        );
+        assert_eq!(
+            hex::encode(*PolicyKey::new(&[0x02; 32]).0),
+            "7a54cda29936474824276d91dc6b3f210ed6e64374a4e14d8d4cda1718890262"
+        );
+    }
+}

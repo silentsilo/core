@@ -1313,3 +1313,17 @@ mod tests {
         assert_eq!(numbers, (0..100).collect::<Vec<_>>());
     }
 }
+
+/// Literal value from 1.10: a queue kept across an update must still check.
+#[cfg(test)]
+mod known_answers {
+    use super::*;
+
+    #[test]
+    fn the_queue_check_key_is_fixed() {
+        assert_eq!(
+            hex::encode(*QueueKeys::new(&[0x04; 32]).check),
+            "1177ff0208177b506fed21e1affba1ebeab455621977b6780e6c2e0cdbddb46c"
+        );
+    }
+}

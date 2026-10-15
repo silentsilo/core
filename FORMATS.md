@@ -254,6 +254,8 @@ published to `keys/….env`. There are three values:
   48-byte ciphertext and tag, all hex; `public_key` is empty. Not the enclave's
   key agreement, because Android binds a single use of a key to a biometric
   only for ciphers, signatures and MACs, and every StrongBox chip does AES.
+  `silentsilo-vault/src/android_keystore.rs` does the same operation with a
+  key in memory and pins the layout with a vector computed apart from it.
 
 Core 1.1.0 wrote the ephemeral point into `public_key` of a `secure-enclave`
 envelope. No release of any client carried that code, so no such envelope

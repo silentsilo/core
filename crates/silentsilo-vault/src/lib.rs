@@ -8,6 +8,7 @@
 /// has no business in a shipped binary.
 pub const FIXTURE_SUPPORT: bool = cfg!(feature = "fixture-support");
 
+pub mod android_keystore;
 pub mod cache_store;
 mod cloud_token;
 pub mod dek_store;
