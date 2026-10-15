@@ -524,6 +524,66 @@ impl Reports for SoftHid {
     }
 }
 
+/// A key behind 64-byte reports that hands out a channel and answers every
+/// command with CTAPHID error `code`. ERR_INVALID_CMD (0x01) is what a
+/// U2F-only key says to a CBOR command.
+pub(crate) struct RefusingHid {
+    code: u8,
+    out: VecDeque<[u8; REPORT_LEN]>,
+}
+
+impl RefusingHid {
+    pub(crate) fn new(code: u8) -> Self {
+        Self {
+            code,
+            out: VecDeque::new(),
+        }
+    }
+}
+
+impl Reports for RefusingHid {
+    fn write(&mut self, report: &[u8; REPORT_LEN]) -> Result<(), CtapError> {
+        let cid: [u8; 4] = report[..4].try_into().unwrap();
+        let mut reply = [0u8; REPORT_LEN];
+        match report[4] {
+            0x86 => {
+                reply[..4].copy_from_slice(&cid);
+                reply[4] = 0x86;
+                reply[6] = 17;
+                reply[7..15].copy_from_slice(&report[7..15]);
+                reply[15..19].copy_from_slice(&[0x55; 4]);
+            }
+            // A continuation: the answer went with the first report.
+            cmd if cmd & 0x80 == 0 => return Ok(()),
+            _ => {
+                reply[..4].copy_from_slice(&cid);
+                reply[4] = 0xBF;
+                reply[6] = 1;
+                reply[7] = self.code;
+            }
+        }
+        self.out.push_back(reply);
+        Ok(())
+    }
+
+    fn read(&mut self, _timeout_ms: u32) -> Result<Option<[u8; REPORT_LEN]>, CtapError> {
+        Ok(self.out.pop_front())
+    }
+}
+
+#[test]
+fn a_key_that_speaks_only_u2f_is_unsupported_rather_than_unreadable() {
+    let mut hid = Hid::new(RefusingHid::new(0x01));
+    assert!(matches!(get_info(&mut hid), Err(CtapError::Unsupported(_))));
+    // Any other CTAPHID error is still the key misbehaving.
+    let mut hid = Hid::new(RefusingHid::new(0x06));
+    match get_info(&mut hid) {
+        Err(CtapError::Protocol(why)) => assert!(why.contains("0x06"), "{why}"),
+        Err(other) => panic!("{other}"),
+        Ok(_) => panic!("an error was read as an answer"),
+    }
+}
+
 #[test]
 fn over_usb_messages_span_reports_and_keepalives_are_waited_out() {
     let mut hid = Hid::new(SoftHid {

@@ -14,6 +14,20 @@ mod ctap;
 #[cfg(all(feature = "hardware", not(feature = "test-authenticator"), windows))]
 mod win;
 
+// What the platform calls answer, read apart from them: built for the
+// backend that asks, and for the tests on every platform.
+#[cfg(any(
+    test,
+    all(feature = "hardware", not(feature = "test-authenticator"), windows)
+))]
+mod win_answers;
+
+#[cfg(any(
+    test,
+    all(feature = "enclave", any(target_os = "macos", target_os = "ios"))
+))]
+mod mac_answers;
+
 #[cfg(all(feature = "enclave", any(target_os = "macos", target_os = "ios")))]
 pub(crate) mod enclave_mac;
 

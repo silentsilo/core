@@ -459,6 +459,8 @@ mod tests {
             "the OS keyring did not hand back what was just written to it, \
              which is what the mock backend does"
         );
+        // What the app reads to decide whether secrets need a file.
+        assert_eq!(crate::keychain::keyring_keeps_secrets(), Some(true));
 
         if let Ok(entry) = keyring_entry(id) {
             let _ = entry.delete_credential();

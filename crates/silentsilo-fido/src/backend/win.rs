@@ -102,11 +102,12 @@ use crate::types::{
 };
 use crate::{FidoError, RP_ID, dek_salt_for_vault};
 
+use super::win_answers::{API_VERSION_8, Failure};
+
 const ES256_ALG: i32 = -7;
 const TIMEOUT_MS: u32 = 120_000;
 /// webauthn.h — not yet in windows crate 0.61.
 const MAKE_CRED_OPTIONS_VERSION_8: u32 = 8;
-const API_VERSION_8: u32 = 8;
 /// The first WebAuthn API that returns a security key's hmac-secret.
 const API_VERSION_4: u32 = 4;
 /// The attestation version that first carries `pHmacSecret`. The crate knows
@@ -200,21 +201,8 @@ pub(crate) fn platform_authenticator_available() -> bool {
 /// [`platform_authenticator_available`], with the reason. The TPM first:
 /// without one, neither an update nor setting up Hello would help.
 pub(crate) fn platform_status() -> crate::PlatformStatus {
-    use crate::PlatformStatus;
-    if tpm_version() != Some(TPM_VERSION_20) {
-        PlatformStatus::NoTpm
-    } else if webauthn_api_version() < API_VERSION_8 {
-        PlatformStatus::UpdateWindows
-    } else if !hello_enrolled() {
-        PlatformStatus::NotSetUp
-    } else {
-        PlatformStatus::Ready
-    }
+    super::win_answers::platform_status(tpm_version(), webauthn_api_version(), hello_enrolled())
 }
-
-/// `TPM_DEVICE_INFO::tpmVersion` of a TPM 2.0; 1 is a TPM 1.2, which Hello
-/// cannot derive a PRF secret from either.
-const TPM_VERSION_20: u8 = 2;
 
 /// Whether this machine has a TPM at all.
 ///
@@ -556,9 +544,8 @@ pub fn derive_unlock_material(
             .into(),
         )
     })?;
-    // Flags follow the 32-byte rpIdHash; bit 2 is UV.
     let auth_data = copy_bytes(att.pbAuthenticatorData, att.cbAuthenticatorData);
-    let verified = auth_data.get(32).is_some_and(|flags| flags & 0x04 != 0);
+    let verified = super::win_answers::user_verified(&auth_data);
     Ok(UnlockMaterial {
         wrap_key: blake3_key(&hmac[..]),
         credential_id: used_cred,
@@ -801,50 +788,18 @@ fn map_webauthn_err_impl(err: windows::core::Error, enroll: bool) -> FidoError {
             FidoError::UnlockFailed(t)
         }
     };
-    // WebAuthn reports most of these as "NotAllowedError"; the HRESULT says
-    // which one it was.
-    match code {
-        // NTE_NOT_FOUND: no credential of this silo on what was offered,
-        // such as a Hello key gone with a reset TPM, or one held by the
-        // computer at the other end of a remote desktop.
-        0x8009_0011 if !enroll => {
-            return fail(
-                crate::coded!(
-                    "err.key_not_of_silo_here",
-                    "Neither the security key nor Windows Hello on this computer holds a key for this silo. Use another of its keys or your recovery code."
-                )
-                .into(),
-            );
-        }
-        // NTE_DEVICE_NOT_FOUND
-        0x8009_0035 => return FidoError::NoDevice,
-        _ => {}
-    }
-    // NTE_USER_CANCELLED (0x80090036) is left out: it is not known whether
-    // the second ceremony of an enrolment, started while the first dialog
-    // closes, fails with it, and that failure is retried.
-    if lower.contains("cancel") || code == 0x800704C7 {
-        let t = "Security key operation cancelled".to_string();
-        return if enroll {
-            FidoError::EnrollmentFailed(t)
-        } else {
-            FidoError::UnlockFailed(t)
-        };
-    }
-    // ERROR_TIMEOUT as an HRESULT: the prompt was left to run out. Said as
-    // such, so the app neither retries it nor blames the storage.
-    if code == 0x800705B4 || lower.contains("timeout") || lower.contains("timed out") {
-        let t = "Security key prompt timed out".to_string();
-        return if enroll {
-            FidoError::EnrollmentFailed(t)
-        } else {
-            FidoError::UnlockFailed(t)
-        };
-    }
-    if enroll {
-        FidoError::EnrollmentFailed(text)
-    } else {
-        FidoError::UnlockFailed(text)
+    match super::win_answers::failure(code, &name, enroll) {
+        Failure::NotFoundHere => fail(
+            crate::coded!(
+                "err.key_not_of_silo_here",
+                "Neither the security key nor Windows Hello on this computer holds a key for this silo. Use another of its keys or your recovery code."
+            )
+            .into(),
+        ),
+        Failure::NoDevice => FidoError::NoDevice,
+        Failure::Cancelled => fail("Security key operation cancelled".to_string()),
+        Failure::Timeout => fail("Security key prompt timed out".to_string()),
+        Failure::Other => fail(text),
     }
 }
 

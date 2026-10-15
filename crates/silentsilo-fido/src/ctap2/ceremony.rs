@@ -186,7 +186,8 @@ fn failure(error: CtapError, fail: fn(String) -> FidoError) -> FidoError {
 #[cfg(test)]
 mod tests {
     use super::super::RP_ID;
-    use super::super::soft_key::SoftKey;
+    use super::super::hid::Hid;
+    use super::super::soft_key::{RefusingHid, SoftKey};
     use super::*;
     use crate::types::Authenticator;
     use std::sync::Mutex;
@@ -322,6 +323,22 @@ mod tests {
             enrol_on(&mut key, &challenge()),
             Err(FidoError::Cancelled)
         ));
+    }
+
+    #[test]
+    fn a_u2f_only_key_is_told_what_kind_of_key_works() {
+        let _turn = PROMPT.lock().unwrap_or_else(|e| e.into_inner());
+        let asked = answer_with(&[]);
+        let mut key = Hid::new(RefusingHid::new(0x01));
+        let Err(FidoError::EnrollmentFailed(why)) = enrol_on(&mut key, &challenge()) else {
+            panic!("a U2F-only key was enrolled");
+        };
+        assert!(why.contains("err.key_unsupported"), "{why}");
+        let Err(FidoError::UnlockFailed(why)) = unlock_on(&mut key, &[vec![1; 16]], VAULT) else {
+            panic!("a U2F-only key unlocked");
+        };
+        assert!(why.contains("err.key_unsupported"), "{why}");
+        assert!(asked.lock().unwrap().is_empty());
     }
 
     #[test]

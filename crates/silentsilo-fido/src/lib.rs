@@ -220,6 +220,14 @@ pub fn derive_enrolment_material(
     on: Authenticator,
 ) -> Result<UnlockMaterial, FidoError> {
     let material = derive_unlock_material(credential_ids, vault_id, Some(on))?;
+    refuse_unverified_key(material, on)
+}
+
+/// The check [`derive_enrolment_material`] makes, apart from the ceremony.
+fn refuse_unverified_key(
+    material: UnlockMaterial,
+    on: Authenticator,
+) -> Result<UnlockMaterial, FidoError> {
     if on == Authenticator::SecurityKey && !material.verified {
         return Err(FidoError::EnrollmentFailed(
             coded!(
@@ -249,4 +257,42 @@ pub fn forget_platform_key(credential_id: &[u8]) -> Result<(), FidoError> {
 
 pub fn dek_salt_for_vault(vault_id: &str) -> String {
     format!("silentsilo-dek-v1:{vault_id}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn material(verified: bool) -> UnlockMaterial {
+        UnlockMaterial {
+            wrap_key: [7; 32],
+            credential_id: vec![1, 2, 3],
+            verified,
+            unverified_wrap_key: None,
+        }
+    }
+
+    #[test]
+    fn a_security_key_that_did_not_verify_is_not_enrolled() {
+        let Err(FidoError::EnrollmentFailed(why)) =
+            refuse_unverified_key(material(false), Authenticator::SecurityKey)
+        else {
+            panic!("a security key without a PIN was enrolled");
+        };
+        assert!(why.contains("err.key_needs_pin"), "{why}");
+    }
+
+    #[test]
+    fn a_security_key_that_verified_is_enrolled_as_derived() {
+        let kept = refuse_unverified_key(material(true), Authenticator::SecurityKey).unwrap();
+        assert_eq!(kept.wrap_key, [7; 32]);
+        assert_eq!(kept.credential_id, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn this_devices_authenticator_is_never_refused_for_it() {
+        for verified in [true, false] {
+            assert!(refuse_unverified_key(material(verified), Authenticator::ThisDevice).is_ok());
+        }
+    }
 }

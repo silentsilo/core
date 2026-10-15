@@ -69,26 +69,12 @@ pub fn available() -> bool {
 /// [`available`], with the reason when the answer is no, from the
 /// `LAError` code: each one is a different thing for the person to do.
 pub fn status() -> crate::PlatformStatus {
-    use crate::PlatformStatus;
     // SAFETY: LAContext has no preconditions; the policy is a documented
     // constant and the result is read once.
     let answer = unsafe {
         LAContext::new().canEvaluatePolicy_error(LAPolicy::DeviceOwnerAuthenticationWithBiometrics)
     };
-    match answer {
-        Ok(()) => PlatformStatus::Ready,
-        Err(error) => match error.code() {
-            // passcodeNotSet, biometryNotEnrolled
-            -5 | -7 => PlatformStatus::NotSetUp,
-            // biometryLockout; biometryNotPaired and biometryDisconnected,
-            // a Touch ID keyboard not paired or unplugged.
-            -8 | -12 | -13 => PlatformStatus::Unavailable,
-            // biometryNotAvailable: no sensor, or one out of reach for now.
-            // Told apart by whether this Mac has ever had biometry at all.
-            -6 if has_sensor() => PlatformStatus::Unavailable,
-            _ => PlatformStatus::Absent,
-        },
-    }
+    super::mac_answers::touch_id_status(answer.err().map(|error| error.code()), has_sensor)
 }
 
 /// Whether this Mac has a Touch ID sensor, even one it cannot reach right

@@ -27,15 +27,36 @@ pub(crate) fn service() -> &'static str {
 }
 
 /// What this run has seen of the keyring: 0 nothing yet, 1 it kept a
-/// secret, 2 it refused or lost one.
-static SEEN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// secret, 2 it refused or lost one. A type of its own so a test can have
+/// one without the process-wide record other tests write to.
+struct Seen(std::sync::atomic::AtomicU8);
+
+impl Seen {
+    const fn new() -> Self {
+        Self(std::sync::atomic::AtomicU8::new(0))
+    }
+
+    fn note(&self, kept: bool) {
+        self.0.store(
+            if kept { 1 } else { 2 },
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    fn last(&self) -> Option<bool> {
+        match self.0.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => Some(true),
+            2 => Some(false),
+            _ => None,
+        }
+    }
+}
+
+static SEEN: Seen = Seen::new();
 
 /// Records whether the keyring kept a secret just written to it.
 pub(crate) fn note(kept: bool) {
-    SEEN.store(
-        if kept { 1 } else { 2 },
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    SEEN.note(kept);
 }
 
 /// Whether the OS keyring kept the last device secret written to it in this
@@ -47,10 +68,28 @@ pub(crate) fn note(kept: bool) {
 /// KWallet without its Secret Service API), where secrets need a file and
 /// the user's consent to one.
 pub fn keyring_keeps_secrets() -> Option<bool> {
-    match SEEN.load(std::sync::atomic::Ordering::Relaxed) {
-        1 => Some(true),
-        2 => Some(false),
-        _ => None,
+    SEEN.last()
+}
+
+#[cfg(test)]
+mod seen_tests {
+    use super::Seen;
+
+    #[test]
+    fn nothing_is_said_of_the_keyring_before_the_first_write() {
+        assert_eq!(Seen::new().last(), None);
+    }
+
+    #[test]
+    fn the_last_write_says_whether_the_keyring_keeps_secrets() {
+        let seen = Seen::new();
+        seen.note(true);
+        assert_eq!(seen.last(), Some(true));
+        // A keyring that kept one secret and lost the next is not trusted.
+        seen.note(false);
+        assert_eq!(seen.last(), Some(false));
+        seen.note(true);
+        assert_eq!(seen.last(), Some(true));
     }
 }
 

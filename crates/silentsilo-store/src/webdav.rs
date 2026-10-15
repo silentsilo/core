@@ -903,6 +903,48 @@ mod tests {
         }
     }
 
+    /// The same test picks the servers reached without the system proxy, so
+    /// an https address counts by its host, and nothing outside the local
+    /// network skips a company proxy.
+    #[test]
+    fn only_a_local_server_skips_the_proxy() {
+        let local = |url: &str| is_local_network(&url::Url::parse(url).unwrap());
+        for near in [
+            "https://localhost/dav",
+            "https://nas.localhost/dav",
+            "https://10.1.2.3/dav",
+            "https://192.168.0.10:5006/dav",
+            "https://172.31.255.254/dav",
+            "https://169.254.0.1/dav",
+            "https://100.64.0.1/dav",
+            "https://100.127.255.254/dav",
+            "https://[::1]/dav",
+            "https://[fe80::1]/dav",
+            "https://[fc00::1]/dav",
+            "https://[::ffff:192.168.1.2]/dav",
+            "https://nas/dav",
+            "https://NAS.Local./dav",
+            "https://nas.lan/dav",
+            "https://nas.home.arpa/dav",
+            "https://nas.internal/dav",
+        ] {
+            assert!(local(near), "{near} should skip the proxy");
+        }
+        for far in [
+            "https://dav.example.com/dav",
+            "https://8.8.8.8/dav",
+            "https://100.63.255.255/dav",
+            "https://100.128.0.1/dav",
+            "https://172.32.0.1/dav",
+            "https://[2001:db8::1]/dav",
+            "https://[::ffff:8.8.8.8]/dav",
+            "https://local.example.com/dav",
+            "https://nas.local.example.com/dav",
+        ] {
+            assert!(!local(far), "{far} must go through the proxy");
+        }
+    }
+
     /// A redirect to another address is not followed: the credentials and
     /// the silo would go wherever the server said.
     #[tokio::test]
