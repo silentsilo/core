@@ -11,6 +11,8 @@ release notes should say.
 
 ## [Unreleased]
 
+## [1.10.1-beta.4] - A phone as the key
+
 ### Added
 
 - `Authenticator::Phone` and `phone_available()`: a phone over the QR code
@@ -25,6 +27,9 @@ release notes should say.
 
 - A phone that cannot give the silo's secret is refused with a coded
   message naming the passkey apps that can.
+- Error texts: the Windows tip no longer says to avoid a phone, and the
+  key, keyring, Google Drive, PIN, WebDAV and iCloud messages say what to
+  do and where.
 
 ## [1.10.1-beta.3] - The other secret on demand
 
