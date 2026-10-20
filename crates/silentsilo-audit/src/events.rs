@@ -88,6 +88,8 @@ pub mod codes {
     pub const ENTRY_DELETED: u16 = 22;
     pub const ENTRY_RESTORED: u16 = 23;
     pub const HISTORY_CLEARED: u16 = 24;
+    /// From core 1.10.1: a deleted entry put back from the password trash.
+    pub const ENTRY_UNDELETED: u16 = 25;
 
     pub const FILE_OPENED: u16 = 30;
     pub const FILE_SAVED_OUTSIDE: u16 = 31;
@@ -140,6 +142,7 @@ pub fn describe(code: u16) -> String {
         ENTRY_DELETED => "Entry deleted",
         ENTRY_RESTORED => "Earlier version restored",
         HISTORY_CLEARED => "Entry history cleared",
+        ENTRY_UNDELETED => "Entry restored from the trash",
         FILE_OPENED => "File opened",
         FILE_SAVED_OUTSIDE => "File saved outside the silo",
         FILE_ADDED => "File added",
@@ -211,6 +214,7 @@ mod tests {
             (ENTRY_DELETED, 22),
             (ENTRY_RESTORED, 23),
             (HISTORY_CLEARED, 24),
+            (ENTRY_UNDELETED, 25),
             (FILE_OPENED, 30),
             (FILE_SAVED_OUTSIDE, 31),
             (FILE_ADDED, 32),

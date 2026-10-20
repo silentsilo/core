@@ -507,7 +507,8 @@ stateDiagram-v2
 The referenced set is `files.blob_id` (trash included, a restore needs the
 bytes) plus password attachment blobs parsed out of the decrypted entries,
 because attachments have no row anywhere; the sealed entry is their only
-reference (`Vfs::referenced_blobs_with_attachments`). Purge and attachment
+reference (`Vfs::referenced_blobs_with_attachments`). Entries in the password
+trash count too, so a restore within its 30 days brings the attachments back. Purge and attachment
 removal clean the local cache only, and a purge leaves content no copy holds
 yet until a push has sent it (`files::release_purged_blobs`): a device that
 has not seen the purge may keep an edit pointing at it. The pass drops such
@@ -690,6 +691,14 @@ bucket):
 
 Read this before "fixing" any of it.
 
+- **The password trash has no table and no record of its own.** It is read
+  from the local log (`Vfs::list_password_trash`): an entry whose last record
+  is a delete from the last 30 days, with what its last save wrote. A
+  restore is an ordinary `UpsertPassword`. A table would make it depend on
+  arrival order, and a new record kind would be a format change that 1.10.0
+  cannot read. There is no "delete for good": the records stay until
+  compaction anyway, so the trash empties itself after 30 days, or sooner
+  when compaction drops the records.
 - **`verify_chains` is never called.** Wiring it naively false-positives on
   every rebootstrapped device, whose new chain legitimately starts above
   zero from the fetcher's point of view. It waits for a checkpoint design.

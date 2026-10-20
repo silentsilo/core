@@ -21,6 +21,7 @@ mod kdf;
 mod kek_store;
 mod keychain;
 mod openssl;
+pub mod passwords_export;
 mod process;
 pub mod protected;
 pub mod recovery;

@@ -226,6 +226,24 @@ What each release does with the other's file, proven by
   with this silo's current key"). The silo still opens under the old key and
   nothing is lost; updating finishes the rotation.
 
+## Files a person carries
+
+| What | Where | Version | An older build meeting a newer one |
+|---|---|---|---|
+| Password export | any `*.silopwd` the person saves | `FORMAT_VERSION = 1` after the `SSPWEXPT` marker, `silentsilo-vault/passwords_export.rs` | From core 1.10.1; no earlier build opens these files. A newer version is refused by name with "update SilentSilo", never read in part |
+
+Written by the desktop app's export, read by its import. After the marker
+and version: a little-endian `u16` length and a JSON header with the KDF
+parameters (Argon2id, those of the recovery code, bounded on read as in the
+recovery envelope) and a 16-byte salt in hex; then a sealed payload under
+the derived key. Opened, the payload is a little-endian `u32` length, a JSON
+manifest (`entries` as the silo stores them, history included;
+`categories`; `attachments` as `blob_id` and `size`, in order), then the
+attached files' bytes in that order. A wrong password and a changed byte
+fail the same authentication. The v1 file in
+`crates/silentsilo-vault/tests/fixtures/` is opened on every test run and
+pinned by its hash: changing how it reads is a format break.
+
 ## The kind of a key
 
 Every enrolled key carries a `kind`, in `keys/fido.json` and in the envelope

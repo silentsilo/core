@@ -11,6 +11,18 @@ release notes should say.
 
 ## [Unreleased]
 
+### Added
+
+- The SilentSilo password export (`silentsilo_vault::passwords_export`):
+  entries as stored, the category list and attached files in one file under
+  a password, Argon2id and a sealed payload, version 1. A newer version is
+  refused with a message to update. Described in FORMATS.md, with a v1
+  fixture pinned by its hash.
+- A password trash: `Vfs::list_password_trash` and `Vfs::restore_password`.
+  A deleted entry can be put back for 30 days. Read from the local log, with
+  no new record or table, so no format changed and 1.10.0 applies a restore
+  like any save. Attachments of entries in the trash stay referenced.
+
 ## [1.10.1-beta.4] - A phone as the key
 
 ### Added

@@ -51,6 +51,19 @@ const PURGE_IDS_PER_RECORD: usize = 40;
 /// record after it is held back on those devices.
 pub const MAX_ENTRY_BYTES: usize = 512 * 1024;
 
+/// How long a deleted password entry can be put back. Measured from the
+/// delete record's own time, so every device shows the same trash.
+pub const PASSWORD_TRASH_SECS: i64 = 30 * 24 * 60 * 60;
+
+/// A deleted password entry that can still be put back: the entry as its
+/// last save before the delete left it, and when it was deleted.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TrashedPassword {
+    pub id: Uuid,
+    pub data: String,
+    pub deleted_at: i64,
+}
+
 pub struct Vfs<'a> {
     session: &'a VaultSession,
 }
@@ -420,6 +433,14 @@ impl<'a> Vfs<'a> {
         Ok(out)
     }
 
+    /// Every entry whose attachments the silo still needs: the live ones and
+    /// those in the password trash, which a restore brings back whole.
+    fn entries_with_attachments(&self) -> CoreResult<Vec<String>> {
+        let mut out = self.list_passwords()?;
+        out.extend(self.list_password_trash()?.into_iter().map(|t| t.data));
+        Ok(out)
+    }
+
     /// Every password attachment's blob, with its plaintext size and its
     /// wrapped content key. Attachments have no row in `files`: the sealed
     /// entry is their only reference, so anything deciding which blobs are
@@ -428,7 +449,7 @@ impl<'a> Vfs<'a> {
     /// fails the call, like `list_passwords`.
     pub fn attachment_blobs(&self) -> CoreResult<Vec<AttachmentBlob>> {
         let mut out = Vec::new();
-        for raw in self.list_passwords()? {
+        for raw in self.entries_with_attachments()? {
             let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
                 continue;
             };
@@ -1709,6 +1730,93 @@ impl<'a> Vfs<'a> {
         Ok(())
     }
 
+    /// Deleted entries that can still be put back, newest delete first.
+    ///
+    /// Read from the local log rather than kept in a table: an entry is here
+    /// when the last record about it in the total order is a delete from the
+    /// last [`PASSWORD_TRASH_SECS`], and it holds what the last save before
+    /// that delete wrote. A pure function of the records, so arrival order
+    /// decides nothing, and no format changed: putting one back is an
+    /// ordinary save, which every earlier release already applies. A delete
+    /// older than the last compaction has no records left and is gone.
+    pub fn list_password_trash(&self) -> CoreResult<Vec<TrashedPassword>> {
+        self.password_trash_at(chrono::Utc::now().timestamp())
+    }
+
+    fn password_trash_at(&self, now: i64) -> CoreResult<Vec<TrashedPassword>> {
+        let db = |e: rusqlite::Error| CoreError::Database(e.to_string());
+        let mut stmt = self
+            .conn()
+            .prepare(
+                "SELECT payload FROM oplog
+                  WHERE json_extract(payload, '$.op') IN ('upsert_password', 'delete_password')",
+            )
+            .map_err(db)?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(db)?;
+        // Per entry, the newest record, and the newest save before it.
+        let mut last: std::collections::HashMap<Uuid, crate::oplog::OpRecord> =
+            std::collections::HashMap::new();
+        let mut records = Vec::new();
+        for row in rows {
+            let payload = row.map_err(db)?;
+            records.push(crate::oplog::OpRecord::from_bytes(payload.as_bytes())?);
+        }
+        records.sort_by_key(|r| r.sort_key());
+        let mut saved: std::collections::HashMap<Uuid, String> = std::collections::HashMap::new();
+        for record in records {
+            let id = match &record.op {
+                crate::oplog::OpBody::Known(crate::oplog::VaultOp::UpsertPassword { id, data }) => {
+                    saved.insert(*id, data.clone());
+                    *id
+                }
+                crate::oplog::OpBody::Known(crate::oplog::VaultOp::DeletePassword { id }) => *id,
+                _ => continue,
+            };
+            last.insert(id, record);
+        }
+
+        let mut out = Vec::new();
+        for (id, record) in last {
+            let crate::oplog::OpBody::Known(crate::oplog::VaultOp::DeletePassword { .. }) =
+                record.op
+            else {
+                continue;
+            };
+            if now - record.at > PASSWORD_TRASH_SECS {
+                continue;
+            }
+            let Some(sealed) = saved.get(&id) else {
+                continue;
+            };
+            // One that will not open is left out rather than failing the
+            // whole trash: it can no longer be put back either way.
+            let Ok(data) = self.unseal_entry(sealed) else {
+                continue;
+            };
+            out.push(TrashedPassword {
+                id,
+                data,
+                deleted_at: record.at,
+            });
+        }
+        out.sort_by(|a, b| b.deleted_at.cmp(&a.deleted_at).then(a.id.cmp(&b.id)));
+        Ok(out)
+    }
+
+    /// Puts a deleted entry back as it was when deleted, under the same id,
+    /// with an ordinary save. An id no longer in the trash is an error, so a
+    /// restore can never write an entry nobody deleted.
+    pub fn restore_password(&self, id: Uuid) -> CoreResult<()> {
+        let Some(trashed) = self.list_password_trash()?.into_iter().find(|t| t.id == id) else {
+            return Err(CoreError::NotFound(
+                "This entry is no longer in the trash.".into(),
+            ));
+        };
+        self.upsert_password(id, &trashed.data)
+    }
+
     pub fn trash_folder(&self, folder_id: Uuid) -> CoreResult<()> {
         let folder = self.get_folder(folder_id)?;
         if folder.path == "/" || folder.path == "/Inbox" {
@@ -2568,6 +2676,85 @@ mod tests {
             vfs.create_folder(root, "Photos"),
             Err(CoreError::NameConflict(_))
         ));
+    }
+
+    #[test]
+    fn a_deleted_entry_waits_in_the_trash_and_comes_back_whole() {
+        let (_dir, session) = new_session();
+        let vfs = Vfs::new(&session);
+        let id = Uuid::new_v4();
+        vfs.upsert_password(id, r#"{"id":"a","title":"first"}"#)
+            .unwrap();
+        vfs.upsert_password(id, r#"{"id":"a","title":"second"}"#)
+            .unwrap();
+        vfs.delete_password(id).unwrap();
+
+        let trash = vfs.list_password_trash().unwrap();
+        assert_eq!(trash.len(), 1);
+        assert_eq!(trash[0].id, id);
+        assert_eq!(trash[0].data, r#"{"id":"a","title":"second"}"#);
+        assert!(vfs.list_passwords().unwrap().is_empty());
+
+        vfs.restore_password(id).unwrap();
+        assert_eq!(
+            vfs.list_passwords().unwrap(),
+            vec![r#"{"id":"a","title":"second"}"#]
+        );
+        assert!(vfs.list_password_trash().unwrap().is_empty());
+        // Once back, it is not in the trash to restore twice.
+        assert!(vfs.restore_password(id).is_err());
+    }
+
+    #[test]
+    fn the_trash_forgets_after_thirty_days() {
+        let (_dir, session) = new_session();
+        let vfs = Vfs::new(&session);
+        let id = Uuid::new_v4();
+        vfs.upsert_password(id, r#"{"id":"a"}"#).unwrap();
+        vfs.delete_password(id).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        assert_eq!(
+            vfs.password_trash_at(now + PASSWORD_TRASH_SECS - 60)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            vfs.password_trash_at(now + PASSWORD_TRASH_SECS + 60)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_trashed_entry_keeps_its_attachments_referenced() {
+        let (_dir, session) = new_session();
+        let vfs = Vfs::new(&session);
+        let id = Uuid::new_v4();
+        let attached = Uuid::new_v4();
+        vfs.upsert_password(
+            id,
+            &format!(
+                r#"{{"id":"e1","attachments":[{{"blob_id":"{attached}","name":"scan.pdf","size_bytes":7,"blob_key":"k"}}]}}"#
+            ),
+        )
+        .unwrap();
+        vfs.delete_password(id).unwrap();
+        assert!(
+            vfs.referenced_blobs_with_attachments()
+                .unwrap()
+                .contains(&attached)
+        );
+    }
+
+    #[test]
+    fn an_entry_never_saved_here_is_not_in_the_trash() {
+        // A delete with no save before it in the log (compacted away, or an
+        // entry that never reached this device) has nothing to put back.
+        let (_dir, session) = new_session();
+        let vfs = Vfs::new(&session);
+        vfs.delete_password(Uuid::new_v4()).unwrap();
+        assert!(vfs.list_password_trash().unwrap().is_empty());
     }
 
     #[test]

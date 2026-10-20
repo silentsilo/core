@@ -105,8 +105,10 @@ pub enum VaultOp {
         id: Uuid,
         data: String,
     },
-    /// Removes a password entry outright. There is no trash for logins: a
-    /// deleted credential should stop existing, not wait in a bin.
+    /// Removes a password entry. Since 1.10.1 the entry can be put back for
+    /// 30 days: the password trash is read from the log (the last save before
+    /// this record), and a restore is an ordinary `UpsertPassword`, so this
+    /// record and every earlier release are unchanged.
     DeletePassword {
         id: Uuid,
     },
