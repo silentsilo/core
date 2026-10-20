@@ -11,6 +11,10 @@ release notes should say.
 
 ## [Unreleased]
 
+## [1.10.1] - Trash and export
+
+The release of everything in the 1.10.1 betas below, plus:
+
 ### Added
 
 - The SilentSilo password export (`silentsilo_vault::passwords_export`):
