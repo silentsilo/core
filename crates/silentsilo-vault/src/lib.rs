@@ -38,7 +38,7 @@ pub use cache_store::{
     list_absent_blob_ids, list_local_blob_ids, list_undelivered_blob_ids, list_unsynced_blob_ids,
     record_blob_absent, record_blob_delivered, record_blob_present, release_purged_blob,
     remove_blob_from_cache, set_cache_limit_bytes, set_keep_full_copy, settle_blob_delivery,
-    touch_blob_access,
+    settle_blob_delivery_among, touch_blob_access,
 };
 pub use cloud_token::{
     CloudSignIn, adopt_cloud_sign_in, cancel_cloud_sign_in, cloud_sign_in, cloud_sign_in_account,

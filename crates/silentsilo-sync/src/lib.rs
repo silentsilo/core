@@ -147,6 +147,9 @@ pub struct MissingOps {
     /// from the names. After a complete fetch, this device holds every
     /// record storage had up to here.
     pub listed_through: u64,
+    /// Every record id the listing names, whatever its number. What the pass
+    /// notes as already on this copy, so it does not ask for each again.
+    pub listed: std::collections::HashSet<Uuid>,
 }
 
 /// Downloads every record the bucket holds that `known` does not name.
@@ -185,6 +188,10 @@ pub async fn fetch_missing_ops_reporting(
         .filter_map(|entry| lamport_from_key(&entry.key))
         .max()
         .unwrap_or(0);
+    let listed_ids = listed
+        .iter()
+        .filter_map(|entry| op_id_from_key(&entry.key))
+        .collect();
     let listing: Vec<_> = listed
         .into_iter()
         .filter(|entry| match lamport_from_key(&entry.key) {
@@ -203,6 +210,7 @@ pub async fn fetch_missing_ops_reporting(
     let total = listing.len();
     let mut out = MissingOps {
         listed_through,
+        listed: listed_ids,
         ..MissingOps::default()
     };
     progress(0, total);
@@ -737,6 +745,8 @@ pub struct BlobPushOutcome {
     /// fatal to the pass: the rest still go, and these stay unsynced so the
     /// next attempt retries them.
     pub failed: Vec<(Uuid, String)>,
+    /// Blobs not started because the time given ran out.
+    pub left: usize,
 }
 
 /// Uploads every blob on this device that isn't confirmed in the bucket.
@@ -789,9 +799,28 @@ pub async fn push_blobs_reporting(
     blob_ids: &[Uuid],
     progress: &mut (dyn FnMut(BlobPush) + Send),
 ) -> Result<BlobPushOutcome, SyncError> {
+    push_blobs_within(client, vault_root, target, blob_ids, None, progress).await
+}
+
+/// [`push_blobs_reporting`] that starts no new blob after `until`. A blob
+/// already going finishes. What was not started is counted in `left`, for
+/// the next pass: a backlog of videos used to hold one pass, and every
+/// other silo's, for as long as all of it took.
+pub async fn push_blobs_within(
+    client: &dyn ObjectStore,
+    vault_root: &Path,
+    target: Uuid,
+    blob_ids: &[Uuid],
+    until: Option<std::time::Instant>,
+    progress: &mut (dyn FnMut(BlobPush) + Send),
+) -> Result<BlobPushOutcome, SyncError> {
     let mut outcome = BlobPushOutcome::default();
 
     for (done, blob_id) in blob_ids.iter().enumerate() {
+        if until.is_some_and(|until| std::time::Instant::now() >= until) {
+            outcome.left = blob_ids.len() - done;
+            break;
+        }
         let mut step = BlobPush {
             done,
             total: blob_ids.len(),
@@ -3054,6 +3083,38 @@ pub async fn push_everything_to_reporting(
     silo: &SiloState<'_>,
     progress: &mut (dyn FnMut(PushStep) + Send),
 ) -> TargetPushOutcome {
+    let mut outcome = push_records_to_reporting(target, silo, progress).await;
+    if outcome.failed.is_some() {
+        return outcome;
+    }
+    let pending = list_undelivered_blob_ids(silo.vault_root, target.id);
+    match push_blobs_reporting(
+        target.store,
+        silo.vault_root,
+        target.id,
+        &pending,
+        &mut |step| progress(PushStep::Blob(step)),
+    )
+    .await
+    {
+        Ok(blobs) => {
+            outcome.blobs_uploaded = blobs.uploaded;
+            outcome.blobs_failed = blobs.failed.len();
+        }
+        Err(e) => outcome.failed = Some(e.to_string()),
+    }
+    outcome
+}
+
+/// Everything [`push_everything_to`] sends except content: what a joining
+/// device needs to open the silo, then the records. A pass sends content
+/// after it has read the other devices' records, so a large upload no
+/// longer holds back what they wrote. Records still go before their content.
+pub async fn push_records_to_reporting(
+    target: &TargetPush<'_>,
+    silo: &SiloState<'_>,
+    progress: &mut (dyn FnMut(PushStep) + Send),
+) -> TargetPushOutcome {
     let mut outcome = TargetPushOutcome::default();
     macro_rules! attempt {
         ($e:expr) => {
@@ -3092,29 +3153,8 @@ pub async fn push_everything_to_reporting(
     .await
     {
         Ok(count) => outcome.ops_pushed = count,
-        Err(e) => {
-            outcome.failed = Some(e.to_string());
-            return outcome;
-        }
-    }
-
-    let pending = list_undelivered_blob_ids(silo.vault_root, target.id);
-    match push_blobs_reporting(
-        target.store,
-        silo.vault_root,
-        target.id,
-        &pending,
-        &mut |step| progress(PushStep::Blob(step)),
-    )
-    .await
-    {
-        Ok(blobs) => {
-            outcome.blobs_uploaded = blobs.uploaded;
-            outcome.blobs_failed = blobs.failed.len();
-        }
         Err(e) => outcome.failed = Some(e.to_string()),
     }
-
     outcome
 }
 

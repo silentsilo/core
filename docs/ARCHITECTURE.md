@@ -298,7 +298,11 @@ in a loop, or whenever the working copy was unplugged. Such a copy, one that
 reads as rotated beside working copies, is retired: the pass leaves it out
 with `RETIRED_COPY` as its status and does not count it as a copy to reach.
 Counting it held the inbox, the sweep and compaction for as long as it stayed
-configured, since it can never be reached under the new key.
+configured, since it can never be reached under the new key. The retirement is
+kept in `vault_meta` (`target:<id>:retired`) and cleared when the copy next
+reads as current, so a pass that does not reach it still leaves it out of
+`required`, the copies a record or a blob has to reach before it counts as
+backed up (`settle_delivery_among`, `settle_blob_delivery_among`).
 
 A working copy can miss a rotation the same way: one only this device lists,
 or a drive that was unplugged while another device rotated. To a device the
@@ -428,9 +432,12 @@ to storage can put one at a low number, and holding for good stopped
 incoming changes for good; a week leaves an interrupted upload or a damaged
 record time to be sent again or repaired. One that opens and still cannot be
 used (a newer build's, or a Lamport value above `LAMPORT_CEILING`, 2^53)
-holds back for as long as it is there. Either kind keeps the pass from
-compacting and sweeping, since the device's view of the silo is then
-short.
+holds back for as long as it is there. That includes a record naming an
+operation this build does not know and may not skip: replay refuses it, and
+before the pass held it back that refusal failed the whole pass on every pass,
+with nothing marked delivered and no inbox import. The report says
+`needs_update`. Either kind keeps the pass from compacting and sweeping, since
+the device's view of the silo is then short.
 
 Name resolution is the subtle part. Uniqueness is per folder,
 case-insensitive and Unicode-composed (`names::fold`). The `name_claims`
@@ -495,7 +502,7 @@ one failed and backs off instead of stopping with an error.
 stateDiagram-v2
     [*] --> LocalOnly: import (encrypt_file, record_blob_present)
     LocalOnly --> Delivered: put_from_file per target, record_blob_delivered
-    Delivered --> Synced: settle_blob_delivery (every configured target has it)
+    Delivered --> Synced: settle_blob_delivery (every target still taking content has it)
     Synced --> Evicted: cache limit (LRU, never full-copy silos, never unsynced)
     Evicted --> LocalOnly: fetch_blob on open/export (from any copy)
     Synced --> Candidate: sweep sees it unreferenced
@@ -562,14 +569,20 @@ unlocked device imports it (`silentsilo-sync/src/inbox.rs`, formats in
 the file and deletes the item only after. Nothing waiting may live under
 `blobs/`: the sweep would delete it after two passes, on any version.
 
-In `silentsilo-app` the import runs after the pull and before housekeeping.
-An item recorded in one pass leaves the inbox in a later pass, and only when
-that pass reached every configured target: the record is pushed at the start
-of the pass after the one that wrote it, so the item is never gone from
-storage while the only trace of it is one device's database. An archive
-target keeps its items; they are skipped as already known. With more than one
-target the importer fetches the content down, so its next push spreads it to
-the targets the phone did not send to.
+In `silentsilo-app` the import runs after the pull and the content push, and
+before housekeeping. An item recorded in one pass leaves a target's inbox in a
+later pass, and only when that pass found the target holding every record this
+device has: the record is pushed at the start of the pass after the one that
+wrote it, and the content is staged in that target's `blobs/` first, so the
+item is never gone from storage while the only trace of it is one device's
+database. Per target, not per pass: waiting for one pass to reach every
+configured target kept every item, and a phone's "waiting" count, in place for
+as long as one copy did not answer. An item recorded earlier in the same pass
+(the same item in two inboxes) stays. One pass records at most
+`INBOX_IMPORT_PER_PASS` items and says `more_to_do` when it left some. An
+archive target keeps its items; they are skipped as already known. With more
+than one target the importer fetches the content down, so its next push
+spreads it to the targets the phone did not send to.
 
 Several unlocked devices import the same items at once, and nothing stops
 that. What keeps them agreeing:
@@ -691,6 +704,32 @@ bucket):
 
 Read this before "fixing" any of it.
 
+- **A record a copy's listing names counts as delivered there.** The pass
+  writes an `op_delivery` row for every local record whose name the fetch
+  listed (`mark_listed_delivered`), without reading it. That is no weaker
+  than the push, which asks each record by name (`head`) and skips one that
+  is there. Without it a record that came from storage had no row for the
+  copy it came from, so it read as "changes waiting" until the next pass
+  asked for it again, and after a join or a rebuild that meant a request per
+  record per copy.
+- **Passes are per silo, and a key operation holds them all.** Two passes
+  over one silo would read the same pending queue and send it twice; two
+  silos share nothing a pass writes. A key operation (rotation, a key added
+  or removed, a fill) waits for every pass and holds new ones off
+  (`try_hold_sync`), because a pass that loaded `fido.json` before the change
+  and saved it after put the old envelopes back.
+- **Content goes after the pull.** Records go out first, then every copy is
+  read, then content goes out within `UPLOAD_BUDGET` (ten minutes; a blob
+  already going finishes). Records still reach a copy before their content,
+  which is the order that matters: a record whose content is late
+  self-corrects, content with no record looks like an orphan. A blob that
+  fails, or that no copy gives for a full copy, waits before it is tried
+  again (`blob_waits`, in memory: one more attempt after a restart is cheap).
+- **A pass that reaches nothing returns `Ok`.** Every copy resting after a
+  failure is not an error of this pass, so the report says so with
+  `reached: 0` and each copy's `retry_in`. A client must not show that as
+  "synced just now". An `Err` is announced too, as a report with `error`
+  set, so a screen showing a step hears that the pass ended.
 - **The password trash has no table and no record of its own.** It is read
   from the local log (`Vfs::list_password_trash`): an entry whose last record
   is a delete from the last 30 days, with what its last save wrote. A
@@ -760,9 +799,9 @@ Read this before "fixing" any of it.
   entries a later record creates there (`purged_ids`). A rebuild writes
   again, on top, only what this device wrote and no copy took
   (`vfs::undelivered_own_ops`, `sync::apply_rebuild`). Not `pushed = 0`: that
-  flag waits for every copy, so beside an unplugged drive or a never-delete
-  copy under a replaced key it is unset on everything, and a rebuild that
-  took it wrote old history again as new changes, purged folders included.
+  flag waits for every copy still taking records, so beside an unplugged
+  drive it is unset on everything, and a rebuild that took it wrote old
+  history again as new changes, purged folders included.
 - **A purge keeps the edits its author could not have seen.** An edit to a
   purged file made on a device that had not received the purge becomes a
   file of its own at the top of the silo, named as a conflict copy of the

@@ -1,11 +1,12 @@
 //! Moving what a locked phone sent into the silo, during a sync pass.
 //!
 //! The steps and why each is safe to repeat are in
-//! `silentsilo_sync::inbox`. What this adds is when an item may leave the
-//! inbox: only once a pass has found it already recorded and has reached
-//! every copy. The record is pushed by the pass after the one that wrote it,
-//! so an item never disappears from storage while the only trace of it is
-//! this device's database.
+//! `silentsilo_sync::inbox`. What this adds is when an item may leave a
+//! copy's inbox: only once a pass has found it already recorded, by an
+//! earlier pass, and that copy holds every record this device has. The
+//! record is pushed by the pass after the one that wrote it, and the content
+//! is staged on the same copy, so an item never disappears from storage
+//! while the only trace of it is this device's database.
 //!
 //! Public for a client whose sync pass is still its own: it supplies its
 //! session map through [`OpenSilo`] and calls [`import_inbox`] at the same
@@ -38,9 +39,10 @@ pub struct InboxTarget<'a> {
     pub id: Uuid,
     pub store: &'a dyn ObjectStore,
     pub label: &'a str,
-    /// Whether an item already recorded may leave this target's inbox: the
-    /// pass reached every configured copy, and the target allows deletes.
-    /// An append-only target keeps its items, and they are skipped as known.
+    /// Whether an item already recorded may leave this target's inbox: this
+    /// pass found the target holding every record this device has, and the
+    /// target allows deletes. An append-only target keeps its items, and they
+    /// are skipped as known.
     pub may_finish: bool,
 }
 
@@ -48,7 +50,14 @@ pub struct InboxTarget<'a> {
 pub struct InboxOutcome {
     pub imported: usize,
     pub refused: Vec<String>,
+    /// Items not looked at because this pass imported its share already.
+    pub left: usize,
 }
+
+/// How many items one pass records. Each may bring its content down too, and
+/// a phone that sent a thousand photos while locked held one pass, and the
+/// silo's other changes behind it, for as long as all of them took.
+pub const INBOX_IMPORT_PER_PASS: usize = 50;
 
 /// `silo_root` is where content is fetched to when `keep_local` is set,
 /// which makes the next push copy it to the targets that do not have it.
@@ -66,6 +75,10 @@ pub async fn import_inbox(
     progress: &(dyn Fn(usize, usize) + Sync),
 ) -> InboxOutcome {
     let mut outcome = InboxOutcome::default();
+    // Recorded by this pass: their records have not left this device yet,
+    // so the same item in another copy's inbox stays there too.
+    let mut recorded_now: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+    let mut taken = 0usize;
     // Content ids the silo already uses. An item naming one would be copied
     // over that content, so it is refused instead.
     let mut referenced = std::collections::HashSet::new();
@@ -114,12 +127,17 @@ pub async fn import_inbox(
                 // Copied back only over the content this item's own record
                 // names. A record with other content has no use for it.
                 if target.may_finish
+                    && !recorded_now.contains(&item.item_id)
                     && (recorded != item.blob_id
                         || ensure_staged(target.store, &item, warn, target.label).await)
                     && let Err(e) = finish_item(target.store, item.item_id).await
                 {
                     warn(&format!("{}: {e}", target.label));
                 }
+                continue;
+            }
+            if taken >= INBOX_IMPORT_PER_PASS {
+                outcome.left += 1;
                 continue;
             }
             if referenced.contains(&item.blob_id) {
@@ -185,6 +203,8 @@ pub async fn import_inbox(
                 continue;
             }
             referenced.insert(item.blob_id);
+            recorded_now.insert(item.item_id);
+            taken += 1;
             if added {
                 outcome.imported += 1;
             }

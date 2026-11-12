@@ -4108,6 +4108,19 @@ pub fn target_retry_in(conn: &Connection, target: Uuid, now: i64) -> CoreResult<
     Ok((read_target_number(conn, target, "next_try")? - now).max(0))
 }
 
+/// Whether the last pass that read this copy found it retired: a
+/// never-delete copy left under a replaced key, or a working copy that missed
+/// a rotation. Kept here so a pass that does not reach it still leaves it out
+/// of what has to hold a record before it counts as backed up. Cleared the
+/// next time it reads as current.
+pub fn target_retired(conn: &Connection, target: Uuid) -> CoreResult<bool> {
+    Ok(read_target_number(conn, target, "retired")? != 0)
+}
+
+pub fn set_target_retired(conn: &Connection, target: Uuid, retired: bool) -> CoreResult<()> {
+    write_target_number(conn, target, "retired", i64::from(retired))
+}
+
 const TARGET_BACKOFF_BASE_SECS: i64 = 30;
 const TARGET_BACKOFF_MAX_SECS: i64 = 15 * 60;
 
@@ -4154,6 +4167,49 @@ pub fn init_delivery(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_op_delivery_op ON op_delivery(op_id);
         ",
     )
+}
+
+/// Notes as held by `target` every local record its listing named. A record
+/// listed there is one a push would skip anyway (`push_ops` asks by name),
+/// so marking it here only saves that question. Without it a record that
+/// came from storage had no row for the copy it came from: it read as
+/// "waiting to sync" until the next pass asked each copy for it again, and
+/// after a join or a rebuild that was the whole history, one request per
+/// record per copy. Ids this device does not hold get no row.
+pub fn mark_listed_delivered(
+    conn: &Connection,
+    target: Uuid,
+    listed: &std::collections::HashSet<Uuid>,
+) -> CoreResult<usize> {
+    if listed.is_empty() {
+        return Ok(0);
+    }
+    let db = |e: rusqlite::Error| CoreError::Database(e.to_string());
+    conn.execute_batch("SAVEPOINT mark_listed").map_err(db)?;
+    let written = (|| -> CoreResult<usize> {
+        let mut stmt = conn
+            .prepare_cached(
+                "INSERT OR IGNORE INTO op_delivery(target, op_id)
+                 SELECT ?1, op_id FROM oplog WHERE op_id = ?2",
+            )
+            .map_err(db)?;
+        let target = target.to_string();
+        let mut added = 0;
+        for id in listed {
+            added += stmt.execute(params![target, id.to_string()]).map_err(db)?;
+        }
+        Ok(added)
+    })();
+    match written {
+        Ok(added) => {
+            conn.execute_batch("RELEASE mark_listed").map_err(db)?;
+            Ok(added)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK TO mark_listed; RELEASE mark_listed");
+            Err(e)
+        }
+    }
 }
 
 /// Records this device still owes one particular target.
@@ -4237,6 +4293,18 @@ pub fn mark_delivered(conn: &Connection, target: Uuid, records: &[OpRecord]) -> 
 /// has to mean "every target has this". A target removed from the list
 /// stops being waited for.
 pub fn settle_delivery(conn: &mut Connection, targets: &[Uuid]) -> CoreResult<usize> {
+    settle_delivery_among(conn, targets, targets)
+}
+
+/// [`settle_delivery`], where only `required` has to hold a record for it to
+/// count as pushed. The rest of `targets` keep their rows: a copy retired
+/// under a replaced key takes nothing new, and counting it held `pushed` at
+/// zero for good, with pruning off and "changes waiting" never clearing.
+pub fn settle_delivery_among(
+    conn: &mut Connection,
+    targets: &[Uuid],
+    required: &[Uuid],
+) -> CoreResult<usize> {
     let db = |e: rusqlite::Error| CoreError::Database(e.to_string());
     if targets.is_empty() {
         // Nothing configured holds anything. Left alone, records would stay
@@ -4261,15 +4329,24 @@ pub fn settle_delivery(conn: &mut Connection, targets: &[Uuid]) -> CoreResult<us
     )
     .map_err(db)?;
 
+    // Every copy retired: nothing current holds anything.
+    if required.is_empty() {
+        tx.execute("UPDATE oplog SET pushed = 0", []).map_err(db)?;
+        tx.commit().map_err(db)?;
+        return Ok(0);
+    }
+    let needed: Vec<String> = required.iter().map(|t| t.to_string()).collect();
+    let needed_marks = vec!["?"; needed.len()].join(",");
     let settled = tx
         .execute(
             &format!(
                 "UPDATE oplog SET pushed = 1
                  WHERE pushed = 0
-                   AND (SELECT COUNT(*) FROM op_delivery d WHERE d.op_id = oplog.op_id) = {}",
-                list.len()
+                   AND (SELECT COUNT(*) FROM op_delivery d
+                        WHERE d.op_id = oplog.op_id AND d.target IN ({needed_marks})) = {}",
+                needed.len()
             ),
-            [],
+            rusqlite::params_from_iter(needed.iter()),
         )
         .map_err(db)?;
 
@@ -4280,10 +4357,11 @@ pub fn settle_delivery(conn: &mut Connection, targets: &[Uuid]) -> CoreResult<us
         &format!(
             "UPDATE oplog SET pushed = 0
              WHERE pushed = 1
-               AND (SELECT COUNT(*) FROM op_delivery d WHERE d.op_id = oplog.op_id) < {}",
-            list.len()
+               AND (SELECT COUNT(*) FROM op_delivery d
+                    WHERE d.op_id = oplog.op_id AND d.target IN ({needed_marks})) < {}",
+            needed.len()
         ),
-        [],
+        rusqlite::params_from_iter(needed.iter()),
     )
     .map_err(db)?;
 

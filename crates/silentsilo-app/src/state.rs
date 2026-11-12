@@ -50,10 +50,15 @@ pub struct AppState {
     /// Stopping a seed is safe: what already landed stays, and the next run
     /// skips it and carries on.
     pub seed_cancelled: AtomicBool,
-    /// Held for the duration of a sync pass. Two passes at once, the timer
-    /// firing while the user is holding the button, would each read the
-    /// same pending queue and upload it twice.
-    pub sync_in_flight: AtomicBool,
+    /// Which silos have a pass running, and whether a key operation holds
+    /// every pass off. Per silo: two passes over one silo would read the
+    /// same pending queue and upload it twice, but a large upload on one
+    /// silo has no reason to stop another from syncing.
+    pub(crate) sync_locks: Mutex<SyncLocks>,
+    /// Content that would not go to a copy, or come down from any, and when
+    /// to try it again. In memory only: one more attempt after a restart is
+    /// cheap, and a file refused for its size is not sent again every pass.
+    pub(crate) blob_waits: Mutex<HashMap<(Uuid, Uuid), BlobWait>>,
     /// Silos this process has seen keep an organisation's log. Never
     /// forgotten while it runs: a queue that later cannot be read must not
     /// make such a silo look like one that may go on unrecorded.
@@ -62,6 +67,33 @@ pub struct AppState {
     /// only new segments. The log in clear: forgotten when the silo closes
     /// ([`AppState::forget_audit_read`]), never written anywhere.
     pub(crate) audit_opened: Mutex<HashMap<Uuid, silentsilo_audit::reading::Opened>>,
+}
+
+/// What [`AppState::sync_locks`] holds.
+#[derive(Default)]
+pub(crate) struct SyncLocks {
+    pub(crate) held: bool,
+    pub(crate) running: HashSet<Uuid>,
+}
+
+/// One blob's failures on one copy.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BlobWait {
+    pub(crate) fails: u32,
+    pub(crate) next_try: i64,
+}
+
+/// Held while a pass runs over one silo. Released on drop, so an error or
+/// an early return cannot leave that silo's sync off for the session.
+pub(crate) struct PassGuard<'a> {
+    state: &'a AppState,
+    silo: Uuid,
+}
+
+impl Drop for PassGuard<'_> {
+    fn drop(&mut self) {
+        self.state.locks().running.remove(&self.silo);
+    }
 }
 
 /// A silo's activity log, as this device knows it.
@@ -114,6 +146,52 @@ pub struct SessionSnapshot {
 }
 
 impl AppState {
+    fn locks(&self) -> std::sync::MutexGuard<'_, SyncLocks> {
+        // Two plain fields that no panic leaves half written.
+        self.sync_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Starts a pass over `silo`, unless one is running there already or a
+    /// key operation holds sync off.
+    pub(crate) fn try_start_pass(&self, silo: Uuid) -> Option<PassGuard<'_>> {
+        let mut locks = self.locks();
+        if locks.held || !locks.running.insert(silo) {
+            return None;
+        }
+        Some(PassGuard { state: self, silo })
+    }
+
+    /// Whether a pass over `silo` is running, or sync is held off.
+    pub fn pass_running(&self, silo: Uuid) -> bool {
+        let locks = self.locks();
+        locks.held || locks.running.contains(&silo)
+    }
+
+    /// Whether any pass is running, or sync is held off.
+    pub fn sync_busy(&self) -> bool {
+        let locks = self.locks();
+        locks.held || !locks.running.is_empty()
+    }
+
+    /// Holds every pass off, when none is running and nothing else holds
+    /// them. For a key operation that rewrites what a pass reads: a pass
+    /// that loaded the key file before the change and saved it after put
+    /// the old envelopes back. Released with [`AppState::release_sync_hold`].
+    pub fn try_hold_sync(&self) -> bool {
+        let mut locks = self.locks();
+        if locks.held || !locks.running.is_empty() {
+            return false;
+        }
+        locks.held = true;
+        true
+    }
+
+    pub fn release_sync_hold(&self) {
+        self.locks().held = false;
+    }
+
     /// Locks `active_silo` before `sessions`, and never the other way
     /// round: the two are taken together often enough for the order to
     /// matter.
@@ -655,6 +733,30 @@ mod tests {
 
     fn id(n: u8) -> Uuid {
         Uuid::from_bytes([n; 16])
+    }
+
+    #[test]
+    fn a_pass_on_one_silo_does_not_stand_another_down() {
+        let state = AppState::default();
+        let first = state.try_start_pass(id(1)).expect("free");
+        assert!(state.try_start_pass(id(1)).is_none(), "one per silo");
+        let second = state.try_start_pass(id(2)).expect("another silo runs");
+        assert!(state.pass_running(id(1)) && state.pass_running(id(2)));
+        assert!(!state.try_hold_sync(), "a key operation waits for both");
+        drop(first);
+        drop(second);
+        assert!(!state.sync_busy());
+    }
+
+    #[test]
+    fn a_held_sync_stops_every_pass_until_released() {
+        let state = AppState::default();
+        assert!(state.try_hold_sync());
+        assert!(!state.try_hold_sync(), "one hold at a time");
+        assert!(state.try_start_pass(id(1)).is_none());
+        assert!(state.pass_running(id(1)));
+        state.release_sync_hold();
+        assert!(state.try_start_pass(id(1)).is_some());
     }
 
     #[test]

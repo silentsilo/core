@@ -4,7 +4,6 @@
 
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::sync::atomic::Ordering;
 
 use silentsilo_app::{AppEvent, AppState, Host, SyncReport, run_sync_pass, sync_now};
 use silentsilo_store::StoreConfig;
@@ -166,15 +165,18 @@ async fn a_pass_already_running_is_stood_down_without_an_event() {
         storage.path().to_path_buf(),
         TargetRole::Working,
     )];
-    device.state.sync_in_flight.store(true, Ordering::SeqCst);
+    assert!(device.state.try_hold_sync());
 
     let report = device.pass().await;
     assert!(report.configured && report.skipped);
+    assert_eq!(report.silo_id, device.silo.id.to_string());
     assert!(device.host.events.lock().unwrap().is_empty());
     assert!(
-        device.state.sync_in_flight.load(Ordering::SeqCst),
-        "the running pass still holds the flag"
+        device.state.pass_running(device.silo.id),
+        "the hold is still there"
     );
+    device.state.release_sync_hold();
+    assert!(!device.state.sync_busy());
 }
 
 #[tokio::test]
@@ -196,7 +198,7 @@ async fn a_pass_pushes_local_changes_reports_every_target_and_releases_the_flag(
     assert!(report.targets[0].failed.is_none());
     assert_eq!(report.targets[0].ops_behind, 0);
     assert_eq!(device.pending(), 0, "delivered to every target");
-    assert!(!device.state.sync_in_flight.load(Ordering::SeqCst));
+    assert!(!device.state.sync_busy());
     assert_eq!(device.host.reports().len(), 1, "one sync-report per pass");
     assert_eq!(device.host.vault_changed(), 0, "nothing arrived");
 }
@@ -373,6 +375,16 @@ async fn a_working_copy_that_missed_a_rotation_is_left_out_not_a_reason_to_rejoi
             .any(|t| t.failed.is_none() && t.ops_pushed > 0),
         "the main copy still gets the new record: {second:?}"
     );
+    // The copy left out takes nothing new, so it is not waited for: before,
+    // "changes waiting" never cleared and nothing local could be pruned.
+    assert_eq!(device.pending(), 0, "{second:?}");
+    assert_eq!(
+        silentsilo_app::owed_now(&device.state, &device.host, device.silo.id),
+        0
+    );
+    device.make_folder("Later");
+    device.pass().await;
+    assert_eq!(device.pending(), 0, "still left out on the next pass");
 }
 
 #[tokio::test]
@@ -760,4 +772,146 @@ async fn content_purged_on_a_silo_with_no_storage_goes_at_once() {
     let device = Device::new(Uuid::new_v4(), None);
     let blob = device.import_and_purge();
     assert!(!device.holds_blob(blob), "no other device can want it");
+}
+
+#[tokio::test]
+async fn records_that_came_from_storage_are_not_waiting_to_be_sent_back() {
+    // They used to have no row for the copy they came from, so the device
+    // that received them showed "changes waiting" and asked the copy for
+    // every one of them again on the next pass.
+    let storage = tempfile::tempdir().unwrap();
+    let target = folder_target(storage.path().to_path_buf(), TargetRole::Working);
+
+    let a = Device::new(Uuid::new_v4(), None);
+    *a.host.targets.lock().unwrap() = vec![target.clone()];
+    a.make_folder("From A");
+    a.make_folder("Also from A");
+    a.pass().await;
+
+    let b = Device::new(a.vault_id(), Some(a.keys()));
+    *b.host.targets.lock().unwrap() = vec![target];
+    let report = b.pass().await;
+    assert!(report.ops_applied > 0, "{report:?}");
+    assert_eq!(b.pending(), 0, "nothing of A's is waiting on B");
+    assert_eq!(silentsilo_app::owed_now(&b.state, &b.host, b.silo.id), 0);
+    assert_eq!(report.reached, 1);
+}
+
+#[tokio::test]
+async fn a_resting_copy_is_not_a_reason_for_another_pass() {
+    let good = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let bad = dir.path().join("file");
+    std::fs::write(&bad, b"x").unwrap();
+
+    let device = Device::new(Uuid::new_v4(), None);
+    *device.host.targets.lock().unwrap() = vec![
+        folder_target(good.path().to_path_buf(), TargetRole::Working),
+        folder_target(bad, TargetRole::Working),
+    ];
+    device.make_folder("Documents");
+    device.pass().await;
+
+    // Not on every copy, so still counted as not backed up everywhere...
+    assert!(device.pending() > 0);
+    // ...but the only copy that lacks it is resting: nothing to run for.
+    assert_eq!(
+        silentsilo_app::owed_now(&device.state, &device.host, device.silo.id),
+        0
+    );
+
+    // Someone is there: the wait goes, and the copy is owed again.
+    silentsilo_app::clear_backoff(&device.state, &device.host, device.silo.id);
+    assert!(silentsilo_app::owed_now(&device.state, &device.host, device.silo.id) > 0);
+    let again = device.pass().await;
+    assert!(
+        again.targets.iter().all(|t| !t.waiting),
+        "tried again: {again:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_pass_that_reaches_no_copy_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let not_a_folder = dir.path().join("file");
+    std::fs::write(&not_a_folder, b"x").unwrap();
+    let device = Device::new(Uuid::new_v4(), None);
+    *device.host.targets.lock().unwrap() = vec![folder_target(not_a_folder, TargetRole::Working)];
+    device.make_folder("Documents");
+
+    assert_eq!(device.pass().await.reached, 0);
+    let resting = device.pass().await;
+    assert_eq!(resting.reached, 0, "{resting:?}");
+    assert!(resting.targets[0].waiting);
+}
+
+/// A change written by a release that knows an operation this one does not,
+/// and says it may not be skipped.
+fn from_a_newer_release(lamport: u64) -> silentsilo_vfs::OpRecord {
+    let raw = serde_json::json!({
+        "op_id": Uuid::new_v4().to_string(),
+        "lamport": lamport,
+        "device_id": Uuid::new_v4().to_string(),
+        "at": 1_700_000_000,
+        "skippable": false,
+        "seq": 0,
+        "op": "set_file_colour",
+        "id": Uuid::new_v4().to_string(),
+        "colour": "red",
+    });
+    silentsilo_vfs::OpRecord::from_bytes(&serde_json::to_vec(&raw).unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn a_change_from_a_newer_release_holds_back_without_stopping_the_pass() {
+    // Replay refuses it, which is right. Refusing it there failed the whole
+    // pass, every pass: this device's own records never counted as sent,
+    // and the screen never said to update.
+    let storage = tempfile::tempdir().unwrap();
+    let device = Device::new(Uuid::new_v4(), None);
+    *device.host.targets.lock().unwrap() = vec![folder_target(
+        storage.path().to_path_buf(),
+        TargetRole::Working,
+    )];
+    device.make_folder("Before");
+    device.pass().await;
+
+    let (dek, _) = device.keys();
+    let store = silentsilo_store::FolderStore::new(storage.path().to_path_buf());
+    silentsilo_sync::push_ops(&store, &dek, &[from_a_newer_release(5_000)])
+        .await
+        .unwrap();
+    device.make_folder("Mine");
+
+    let report = device.pass().await;
+    assert!(report.needs_update, "{report:?}");
+    assert!(report.error.is_none(), "{report:?}");
+    assert!(report.ops_pushed > 0, "this device's change still went out");
+    assert_eq!(device.pending(), 0, "and counts as sent");
+    assert_eq!(report.compacted, 0);
+    let again = device.pass().await;
+    assert!(again.needs_update, "{again:?}");
+}
+
+#[tokio::test]
+async fn a_pass_that_fails_part_way_still_ends_with_a_report() {
+    // Locked between the fetch and the replay is the easiest way to make the
+    // pass stop with an error. A screen showing the step it was on has to
+    // hear that it ended.
+    let storage = tempfile::tempdir().unwrap();
+    let device = Device::new(Uuid::new_v4(), None);
+    *device.host.targets.lock().unwrap() = vec![folder_target(
+        storage.path().to_path_buf(),
+        TargetRole::Working,
+    )];
+    device
+        .state
+        .close_session(&device.host, device.silo.id)
+        .unwrap();
+    let failed = run_sync_pass(&device.state, &device.host, &device.silo).await;
+    assert!(failed.is_err());
+    let reports = device.host.reports();
+    assert_eq!(reports.len(), 1, "one report for the failed pass");
+    assert!(reports[0].error.is_some(), "{:?}", reports[0]);
+    assert_eq!(reports[0].silo_id, device.silo.id.to_string());
 }

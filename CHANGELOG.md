@@ -11,6 +11,50 @@ release notes should say.
 
 ## [Unreleased]
 
+### Fixed
+
+- Records that came from storage no longer read as changes waiting to be
+  sent. They had no delivery row for the copy they came from, so a device
+  that received changes showed "changes waiting" and its next pass asked the
+  copy for every one of them again. A record a copy's listing names now
+  counts as held there (`mark_listed_delivered`).
+- A copy retired under a replaced key no longer keeps every record and blob
+  counted as not backed up. The retirement is kept in the silo, and only the
+  copies still taking records have to hold one (`settle_delivery_among`,
+  `settle_blob_delivery_among`).
+- A change written by a newer release that this one may not skip no longer
+  fails every pass. It holds back the records from it on, like an object
+  that does not open, and the report says `needs_update`; this device's own
+  changes still go out and the inbox is still read.
+- An inbox item leaves a copy once that copy holds every record this device
+  has and the item's content. It waited for one pass to reach every copy, so
+  a copy that did not answer kept every item, and a phone's waiting count,
+  in place for good.
+- `sync_now` clears the backoff after waiting out the pass already running,
+  which could set it again.
+
+### Changed
+
+- The pass sends content after it has read the other devices' records, so a
+  large upload no longer holds back what they wrote. Uploads stop starting
+  after ten minutes and the report says `more_to_do`. A blob that fails, or
+  that no copy gives for a full copy, waits before it is tried again.
+- Passes run per silo. `AppState::sync_in_flight` is gone: a key operation
+  holds every pass off with `try_hold_sync` and `release_sync_hold`;
+  `pass_running` and `sync_busy` say what runs.
+- One pass imports at most `INBOX_IMPORT_PER_PASS` (50) inbox items.
+- A resting copy's backlog is counted, not decoded, on every pass.
+
+### Added
+
+- `clear_backoff`, for when someone is there (an unlock, the app back on
+  screen), and `owed_now`, the records owed to copies due now, for a
+  client's background loop.
+- `SyncReport` fields: `error` (a pass that fails is now announced too),
+  `needs_update`, `reached` (copies that answered; zero must not read as
+  synced), `more_to_do` and `blob_errors`. A skipped pass carries its
+  `silo_id`.
+
 ## [1.10.1] - Trash and export
 
 The release of everything in the 1.10.1 betas below, plus:

@@ -464,3 +464,48 @@ async fn a_phone_whose_key_was_revoked_is_refused_even_with_its_envelope_put_bac
     assert_eq!(report.inbox_refused.len(), 1, "{report:?}");
     assert!(store.head(&envelope(item_id)).await.unwrap().is_some());
 }
+
+#[tokio::test]
+async fn an_item_leaves_the_copy_that_holds_it_while_another_copy_is_unreachable() {
+    // It used to wait until one pass reached every copy, so a second copy
+    // that did not answer kept every item, and the phone's "waiting" count,
+    // there for good.
+    let storage = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let unplugged = dir.path().join("file");
+    std::fs::write(&unplugged, b"x").unwrap();
+    let host = Targets(vec![
+        folder_target(&storage),
+        BackupTarget {
+            config: StoreConfig::Folder { path: unplugged },
+            label: String::new(),
+            role: TargetRole::Working,
+        },
+    ]);
+    let store = FolderStore::new(storage.path().to_path_buf());
+    let device = Device::new(&host).await;
+    let phone = phone(&store, &device, "aa11").await;
+    let item_id = send_photo(&store, &phone, b"a photo").await;
+
+    assert_eq!(device.pass(&host).await.inbox_imported, 1);
+    assert!(store.head(&envelope(item_id)).await.unwrap().is_some());
+    device.pass(&host).await;
+    assert!(
+        store.head(&envelope(item_id)).await.unwrap().is_none(),
+        "gone from the copy that has its record and content"
+    );
+    let blob_id = {
+        let sessions = device.state.sessions.lock().unwrap();
+        Vfs::new(&sessions[&device.silo.id])
+            .get_file(item_id)
+            .unwrap()
+            .blob_id
+    };
+    assert!(
+        store
+            .head(&format!("blobs/{blob_id}.sslo"))
+            .await
+            .unwrap()
+            .is_some()
+    );
+}

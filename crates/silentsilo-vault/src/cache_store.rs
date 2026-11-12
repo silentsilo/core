@@ -122,6 +122,18 @@ pub fn record_blob_delivered(
 /// targets that are no longer configured. `synced` gates eviction, so it has
 /// to mean every copy has it, not merely one.
 pub fn settle_blob_delivery(vault_root: &Path, targets: &[Uuid]) -> Result<(), VaultError> {
+    settle_blob_delivery_among(vault_root, targets, targets)
+}
+
+/// [`settle_blob_delivery`], where only `required` has to hold a blob for it
+/// to count as backed up. The rest of `targets` keep their rows: a copy
+/// retired under a replaced key takes nothing new, and waiting on it pinned
+/// every file on this disk for good.
+pub fn settle_blob_delivery_among(
+    vault_root: &Path,
+    targets: &[Uuid],
+    required: &[Uuid],
+) -> Result<(), VaultError> {
     let conn = open_cache_db(vault_root)?;
 
     if targets.is_empty() {
@@ -144,15 +156,22 @@ pub fn settle_blob_delivery(vault_root: &Path, targets: &[Uuid]) -> Result<(), V
     // Both directions. Only ever setting it would leave a blob evictable
     // after the copy that held it was removed, which is how a local file
     // gets thrown away while no backup has it.
+    if required.is_empty() {
+        conn.execute("UPDATE blob_cache SET synced = 0", [])?;
+        return Ok(());
+    }
+    let needed: Vec<String> = required.iter().map(|t| t.to_string()).collect();
+    let needed_marks = vec!["?"; needed.len()].join(",");
     conn.execute(
         &format!(
             "UPDATE blob_cache SET synced = CASE
                 WHEN (SELECT COUNT(*) FROM blob_delivery d
-                      WHERE d.blob_id = blob_cache.blob_id) = {} THEN 1
+                      WHERE d.blob_id = blob_cache.blob_id
+                        AND d.target IN ({needed_marks})) = {} THEN 1
                 ELSE 0 END",
-            list.len()
+            needed.len()
         ),
-        [],
+        rusqlite::params_from_iter(needed.iter()),
     )?;
     Ok(())
 }

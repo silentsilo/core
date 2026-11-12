@@ -678,6 +678,8 @@ fn move_staged_snapshot(root: &Path) {
 
 // ── Devices ─────────────────────────────────────────────────────────
 
+// A handful live for one test; boxing them would only add noise.
+#[allow(clippy::large_enum_variant)]
 enum Kind {
     Old(old::Dev),
     New(new::Dev),

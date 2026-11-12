@@ -1,14 +1,12 @@
 //! One sync pass, in the order the desktop's `docs/ARCHITECTURE.md`
 //! describes and for the reasons given there.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use silentsilo_store::ObjectStore;
 use silentsilo_sync as sync;
 use silentsilo_vault::{SiloEntry, load_fido_keys};
 use silentsilo_vfs::{
     OpRecord, Vfs, highest_applied_lamport, mark_delivered, pending_ops_for, record_target_failure,
-    record_target_success, replay, settle_delivery, target_last_success, target_retry_in,
+    record_target_success, replay, target_last_success, target_retry_in,
 };
 use uuid::Uuid;
 
@@ -98,6 +96,29 @@ pub struct SyncReport {
     /// newer format.
     #[serde(default)]
     pub inbox_refused: Vec<String>,
+    /// Why the pass stopped part way, when it did. Sent as a report so a
+    /// screen showing where the pass was hears that it ended; before, an
+    /// error ended it with no event and the last step stayed on screen.
+    #[serde(default)]
+    pub error: Option<String>,
+    /// Another device wrote a change only a newer release understands.
+    /// Nothing from it on is applied here until this one is updated; the
+    /// rest of the pass still runs.
+    #[serde(default)]
+    pub needs_update: bool,
+    /// Copies this pass talked to and that answered. Zero with copies
+    /// configured means nothing was checked, which a screen must not show as
+    /// "synced just now".
+    #[serde(default)]
+    pub reached: usize,
+    /// Work left for the next pass: content not uploaded or downloaded in the
+    /// time a pass gives it, or inbox items past the per-pass limit.
+    #[serde(default)]
+    pub more_to_do: bool,
+    /// Content that would not go to a copy, with why. Each one waits before
+    /// it is tried again, so one file the copy refuses is not sent every pass.
+    #[serde(default)]
+    pub blob_errors: Vec<String>,
 }
 
 /// Where a running pass is, for a status line and a marker on the file being
@@ -234,31 +255,70 @@ pub async fn sync_now(
     host: &dyn Host,
     silo: &SiloEntry,
 ) -> Result<SyncReport, String> {
-    // Pressing the button clears every backoff timer first. The wait exists
-    // to stop this device hammering a target that is not answering, which is
-    // not the situation when someone is sitting there asking for a pass now.
-    let configured = host.targets(silo.id);
+    // Someone pressed a button and is owed an answer about their own silo, so
+    // a background pass already running there is waited out rather than
+    // reported as nothing to do. Bounded: a pass that never finishes must
+    // not leave the button spinning for the rest of the session.
+    wait_for_pass_to_finish(state, silo.id, WAIT_FOR_PASS).await;
+    // After the wait, not before: the pass waited out records its own
+    // outcomes, and a failure there put the backoff straight back.
+    clear_backoff(state, host, silo.id);
+    run_sync_pass(state, host, silo).await
+}
+
+/// Clears every copy's backoff for one silo. For when someone is there: an
+/// unlock, the app back on screen, a pressed Sync. The wait exists to stop a
+/// device hammering a copy that does not answer, and a phone whose network
+/// the system cut while it was in the background collected up to fifteen
+/// minutes of it, kept in the silo, so the pass after an unlock did nothing.
+pub fn clear_backoff(state: &AppState, host: &dyn Host, silo_id: Uuid) {
+    let configured = host.targets(silo_id);
     if let Ok(sessions) = state.sessions.lock()
-        && let Some(session) = sessions.get(&silo.id)
+        && let Some(session) = sessions.get(&silo_id)
     {
         for target in &configured {
             let _ = silentsilo_vfs::reset_target_backoff(&session.conn, target.config.target_id());
         }
     }
-    // Someone pressed a button and is owed an answer about their own silo, so
-    // a background pass already running is waited out rather than reported as
-    // nothing to do. Bounded: a pass that never finishes must not leave the
-    // button spinning for the rest of the session.
-    wait_for_pass_to_finish(state, WAIT_FOR_PASS).await;
-    run_sync_pass(state, host, silo).await
+}
+
+/// Records owed to copies that are due now and not retired: what a
+/// background loop should run a pass for. A copy resting after a failure,
+/// or retired under a replaced key, is left out, or one disk in a drawer
+/// kept the loop running a full pass every few seconds. Zero when locked.
+pub fn owed_now(state: &AppState, host: &dyn Host, silo_id: Uuid) -> usize {
+    let configured = host.targets(silo_id);
+    let now = unix_now();
+    let Ok(sessions) = state.sessions.lock() else {
+        return 0;
+    };
+    let Some(session) = sessions.get(&silo_id) else {
+        return 0;
+    };
+    configured
+        .iter()
+        .map(|t| t.config.target_id())
+        .filter(|id| {
+            matches!(target_retry_in(&session.conn, *id, now), Ok(0))
+                && !matches!(silentsilo_vfs::target_retired(&session.conn, *id), Ok(true))
+        })
+        .map(|id| silentsilo_vfs::pending_count_for(&session.conn, id).unwrap_or(0))
+        .sum()
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// How long a pressed Sync waits for a pass already running.
 const WAIT_FOR_PASS: std::time::Duration = std::time::Duration::from_secs(90);
 
-async fn wait_for_pass_to_finish(state: &AppState, limit: std::time::Duration) {
+async fn wait_for_pass_to_finish(state: &AppState, silo: Uuid, limit: std::time::Duration) {
     let deadline = std::time::Instant::now() + limit;
-    while state.sync_in_flight.load(Ordering::SeqCst) {
+    while state.pass_running(silo) {
         if std::time::Instant::now() >= deadline {
             return;
         }
@@ -266,23 +326,47 @@ async fn wait_for_pass_to_finish(state: &AppState, limit: std::time::Duration) {
     }
 }
 
-/// Guards a pass so only one runs at a time.
-///
-/// Released on drop, so an error or an early return can't leave sync wedged
-/// off for the rest of the session.
-struct SyncGuard<'a>(&'a AtomicBool);
+/// How long one pass spends starting uploads. A blob already going finishes;
+/// the rest wait for the next pass, which comes at once (`more_to_do`).
+const UPLOAD_BUDGET: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
-impl<'a> SyncGuard<'a> {
-    fn acquire(flag: &'a AtomicBool) -> Option<Self> {
-        flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .ok()
-            .map(|_| Self(flag))
+/// How long a blob that failed waits before it is tried again, first and at
+/// most. Doubling in between.
+const BLOB_WAIT_BASE_SECS: i64 = 60;
+const BLOB_WAIT_MAX_SECS: i64 = 6 * 60 * 60;
+
+/// The id under which content no copy gave is remembered. Downloads are not
+/// about one copy, so they share one slot per blob.
+const ANY_COPY: Uuid = Uuid::nil();
+
+impl AppState {
+    fn blob_due(&self, target: Uuid, blob: Uuid, now: i64) -> bool {
+        self.blob_waits
+            .lock()
+            .map(|waits| waits.get(&(target, blob)).is_none_or(|w| w.next_try <= now))
+            .unwrap_or(true)
     }
-}
 
-impl Drop for SyncGuard<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
+    fn blob_failed(&self, target: Uuid, blob: Uuid, now: i64) {
+        if let Ok(mut waits) = self.blob_waits.lock() {
+            let wait = waits
+                .entry((target, blob))
+                .or_insert(crate::state::BlobWait {
+                    fails: 0,
+                    next_try: 0,
+                });
+            wait.fails = wait.fails.saturating_add(1);
+            let secs = BLOB_WAIT_BASE_SECS
+                .saturating_mul(1 << wait.fails.min(10))
+                .min(BLOB_WAIT_MAX_SECS);
+            wait.next_try = now + secs;
+        }
+    }
+
+    fn blob_done(&self, target: Uuid, blob: Uuid) {
+        if let Ok(mut waits) = self.blob_waits.lock() {
+            waits.remove(&(target, blob));
+        }
     }
 }
 
@@ -676,31 +760,57 @@ pub async fn run_sync_pass(
 ) -> Result<SyncReport, String> {
     let configured = host.targets(silo.id);
     if configured.is_empty() {
-        return Ok(SyncReport::default());
+        return Ok(SyncReport {
+            silo_id: silo.id.to_string(),
+            ..SyncReport::default()
+        });
     }
 
-    // Two passes at once would each read the same pending queue and send it
-    // twice. Skipping is right rather than queueing: the pass already
-    // running will pick up whatever this one would have sent.
-    let Some(_guard) = SyncGuard::acquire(&state.sync_in_flight) else {
+    // Two passes over one silo would each read the same pending queue and
+    // send it twice. Skipping is right rather than queueing: the pass already
+    // running picks up whatever this one would have sent. Not announced: a
+    // screen hearing it would clear the progress of the pass still going.
+    let Some(_guard) = state.try_start_pass(silo.id) else {
         return Ok(SyncReport {
+            silo_id: silo.id.to_string(),
             configured: true,
             skipped: true,
             ..SyncReport::default()
         });
     };
+    match pass(state, host, silo, configured).await {
+        Ok(report) => Ok(report),
+        Err(e) => {
+            announce(
+                host,
+                silo,
+                SyncReport {
+                    configured: true,
+                    error: Some(e.clone()),
+                    ..SyncReport::default()
+                },
+            );
+            Err(e)
+        }
+    }
+}
+
+async fn pass(
+    state: &AppState,
+    host: &dyn Host,
+    silo: &SiloEntry,
+    configured: Vec<silentsilo_vault::BackupTarget>,
+) -> Result<SyncReport, String> {
     let root = silo.path.clone();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    let now = unix_now();
     let every_target: Vec<Uuid> = configured.iter().map(|t| t.config.target_id()).collect();
 
     // Everything the network phase needs is read up front, then the lock is
     // released, so a slow upload never blocks the UI. What each target is
     // owed is read per target: one shared queue would let a disk in a
-    // drawer decide what the bucket is offered.
-    let (due, dek, kek, vault_id, applied_through, base, known) = {
+    // drawer decide what the bucket is offered. Only for copies this pass
+    // will try: a resting one's backlog is counted, not decoded.
+    let (due, dek, kek, vault_id, applied_through, base, known, mut retired_before) = {
         let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
         let session = sessions.get(&silo.id).ok_or_else(|| {
             silentsilo_core::coded!("err.unlock_before_sync", "Unlock the silo before syncing.")
@@ -709,12 +819,27 @@ pub async fn run_sync_pass(
         let conn = &session.conn;
 
         let mut due = Vec::new();
+        let mut retired_before = std::collections::HashSet::new();
         for id in &every_target {
+            let retry_in = target_retry_in(conn, *id, now).map_err(|e| e.to_string())?;
+            let (owed, behind) = if retry_in > 0 {
+                let behind =
+                    silentsilo_vfs::pending_count_for(conn, *id).map_err(|e| e.to_string())?;
+                (Vec::new(), behind)
+            } else {
+                let owed = pending_ops_for(conn, *id).map_err(|e| e.to_string())?;
+                let behind = owed.len();
+                (owed, behind)
+            };
+            if silentsilo_vfs::target_retired(conn, *id).map_err(|e| e.to_string())? {
+                retired_before.insert(*id);
+            }
             due.push((
                 *id,
-                pending_ops_for(conn, *id).map_err(|e| e.to_string())?,
+                owed,
+                behind,
                 target_last_success(conn, *id).map_err(|e| e.to_string())?,
-                target_retry_in(conn, *id, now).map_err(|e| e.to_string())?,
+                retry_in,
             ));
         }
         (
@@ -725,6 +850,7 @@ pub async fn run_sync_pass(
             highest_applied_lamport(conn).map_err(|e| e.to_string())?,
             silentsilo_vfs::snapshot::read_base(conn).map_err(|e| e.to_string())?,
             silentsilo_vfs::all_op_ids(conn).map_err(|e| e.to_string())?,
+            retired_before,
         )
     };
     let local_horizon = base.as_ref().map(|s| s.horizon).unwrap_or(0);
@@ -734,7 +860,7 @@ pub async fn run_sync_pass(
     // so.
     let mut targets: Vec<OpenTarget> = Vec::new();
     let mut resting: Vec<TargetStatus> = Vec::new();
-    for (target, (id, owed, last_success, retry_in)) in configured.iter().zip(due) {
+    for (target, (id, owed, behind, last_success, retry_in)) in configured.iter().zip(due) {
         let mut status = TargetStatus {
             id: id.to_string(),
             label: target.label.clone(),
@@ -744,7 +870,7 @@ pub async fn run_sync_pass(
             last_success,
             retry_in,
             waiting: retry_in > 0,
-            ops_behind: owed.len(),
+            ops_behind: behind,
         };
         if retry_in > 0 {
             resting.push(status);
@@ -893,11 +1019,15 @@ pub async fn run_sync_pass(
     let mut retired: std::collections::HashMap<Uuid, &'static str> =
         std::collections::HashMap::new();
     let mut unproven = false;
+    // Copies whose key state was read this pass, so their retirement can be
+    // written down either way.
+    let mut evaluated = std::collections::HashSet::new();
     for target in &targets {
         // Unreachable: it has no say, and the push below fails on it.
         let Ok(state) = sync::kek_envelope_state(&*target.store, &dek).await else {
             continue;
         };
+        evaluated.insert(target.id);
         // Decided like a rotation; only the wording differs.
         let state = if state == sync::KekState::RotatedUnproven {
             unproven = true;
@@ -1024,7 +1154,38 @@ pub async fn run_sync_pass(
         });
         false
     });
-    let live_targets = every_target.len() - retired.len();
+    // Retirement is kept in the silo, so a pass that does not reach a
+    // retired copy still leaves it out of what has to hold a record before
+    // it counts as backed up.
+    {
+        let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
+        if let Some(session) = sessions.get(&silo.id) {
+            for id in &evaluated {
+                let now_retired = retired.contains_key(id);
+                if now_retired != retired_before.contains(id) {
+                    silentsilo_vfs::set_target_retired(&session.conn, *id, now_retired)
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+        }
+    }
+    for id in &evaluated {
+        if retired.contains_key(id) {
+            retired_before.insert(*id);
+        } else {
+            retired_before.remove(id);
+        }
+    }
+    for id in retired.keys() {
+        retired_before.insert(*id);
+    }
+    let retired_ids = retired_before;
+    // The copies a record has to reach before it counts as backed up.
+    let required: Vec<Uuid> = every_target
+        .iter()
+        .copied()
+        .filter(|id| !retired_ids.contains(id))
+        .collect();
 
     // Other devices' keys in, and this device's revocations out as markers,
     // before the push publishes anything: publishing first would put back a
@@ -1097,7 +1258,7 @@ pub async fn run_sync_pass(
     let keys = load_fido_keys(&root).ok();
 
     let several_copies = targets.len() > 1;
-    // Targets that took everything they were owed. Kept apart from the
+    // Targets that took every record they were owed. Kept apart from the
     // status, which a later failed fetch also marks: what was delivered
     // stays delivered, and the fetch failure is still reported.
     let mut pushed_to: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
@@ -1111,10 +1272,9 @@ pub async fn run_sync_pass(
             base: base.as_ref(),
             vault_root: &root,
         };
-        // What the last blob report resolved to a file, so several reports
-        // about one blob cost one lookup.
-        let mut named = None;
-        let outcome = sync::push_everything_to_reporting(
+        // Records only. Content goes after the other devices' records have
+        // been read, so a large upload no longer holds back what they wrote.
+        let outcome = sync::push_records_to_reporting(
             &sync::TargetPush {
                 id: target.id,
                 store: &*target.store,
@@ -1122,36 +1282,21 @@ pub async fn run_sync_pass(
                 owed: &target.owed,
             },
             &silo_state,
-            &mut |step| match step {
-                sync::PushStep::Ops { done, total } => {
-                    if worth_saying(done, total) {
-                        report_progress(
-                            state,
-                            host,
-                            silo.id,
-                            "sending-changes",
-                            ProgressStep::counted(done, total),
-                            None,
-                            &mut named,
-                            None,
-                        );
-                    }
+            &mut |step| {
+                if let sync::PushStep::Ops { done, total } = step
+                    && worth_saying(done, total)
+                {
+                    report_progress(
+                        state,
+                        host,
+                        silo.id,
+                        "sending-changes",
+                        ProgressStep::counted(done, total),
+                        None,
+                        &mut None,
+                        None,
+                    );
                 }
-                sync::PushStep::Blob(blob) => report_progress(
-                    state,
-                    host,
-                    silo.id,
-                    "uploading",
-                    ProgressStep {
-                        done: blob.done,
-                        total: blob.total,
-                        bytes_done: blob.bytes_done,
-                        bytes_total: blob.bytes_total,
-                    },
-                    Some(blob.blob_id),
-                    &mut named,
-                    several_copies.then_some(target.label.as_str()),
-                ),
             },
         )
         .await;
@@ -1163,8 +1308,6 @@ pub async fn run_sync_pass(
         // Kept, the key is known here as removed and is never taken in.
 
         ops_pushed += outcome.ops_pushed;
-        blobs_uploaded += outcome.blobs_uploaded;
-        blobs_failed += outcome.blobs_failed;
         if outcome.failed.is_none() {
             pushed_to.insert(target.id);
         }
@@ -1172,7 +1315,7 @@ pub async fn run_sync_pass(
             id: target.id.to_string(),
             label: target.label.clone(),
             ops_pushed: outcome.ops_pushed,
-            blobs_uploaded: outcome.blobs_uploaded,
+            blobs_uploaded: 0,
             // Everything it was owed either arrived this pass or was already
             // there; `push_ops` skips what the target already holds.
             ops_behind: if outcome.failed.is_some() {
@@ -1198,11 +1341,7 @@ pub async fn run_sync_pass(
         })
     };
     if let Some((device, unchecked)) = audit_device {
-        let required: std::collections::HashSet<Uuid> = every_target
-            .iter()
-            .copied()
-            .filter(|id| !retired.contains_key(id))
-            .collect();
+        let required: std::collections::HashSet<Uuid> = required.iter().copied().collect();
         let pass = AuditPass {
             root: &root,
             device,
@@ -1224,6 +1363,8 @@ pub async fn run_sync_pass(
     let mut fetch_failed = false;
     let mut misplaced: Vec<String> = Vec::new();
     let mut listed_through = 0u64;
+    // What each copy's listing named, to note those records as held there.
+    let mut listed_on: Vec<(Uuid, std::collections::HashSet<Uuid>)> = Vec::new();
     for target in &targets {
         match sync::fetch_missing_ops_reporting(
             &*target.store,
@@ -1252,6 +1393,7 @@ pub async fn run_sync_pass(
                 unreadable.append(&mut got.unreadable);
                 misplaced.append(&mut got.misplaced);
                 listed_through = listed_through.max(got.listed_through);
+                listed_on.push((target.id, std::mem::take(&mut got.listed)));
             }
             Err(e) => {
                 fetch_failed = true;
@@ -1271,6 +1413,32 @@ pub async fn run_sync_pass(
             &format!("{key} holds a record under another name; skipped"),
         );
     }
+    // The same record comes from every copy that holds it.
+    {
+        let mut seen = std::collections::HashSet::new();
+        incoming.retain(|r| seen.insert(r.op_id));
+    }
+    // A change only a newer release understands, which this one may not skip.
+    // Replay refuses it, and refusing it there failed the whole pass on every
+    // pass: nothing marked delivered, the inbox never read, and no word on
+    // screen. Held back here instead, like an object that does not open, so
+    // nothing from it on is applied and the rest of the pass still runs.
+    let mut needs_update = false;
+    incoming.retain(|r| match &r.op {
+        silentsilo_vfs::OpBody::Unknown { op, .. } if !r.skippable => {
+            needs_update = true;
+            unreadable.push(sync::UnreadableOp {
+                key: format!("{}", r.op_id),
+                op_id: Some(r.op_id),
+                lamport: Some(r.lamport),
+                error: format!("written by a newer SilentSilo ({op}); update this one to apply it"),
+                opened: true,
+                holds_back: true,
+            });
+            false
+        }
+        _ => true,
+    });
     let fetched_ids: std::collections::HashSet<Uuid> = incoming.iter().map(|r| r.op_id).collect();
     unreadable.retain(|u| u.op_id.is_none_or(|id| !fetched_ids.contains(&id)));
     // One that has not opened for a week stops holding the rest back (see
@@ -1297,8 +1465,12 @@ pub async fn run_sync_pass(
     }
     let (incoming, held_back) = sync::usable_prefix(incoming, &unreadable);
     // Everything every copy holds was read and nothing is held back.
-    let view_complete =
-        !fetch_failed && unreadable.is_empty() && held_back == 0 && targets.len() == live_targets;
+    let view_complete = !fetch_failed
+        && unreadable.is_empty()
+        && held_back == 0
+        && required
+            .iter()
+            .all(|id| targets.iter().any(|t| t.id == *id));
     let fetched = incoming.len();
     for u in &unreadable {
         host.warn("sync", &format!("{} could not be read: {}", u.key, u.error));
@@ -1373,7 +1545,9 @@ pub async fn run_sync_pass(
 
         // Written down per target, after the write and never before: a
         // record noted as delivered without having arrived is one this
-        // device will never offer again.
+        // device will never offer again. Records a copy's listing named are
+        // noted too, the ones that just came from it among them: a push asks
+        // for each by name and would skip them anyway.
         //
         // All of it in one transaction, across every target. `mark_delivered`
         // takes a savepoint of its own and nests inside this one, so this is
@@ -1390,6 +1564,10 @@ pub async fn run_sync_pass(
                     .map_err(|e| e.to_string())?;
             }
         }
+        for (target, listed) in &listed_on {
+            silentsilo_vfs::mark_listed_delivered(&session.conn, *target, listed)
+                .map_err(|e| e.to_string())?;
+        }
         delivery.commit().map_err(|e| e.to_string())?;
         report
     };
@@ -1397,21 +1575,103 @@ pub async fn run_sync_pass(
         host.warn("sync", hole);
     }
 
+    // ── Content out ─────────────────────────────────────────────────
+    //
+    // After the records, as before, and now after the other devices' records
+    // too. Only to copies that took the records: content with no record
+    // there would look like an orphan. A blob that failed waits before it is
+    // tried again, and uploads stop starting once the pass has spent its
+    // budget on them.
+    let upload_until = std::time::Instant::now() + UPLOAD_BUDGET;
+    let mut blob_errors: Vec<String> = Vec::new();
+    let mut more_to_do = false;
+    for target in &targets {
+        if !pushed_to.contains(&target.id) {
+            continue;
+        }
+        let pending: Vec<Uuid> = silentsilo_vault::list_undelivered_blob_ids(&root, target.id)
+            .into_iter()
+            .filter(|blob| state.blob_due(target.id, *blob, now))
+            .collect();
+        if pending.is_empty() {
+            continue;
+        }
+        let mut named = None;
+        let sent = sync::push_blobs_within(
+            &*target.store,
+            &root,
+            target.id,
+            &pending,
+            Some(upload_until),
+            &mut |blob| {
+                report_progress(
+                    state,
+                    host,
+                    silo.id,
+                    "uploading",
+                    ProgressStep {
+                        done: blob.done,
+                        total: blob.total,
+                        bytes_done: blob.bytes_done,
+                        bytes_total: blob.bytes_total,
+                    },
+                    Some(blob.blob_id),
+                    &mut named,
+                    several_copies.then_some(target.label.as_str()),
+                )
+            },
+        )
+        .await;
+        let status = statuses.iter_mut().find(|s| s.id == target.id.to_string());
+        match sent {
+            Ok(outcome) => {
+                blobs_uploaded += outcome.uploaded;
+                blobs_failed += outcome.failed.len();
+                more_to_do |= outcome.left > 0;
+                for blob in &pending {
+                    if !outcome.failed.iter().any(|(id, _)| id == blob) {
+                        state.blob_done(target.id, *blob);
+                    }
+                }
+                for (blob, why) in &outcome.failed {
+                    state.blob_failed(target.id, *blob, now);
+                    if blob_errors.len() < 3 {
+                        blob_errors.push(format!("{}: {why}", target.label));
+                    }
+                    host.warn("sync", &format!("{}: blob {blob}: {why}", target.label));
+                }
+                if let Some(status) = status {
+                    status.blobs_uploaded = outcome.uploaded;
+                }
+            }
+            Err(e) => {
+                if let Some(status) = status
+                    && status.failed.is_none()
+                {
+                    status.failed = Some(e.to_string());
+                }
+            }
+        }
+    }
+
     // `pushed` gates local pruning as well as re-sending, so it may only be
-    // set once every configured target holds the record. Compaction dropping
-    // something one target never received would leave it permanently short,
-    // with no local copy left to offer. A target removed from the list stops
-    // being waited for, which is what makes this terminate.
+    // set once every copy that can still take records holds the record.
+    // Compaction dropping something one target never received would leave
+    // it permanently short, with no local copy left to offer. A target
+    // removed from the list stops being waited for, which is what makes
+    // this terminate, and so does a retired one, which takes nothing new.
     {
         let mut sessions = state.sessions.lock().map_err(|e| e.to_string())?;
         if let Some(session) = sessions.get_mut(&silo.id) {
-            settle_delivery(&mut session.conn, &every_target).map_err(|e| e.to_string())?;
+            silentsilo_vfs::settle_delivery_among(&mut session.conn, &every_target, &required)
+                .map_err(|e| e.to_string())?;
         }
     }
     // The same accounting for content. Both tables also drop what they hold
     // for a target that is no longer configured, so removing a copy and
     // adding another leaves nothing claiming the new one is up to date.
-    silentsilo_vault::settle_blob_delivery(&root, &every_target).map_err(|e| e.to_string())?;
+    silentsilo_vault::settle_blob_delivery_among(&root, &every_target, &required)
+        .map_err(|e| e.to_string())?;
     // Content a purge left here for the push, now that every copy has it.
     let referenced = {
         let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
@@ -1427,10 +1687,39 @@ pub async fn run_sync_pass(
     // ── The inbox ───────────────────────────────────────────────────
     //
     // After the push, so an item recorded by an earlier pass has had its
-    // record sent before it may leave the inbox. With more than one copy the
-    // content comes down too, for the next push to spread.
-    let every_copy_reached =
-        statuses.len() == live_targets && statuses.iter().all(|s| s.failed.is_none() && !s.waiting);
+    // record sent before it may leave the inbox. An item leaves a copy's
+    // inbox once that copy holds every record this device has, the item's
+    // among them: its content is staged there too, so storage never loses
+    // it while the only trace is this device's database. It used to wait
+    // for every copy at once, and one disk in a drawer kept every item, and
+    // the phone's "waiting" count, there for good. With more than one copy
+    // the content comes down too, for the next push to spread.
+    let every_copy_reached = required.iter().all(|id| {
+        statuses
+            .iter()
+            .any(|s| s.id == id.to_string() && s.failed.is_none() && !s.waiting)
+    });
+    let caught_up: std::collections::HashSet<Uuid> = {
+        let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
+        match sessions.get(&silo.id) {
+            Some(session) => targets
+                .iter()
+                .filter(|t| pushed_to.contains(&t.id))
+                .filter(|t| {
+                    matches!(
+                        silentsilo_vfs::pending_count_for(&session.conn, t.id),
+                        Ok(0)
+                    )
+                })
+                .map(|t| t.id)
+                .collect(),
+            None => std::collections::HashSet::new(),
+        }
+    };
+    let reached = statuses
+        .iter()
+        .filter(|s| s.failed.is_none() && !s.waiting)
+        .count();
     statuses.extend(retired_statuses);
     let inbox_targets: Vec<crate::inbox_import::InboxTarget<'_>> = targets
         .iter()
@@ -1438,7 +1727,7 @@ pub async fn run_sync_pass(
             id: t.id,
             store: &*t.store,
             label: &t.label,
-            may_finish: every_copy_reached && t.role.allows_delete(),
+            may_finish: caught_up.contains(&t.id) && t.role.allows_delete(),
         })
         .collect();
     let inbox = crate::inbox_import::import_inbox(
@@ -1463,6 +1752,7 @@ pub async fn run_sync_pass(
         },
     )
     .await;
+    more_to_do |= inbox.left > 0;
 
     // ── Housekeeping ────────────────────────────────────────────────
     //
@@ -1472,12 +1762,13 @@ pub async fn run_sync_pass(
     let reachable: Vec<(Uuid, &dyn ObjectStore)> =
         targets.iter().map(|t| (t.id, &*t.store)).collect();
     sync::recheck_absent_blobs(&reachable, &root).await;
-    let pulled =
-        fetch_missing_for_full_copy(state, host, silo, &reachable, every_copy_reached).await;
+    let (pulled, full_copy_left) =
+        fetch_missing_for_full_copy(state, host, silo, &reachable, every_copy_reached, now).await;
+    more_to_do |= full_copy_left > 0;
     // What came down, from the inbox or for the full copy, is on the copy it
     // came from, and no longer counts as waiting to back up there.
     if pulled > 0 || inbox.imported > 0 {
-        let _ = silentsilo_vault::settle_blob_delivery(&root, &every_target);
+        let _ = silentsilo_vault::settle_blob_delivery_among(&root, &every_target, &required);
     }
 
     // Both steps below act on what this device believes the silo holds:
@@ -1539,6 +1830,11 @@ pub async fn run_sync_pass(
         held_back,
         inbox_imported: inbox.imported,
         inbox_refused: inbox.refused,
+        error: None,
+        needs_update,
+        reached,
+        more_to_do,
+        blob_errors,
     };
 
     // The file list is stale the moment remote changes land.
@@ -1681,16 +1977,22 @@ fn record_target_outcomes(
 /// Downloads whatever this device is missing, when it is meant to hold a
 /// full copy. Bounded per pass so a hundred-gigabyte silo does not hold
 /// the sync loop for hours; every following pass carries on where this one
-/// stopped. Failures are counted rather than raised.
+/// stopped. Failures are counted rather than raised. Returns how many came
+/// down and how many are still missing.
+///
+/// Content no copy gave waits before it is asked for again: with one copy
+/// resting it cannot be recorded as absent everywhere, and it was asked for,
+/// and shown as downloading, on every pass.
 async fn fetch_missing_for_full_copy(
     state: &AppState,
     host: &dyn Host,
     silo: &SiloEntry,
     stores: &[(Uuid, &dyn ObjectStore)],
     every_copy: bool,
-) -> usize {
-    if !silentsilo_vault::keep_full_copy(&silo.path) {
-        return 0;
+    now: i64,
+) -> (usize, usize) {
+    if !silentsilo_vault::keep_full_copy(&silo.path) || stores.is_empty() {
+        return (0, 0);
     }
 
     // The blob directory is walked before the lock, not under it: on a full
@@ -1705,25 +2007,34 @@ async fn fetch_missing_for_full_copy(
     })
     .await;
     let Ok(here) = listed else {
-        return 0;
+        return (0, 0);
     };
     let missing: Vec<Uuid> = {
         let Ok(sessions) = state.sessions.lock() else {
-            return 0;
+            return (0, 0);
         };
         let Some(session) = sessions.get(&silo.id) else {
-            return 0;
+            return (0, 0);
         };
         // With attachments: a full copy that left them out would restore
         // every file and no attachment.
         match Vfs::new(session).referenced_blobs_with_attachments() {
-            Ok(referenced) => referenced.difference(&here).copied().collect(),
-            Err(_) => return 0,
+            Ok(referenced) => {
+                let mut missing: Vec<Uuid> = referenced.difference(&here).copied().collect();
+                missing.sort();
+                missing
+            }
+            Err(_) => return (0, 0),
         }
     };
+    let due: Vec<Uuid> = missing
+        .iter()
+        .copied()
+        .filter(|blob| state.blob_due(ANY_COPY, *blob, now))
+        .collect();
 
     let mut fetched = 0;
-    let batch: Vec<Uuid> = missing.into_iter().take(FULL_COPY_FETCH_PER_PASS).collect();
+    let batch: Vec<Uuid> = due.iter().copied().take(FULL_COPY_FETCH_PER_PASS).collect();
     let mut named = None;
     for (done, blob_id) in batch.iter().copied().enumerate() {
         report_progress(
@@ -1742,11 +2053,19 @@ async fn fetch_missing_for_full_copy(
         // afterwards: a device asked to keep a full copy never became one
         // and never said why.
         match sync::fetch_blob_from_targets(stores, &silo.path, blob_id, every_copy).await {
-            Ok(_) => fetched += 1,
-            Err(e) => host.warn("sync", &format!("blob {blob_id} did not come down: {e}")),
+            Ok(_) => {
+                fetched += 1;
+                state.blob_done(ANY_COPY, blob_id);
+            }
+            Err(e) => {
+                state.blob_failed(ANY_COPY, blob_id, now);
+                host.warn("sync", &format!("blob {blob_id} did not come down: {e}"));
+            }
         }
     }
-    fetched
+    // Only what is due counts as work left: content waiting after a failure
+    // must not make the next pass come at once.
+    (fetched, due.len().saturating_sub(batch.len()))
 }
 
 /// How many blobs one pass will pull when catching a full copy up.
@@ -1978,7 +2297,7 @@ fn the_pass_runs_on_any_thread(state: &AppState, host: &dyn Host, silo: &SiloEnt
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use silentsilo_store::{StoreError, StoredObject};
     use silentsilo_vault::{BackupTarget, VaultSession};
@@ -2029,6 +2348,25 @@ mod tests {
             self.aborts.fetch_add(1, Ordering::SeqCst);
             self.inner.abort_stale_uploads(prefix, older_than).await
         }
+    }
+
+    #[test]
+    fn a_blob_that_failed_waits_longer_each_time_and_is_forgotten_once_sent() {
+        let state = AppState::default();
+        let (target, blob) = (Uuid::new_v4(), Uuid::new_v4());
+        assert!(state.blob_due(target, blob, 0));
+        state.blob_failed(target, blob, 0);
+        assert!(!state.blob_due(target, blob, BLOB_WAIT_BASE_SECS));
+        assert!(state.blob_due(target, blob, 2 * BLOB_WAIT_BASE_SECS));
+        state.blob_failed(target, blob, 0);
+        assert!(!state.blob_due(target, blob, 2 * BLOB_WAIT_BASE_SECS));
+        for _ in 0..20 {
+            state.blob_failed(target, blob, 0);
+        }
+        assert!(state.blob_due(target, blob, BLOB_WAIT_MAX_SECS), "capped");
+        assert!(state.blob_due(Uuid::new_v4(), blob, 0), "per copy");
+        state.blob_done(target, blob);
+        assert!(state.blob_due(target, blob, 0));
     }
 
     #[tokio::test]
