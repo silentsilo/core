@@ -11,6 +11,11 @@ release notes should say.
 
 ## [Unreleased]
 
+## [1.10.2] - Sync that starts and says what it did
+
+No persisted format changed. One local key is new in `vault_meta`
+(`target:<id>:retired`); older releases ignore it.
+
 ### Fixed
 
 - Records that came from storage no longer read as changes waiting to be
