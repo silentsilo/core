@@ -11,6 +11,30 @@ release notes should say.
 
 ## [Unreleased]
 
+## [1.10.3] - Dependency advisories
+
+No persisted format changed. Same code as 1.10.2, with dependencies moved
+past the advisories published since.
+
+### Security
+
+- crypto-bigint 0.7.11 and ctutils 0.4.8 (RUSTSEC-2026-0387, -0385:
+  operations meant to be constant-time that were not).
+- rustls-webpki 0.103.16 and webpki-root-certs 1.0.12 (RUSTSEC-2026-0382,
+  -0383: distrusted emSign intermediates were still accepted).
+- tokio 1.54.1, rustix 1.1.6.
+- silentsilo-store requires russh 0.63.1, which drops channel messages for
+  channels the client never opened (RUSTSEC-2026-0492).
+- Two advisories are ignored in `.cargo/audit.toml`, each with its reason:
+  the SQLite `-wal` one (RUSTSEC-2026-0459), whose fix does not reach
+  SQLCipher yet and which needs a database file written by someone else, and
+  russh's agent server (RUSTSEC-2026-0495), which is never run.
+
+### Changed
+
+- CI gives the Windows test job 60 minutes. A cold cache spends half an hour
+  compiling before the first test.
+
 ## [1.10.2] - Sync that starts and says what it did
 
 No persisted format changed. One local key is new in `vault_meta`

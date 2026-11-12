@@ -7,4 +7,20 @@ ignore = [
     # the common cases, never touch this code. Re-check whenever russh or
     # rsa moves.
     "RUSTSEC-2023-0071",
+    # SQLite before 3.54.0 can return stale memory when it opens a database
+    # with a crafted `-wal` beside it (RUSTSEC-2026-0459). The fix in
+    # libsqlite3-sys 0.39 does not reach `bundled-sqlcipher`: its SQLCipher
+    # still carries SQLite 3.53.4. Every database opened here sits in the
+    # app's own folders and is written only by the app; nothing from storage
+    # is opened as a SQLite file. Re-check when sqlcipher-src ships SQLite
+    # 3.54, and note the compat fixture's old core tags pin rusqlite 0.40.
+    "RUSTSEC-2026-0459",
+    # russh's agent server ignored the confirm constraint
+    # (RUSTSEC-2026-0495). Only the SFTP client is used; no agent server
+    # runs. Fixed in 0.65.
+    "RUSTSEC-2026-0495",
+    # russh client callbacks for channels never opened (RUSTSEC-2026-0492).
+    # silentsilo-store requires 0.63.1, which has the fix; 0.62.7 comes only
+    # from the old core tags the compat fixture builds against.
+    "RUSTSEC-2026-0492",
 ]

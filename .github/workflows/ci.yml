@@ -29,11 +29,12 @@ jobs:
   # `--locked` everywhere: a lockfile that drifts silently is how a release
   # picks up dependency versions nobody chose.
   #
-  # 45 minutes: the OpenSSL that SQLCipher vendors takes several to build
-  # cold, with the runner's Strawberry Perl.
+  # 60 minutes: the OpenSSL that SQLCipher vendors takes several to build
+  # cold, with the runner's Strawberry Perl, and a cold cache (evicted after
+  # a week without a run) spends half an hour compiling before a test runs.
   test:
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
