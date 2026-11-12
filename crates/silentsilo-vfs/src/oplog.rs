@@ -4169,34 +4169,59 @@ pub fn init_delivery(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
-/// Notes as held by `target` every local record its listing named. A record
-/// listed there is one a push would skip anyway (`push_ops` asks by name),
-/// so marking it here only saves that question. Without it a record that
-/// came from storage had no row for the copy it came from: it read as
-/// "waiting to sync" until the next pass asked each copy for it again, and
-/// after a join or a rebuild that was the whole history, one request per
-/// record per copy. Ids this device does not hold get no row.
+/// Notes as held by `target` every local record its listing named, by its
+/// whole object name (`OpRecord::object_key`: number, device and id), which
+/// is what a push asks for by `head`, so this trusts storage no further than
+/// the push. Without it a record that came from storage had no row for the
+/// copy it came from: it read as "waiting to sync" until the next pass asked
+/// the copy for it again. Only records still owed to `target` are looked at.
 pub fn mark_listed_delivered(
     conn: &Connection,
     target: Uuid,
-    listed: &std::collections::HashSet<Uuid>,
+    listed: &std::collections::HashSet<String>,
 ) -> CoreResult<usize> {
     if listed.is_empty() {
         return Ok(0);
     }
     let db = |e: rusqlite::Error| CoreError::Database(e.to_string());
+    let owed: Vec<(String, String)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT o.op_id, o.lamport, o.device_id FROM oplog o
+                 WHERE NOT EXISTS (
+                       SELECT 1 FROM op_delivery d
+                       WHERE d.op_id = o.op_id AND d.target = ?1
+                   )",
+            )
+            .map_err(db)?;
+        stmt.query_map([target.to_string()], |row| {
+            let id: String = row.get(0)?;
+            let lamport: i64 = row.get(1)?;
+            let device: String = row.get(2)?;
+            let key = format!("{lamport:020}-{device}-{id}");
+            Ok((id, key))
+        })
+        .map_err(db)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(db)?
+    };
+    let held: Vec<String> = owed
+        .into_iter()
+        .filter(|(_, key)| listed.contains(key))
+        .map(|(id, _)| id)
+        .collect();
+    if held.is_empty() {
+        return Ok(0);
+    }
     conn.execute_batch("SAVEPOINT mark_listed").map_err(db)?;
     let written = (|| -> CoreResult<usize> {
         let mut stmt = conn
-            .prepare_cached(
-                "INSERT OR IGNORE INTO op_delivery(target, op_id)
-                 SELECT ?1, op_id FROM oplog WHERE op_id = ?2",
-            )
+            .prepare_cached("INSERT OR IGNORE INTO op_delivery(target, op_id) VALUES (?1, ?2)")
             .map_err(db)?;
         let target = target.to_string();
         let mut added = 0;
-        for id in listed {
-            added += stmt.execute(params![target, id.to_string()]).map_err(db)?;
+        for id in &held {
+            added += stmt.execute(params![target, id]).map_err(db)?;
         }
         Ok(added)
     })();
@@ -4326,6 +4351,16 @@ pub fn settle_delivery_among(
     tx.execute(
         &format!("DELETE FROM op_delivery WHERE target NOT IN ({placeholders})"),
         rusqlite::params_from_iter(list.iter()),
+    )
+    .map_err(db)?;
+    // A copy removed is not retired any more: the same location added back
+    // gets the same id, and must count again until a pass reads its key.
+    let keep: Vec<String> = targets.iter().map(|t| target_key(*t, "retired")).collect();
+    tx.execute(
+        &format!(
+            "DELETE FROM vault_meta WHERE key LIKE 'target:%:retired' AND key NOT IN ({placeholders})"
+        ),
+        rusqlite::params_from_iter(keep.iter()),
     )
     .map_err(db)?;
 
@@ -7371,6 +7406,90 @@ mod emission_tests {
         mark_delivered(&conn, drawer, &queued).unwrap();
         assert_eq!(settle_delivery(&mut conn, &targets).unwrap(), 1);
         assert_eq!(pending_count(&conn).unwrap(), 0);
+    }
+
+    /// A retired copy takes nothing new, so it is not waited for; with every
+    /// copy retired nothing current holds anything.
+    #[test]
+    fn only_the_copies_still_taking_records_have_to_hold_one() {
+        let vault = Uuid::new_v4();
+        let mut conn = bare_device(vault);
+        let root = crate::schema::root_folder_id_for(vault);
+        let (live, retired) = (Uuid::new_v4(), Uuid::new_v4());
+        emit(
+            &conn,
+            VaultOp::CreateFolder {
+                id: Uuid::new_v4(),
+                parent_id: root,
+                name: "Docs".into(),
+            },
+        )
+        .unwrap();
+        let queued = pending_ops_for(&conn, live).unwrap();
+        mark_delivered(&conn, live, &queued).unwrap();
+
+        assert_eq!(
+            settle_delivery_among(&mut conn, &[live, retired], &[live]).unwrap(),
+            1
+        );
+        assert_eq!(pending_count(&conn).unwrap(), 0);
+        assert_eq!(
+            pending_ops_for(&conn, retired).unwrap().len(),
+            1,
+            "its own rows are kept"
+        );
+
+        settle_delivery_among(&mut conn, &[live, retired], &[]).unwrap();
+        assert_eq!(pending_count(&conn).unwrap(), 1, "every copy retired");
+    }
+
+    /// Marked by the whole name a push would ask for, never by the id alone:
+    /// a copy of the record under another number is not the record.
+    #[test]
+    fn a_listed_record_counts_as_held_only_under_its_own_name() {
+        let vault = Uuid::new_v4();
+        let conn = bare_device(vault);
+        let root = crate::schema::root_folder_id_for(vault);
+        let copy = Uuid::new_v4();
+        emit(
+            &conn,
+            VaultOp::CreateFolder {
+                id: Uuid::new_v4(),
+                parent_id: root,
+                name: "Docs".into(),
+            },
+        )
+        .unwrap();
+        let record = pending_ops_for(&conn, copy).unwrap().remove(0);
+
+        let elsewhere: std::collections::HashSet<String> = [format!(
+            "{:020}-{}-{}",
+            record.lamport + 7,
+            record.device_id,
+            record.op_id
+        )]
+        .into();
+        assert_eq!(mark_listed_delivered(&conn, copy, &elsewhere).unwrap(), 0);
+        assert_eq!(pending_ops_for(&conn, copy).unwrap().len(), 1);
+
+        let own: std::collections::HashSet<String> = [record.object_key()].into();
+        assert_eq!(mark_listed_delivered(&conn, copy, &own).unwrap(), 1);
+        assert!(pending_ops_for(&conn, copy).unwrap().is_empty());
+        assert_eq!(mark_listed_delivered(&conn, copy, &own).unwrap(), 0, "once");
+    }
+
+    /// The same location added back gets the same id: removing the copy
+    /// forgets that it was retired.
+    #[test]
+    fn a_removed_copy_is_not_retired_any_more() {
+        let vault = Uuid::new_v4();
+        let mut conn = bare_device(vault);
+        let (kept, removed) = (Uuid::new_v4(), Uuid::new_v4());
+        set_target_retired(&conn, kept, true).unwrap();
+        set_target_retired(&conn, removed, true).unwrap();
+        settle_delivery_among(&mut conn, &[kept], &[]).unwrap();
+        assert!(target_retired(&conn, kept).unwrap());
+        assert!(!target_retired(&conn, removed).unwrap());
     }
 
     /// Removing a target must not leave records waiting for it. Otherwise

@@ -705,19 +705,24 @@ bucket):
 Read this before "fixing" any of it.
 
 - **A record a copy's listing names counts as delivered there.** The pass
-  writes an `op_delivery` row for every local record whose name the fetch
-  listed (`mark_listed_delivered`), without reading it. That is no weaker
-  than the push, which asks each record by name (`head`) and skips one that
-  is there. Without it a record that came from storage had no row for the
-  copy it came from, so it read as "changes waiting" until the next pass
-  asked for it again, and after a join or a rebuild that meant a request per
-  record per copy.
+  writes an `op_delivery` row for every local record whose whole object name
+  (number, device and id) the fetch listed (`mark_listed_delivered`),
+  without reading it. That is the same name the push asks for (`head`)
+  before it skips a record, so storage is trusted no further. Without it a
+  record that came from storage had no row for the copy it came from, so it
+  read as "changes waiting" and the next pass asked the copy for it again.
 - **Passes are per silo, and a key operation holds them all.** Two passes
   over one silo would read the same pending queue and send it twice; two
   silos share nothing a pass writes. A key operation (rotation, a key added
   or removed, a fill) waits for every pass and holds new ones off
   (`try_hold_sync`), because a pass that loaded `fido.json` before the change
-  and saved it after put the old envelopes back.
+  and saved it after put the old envelopes back. While it waits no new pass
+  starts, or passes running back to back could keep it waiting for good.
+- **A copy that does not answer a `head` fails as a copy.** The content
+  push stops at the first transport error and the copy backs off. Counted
+  per blob, a dropped connection gave every blob in a backlog a wait of its
+  own, up to six hours. A blob the copy refuses (a size limit, a full quota)
+  still waits on its own, and `clear_backoff` clears those waits too.
 - **Content goes after the pull.** Records go out first, then every copy is
   read, then content goes out within `UPLOAD_BUDGET` (ten minutes; a blob
   already going finishes). Records still reach a copy before their content,

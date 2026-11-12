@@ -147,9 +147,10 @@ pub struct MissingOps {
     /// from the names. After a complete fetch, this device holds every
     /// record storage had up to here.
     pub listed_through: u64,
-    /// Every record id the listing names, whatever its number. What the pass
-    /// notes as already on this copy, so it does not ask for each again.
-    pub listed: std::collections::HashSet<Uuid>,
+    /// Every record the listing names, as its object name without prefix
+    /// and suffix (`OpRecord::object_key`), whatever its number. What the
+    /// pass notes as already on this copy, so it does not ask for each again.
+    pub listed: std::collections::HashSet<String>,
 }
 
 /// Downloads every record the bucket holds that `known` does not name.
@@ -190,7 +191,13 @@ pub async fn fetch_missing_ops_reporting(
         .unwrap_or(0);
     let listed_ids = listed
         .iter()
-        .filter_map(|entry| op_id_from_key(&entry.key))
+        .filter_map(|entry| {
+            entry
+                .key
+                .strip_prefix(OPS_PREFIX)?
+                .strip_suffix(".op")
+                .map(str::to_string)
+        })
         .collect();
     let listing: Vec<_> = listed
         .into_iter()
@@ -851,10 +858,11 @@ pub async fn push_blobs_within(
                 continue;
             }
             Ok(None) => {}
-            Err(e) => {
-                outcome.failed.push((*blob_id, e.to_string()));
-                continue;
-            }
+            // Asking whether a blob is there says nothing about the blob: the
+            // copy did not answer, so the rest would fail the same way. Each
+            // of them used to get a wait of its own, and a dropped connection
+            // left a whole backlog waiting for hours.
+            Err(e) => return Err(SyncError::Storage(e.to_string())),
         }
 
         // Streamed from disk: a blob is whatever size the user stored, and

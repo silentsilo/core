@@ -237,6 +237,10 @@ async fn a_target_that_will_not_open_backs_off_and_waits_next_time() {
 
     let first = device.pass().await;
     assert!(first.targets[0].failed.is_some(), "{first:?}");
+    assert!(
+        first.targets[0].retry_in > 0,
+        "says the wait it just set: {first:?}"
+    );
     assert!(device.pending() > 0, "nothing counts as delivered");
 
     let second = device.pass().await;
@@ -368,6 +372,10 @@ async fn a_working_copy_that_missed_a_rotation_is_left_out_not_a_reason_to_rejoi
         .iter()
         .find(|t| t.failed.as_deref() == Some(silentsilo_app::MISSED_ROTATION));
     assert!(left_out.is_some(), "the stale copy says why: {second:?}");
+    assert!(
+        left_out.unwrap().retired,
+        "and is marked retired: {second:?}"
+    );
     assert!(
         second
             .targets
@@ -821,7 +829,15 @@ async fn a_resting_copy_is_not_a_reason_for_another_pass() {
     );
 
     // Someone is there: the wait goes, and the copy is owed again.
-    silentsilo_app::clear_backoff(&device.state, &device.host, device.silo.id);
+    assert!(silentsilo_app::clear_backoff(
+        &device.state,
+        &device.host,
+        device.silo.id
+    ));
+    assert!(
+        !silentsilo_app::clear_backoff(&device.state, &device.host, device.silo.id),
+        "nothing was resting the second time"
+    );
     assert!(silentsilo_app::owed_now(&device.state, &device.host, device.silo.id) > 0);
     let again = device.pass().await;
     assert!(
@@ -883,21 +899,60 @@ async fn a_change_from_a_newer_release_holds_back_without_stopping_the_pass() {
         .unwrap();
     device.make_folder("Mine");
 
+    // Another device's change above it waits with it.
+    let root = {
+        let sessions = device.state.sessions.lock().unwrap();
+        Vfs::new(&sessions[&device.silo.id])
+            .root_folder_id()
+            .unwrap()
+    };
+    let later = silentsilo_vfs::OpRecord::authored(
+        Uuid::new_v4(),
+        6_000,
+        Uuid::new_v4(),
+        1_700_000_000,
+        6_000,
+        None,
+        silentsilo_vfs::VaultOp::CreateFolder {
+            id: Uuid::new_v4(),
+            parent_id: root,
+            name: "Later".into(),
+        },
+    );
+    silentsilo_sync::push_ops(&store, &dek, &[later])
+        .await
+        .unwrap();
+
     let report = device.pass().await;
     assert!(report.needs_update, "{report:?}");
     assert!(report.error.is_none(), "{report:?}");
     assert!(report.ops_pushed > 0, "this device's change still went out");
     assert_eq!(device.pending(), 0, "and counts as sent");
+    assert_eq!(report.held_back, 1, "the later record waits: {report:?}");
     assert_eq!(report.compacted, 0);
+    assert!(
+        !device.folder_names().contains(&"Later".to_string()),
+        "nothing above it is applied"
+    );
+    let stored =
+        silentsilo_vfs::all_op_ids(&device.state.sessions.lock().unwrap()[&device.silo.id].conn)
+            .unwrap()
+            .len();
     let again = device.pass().await;
+    assert_eq!(
+        silentsilo_vfs::all_op_ids(&device.state.sessions.lock().unwrap()[&device.silo.id].conn)
+            .unwrap()
+            .len(),
+        stored,
+        "the unknown record is not stored"
+    );
     assert!(again.needs_update, "{again:?}");
 }
 
 #[tokio::test]
 async fn a_pass_that_fails_part_way_still_ends_with_a_report() {
-    // Locked between the fetch and the replay is the easiest way to make the
-    // pass stop with an error. A screen showing the step it was on has to
-    // hear that it ended.
+    // A silo closed before the pass is the easiest way to make it stop with
+    // an error. A screen showing the step it was on has to hear that it ended.
     let storage = tempfile::tempdir().unwrap();
     let device = Device::new(Uuid::new_v4(), None);
     *device.host.targets.lock().unwrap() = vec![folder_target(

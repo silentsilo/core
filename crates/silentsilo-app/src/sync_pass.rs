@@ -246,6 +246,11 @@ pub struct TargetStatus {
     /// changes not backed up" is only true of the target that is missing
     /// them.
     pub ops_behind: usize,
+    /// Left under a key another device replaced: it answers, takes nothing
+    /// new, and is never tried again, so a screen says to remove it and add
+    /// it again rather than counting down to a retry.
+    #[serde(default)]
+    pub retired: bool,
 }
 
 /// A pass someone asked for: every backoff cleared, and a background pass
@@ -271,15 +276,28 @@ pub async fn sync_now(
 /// device hammering a copy that does not answer, and a phone whose network
 /// the system cut while it was in the background collected up to fifteen
 /// minutes of it, kept in the silo, so the pass after an unlock did nothing.
-pub fn clear_backoff(state: &AppState, host: &dyn Host, silo_id: Uuid) {
+///
+/// Says whether any copy was resting, so a caller can tell news from a
+/// focus with every copy answering.
+pub fn clear_backoff(state: &AppState, host: &dyn Host, silo_id: Uuid) -> bool {
     let configured = host.targets(silo_id);
+    let now = unix_now();
+    let mut was_resting = false;
     if let Ok(sessions) = state.sessions.lock()
         && let Some(session) = sessions.get(&silo_id)
     {
         for target in &configured {
-            let _ = silentsilo_vfs::reset_target_backoff(&session.conn, target.config.target_id());
+            let id = target.config.target_id();
+            was_resting |= matches!(target_retry_in(&session.conn, id, now), Ok(wait) if wait > 0);
+            let _ = silentsilo_vfs::reset_target_backoff(&session.conn, id);
         }
     }
+    // The content waits too: uploads that failed get their try now.
+    if let Ok(mut waits) = state.blob_waits.lock() {
+        let ids: Vec<Uuid> = configured.iter().map(|t| t.config.target_id()).collect();
+        waits.retain(|(target, _), _| !ids.contains(target));
+    }
+    was_resting
 }
 
 /// Records owed to copies that are due now and not retired: what a
@@ -822,7 +840,11 @@ async fn pass(
         let mut retired_before = std::collections::HashSet::new();
         for id in &every_target {
             let retry_in = target_retry_in(conn, *id, now).map_err(|e| e.to_string())?;
-            let (owed, behind) = if retry_in > 0 {
+            let retired_here =
+                silentsilo_vfs::target_retired(conn, *id).map_err(|e| e.to_string())?;
+            // A resting copy is skipped and a retired one takes nothing: their
+            // backlog is counted, not decoded.
+            let (owed, behind) = if retry_in > 0 || retired_here {
                 let behind =
                     silentsilo_vfs::pending_count_for(conn, *id).map_err(|e| e.to_string())?;
                 (Vec::new(), behind)
@@ -831,7 +853,7 @@ async fn pass(
                 let behind = owed.len();
                 (owed, behind)
             };
-            if silentsilo_vfs::target_retired(conn, *id).map_err(|e| e.to_string())? {
+            if retired_here {
                 retired_before.insert(*id);
             }
             due.push((
@@ -871,6 +893,7 @@ async fn pass(
             retry_in,
             waiting: retry_in > 0,
             ops_behind: behind,
+            retired: false,
         };
         if retry_in > 0 {
             resting.push(status);
@@ -903,7 +926,7 @@ async fn pass(
         // recorded: a target whose settings will not open should back off
         // like any other, or a broken config means a pass every ten seconds
         // for as long as it stays broken.
-        record_target_outcomes(state, silo, &resting, now)?;
+        record_target_outcomes(state, silo, &mut resting, now)?;
         return Ok(announce(
             host,
             silo,
@@ -936,10 +959,11 @@ async fn pass(
                     retry_in: 0,
                     waiting: false,
                     ops_behind: t.owed.len(),
+                    retired: false,
                 })
                 .collect();
             resting.extend(failed);
-            record_target_outcomes(state, silo, &resting, now)?;
+            record_target_outcomes(state, silo, &mut resting, now)?;
             return Ok(announce(
                 host,
                 silo,
@@ -1151,6 +1175,7 @@ async fn pass(
             retry_in: 0,
             waiting: true,
             ops_behind: t.owed.len(),
+            retired: true,
         });
         false
     });
@@ -1327,6 +1352,7 @@ async fn pass(
             last_success: 0,
             retry_in: 0,
             waiting: false,
+            retired: false,
         });
     }
 
@@ -1364,7 +1390,7 @@ async fn pass(
     let mut misplaced: Vec<String> = Vec::new();
     let mut listed_through = 0u64;
     // What each copy's listing named, to note those records as held there.
-    let mut listed_on: Vec<(Uuid, std::collections::HashSet<Uuid>)> = Vec::new();
+    let mut listed_on: Vec<(Uuid, std::collections::HashSet<String>)> = Vec::new();
     for target in &targets {
         match sync::fetch_missing_ops_reporting(
             &*target.store,
@@ -1628,7 +1654,9 @@ async fn pass(
                 blobs_uploaded += outcome.uploaded;
                 blobs_failed += outcome.failed.len();
                 more_to_do |= outcome.left > 0;
-                for blob in &pending {
+                // Only the ones tried: one the budget left out keeps its count.
+                let tried = &pending[..pending.len() - outcome.left];
+                for blob in tried {
                     if !outcome.failed.iter().any(|(id, _)| id == blob) {
                         state.blob_done(target.id, *blob);
                     }
@@ -1682,7 +1710,7 @@ async fn pass(
     if let Some(referenced) = referenced {
         let _ = silentsilo_vault::drop_delivered_unreferenced(&root, &referenced);
     }
-    record_target_outcomes(state, silo, &statuses, now)?;
+    record_target_outcomes(state, silo, &mut statuses, now)?;
 
     // ── The inbox ───────────────────────────────────────────────────
     //
@@ -1951,7 +1979,7 @@ fn gravest_kek_state(states: &[sync::KekState]) -> Option<sync::KekState> {
 fn record_target_outcomes(
     state: &AppState,
     silo: &SiloEntry,
-    statuses: &[TargetStatus],
+    statuses: &mut [TargetStatus],
     now: i64,
 ) -> Result<(), String> {
     let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
@@ -1966,7 +1994,10 @@ fn record_target_outcomes(
             continue;
         };
         if status.failed.is_some() {
-            record_target_failure(&session.conn, id, now).map_err(|e| e.to_string())?;
+            // The wait just set, so a screen says when the next try is
+            // rather than "shortly" for a copy that rests for minutes.
+            status.retry_in =
+                record_target_failure(&session.conn, id, now).map_err(|e| e.to_string())?;
         } else {
             record_target_success(&session.conn, id, now).map_err(|e| e.to_string())?;
         }

@@ -16,8 +16,8 @@ release notes should say.
 - Records that came from storage no longer read as changes waiting to be
   sent. They had no delivery row for the copy they came from, so a device
   that received changes showed "changes waiting" and its next pass asked the
-  copy for every one of them again. A record a copy's listing names now
-  counts as held there (`mark_listed_delivered`).
+  copy for every one of them again. A record a copy's listing names, under
+  its whole object name, now counts as held there (`mark_listed_delivered`).
 - A copy retired under a replaced key no longer keeps every record and blob
   counted as not backed up. The retirement is kept in the silo, and only the
   copies still taking records have to hold one (`settle_delivery_among`,
@@ -32,6 +32,12 @@ release notes should say.
   in place for good.
 - `sync_now` clears the backoff after waiting out the pass already running,
   which could set it again.
+- A copy that stops answering during the content push fails as a copy and
+  backs off, instead of every blob in the backlog waiting on its own.
+- A key operation waiting for sync is no longer kept waiting by passes that
+  start one after another.
+- A copy that failed this pass reports the wait just set in `retry_in`
+  instead of 0.
 
 ### Changed
 
@@ -48,8 +54,10 @@ release notes should say.
 ### Added
 
 - `clear_backoff`, for when someone is there (an unlock, the app back on
-  screen), and `owed_now`, the records owed to copies due now, for a
-  client's background loop.
+  screen), which says whether a copy was resting, and `owed_now`, the
+  records owed to copies due now, for a client's background loop.
+- `TargetStatus::retired`: a copy left under a replaced key, which a screen
+  should not count down to a retry.
 - `SyncReport` fields: `error` (a pass that fails is now announced too),
   `needs_update`, `reached` (copies that answered; zero must not read as
   synced), `more_to_do` and `blob_errors`. A skipped pass carries its

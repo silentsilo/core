@@ -74,7 +74,14 @@ pub struct AppState {
 pub(crate) struct SyncLocks {
     pub(crate) held: bool,
     pub(crate) running: HashSet<Uuid>,
+    /// A key operation is waiting for the running passes to end: no new pass
+    /// starts until then. Renewed by every try, so a caller that gives up
+    /// lets passes start again a few seconds later.
+    pub(crate) wanted_until: Option<Instant>,
 }
+
+/// How long one failed `try_hold_sync` keeps new passes from starting.
+const HOLD_WANTED_FOR: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// One blob's failures on one copy.
 #[derive(Debug, Clone, Copy)]
@@ -157,7 +164,10 @@ impl AppState {
     /// key operation holds sync off.
     pub(crate) fn try_start_pass(&self, silo: Uuid) -> Option<PassGuard<'_>> {
         let mut locks = self.locks();
-        if locks.held || !locks.running.insert(silo) {
+        let wanted = locks
+            .wanted_until
+            .is_some_and(|until| Instant::now() < until);
+        if locks.held || wanted || !locks.running.insert(silo) {
             return None;
         }
         Some(PassGuard { state: self, silo })
@@ -182,9 +192,15 @@ impl AppState {
     pub fn try_hold_sync(&self) -> bool {
         let mut locks = self.locks();
         if locks.held || !locks.running.is_empty() {
+            // Passes keep starting otherwise, back to back with work left,
+            // and the moment none runs may never come.
+            if !locks.held {
+                locks.wanted_until = Some(Instant::now() + HOLD_WANTED_FOR);
+            }
             return false;
         }
         locks.held = true;
+        locks.wanted_until = None;
         true
     }
 
@@ -746,6 +762,21 @@ mod tests {
         drop(first);
         drop(second);
         assert!(!state.sync_busy());
+    }
+
+    #[test]
+    fn a_key_operation_waiting_stops_new_passes() {
+        let state = AppState::default();
+        let running = state.try_start_pass(id(1)).expect("free");
+        assert!(!state.try_hold_sync(), "a pass runs");
+        assert!(
+            state.try_start_pass(id(2)).is_none(),
+            "no new pass while it waits"
+        );
+        drop(running);
+        assert!(state.try_hold_sync(), "its turn came");
+        state.release_sync_hold();
+        assert!(state.try_start_pass(id(2)).is_some());
     }
 
     #[test]

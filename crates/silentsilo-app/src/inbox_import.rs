@@ -62,7 +62,8 @@ pub const INBOX_IMPORT_PER_PASS: usize = 50;
 /// `silo_root` is where content is fetched to when `keep_local` is set,
 /// which makes the next push copy it to the targets that do not have it.
 /// `warn` gets what went wrong with single items; they stay for next time.
-/// `progress` hears how many of a target's ready items came before each.
+/// `progress` hears how many of the items this pass adds from a target came
+/// before each; items recorded already are not counted.
 #[allow(clippy::too_many_arguments)]
 pub async fn import_inbox(
     silo: &dyn OpenSilo,
@@ -106,12 +107,29 @@ pub async fn import_inbox(
             ));
         }
 
-        let total = scan.ready.len();
+        // What this pass will add, for the progress line: items recorded
+        // already only wait to leave the inbox, which on a never-delete copy
+        // is never, and counting them showed an import on every pass.
+        let mut new_here = 0usize;
+        if silo
+            .with_vfs(&mut |vfs| {
+                for item in &scan.ready {
+                    if vfs.recorded_blob(item.item_id)?.is_none() {
+                        new_here += 1;
+                    }
+                }
+                Ok(())
+            })
+            .is_err()
+        {
+            return outcome;
+        }
+        let total = new_here.min(INBOX_IMPORT_PER_PASS.saturating_sub(taken));
+        let mut done = 0usize;
         // In listing order on every device. Same-named files take their
         // "(2)" suffixes in the order they are recorded, so devices that
         // import at once must record in the same order to agree on names.
-        for (done, item) in scan.ready.into_iter().enumerate() {
-            progress(done, total);
+        for item in scan.ready.into_iter() {
             let mut recorded = None;
             if silo
                 .with_vfs(&mut |vfs| {
@@ -148,6 +166,10 @@ pub async fn import_inbox(
                 continue;
             }
 
+            if done < total {
+                progress(done, total);
+            }
+            done += 1;
             // Another device importing the same item may have copied it
             // already. The same signed blob id, so the same bytes: a second
             // copy through a phone is only time and data.
