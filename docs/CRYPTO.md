@@ -51,15 +51,15 @@ until then the write fails with `err.secrets_unprotected` and the app asks.
 
 Two limits of that sentence, stated here rather than left to be discovered:
 
-**A removable key present at the machine is enough on its own.** Ceremonies
-ask for user verification as `discouraged`, so a key already plugged in
-unlocks the vault with one touch: no PIN, no biometric. The credential id and
-the salt (`silentsilo-dek-v1:{vault_id}`) are both readable from
-`keys/fido.json` and from storage, so a program running as the user can talk
-CTAP2 to the key directly and derive the wrap key on the next touch the user
-makes for any reason. Someone who holds both the folder and the key, even for
-a few seconds, opens the vault. Requiring verification is a setting worth
-having and does not exist yet.
+**A removable key and its PIN are enough on their own.** Since 1.10.1 a key
+without a PIN is not enrolled, and every platform verifies a key that has
+one, so an unlock takes a touch and the PIN. A silo enrolled earlier with a
+key that had no PIN can still open with one touch. The credential id and the
+salt (`silentsilo-dek-v1:{vault_id}`) are both readable from `keys/fido.json`
+and from storage, so a program running as the user that also learns the PIN
+can talk CTAP2 to the key directly and derive the wrap key on the next touch.
+Someone who holds the folder, the key and its PIN, even for a few seconds,
+opens the vault.
 
 **Removing a key does not change the key.** Removing a security key or a
 recovery code deletes its envelope. The DEK itself is untouched, so anyone who
