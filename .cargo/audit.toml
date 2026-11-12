@@ -15,12 +15,11 @@ ignore = [
     # is opened as a SQLite file. Re-check when sqlcipher-src ships SQLite
     # 3.54, and note the compat fixture's old core tags pin rusqlite 0.40.
     "RUSTSEC-2026-0459",
-    # russh's agent server ignored the confirm constraint
-    # (RUSTSEC-2026-0495). Only the SFTP client is used; no agent server
-    # runs. Fixed in 0.65.
+    # russh before 0.65: the agent server ignored the confirm constraint
+    # (RUSTSEC-2026-0495) and client callbacks ran for channels never opened
+    # (RUSTSEC-2026-0492). silentsilo-store requires 0.65; 0.62.7 and 0.63.3
+    # come only from the old core tags the compat fixture builds against,
+    # which run no agent server.
     "RUSTSEC-2026-0495",
-    # russh client callbacks for channels never opened (RUSTSEC-2026-0492).
-    # silentsilo-store requires 0.63.1, which has the fix; 0.62.7 comes only
-    # from the old core tags the compat fixture builds against.
     "RUSTSEC-2026-0492",
 ]

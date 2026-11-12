@@ -11,6 +11,21 @@ release notes should say.
 
 ## [Unreleased]
 
+## [1.10.4] - russh 0.65
+
+No persisted format changed.
+
+### Security
+
+- russh 0.65 for the SFTP client. Before it, a hostile SFTP server could make
+  the client allocate without bound (EXT_INFO) or stall every write by
+  declaring a maximum packet size of zero. The agent server advisory
+  (RUSTSEC-2026-0495) is fixed too; it stays on the ignore list only for the
+  old core tags the compat fixture builds against.
+- pageant 0.2.5 (GHSA-662x-8wvj-2276: unbounded frame buffering).
+- The fuzz workspace lockfile moves to rustls 0.23.46, as the main one
+  already had.
+
 ## [1.10.3] - Dependency advisories
 
 No persisted format changed. Same code as 1.10.2, with dependencies moved
