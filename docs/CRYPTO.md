@@ -30,9 +30,11 @@ lock, a crash, a kill or a power cut leaves nothing readable without the DEK.
 It lives outside the vault directory, under the machine's local application
 data, and so does the fallback file holding the device secret when the OS
 keyring will not take it. Neither travels with the folder. Files the user
-opens are decrypted there too, in the clear, until the lock or the next start
-removes them; on a Mac and an iPhone that folder is excluded from Time
-Machine and device backups (`NSURLIsExcludedFromBackupKey`). On Windows the
+opens are decrypted there too, under random names, and overwritten and
+deleted when the viewer lets go of them, at the lock or at the next start
+(see [Files opened in another application](#files-opened-in-another-application));
+on a Mac and an iPhone that folder is excluded from Time Machine and device
+backups (`NSURLIsExcludedFromBackupKey`). On Windows the
 keyring entries (the device secret and the storage settings with their
 secrets) are written with `CRED_PERSIST_LOCAL_MACHINE`, so a roaming domain
 profile does not copy them to other machines; an entry an earlier build
@@ -624,6 +626,63 @@ what was unreferenced on the previous pass as well, because a blob reaches
 storage before the record that names it and deleting on first sight would
 remove content that is about to be referenced.
 
+## Files opened in another application
+
+A file opened from a silo has to exist as a file for another program to
+read it, so it is decrypted into the machine workdir, under `open/` in the
+silo's scratch directory. Tested on Windows 11 in November 2026 against an
+undelete-style read of the raw volume, with Word, Acrobat, Photos and
+Notepad as viewers.
+
+- **A random name.** Sixteen random characters and the original extension
+  (`workdir::opened_file_name`), so the system still picks the right
+  application. NTFS writes a name into its change journal (`$UsnJrnl`) when
+  the file is created and keeps it for weeks, and viewers keep paths in
+  their recent lists, so the original name never reaches the file system.
+  Renaming the file before deleting it would not hide it.
+- **EFS on Windows.** The `open/` folder is marked encrypted
+  (`workdir::encrypt_scratch_dir`, `EncryptFileW`), so the copy and what a
+  viewer writes beside it (Word's `~$` owner file) are encrypted on disk
+  under the user's account. The viewers read the file as usual. Windows Home
+  cannot encrypt, and there nothing changes. The first use may show the
+  Windows notice about backing up the file encryption key.
+- **Overwritten before it is deleted.** Random bytes over the whole length,
+  flushed to the disk, then the delete (`workdir::shred_file`). A plain
+  delete left the content readable in its clusters, and a small file whole
+  in its MFT record, on an unencrypted NTFS volume on SSDs; TRIM did not
+  clear them. This defeats recovery through the file system, not a lab
+  reading the flash chips.
+- **Deleted when the viewer lets go, on Windows.** Every two seconds the
+  Restart Manager is asked which processes hold the file
+  (`workdir::holders`), which looks without opening it: probing with an
+  exclusive open could make a viewer opening it at that instant fail. A copy
+  seen held and then released is shredded at once (Word). A viewer that
+  reads the file and closes it never holds it (Acrobat, Photos and Notepad
+  in the test), and its copy waits for the lock.
+- **At lock, at unlock and at start.** Everything readable in the workdir is
+  shredded. A copy another application still holds is reported, and
+  shredded once that application lets go.
+
+What none of this covers, stated so the claim stays exact:
+
+- Code running as the user while the silo is open reads the copy whatever
+  its name and whether EFS is on (see [Malware on the user's
+  machine](#malware-on-the-users-machine)).
+- What the viewer keeps of its own: recent lists (with the random name and
+  the time), AutoRecover when a document is edited, a copy the user saves
+  elsewhere.
+- Memory Windows writes to disk (the paging file, hibernation, crash dumps),
+  and shadow copies or backups taken while the copy existed.
+- macOS and Linux: no EFS, and no "held" to ask, so copies wait for the
+  lock. On APFS an overwrite is not guaranteed to land on the same blocks.
+- The phone apps hand a copy to another app through the share sheet or a
+  content provider, and that app may keep it.
+
+Full-disk encryption (BitLocker or Device Encryption, FileVault, LUKS)
+covers the disk-level part of that list against someone holding the disk.
+The desktop app's Settings, General says when the volume opened files land
+on is not encrypted.
+
 ## Local metadata (`vault.db`)
 
 `vault.db` holds folder/file names, blob references and the password store, in a SQLite database.
@@ -674,7 +733,7 @@ Code running as the user, while a silo is unlocked, can read this process's memo
 | Locking on workstation lock, disconnect and suspend | The common case: the user locks the screen and leaves, while the idle timer still has minutes to run |
 | Per-entry sealing of passwords | Reading credentials out of the database, in memory or in any copy of it, without also holding the KEK |
 | SQLCipher working copy, key sealed under the DEK | Reading names or structure out of the working copy a lock keeps, or one a crash, a kill or a power cut left behind |
-| Clipboard opt-out (`CanIncludeInClipboardHistory`, `ExcludeClipboardContentFromMonitorProcessing`) plus a 45-second clear | Copied passwords being retained by Clipboard History, which persists to disk, and by Cloud Clipboard, which syncs them off the machine |
+| Clipboard opt-out (`CanIncludeInClipboardHistory`, `ExcludeClipboardContentFromMonitorProcessing`) plus a 45-second clear | Copied passwords being retained by Clipboard History, which persists to disk, and by Cloud Clipboard, which syncs them off the machine. User names, emails and public keys take the same opt-out without the clear |
 | `ProcessExtensionPointDisablePolicy` | AppInit_DLLs, `SetWindowsHookEx` and other injection paths the system performs on an attacker's behalf, needing no exploit |
 
 One mitigation is deliberately absent. `ProcessSignaturePolicy` with

@@ -233,6 +233,224 @@ pub fn seal_readonly(path: &Path) {
     }
 }
 
+/// The name a decrypted copy gets on disk: random, with the original
+/// extension so the OS still picks the right application.
+///
+/// The original name stays out of the file system entirely. NTFS keeps a
+/// name in its change journal from the moment the file is created, for
+/// weeks, so renaming it before deletion would hide nothing; viewers add
+/// the path to their recent lists too. An extension that is not short and
+/// plain is dropped rather than carried.
+pub fn opened_file_name(original: &str) -> String {
+    use rand::Rng;
+    const LETTERS: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut rng = rand::rng();
+    let stem: String = (0..16)
+        .map(|_| LETTERS[rng.random_range(0..LETTERS.len())] as char)
+        .collect();
+    let ext = Path::new(original)
+        .extension()
+        .and_then(|e| e.to_str())
+        .filter(|e| (1..=16).contains(&e.len()) && e.chars().all(|c| c.is_ascii_alphanumeric()));
+    match ext {
+        Some(ext) => format!("{stem}.{ext}"),
+        None => stem,
+    }
+}
+
+/// Overwrites a decrypted file with random bytes, flushes that to the disk,
+/// then deletes it. A plain delete leaves the content in its clusters for an
+/// undelete tool, and a small file whole in its MFT record (both seen on an
+/// unencrypted NTFS volume on SSDs, November 2026).
+///
+/// What the flash keeps underneath is out of reach: this defeats recovery
+/// through the file system, not a lab reading the chips. Fails without
+/// touching the file when another application holds it open on Windows,
+/// which is how a caller learns it is still in use.
+pub fn shred_file(path: &Path) -> std::io::Result<()> {
+    use rand::RngCore;
+    use std::io::Write;
+    const CHUNK: u64 = 1 << 20;
+
+    clear_readonly(path);
+    let len = std::fs::metadata(path)?.len();
+    if len > 0 {
+        let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
+        let mut buf = vec![0u8; len.min(CHUNK) as usize];
+        let mut rng = rand::rng();
+        let mut left = len;
+        while left > 0 {
+            let n = left.min(CHUNK) as usize;
+            rng.fill_bytes(&mut buf[..n]);
+            file.write_all(&buf[..n])?;
+            left -= n as u64;
+        }
+        file.sync_all()?;
+    }
+    std::fs::remove_file(path)
+}
+
+/// Shreds every file under `dir` and removes `dir`. Returns whether
+/// something could not go, which means another application holds it.
+fn shred_tree(dir: &Path) -> bool {
+    let mut left = false;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let gone = if path.is_dir() {
+                !shred_tree(&path)
+            } else {
+                shred_file(&path).is_ok() || !path.exists()
+            };
+            left |= !gone;
+        }
+    }
+    if std::fs::remove_dir(dir).is_err() && dir.exists() {
+        left = true;
+    }
+    left
+}
+
+/// Shreds `path`, a file or a directory. Returns whether something is left.
+pub fn shred_path(path: &Path) -> bool {
+    if path.is_dir() {
+        shred_tree(path)
+    } else {
+        shred_file(path).is_err() && path.exists()
+    }
+}
+
+/// The applications that have `path` open, by name, other than this one.
+/// Asked through the Restart Manager, which looks without opening the file:
+/// probing it with an exclusive open instead could make a viewer that opens
+/// it at that instant fail. Windows only; elsewhere, and when the question
+/// cannot be answered, `None`.
+pub fn holders(path: &Path) -> Option<Vec<String>> {
+    #[cfg(windows)]
+    {
+        restart_manager::holders(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// Whether another application has `path` open, as far as [`holders`] can
+/// tell.
+pub fn is_held(path: &Path) -> bool {
+    holders(path).is_some_and(|apps| !apps.is_empty())
+}
+
+#[cfg(windows)]
+mod restart_manager {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+
+    use windows::Win32::Foundation::{ERROR_MORE_DATA, ERROR_SUCCESS};
+    use windows::Win32::System::RestartManager::{
+        CCH_RM_SESSION_KEY, RM_PROCESS_INFO, RmEndSession, RmGetList, RmRegisterResources,
+        RmStartSession,
+    };
+    use windows::core::{PCWSTR, PWSTR};
+
+    pub(super) fn holders(path: &Path) -> Option<Vec<String>> {
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut key = [0u16; CCH_RM_SESSION_KEY as usize + 1];
+        let mut session = 0u32;
+        // SAFETY: every pointer handed over points into a live local buffer of
+        // the size the call is told, and the session is ended on every path.
+        unsafe {
+            if RmStartSession(&mut session, None, PWSTR(key.as_mut_ptr())) != ERROR_SUCCESS {
+                return None;
+            }
+            let found = (|| {
+                let files = [PCWSTR(wide.as_ptr())];
+                if RmRegisterResources(session, Some(&files), None, None) != ERROR_SUCCESS {
+                    return None;
+                }
+                let mut infos: Vec<RM_PROCESS_INFO> = Vec::new();
+                for _ in 0..3 {
+                    let (mut needed, mut count, mut reasons) = (0u32, infos.len() as u32, 0u32);
+                    let ptr = if infos.is_empty() {
+                        None
+                    } else {
+                        Some(infos.as_mut_ptr())
+                    };
+                    let rc = RmGetList(session, &mut needed, &mut count, ptr, &mut reasons);
+                    if rc == ERROR_SUCCESS {
+                        infos.truncate(count as usize);
+                        let me = std::process::id();
+                        return Some(
+                            infos
+                                .iter()
+                                .filter(|info| info.Process.dwProcessId != me)
+                                .map(|info| {
+                                    let name = &info.strAppName;
+                                    let end =
+                                        name.iter().position(|&c| c == 0).unwrap_or(name.len());
+                                    String::from_utf16_lossy(&name[..end])
+                                })
+                                .collect(),
+                        );
+                    }
+                    if rc != ERROR_MORE_DATA {
+                        return None;
+                    }
+                    infos = vec![std::mem::zeroed(); needed as usize];
+                }
+                None
+            })();
+            let _ = RmEndSession(session);
+            found
+        }
+    }
+}
+
+/// Turns on EFS for the folder decrypted files are opened from, so what
+/// is written there later is encrypted on disk under this Windows account,
+/// including the lock and temp files a viewer creates beside the document.
+/// The viewers read it as usual. Best effort: Windows Home cannot encrypt,
+/// and a FAT volume or a policy may refuse; then nothing changes. Returns
+/// whether the folder is encrypted.
+pub fn encrypt_scratch_dir(dir: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        efs::encrypt_dir(dir)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = dir;
+        false
+    }
+}
+
+#[cfg(windows)]
+mod efs {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+
+    use windows::Win32::Storage::FileSystem::{
+        EncryptFileW, FILE_ATTRIBUTE_ENCRYPTED, GetFileAttributesW, INVALID_FILE_ATTRIBUTES,
+    };
+    use windows::core::PCWSTR;
+
+    pub(super) fn encrypt_dir(dir: &Path) -> bool {
+        let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
+        let path = PCWSTR(wide.as_ptr());
+        // SAFETY: `wide` is a NUL-terminated UTF-16 path that outlives both
+        // calls; neither keeps the pointer.
+        unsafe {
+            let attrs = GetFileAttributesW(path);
+            if attrs != INVALID_FILE_ATTRIBUTES && attrs & FILE_ATTRIBUTE_ENCRYPTED.0 != 0 {
+                return true;
+            }
+            EncryptFileW(path).is_ok()
+        }
+    }
+}
+
 /// Machine-local bookkeeping that outlives a lock.
 ///
 /// Separate from the scratch directory precisely so that wiping plaintext
@@ -285,15 +503,11 @@ pub fn wipe_work_dir(silo_root: &Path) {
     if !dir.exists() {
         return;
     }
-    // Files opened from the silo are written read-only so an editor cannot
-    // save into a copy that is about to vanish; Windows will not delete a
-    // read-only file, so the bit has to come off first.
-    clear_readonly(&dir);
-    let _ = std::fs::remove_dir_all(&dir);
+    shred_tree(&dir);
 }
 
-/// Removes everything readable from a silo's scratch directory: opened
-/// files, a plaintext `vault.db` an earlier release left, anything not in
+/// Shreds everything readable in a silo's scratch directory: opened files,
+/// a plaintext `vault.db` an earlier release left, anything not in
 /// [`KEPT_ACROSS_LOCKS`]. Returns whether something could not be removed,
 /// which means another application still holds it open.
 pub fn wipe_plaintext(silo_root: &Path) -> bool {
@@ -310,16 +524,7 @@ fn wipe_plaintext_in(dir: &Path) -> bool {
         if KEPT_ACROSS_LOCKS.iter().any(|kept| name == *kept) {
             continue;
         }
-        let path = entry.path();
-        clear_readonly(&path);
-        let removed = if path.is_dir() {
-            std::fs::remove_dir_all(&path)
-        } else {
-            std::fs::remove_file(&path)
-        };
-        if removed.is_err() && path.exists() {
-            left = true;
-        }
+        left |= shred_path(&entry.path());
     }
     left
 }
@@ -358,8 +563,7 @@ fn wipe_open_dirs_in(base: &Path, open: &[&Path]) -> usize {
             }
             continue;
         }
-        clear_readonly(&path);
-        if std::fs::remove_dir_all(&path).is_err() && path.exists() {
+        if shred_tree(&path) {
             left += 1;
         }
     }
@@ -609,6 +813,129 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, ["vault.key", "vault.sqlcipher"]);
+    }
+
+    #[test]
+    fn an_opened_copy_keeps_only_the_extension() {
+        let name = opened_file_name("Contract Maria Popescu.docx");
+        assert!(name.ends_with(".docx"), "{name}");
+        assert!(!name.to_lowercase().contains("maria"), "{name}");
+        assert_eq!(name.len(), 16 + ".docx".len());
+        assert_ne!(name, opened_file_name("Contract Maria Popescu.docx"));
+    }
+
+    #[test]
+    fn an_odd_extension_is_not_carried() {
+        assert_eq!(opened_file_name("no extension").len(), 16);
+        assert_eq!(opened_file_name("archive.tar.gz").len(), 16 + ".gz".len());
+        // A name that hides text in its "extension" keeps none of it.
+        assert_eq!(opened_file_name("x.secret note here").len(), 16);
+        assert_eq!(opened_file_name("x.ab/../c").len(), 16);
+    }
+
+    #[test]
+    fn a_shredded_file_is_gone_read_only_or_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("opened.txt");
+        std::fs::write(&path, vec![b'p'; 3 * (1 << 20) + 17]).unwrap();
+        seal_readonly(&path);
+        shred_file(&path).unwrap();
+        assert!(!path.exists());
+
+        let empty = tmp.path().join("empty.txt");
+        std::fs::write(&empty, b"").unwrap();
+        shred_file(&empty).unwrap();
+        assert!(!empty.exists());
+    }
+
+    #[test]
+    fn shredding_a_tree_removes_everything_in_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("open");
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        std::fs::write(dir.join("a.txt"), b"plaintext").unwrap();
+        std::fs::write(dir.join("nested").join("b.txt"), b"plaintext").unwrap();
+        seal_readonly(&dir.join("a.txt"));
+        assert!(!shred_path(&dir), "nothing should be left");
+        assert!(!dir.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_file_another_process_holds_is_seen_as_held() {
+        // This process is left out of the answer, so the holder has to be
+        // another one: PowerShell keeping the file open for a few seconds.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("opened.txt");
+        std::fs::write(&path, b"plaintext").unwrap();
+        assert_eq!(holders(&path), Some(vec![]));
+        assert!(!is_held(&path));
+
+        let script = format!(
+            "$f=[IO.File]::Open('{}','Open','Read','Read'); Start-Sleep -Seconds 6; $f.Close()",
+            path.display()
+        );
+        let mut child = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &script])
+            .spawn()
+            .unwrap();
+        let mut seen = false;
+        for _ in 0..40 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if is_held(&path) {
+                seen = true;
+                break;
+            }
+        }
+        child.wait().unwrap();
+        assert!(seen, "the other process's handle was not seen");
+        assert!(!is_held(&path));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_viewer_that_denies_writes_keeps_its_file_until_it_lets_go() {
+        // Word opens a document with no write sharing: the shred must fail
+        // rather than half-delete it, and succeed once Word closes it.
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 1;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("opened.docx");
+        std::fs::write(&path, b"plaintext").unwrap();
+        let word = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&path)
+            .unwrap();
+        assert!(shred_file(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"plaintext");
+        drop(word);
+        shred_file(&path).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_encrypted_scratch_folder_encrypts_what_lands_in_it() {
+        // Windows Home answers no and nothing changes; anywhere EFS works,
+        // a file written afterwards is encrypted without asking.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("open");
+        create_private_dir(&dir).unwrap();
+        if !encrypt_scratch_dir(&dir) {
+            return;
+        }
+        assert!(encrypt_scratch_dir(&dir), "a second call is a no-op");
+        let path = dir.join("opened.txt");
+        std::fs::write(&path, b"plaintext").unwrap();
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_ENCRYPTED: u32 = 0x4000;
+        assert_ne!(
+            std::fs::metadata(&path).unwrap().file_attributes() & FILE_ATTRIBUTE_ENCRYPTED,
+            0
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"plaintext");
+        assert!(!shred_path(&dir));
     }
 
     #[test]

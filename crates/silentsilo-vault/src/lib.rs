@@ -89,9 +89,10 @@ pub use s3_store::{clear_s3_config, load_s3_config, save_s3_config};
 pub use session::{VaultPaths, VaultSession, wipe_plaintext_working_copy};
 pub use silentsilo_cloud::{Account as CloudAccount, Provider as CloudProvider};
 pub use workdir::{
-    KEPT_ACROSS_LOCKS, create_private_dir, detect_sync_provider, seal_readonly, set_work_base,
+    KEPT_ACROSS_LOCKS, create_private_dir, detect_sync_provider, encrypt_scratch_dir, holders,
+    is_held, opened_file_name, seal_readonly, set_work_base, shred_file, shred_path,
     wipe_cache_dir, wipe_machine_state, wipe_plaintext, wipe_work_dir, wipe_work_dirs_except,
-    work_dir_for,
+    work_base, work_dir_for,
 };
 
 #[cfg(test)]

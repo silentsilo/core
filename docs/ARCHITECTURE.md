@@ -356,7 +356,9 @@ property:
   working copy `vault.sqlcipher` with its WAL, ciphered by SQLCipher under a
   random page key, that key sealed under the DEK as `vault.key` (and
   `vault.key.next` mid-rotation), and decrypted files the user opened
-  (`open/`). A lock and the sweeps remove the plaintext and keep the ciphered
+  (`open/`, random names, EFS-encrypted on Windows; CRYPTO.md, "Files opened
+  in another application"). A lock and the sweeps shred the plaintext
+  (`workdir::shred_file`: overwritten, then deleted) and keep the ciphered
   copy and its key (`workdir::KEPT_ACROSS_LOCKS`); the next unlock reuses the
   copy while it still stands for `vault.db.enc`, and exports a fresh one
   otherwise. Only removing the silo deletes the copy. Unlock and snapshots

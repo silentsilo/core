@@ -9,7 +9,22 @@ This repository has its own version line, separate from the desktop
 application's. A client pins a tag from here; the tag it pins is what its
 release notes should say.
 
-## [Unreleased]
+## [1.11.0] - files opened in another application
+
+No persisted format changed.
+
+### Security
+
+- Files opened in another application get a random name with the original
+  extension (`opened_file_name`), so the real name never reaches the file
+  system or the NTFS change journal.
+- Every decrypted copy is overwritten with random bytes and flushed before it
+  is deleted (`shred_file`), at lock, unlock and start. A plain delete left it
+  recoverable from the raw volume.
+- `encrypt_scratch_dir` turns on EFS for the folder opened files go to, on
+  Windows editions that have it.
+- `holders` asks the Restart Manager which applications hold a file, without
+  opening it, so a client can shred a copy as soon as the viewer lets go.
 
 ## [1.10.4] - russh 0.65
 

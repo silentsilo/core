@@ -714,33 +714,17 @@ pub fn open_scratch_dir(vault_root: &Path) -> PathBuf {
     silentsilo_vault::work_dir_for(vault_root).join("open")
 }
 
-/// Removes every decrypted copy left behind by opening files.
+/// Shreds every decrypted copy left behind by opening files.
 ///
 /// Called on lock and on exit, so plaintext never outlives the session that
 /// asked for it. Best-effort: an application still holding a file open will
-/// block the delete on Windows, and failing the lock over that would be
-/// worse than one file surviving until the next attempt, which is why this
-/// also runs on unlock, cleaning up whatever a crash left.
-pub fn wipe_open_scratch(vault_root: &Path) {
+/// block it on Windows, and failing the lock over that would be worse than
+/// one file surviving until the next attempt, which is why this also runs
+/// on unlock, cleaning up whatever a crash left. Returns whether something
+/// is left.
+pub fn wipe_open_scratch(vault_root: &Path) -> bool {
     let dir = open_scratch_dir(vault_root);
-    if !dir.exists() {
-        return;
-    }
-    // Read-only is set on every file written here, and Windows refuses to
-    // delete a read-only file, so the bit has to come off first.
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Ok(meta) = std::fs::metadata(&path) {
-                let mut perms = meta.permissions();
-                #[allow(clippy::permissions_set_readonly_false)]
-                perms.set_readonly(false);
-                let _ = std::fs::set_permissions(&path, perms);
-            }
-            let _ = std::fs::remove_file(&path);
-        }
-    }
-    let _ = std::fs::remove_dir_all(&dir);
+    dir.exists() && silentsilo_vault::shred_path(&dir)
 }
 
 #[cfg(test)]
