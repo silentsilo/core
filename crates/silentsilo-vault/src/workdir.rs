@@ -871,24 +871,29 @@ mod tests {
         assert_eq!(holders(&path), Some(vec![]));
         assert!(!is_held(&path));
 
+        // It says when the file is open and holds it until told to let go:
+        // a cold PowerShell on a CI runner takes longer than any fixed wait.
+        use std::io::{BufRead, Write};
+        use std::process::Stdio;
         let script = format!(
-            "$f=[IO.File]::Open('{}','Open','Read','Read'); Start-Sleep -Seconds 6; $f.Close()",
+            "$f=[IO.File]::Open('{}','Open','Read','Read'); 'open'; [void][Console]::In.ReadLine(); $f.Close()",
             path.display()
         );
         let mut child = std::process::Command::new("powershell")
             .args(["-NoProfile", "-Command", &script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
             .spawn()
             .unwrap();
-        let mut seen = false;
-        for _ in 0..40 {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            if is_held(&path) {
-                seen = true;
-                break;
-            }
-        }
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line.trim(), "open");
+        let held = is_held(&path);
+        writeln!(child.stdin.take().unwrap()).unwrap();
         child.wait().unwrap();
-        assert!(seen, "the other process's handle was not seen");
+        assert!(held, "the other process's handle was not seen");
         assert!(!is_held(&path));
     }
 
