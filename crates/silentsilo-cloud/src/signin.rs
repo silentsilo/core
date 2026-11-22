@@ -51,7 +51,7 @@ impl Loopback {
     /// A `localhost` redirect may reach `::1` first, so the same port is
     /// taken there too. When something else already holds it on `::1`, the
     /// browser would hand that program the redirect: the port is given up
-    /// and the next one tried (audit CL-3). A machine with no IPv6 loopback
+    /// and the next one tried. A machine with no IPv6 loopback
     /// at all keeps the IPv4 listener alone, which is where the browser
     /// then goes.
     pub async fn bind(provider: Provider) -> Result<Self, CloudError> {

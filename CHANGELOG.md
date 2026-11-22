@@ -9,6 +9,29 @@ This repository has its own version line, separate from the desktop
 application's. A client pins a tag from here; the tag it pins is what its
 release notes should say.
 
+## [1.11.1] - shredding stays inside the scratch folder
+
+No persisted format changed.
+
+### Fixed
+
+- `shred_file` and the sweeps no longer follow a symbolic link or a
+  junction: the link is removed and what it points at is left alone, as
+  `remove_dir_all` did before 1.11.0. A file with a second hard link loses
+  only its name.
+- A dangling link no longer reads as a file another application holds.
+- On Windows a copy any other application has open is left untouched, even
+  when that application lets others write; before, it read random bytes.
+- The ciphered working copy is deleted without being overwritten first.
+
+### Added
+
+- `decrypt_blob_to_vec`, for a caller that must not put plaintext on disk.
+
+### Security
+
+- url 2.5.9 (RUSTSEC-2026-0592).
+
 ## [1.11.0] - files opened in another application
 
 No persisted format changed.
@@ -444,7 +467,8 @@ The release of everything in the 1.10.1 betas below, plus:
   move recorded the entry again and trashed the old row, so a moved file
   showed in the trash at its old path, and a file moved then deleted showed
   twice; restoring the old one put it back where it had been.
-- Audit L1 is closed by reader checks, with no format change: a sealed
+- Objects moved under another name are refused by reader checks, with no
+  format change: a sealed
   object's AAD does not bind its name, so every reader now compares the
   name with the content and has a test that moves a real object under
   another name. Fixed where one did not: a content check reports a record
@@ -464,14 +488,14 @@ The release of everything in the 1.10.1 betas below, plus:
   device lists, or a drive unplugged at the time) no longer sends a device
   the rotation kept to rejoin in a loop. It is left out of the pass with a
   status that says to remove and add it again; a device whose own key was
-  retired is still sent to rejoin (audit CO-4).
+  retired is still sent to rejoin.
 - Checking an inbox item's header on WebDAV and SFTP reads only the header,
-  not the whole file (audit CO-3).
+  not the whole file.
 - Answers from OneDrive, Dropbox and Google Drive are read up to 8 MiB, and
   token answers up to 256 KiB; a larger one is refused rather than held in
-  memory (audit CL-7).
+  memory.
 - A sign-in whose port is held on `::1` by another program moves to the
-  next port, so that program never receives the redirect (audit CL-3).
+  next port, so that program never receives the redirect.
 - rustls-platform-verifier 0.7.1: on Android, certificates with only a
   revocation list (Google's now) were reported as revoked.
 

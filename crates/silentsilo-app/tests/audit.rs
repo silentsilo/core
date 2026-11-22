@@ -1379,7 +1379,7 @@ mod organisation {
         );
     }
 
-    /// Audit L1: a segment copied under another one's name is neither read
+    /// Sealing does not bind the name: a segment copied under another one's name is neither read
     /// as that one nor expired in its place.
     #[tokio::test]
     async fn a_segment_moved_under_another_name_is_not_taken_for_it() {

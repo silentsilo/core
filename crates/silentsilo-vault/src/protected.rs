@@ -427,7 +427,7 @@ mod tests {
             &kek,
             &ProtectedFolders {
                 folders: vec![ProtectedFolder {
-                    path: PathBuf::from(r"C:\Users\alex\Documents\Taxes"),
+                    path: PathBuf::from(r"C:\Users\sam\Documents\Taxes"),
                     target: "/Taxes".into(),
                 }],
             },
@@ -557,12 +557,12 @@ mod tests {
         let cache = crate::workdir::cache_dir_for(&silo);
         crate::workdir::create_private_dir(&cache).unwrap();
         let kek = generate_content_kek();
-        let taken = PathBuf::from(r"C:\Users\alex\Documents\Taxes\2025.pdf");
+        let taken = PathBuf::from(r"C:\Users\sam\Documents\Taxes\2025.pdf");
 
         // Exactly the bytes a release before 1.6.0 left behind.
         let folders = ProtectedFolders {
             folders: vec![ProtectedFolder {
-                path: PathBuf::from(r"C:\Users\alex\Documents\Taxes"),
+                path: PathBuf::from(r"C:\Users\sam\Documents\Taxes"),
                 target: "/Taxes".into(),
             }],
         };
@@ -733,7 +733,7 @@ mod tests {
         let kek = generate_content_kek();
         let folders = ProtectedFolders {
             folders: vec![ProtectedFolder {
-                path: PathBuf::from("C:/Users/alex/Documents/Taxes"),
+                path: PathBuf::from("C:/Users/sam/Documents/Taxes"),
                 target: "/Protected/Taxes".into(),
             }],
         };

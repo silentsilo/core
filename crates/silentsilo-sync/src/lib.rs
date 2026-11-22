@@ -1508,7 +1508,7 @@ pub struct RepairReport {
 /// Puts back what a content check found missing or damaged on `target`,
 /// from `sources` (the other copies, and the local cache as a folder store
 /// of the silo's root, which keeps blobs under the same keys). See
-/// `planuri/reparare-automata.md` and ARCHITECTURE, "Repairing a copy".
+/// ARCHITECTURE, "Repairing a copy".
 ///
 /// Only `ops/` and `blobs/` are touched: both are written once and never
 /// changed, so a key holds the same bytes on every copy and putting proven

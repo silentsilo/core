@@ -1086,7 +1086,7 @@ async fn pass(
     // a drive that was unplugged. To this device, still on a key the
     // rotation kept, it then looks rotated, and voting with the others it
     // sent the device to rejoin, which reseals nothing on that copy, so the
-    // answer never changed (audit CO-4). It is told apart from a device
+    // answer never changed. It is told apart from a device
     // whose own key was retired by age: a copy that missed the rotation
     // stops at records older than the newest one this device can open on
     // a current copy, while a rotation another device made is newer than

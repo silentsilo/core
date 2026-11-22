@@ -670,7 +670,7 @@ mod safe_join_tests {
     /// destination must not be able to write anywhere on that machine.
     #[test]
     fn a_path_that_leaves_the_destination_is_refused() {
-        let dest = Path::new("/home/alex/recovered");
+        let dest = Path::new("/home/sam/recovered");
         for bad in [
             "..",
             ".",
@@ -686,7 +686,7 @@ mod safe_join_tests {
 
     #[test]
     fn a_path_inside_the_backup_is_rebuilt_under_the_destination() {
-        let dest = Path::new("/home/alex/recovered");
+        let dest = Path::new("/home/sam/recovered");
         let joined = safe_join(dest, "Acte/2026/contract.pdf").expect("an ordinary path");
         assert!(joined.starts_with(dest));
         assert!(joined.ends_with("Acte/2026/contract.pdf"));

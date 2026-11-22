@@ -2821,7 +2821,7 @@ mod tests {
         let this = crate::oplog::device_id(vfs.conn()).unwrap();
 
         vfs.announce_device(Some("DESK-1"), "Windows").unwrap();
-        vfs.set_device_label(this, "Alex's desktop").unwrap();
+        vfs.set_device_label(this, "Sam's desktop").unwrap();
         vfs.announce_device(Some("DESK-1-RENAMED"), "Windows")
             .unwrap();
 
@@ -2831,7 +2831,7 @@ mod tests {
             .into_iter()
             .find(|d| d.is_this_device)
             .unwrap();
-        assert_eq!(device.label.as_deref(), Some("Alex's desktop"));
+        assert_eq!(device.label.as_deref(), Some("Sam's desktop"));
         assert_eq!(device.system_name.as_deref(), Some("DESK-1-RENAMED"));
     }
 

@@ -6,7 +6,7 @@ the user controls, and the standalone extraction tool. AGPL-3.0.
 
 Nothing here knows about a user interface. The desktop application lives in
 [silentsilo/desktop](https://github.com/silentsilo/desktop) and pins a tag
-from this repository. Mobile clients will do the same.
+from this repository, and so do the Android and iOS apps.
 
 > **No independent security audit has been done.** Nobody outside this
 > project has been paid to attack it. The cryptography is specified in

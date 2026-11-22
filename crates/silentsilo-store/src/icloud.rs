@@ -2,7 +2,7 @@
 //! a folder the system keeps in sync, so it is a [`FolderStore`] at a place
 //! each platform finds on its own.
 //!
-//! Where the container is, verified on 11 October 2026 (`planuri/icloud.md`):
+//! Where the container is, verified on 11 October 2026:
 //! - iPhone: wherever iOS says (`FileManager.url(forUbiquityContainerIdentifier:)`),
 //!   then `Documents`; the app passes a locator in, since only Swift can ask;
 //! - Mac: `~/Library/Mobile Documents/iCloud~com~silentsilo~mobile/Documents`;

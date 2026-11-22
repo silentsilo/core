@@ -288,7 +288,7 @@ mod tests {
     #[test]
     fn the_fallback_file_never_lands_in_the_silo_folder() {
         let scratch = Scratch::new();
-        let silo_root = std::path::Path::new(r"C:\Users\alex\OneDrive\Documents\Silo");
+        let silo_root = std::path::Path::new(r"C:\Users\sam\OneDrive\Documents\Silo");
 
         let path = credentials_path(scratch.id());
 

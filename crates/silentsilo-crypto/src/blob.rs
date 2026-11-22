@@ -341,12 +341,43 @@ fn decrypt_inner(
     }
 }
 
+/// [`decrypt_blob`] into memory, for a caller that must not put the
+/// plaintext on disk even for a moment: a password export reads its
+/// attachments this way, so a lock wiping the scratch folder cannot reach
+/// them halfway.
+pub fn decrypt_blob_to_vec(
+    source: &Path,
+    key: &ContentKey,
+    expected_blob_id: Uuid,
+) -> Result<zeroize::Zeroizing<Vec<u8>>, CryptoError> {
+    let mut source_file = File::open(source)?;
+    let mut header_buf = [0u8; HEADER_SIZE];
+    source_file.read_exact(&mut header_buf)?;
+    let header = BlobHeader::from_bytes(&header_buf)?;
+    if header.blob_id != expected_blob_id {
+        return Err(CryptoError::InvalidHeader(format!(
+            "blob identity mismatch: expected {expected_blob_id}, found {}",
+            header.blob_id
+        )));
+    }
+    // The ciphertext is never shorter than the plaintext, so the buffer is
+    // not reallocated and no copy is left behind in freed memory.
+    let capacity = source_file
+        .metadata()?
+        .len()
+        .saturating_sub(HEADER_SIZE as u64);
+    let mut out = zeroize::Zeroizing::new(Vec::with_capacity(capacity as usize));
+    let cipher = Aes256Gcm::new_from_slice(key.as_bytes()).expect("valid key length");
+    decrypt_chunks(&mut source_file, &mut *out, &header, &cipher)?;
+    Ok(out)
+}
+
 /// The chunk loop of [`decrypt_blob`], including the hash comparison at the
 /// end: everything that has to succeed before the plaintext may take the
 /// caller's path.
 fn decrypt_chunks(
     source_file: &mut File,
-    dest_file: &mut File,
+    dest_file: &mut impl Write,
     header: &BlobHeader,
     cipher: &Aes256Gcm,
 ) -> Result<(), CryptoError> {
@@ -527,6 +558,30 @@ mod tests {
         let header = decrypt_blob(&enc, &out, &key, blob_id).unwrap();
         assert_eq!(header.content_hash, result.header.content_hash);
         assert_eq!(std::fs::read(&out).unwrap(), b"hello silentsilo");
+    }
+
+    #[test]
+    fn decrypting_into_memory_gives_the_same_bytes_and_the_same_checks() {
+        let dir = tempdir().unwrap();
+        let plain = dir.path().join("plain.bin");
+        let enc = dir.path().join("blob.sslo");
+        let bytes: Vec<u8> = (0..3 * CHUNK_SIZE + 5).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&plain, &bytes).unwrap();
+        let key = generate_content_key();
+        let blob_id = Uuid::new_v4();
+        encrypt_file(&plain, &enc, &key, Uuid::new_v4(), blob_id).unwrap();
+
+        let out = decrypt_blob_to_vec(&enc, &key, blob_id).unwrap();
+        assert_eq!(out.as_slice(), bytes.as_slice());
+        assert!(decrypt_blob_to_vec(&enc, &key, Uuid::new_v4()).is_err());
+        assert!(decrypt_blob_to_vec(&enc, &generate_content_key(), blob_id).is_err());
+
+        // Cut at a chunk boundary: every chunk left authenticates, the hash
+        // does not.
+        let whole = std::fs::read(&enc).unwrap();
+        let cut = dir.path().join("cut.sslo");
+        std::fs::write(&cut, &whole[..HEADER_SIZE + CHUNK_SIZE + TAG_SIZE]).unwrap();
+        assert!(decrypt_blob_to_vec(&cut, &key, blob_id).is_err());
     }
 
     /// A party who can rewrite the ciphertext at rest (e.g. swap the whole

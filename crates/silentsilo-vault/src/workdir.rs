@@ -265,17 +265,25 @@ pub fn opened_file_name(original: &str) -> String {
 ///
 /// What the flash keeps underneath is out of reach: this defeats recovery
 /// through the file system, not a lab reading the chips. Fails without
-/// touching the file when another application holds it open on Windows,
-/// which is how a caller learns it is still in use.
+/// touching the file when another application has it open on Windows, which
+/// is how a caller learns it is still in use.
+///
+/// Only the file itself is overwritten. A link (symbolic, junction) loses its
+/// name and its target is left alone, as `remove_dir_all` does; a file with
+/// another hard link loses this name only.
 pub fn shred_file(path: &Path) -> std::io::Result<()> {
     use rand::RngCore;
     use std::io::Write;
     const CHUNK: u64 = 1 << 20;
 
+    if !std::fs::symlink_metadata(path)?.file_type().is_file() {
+        return remove_link(path);
+    }
     clear_readonly(path);
-    let len = std::fs::metadata(path)?.len();
-    if len > 0 {
-        let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
+    let mut file = open_to_shred(path)?;
+    let meta = file.metadata()?;
+    let len = meta.len();
+    if meta.file_type().is_file() && link_count(&file, &meta) == 1 && len > 0 {
         let mut buf = vec![0u8; len.min(CHUNK) as usize];
         let mut rng = rand::rng();
         let mut left = len;
@@ -287,25 +295,101 @@ pub fn shred_file(path: &Path) -> std::io::Result<()> {
         }
         file.sync_all()?;
     }
+    drop(file);
     std::fs::remove_file(path)
 }
 
+/// Opens without following a link. On Windows no sharing at all: a viewer
+/// that holds the file, even one that lets others write, makes this fail
+/// rather than see its copy overwritten.
+fn open_to_shred(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options
+            .share_mode(0)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options.open(path)
+}
+
+#[cfg(unix)]
+fn link_count(_file: &std::fs::File, meta: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    meta.nlink()
+}
+
+#[cfg(windows)]
+fn link_count(file: &std::fs::File, _meta: &std::fs::Metadata) -> u64 {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: the handle is live for the call and `info` is a valid out-pointer.
+    match unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info) } {
+        Ok(()) => u64::from(info.nNumberOfLinks),
+        // Unknown: treat it as shared, so nothing outside is overwritten.
+        Err(_) => u64::MAX,
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn link_count(_file: &std::fs::File, _meta: &std::fs::Metadata) -> u64 {
+    1
+}
+
+/// Removes a link, or anything that is neither a file nor a directory, by
+/// name. A directory link on Windows goes with `remove_dir`.
+fn remove_link(path: &Path) -> std::io::Result<()> {
+    std::fs::remove_file(path).or_else(|e| std::fs::remove_dir(path).map_err(|_| e))
+}
+
+/// Whether anything is left at `path`, a dangling link included.
+fn still_there(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
 /// Shreds every file under `dir` and removes `dir`. Returns whether
-/// something could not go, which means another application holds it.
+/// something could not go, which means another application holds it. A
+/// link is removed, never followed.
 fn shred_tree(dir: &Path) -> bool {
+    match std::fs::symlink_metadata(dir) {
+        Err(_) => return false,
+        Ok(meta) if !meta.file_type().is_dir() => {
+            return shred_file(dir).is_err() && still_there(dir);
+        }
+        Ok(_) => {}
+    }
     let mut left = false;
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            let gone = if path.is_dir() {
+            let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+            let gone = if is_dir {
                 !shred_tree(&path)
+            } else if KEPT_ACROSS_LOCKS
+                .iter()
+                .any(|kept| entry.file_name() == *kept)
+            {
+                // Ciphered or sealed: nothing to overwrite.
+                std::fs::remove_file(&path).is_ok() || !still_there(&path)
             } else {
-                shred_file(&path).is_ok() || !path.exists()
+                shred_file(&path).is_ok() || !still_there(&path)
             };
             left |= !gone;
         }
     }
-    if std::fs::remove_dir(dir).is_err() && dir.exists() {
+    if std::fs::remove_dir(dir).is_err() && still_there(dir) {
         left = true;
     }
     left
@@ -313,11 +397,7 @@ fn shred_tree(dir: &Path) -> bool {
 
 /// Shreds `path`, a file or a directory. Returns whether something is left.
 pub fn shred_path(path: &Path) -> bool {
-    if path.is_dir() {
-        shred_tree(path)
-    } else {
-        shred_file(path).is_err() && path.exists()
-    }
+    shred_tree(path)
 }
 
 /// The applications that have `path` open, by name, other than this one.
@@ -571,15 +651,6 @@ fn wipe_open_dirs_in(base: &Path, open: &[&Path]) -> usize {
 }
 
 fn clear_readonly(path: &Path) {
-    if path.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(path) {
-            for entry in entries.flatten() {
-                clear_readonly(&entry.path());
-            }
-        }
-        return;
-    }
-
     // Owner only. `set_readonly(false)` sets the write bit for group and
     // world too, which would widen a 0400 file on its way to being deleted.
     #[cfg(unix)]
@@ -642,7 +713,7 @@ mod tests {
 
     #[test]
     fn icloud_drive_is_seen_by_its_folder_on_a_mac() {
-        let path = Path::new("/Users/alex/Library/Mobile Documents/com~apple~CloudDocs/Silos");
+        let path = Path::new("/Users/sam/Library/Mobile Documents/com~apple~CloudDocs/Silos");
         assert_eq!(detect_sync_provider(path), Some("iCloud Drive"));
     }
 
@@ -668,8 +739,8 @@ mod tests {
         // `C:\Users` and `c:\users` are the same directory, and two scratch
         // spaces for one silo would mean a lock wiping only half of it.
         assert_eq!(
-            work_dir_for(Path::new(r"C:\Users\alex\Silos\Personal")),
-            work_dir_for(Path::new(r"c:\users\alex\silos\personal"))
+            work_dir_for(Path::new(r"C:\Users\sam\Silos\Personal")),
+            work_dir_for(Path::new(r"c:\users\sam\silos\personal"))
         );
     }
 
@@ -677,22 +748,22 @@ mod tests {
     fn scratch_never_lands_inside_the_silo_itself() {
         // The whole point: nothing decrypted may be written where the user
         // pointed the silo.
-        let root = Path::new(r"C:\Users\alex\OneDrive\Silos\Personal");
+        let root = Path::new(r"C:\Users\sam\OneDrive\Silos\Personal");
         assert!(!work_dir_for(root).starts_with(root));
     }
 
     #[test]
     fn common_sync_folders_are_recognised() {
         assert_eq!(
-            detect_sync_provider(Path::new(r"C:\Users\alex\OneDrive\Documents\Silo")),
+            detect_sync_provider(Path::new(r"C:\Users\sam\OneDrive\Documents\Silo")),
             Some("OneDrive")
         );
         assert_eq!(
-            detect_sync_provider(Path::new("/home/alex/Dropbox/silo")),
+            detect_sync_provider(Path::new("/home/sam/Dropbox/silo")),
             Some("Dropbox")
         );
         assert_eq!(
-            detect_sync_provider(Path::new(r"C:\Users\alex\Google Drive\silo")),
+            detect_sync_provider(Path::new(r"C:\Users\sam\Google Drive\silo")),
             Some("Google Drive")
         );
     }
@@ -700,7 +771,7 @@ mod tests {
     #[test]
     fn an_ordinary_folder_is_not_flagged() {
         assert!(detect_sync_provider(Path::new(r"D:\Silos\Personal")).is_none());
-        assert!(detect_sync_provider(Path::new("/home/alex/silos/personal")).is_none());
+        assert!(detect_sync_provider(Path::new("/home/sam/silos/personal")).is_none());
     }
 
     #[test]
@@ -915,6 +986,103 @@ mod tests {
         assert!(shred_file(&path).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"plaintext");
         drop(word);
+        shred_file(&path).unwrap();
+        assert!(!path.exists());
+    }
+
+    /// A directory link to `target` at `link`: a junction on Windows, which
+    /// needs no privilege, a symbolic link elsewhere.
+    fn dir_link(target: &Path, link: &Path) {
+        #[cfg(windows)]
+        {
+            let made = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .unwrap();
+            assert!(made.status.success(), "{made:?}");
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    #[test]
+    fn a_link_in_the_scratch_folder_is_removed_and_not_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep.txt"), b"not ours").unwrap();
+        let dir = tmp.path().join("open");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir_link(&outside, &dir.join("linked"));
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.join("keep.txt"), dir.join("file-link")).unwrap();
+
+        assert!(!shred_path(&dir), "nothing should be left");
+        assert!(!still_there(&dir));
+        assert_eq!(
+            std::fs::read(outside.join("keep.txt")).unwrap(),
+            b"not ours"
+        );
+
+        // The folder itself a link: the link goes, what it points at stays.
+        let linked = tmp.path().join("linked-open");
+        dir_link(&outside, &linked);
+        assert!(!shred_path(&linked));
+        assert!(!still_there(&linked));
+        assert_eq!(
+            std::fs::read(outside.join("keep.txt")).unwrap(),
+            b"not ours"
+        );
+    }
+
+    #[test]
+    fn a_dangling_link_does_not_read_as_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gone = tmp.path().join("gone");
+        std::fs::create_dir_all(&gone).unwrap();
+        let dir = tmp.path().join("open");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir_link(&gone, &dir.join("dangling"));
+        std::fs::remove_dir(&gone).unwrap();
+
+        assert!(!shred_path(&dir), "a dangling link was left");
+        assert!(!still_there(&dir));
+    }
+
+    #[test]
+    fn a_hard_linked_file_loses_its_name_and_keeps_its_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("keep.txt");
+        std::fs::write(&outside, b"not ours").unwrap();
+        let dir = tmp.path().join("open");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::hard_link(&outside, dir.join("linked.txt")).unwrap();
+
+        assert!(!shred_path(&dir));
+        assert!(!still_there(&dir));
+        assert_eq!(std::fs::read(&outside).unwrap(), b"not ours");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_viewer_that_lets_others_write_keeps_its_copy_intact() {
+        // Sharing write access did not protect a holder: the shred opened the
+        // file beside it and the viewer read random bytes.
+        use std::os::windows::fs::OpenOptionsExt;
+        const SHARE_ALL: u32 = 1 | 2 | 4;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("opened.pdf");
+        std::fs::write(&path, b"plaintext").unwrap();
+        let viewer = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(SHARE_ALL)
+            .open(&path)
+            .unwrap();
+        assert!(shred_file(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"plaintext");
+        drop(viewer);
         shred_file(&path).unwrap();
         assert!(!path.exists());
     }

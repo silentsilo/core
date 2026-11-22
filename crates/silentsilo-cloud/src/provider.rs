@@ -49,7 +49,7 @@ impl Provider {
 
     pub(crate) fn client_id(self) -> &'static str {
         match self {
-            // Microsoft Entra, tenant softwarehive.onmicrosoft.com.
+            // Microsoft Entra.
             Provider::OneDrive => "faef1802-1c8f-4e5b-9165-fda99961785c",
             Provider::Dropbox => "w97d588dlssjw0u",
             Provider::GoogleDrive => {

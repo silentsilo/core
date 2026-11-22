@@ -8,9 +8,10 @@ packaging, reproducible builds and dependency licences.
 
 ## Storage backends
 
-`ObjectStore` is in place with four implementations (S3-compatible, a plain
-folder, WebDAV and SFTP) and a contract suite that runs the same assertions
-against every one of them. Nothing here is outstanding.
+`ObjectStore` is in place with seven implementations (S3-compatible, a plain
+folder, WebDAV, SFTP, OneDrive, Dropbox and Google Drive; iCloud Drive is a
+folder) and a contract suite that runs the same assertions against every one
+of them, the three clouds against fake servers. Nothing here is outstanding.
 
 One thing SFTP deliberately does not support: an SSH agent. Keys are pasted
 in and kept with the silo's other secrets, so a silo works the same on a

@@ -47,7 +47,7 @@ flowchart TD
         AUDIT["silentsilo-audit<br/>activity log: sealed events, segments"]
         CORE["silentsilo-core<br/>shared types"]
     end
-    APP["silentsilo-app<br/>sessions, sync pass order (being moved in)"]
+    APP["silentsilo-app<br/>sessions, sync pass order"]
     EXTRACT["silentsilo-extract<br/>standalone recovery binary"]
     FIXTURE["silentsilo-fixture<br/>format compatibility corpus"]
     TESTKIT["silentsilo-testkit<br/>dev-only: hostile conditions, skip detector"]
@@ -647,7 +647,7 @@ genuine record back from a copy that holds it under its own name.
 ## Sealed objects and their names
 
 A sealed object's AAD is its 5-byte header (`SSEA` and the version), not its
-role and not its name (audit L1). Whoever can write to storage cannot read
+role and not its name. Whoever can write to storage cannot read
 or forge one, but can put a real one under another object's name, of the
 same kind or of another, and it still opens. Closed without a format change
 (decided 8 Oct 2026, `SEAL_VERSION` stays 1): old data stays version 1 for
@@ -988,7 +988,7 @@ Read this before "fixing" any of it.
   Windows, a locator the iPhone app installs through `set_icloud_locator`,
   since only Swift can ask iOS), and a `FolderStore` works inside it. A file
   only in iCloud is brought down by reading it on macOS 14, iOS 17 and
-  Windows (checked on devices, `planuri/icloud.md` in the workspace). Before
+  Windows (checked on devices). Before
   those, Apple leaves `.<name>.icloud` in its place: the store lists it as
   `<name>`, with the size its property list records, and a read asks for the
   download (`startDownloadingUbiquitousItemAtURL`) and waits up to a minute,

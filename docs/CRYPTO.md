@@ -400,7 +400,7 @@ The header is authenticated, so a payload cannot be relabelled as an older
 version to make a reader interpret it under weaker rules. A version this build
 does not know is refused by name rather than guessed at.
 
-The AAD does not bind the payload's role or its name in storage (audit L1).
+The AAD does not bind the payload's role or its name in storage.
 Anyone who can write to storage can put a real sealed object under the name
 of another, of the same kind (another record, snapshot or marker) or of
 another kind (a record where the KEK envelope goes), and it still opens. They
@@ -651,7 +651,11 @@ Notepad as viewers.
   delete left the content readable in its clusters, and a small file whole
   in its MFT record, on an unencrypted NTFS volume on SSDs; TRIM did not
   clear them. This defeats recovery through the file system, not a lab
-  reading the flash chips.
+  reading the flash chips. A link in the folder (symbolic, junction) is
+  removed and never followed, and a file with a second hard link only loses
+  its name, so nothing outside the folder is overwritten. On Windows the
+  file is opened with no sharing, so a copy any other application has open
+  is left as it is, even when that application lets others write.
 - **Deleted when the viewer lets go, on Windows.** Every two seconds the
   Restart Manager is asked which processes hold the file
   (`workdir::holders`), which looks without opening it: probing with an
@@ -674,7 +678,8 @@ What none of this covers, stated so the claim stays exact:
 - Memory Windows writes to disk (the paging file, hibernation, crash dumps),
   and shadow copies or backups taken while the copy existed.
 - macOS and Linux: no EFS, and no "held" to ask, so copies wait for the
-  lock. On APFS an overwrite is not guaranteed to land on the same blocks.
+  lock, and the lock overwrites them even if a viewer still shows one. On
+  APFS an overwrite is not guaranteed to land on the same blocks.
 - The phone apps hand a copy to another app through the share sheet or a
   content provider, and that app may keep it.
 
@@ -803,7 +808,7 @@ obtains a copy of the bucket, reads all of the following without any key:
 
 None of this breaks the encryption, and none of it is unusual for a design
 that stores one object per change. It is listed because "the provider sees
-opaque blobs" is not the whole truth, and because a label like "Alex's work
+opaque blobs" is not the whole truth, and because a label like "Sam's work
 YubiKey" is the user's own words leaving their machine unencrypted.
 
 Reducing the exposure is possible and is not done today: sealing labels under

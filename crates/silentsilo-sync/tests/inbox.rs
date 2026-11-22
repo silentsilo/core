@@ -424,7 +424,7 @@ async fn the_orphan_sweep_never_touches_the_inbox() {
     assert_eq!(s.import().await, 1);
 }
 
-// Audit L1: sealing does not bind the name, so these move real sealed
+// Sealing does not bind the name, so these move real sealed
 // objects under other names and run the readers.
 
 #[tokio::test]

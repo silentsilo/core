@@ -345,7 +345,7 @@ async fn left_under_another_key(dir: &std::path::Path, lamport: u64) {
 async fn a_working_copy_that_missed_a_rotation_is_left_out_not_a_reason_to_rejoin() {
     // This device is on the current key; a second working copy only it
     // lists still holds the silo as it was before the rotation, records
-    // older than anything on the main copy (audit CO-4).
+    // older than anything on the main copy.
     let main = tempfile::tempdir().unwrap();
     let stale = tempfile::tempdir().unwrap();
     let device = Device::new(Uuid::new_v4(), None);

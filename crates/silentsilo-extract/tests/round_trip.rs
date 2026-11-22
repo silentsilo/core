@@ -145,7 +145,7 @@ async fn the_wrong_code_opens_nothing() {
     assert!(wrong.is_err(), "a guessed code must not open a backup");
 }
 
-/// Audit L1: sealing does not bind an object's name. An old record copied
+/// Sealing does not bind an object's name. An old record copied
 /// above a snapshot's horizon is not replayed over it, and a record put
 /// where the content key goes is not taken for one.
 #[tokio::test]
