@@ -310,9 +310,21 @@ async fn a_published_key_joins_the_silo_and_a_wrong_wrap_key_leaves_nothing() {
         .unwrap();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("silo");
+    // Saved first, as a client does before provisioning.
+    silentsilo_vault::save_credentials(&silentsilo_vault::LocalVaultAuth {
+        vault_id: joined.vault_id,
+        device_secret: "secret-b".into(),
+    })
+    .unwrap();
     let session = recovery_join_provision(&store, &joined, root.clone(), "secret-b")
         .await
         .unwrap();
+    // A key opens this copy, so the device secret opens nothing any more.
+    let creds = silentsilo_vault::load_credentials(joined.vault_id).unwrap();
+    assert!(
+        creds.device_secret.is_empty(),
+        "the device secret outlived the join"
+    );
     let plan = silentsilo_sync::fetch_join_plan_reporting(&store, joined.dek(), &mut |_, _| {})
         .await
         .unwrap();
@@ -320,6 +332,7 @@ async fn a_published_key_joins_the_silo_and_a_wrong_wrap_key_leaves_nothing() {
     assert!(folder_names(&session).contains(&"From A".to_string()));
     // The recovery envelope came along, so the code opens this copy too.
     assert!(silentsilo_vault::load_recovery_envelope(&root).is_ok());
+    silentsilo_vault::clear_credentials(joined.vault_id);
 }
 
 #[tokio::test]

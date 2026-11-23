@@ -302,6 +302,14 @@ impl StoreConfigInput {
                 username,
                 password,
             } => {
+                // Credentials in the address would be shown wherever the
+                // address is; they have fields of their own.
+                if silentsilo_store::without_userinfo(url.trim()) != url.trim() {
+                    return Err(
+                        "Put the user name and password in their own fields, not in the address"
+                            .into(),
+                    );
+                }
                 // The same server and user only, for the same reason as S3.
                 let stored = match existing {
                     Some(StoreConfig::WebDav(c))
@@ -474,7 +482,7 @@ impl From<&StoreConfig> for StoreConfigView {
                 path: path.to_string_lossy().to_string(),
             },
             StoreConfig::WebDav(c) => Self::WebDav {
-                url: c.url.clone(),
+                url: silentsilo_store::without_userinfo(&c.url),
                 username: c.username.clone(),
             },
             StoreConfig::Sftp(c) => Self::Sftp {
@@ -799,6 +807,22 @@ mod deserialisation_tests {
         }))
         .unwrap();
         assert!(other_server.into_config(Some(dav)).is_err());
+
+        // A password in the address is refused, and one saved by an earlier
+        // release is never shown.
+        let in_address: StoreConfigInput = serde_json::from_value(serde_json::json!({
+            "kind": "web-dav", "url": "https://alex:secret@cloud.example.com/dav/silo",
+            "username": "alex", "password": "app-pass"
+        }))
+        .unwrap();
+        assert!(in_address.into_config(None).is_err());
+        let earlier = StoreConfig::WebDav(silentsilo_store::WebDavConfig {
+            url: "https://alex:secret@cloud.example.com/dav/silo".into(),
+            username: "alex".into(),
+            password: "app-pass".into(),
+        });
+        let shown = serde_json::to_string(&StoreConfigView::from(&earlier)).unwrap();
+        assert!(!shown.contains("secret"), "{shown}");
 
         let s3 = StoreConfig::S3(silentsilo_core::S3Config {
             endpoint: "https://s3.example.com".into(),

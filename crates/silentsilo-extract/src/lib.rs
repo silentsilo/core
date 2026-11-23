@@ -116,8 +116,12 @@ pub fn passwords_csv(backup: &Backup) -> Option<String> {
     }
     let field = |entry: &serde_json::Value, key: &str| -> String {
         let raw = entry.get(key).and_then(|v| v.as_str()).unwrap_or_default();
-        let escaped = raw.replace('"', "\"\"");
-        format!("\"{escaped}\"")
+        let guarded = if needs_formula_guard(raw) {
+            format!("'{raw}")
+        } else {
+            raw.to_string()
+        };
+        format!("\"{}\"", guarded.replace('"', "\"\""))
     };
     let mut lines = vec!["name,url,username,password,totp,category,note".to_string()];
     for entry in &backup.passwords {
@@ -135,6 +139,33 @@ pub fn passwords_csv(backup: &Backup) -> Option<String> {
         );
     }
     Some(format!("{}\n", lines.join("\n")))
+}
+
+/// Whether a spreadsheet opening the CSV would run this cell, by the rule
+/// the desktop app's own export uses (`passwordCsv.ts`), so both files read
+/// the same. `=` always starts a formula; `+`, `-` and `@` only with a
+/// function call, a DDE pipe or a sheet reference behind them, so a phone
+/// number or a negative amount is written as it is.
+fn needs_formula_guard(value: &str) -> bool {
+    const STARTS: [char; 6] = ['=', '+', '-', '@', '\t', '\r'];
+    if value.starts_with(['=', '\t', '\r']) {
+        return true;
+    }
+    let unquoted = value.trim_start_matches('\'');
+    if unquoted.len() < value.len() && unquoted.starts_with(STARTS) {
+        return true;
+    }
+    let Some(rest) = value.strip_prefix(['+', '-', '@']) else {
+        return false;
+    };
+    if rest.contains(['|', '!', '=']) {
+        return true;
+    }
+    let chars: Vec<char> = rest.chars().collect();
+    chars.iter().enumerate().any(|(i, c)| {
+        (c.is_ascii_alphabetic() || *c == '_' || *c == '.')
+            && chars[i + 1..].iter().find(|c| !c.is_whitespace()) == Some(&'(')
+    })
 }
 
 /// The password entries whole, as the silo keeps them: what a CSV has no
@@ -715,6 +746,36 @@ mod collision_tests {
         }
         for name in ["console", "com10", "nullable.txt", "report"] {
             assert!(!reserved_on_windows(name), "{name}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod formula_tests {
+    use super::needs_formula_guard;
+
+    /// The same cases as the desktop export's own tests.
+    #[test]
+    fn a_formula_is_guarded_and_a_phone_number_is_not() {
+        for guarded in [
+            "=HYPERLINK(\"x\")",
+            "+SUM(A1)",
+            "-cmd|' /C calc'!A0",
+            "@SUM(1)",
+            "\tx",
+            "'=already",
+        ] {
+            assert!(needs_formula_guard(guarded), "{guarded:?}");
+        }
+        for plain in [
+            "+40 721 000 000",
+            "-12.50",
+            "@handle",
+            "pass=word",
+            "",
+            "'quoted",
+        ] {
+            assert!(!needs_formula_guard(plain), "{plain:?}");
         }
     }
 }

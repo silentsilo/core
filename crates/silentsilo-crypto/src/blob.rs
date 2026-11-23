@@ -318,11 +318,7 @@ fn decrypt_inner(
     // Through a sibling temp file, renamed only once the hash holds: a
     // refused blob must not leave a shortened plaintext where the caller
     // asked for the file, nor destroy whatever was already at that path.
-    let temp = {
-        let mut name = dest.as_os_str().to_os_string();
-        name.push(".part");
-        std::path::PathBuf::from(name)
-    };
+    let temp = decrypt_temp_path(dest);
     let mut dest_file = File::create(&temp)?;
     let key = Aes256Gcm::new_from_slice(key.as_bytes()).expect("valid key length");
     let result = decrypt_chunks(&mut source_file, &mut dest_file, &header, &key);
@@ -339,6 +335,15 @@ fn decrypt_inner(
             Err(e)
         }
     }
+}
+
+/// Where [`decrypt_blob`] and [`decrypt_file`] write before they rename onto
+/// `dest`. Not `dest.part`: that may be a file of the user's, which the
+/// write would truncate, and a name near 255 bytes has no room for it.
+pub fn decrypt_temp_path(dest: &Path) -> std::path::PathBuf {
+    let name = dest.file_name().unwrap_or_default();
+    let tag = blake3::hash(name.as_encoded_bytes()).to_hex();
+    dest.with_file_name(format!("SilentSilo-{}.part", &tag[..16]))
 }
 
 /// [`decrypt_blob`] into memory, for a caller that must not put the
@@ -771,9 +776,39 @@ mod tests {
         assert!(decrypt_blob(&enc, &out, &key, blob_id).is_err());
         assert_eq!(std::fs::read(&out).unwrap(), b"precious");
         assert!(
-            !dir.path().join("out.bin.part").exists(),
+            !decrypt_temp_path(&out).exists(),
             "the temp file outlived the failure"
         );
+    }
+
+    /// The temp file is a name of its own: a user's `out.bin.part` beside
+    /// the destination survives, and a 255-byte name still decrypts.
+    #[test]
+    fn the_temp_file_takes_no_name_of_the_users() {
+        let dir = tempdir().unwrap();
+        let plain = dir.path().join("in.bin");
+        let enc = dir.path().join("blob.sslo");
+        let key = generate_content_key();
+        let blob_id = Uuid::new_v4();
+        std::fs::write(&plain, b"the real contents").unwrap();
+        encrypt_file(&plain, &enc, &key, Uuid::new_v4(), blob_id).unwrap();
+
+        let out = dir.path().join("out.bin");
+        let theirs = dir.path().join("out.bin.part");
+        std::fs::write(&theirs, b"precious").unwrap();
+        decrypt_blob(&enc, &out, &key, blob_id).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"the real contents");
+        assert_eq!(std::fs::read(&theirs).unwrap(), b"precious");
+
+        let long = dir.path().join(format!("{}.pdf", "a".repeat(251)));
+        decrypt_blob(&enc, &long, &key, blob_id).unwrap();
+        assert_eq!(std::fs::read(&long).unwrap(), b"the real contents");
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("SilentSilo-"))
+            .collect();
+        assert!(left.is_empty(), "temp files left behind: {left:?}");
     }
 
     /// The version check is exact, so a header from a future format is

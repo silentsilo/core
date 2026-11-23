@@ -16,7 +16,9 @@ use std::path::Path;
 
 use silentsilo_crypto::ContentKek;
 use silentsilo_store::ObjectStore;
-use silentsilo_sync::inbox::{finish_item, is_staged, scan_inbox, source_present, stage_item};
+use silentsilo_sync::inbox::{
+    finish_item, is_staged, scan_inbox_skipping, source_present, stage_item,
+};
 use silentsilo_vfs::Vfs;
 use uuid::Uuid;
 
@@ -93,13 +95,28 @@ pub async fn import_inbox(
         return outcome;
     }
     for target in targets {
-        let scan = match scan_inbox(target.store, vault_id, kek).await {
+        // A copy that keeps its items keeps every one ever imported: those
+        // recorded or purged here are not read again.
+        let mut settled = std::collections::HashSet::new();
+        if !target.may_finish
+            && silo
+                .with_vfs(&mut |vfs| {
+                    settled = vfs.known_file_ids()?;
+                    Ok(())
+                })
+                .is_err()
+        {
+            return outcome;
+        }
+        let known = |id: Uuid| settled.contains(&id);
+        let scan = match scan_inbox_skipping(target.store, vault_id, kek, &known).await {
             Ok(scan) => scan,
             Err(e) => {
                 warn(&format!("{}: {e}", target.label));
                 continue;
             }
         };
+        outcome.left += scan.unread;
         for refused in scan.refused {
             outcome.refused.push(format!(
                 "{}: {} ({})",

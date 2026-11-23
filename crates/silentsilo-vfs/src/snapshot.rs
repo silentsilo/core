@@ -636,20 +636,34 @@ pub fn restore(conn: &Connection, snapshot: &Snapshot) -> CoreResult<()> {
     // to its parent holds at every point. The dump preserves that order.
     // The key does not stop a folder naming itself, which no replay makes
     // and which sends every walk of the tree round in a circle for good.
+    //
+    // Names are repaired and paths rebuilt from them, as replay does: the
+    // snapshot is sealed under a key every former member had, and a name
+    // with a `/` or a `..` in it would otherwise reach the disk on export.
+    let mut paths: std::collections::HashMap<Uuid, String> = std::collections::HashMap::new();
     for row in &snapshot.folders {
         if row.parent_id == Some(row.id) {
             return Err(CoreError::Invalid(
                 "a folder in this snapshot is its own parent".into(),
             ));
         }
+        let (name, path) = match row.parent_id.and_then(|parent| paths.get(&parent)) {
+            Some(parent_path) => {
+                let name = crate::names::sanitize(&row.name);
+                let path = crate::oplog::join_path(parent_path, &name);
+                (name, path)
+            }
+            None => (row.name.clone(), row.path.clone()),
+        };
+        paths.insert(row.id, path.clone());
         conn.execute(
             "INSERT INTO folders(id, parent_id, name, path, created_at, updated_at, deleted_at, favorite)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 row.id.to_string(),
                 row.parent_id.map(|id| id.to_string()),
-                row.name,
-                row.path,
+                name,
+                path,
                 row.created_at,
                 row.updated_at,
                 row.deleted_at,
@@ -668,7 +682,7 @@ pub fn restore(conn: &Connection, snapshot: &Snapshot) -> CoreResult<()> {
             params![
                 row.id.to_string(),
                 row.folder_id.to_string(),
-                row.name,
+                crate::names::sanitize(&row.name),
                 row.blob_id.to_string(),
                 row.size_bytes,
                 row.mime_type,
@@ -2081,6 +2095,46 @@ mod tests {
         let err = restore(&fresh, &snapshot).unwrap_err();
 
         assert!(err.to_string().contains("its own parent"), "was: {err}");
+    }
+
+    /// A name replay would have repaired is repaired on restore too, and
+    /// the path is rebuilt from it rather than taken from the snapshot.
+    #[test]
+    fn a_name_that_climbs_out_is_repaired_on_restore() {
+        let (conn, vault_id, _) = populated();
+        let mut snapshot = capture_at(&conn, vault_id, 3).unwrap();
+        let folder = snapshot
+            .folders
+            .iter_mut()
+            .find(|f| f.parent_id.is_some())
+            .unwrap();
+        folder.name = "../../outside".into();
+        folder.path = "/../../outside".into();
+        let folder_id = folder.id;
+        let file = snapshot.files.first_mut().unwrap();
+        file.name = "..\\evil\u{202E}fdp.exe".into();
+        let file_id = file.id;
+
+        let fresh = bare_device(vault_id);
+        restore(&fresh, &snapshot).unwrap();
+
+        let (name, path): (String, String) = fresh
+            .query_row(
+                "SELECT name, path FROM folders WHERE id = ?1",
+                [folder_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(!name.contains('/'), "{name}");
+        assert_eq!(path, format!("/{name}"));
+        let file_name: String = fresh
+            .query_row(
+                "SELECT name FROM files WHERE id = ?1",
+                [file_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!file_name.contains(['\\', '\u{202E}']), "{file_name}");
     }
 
     #[test]

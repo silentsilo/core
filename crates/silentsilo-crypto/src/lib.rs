@@ -8,7 +8,8 @@ mod sealed;
 
 pub use blob::{
     BlobHeader, CHUNK_SIZE, HEADER_SIZE, SSLO_MAGIC, SSLO_VERSION, decrypt_blob,
-    decrypt_blob_to_vec, decrypt_file, encrypt_file, encrypt_stream, verify_blob, verify_file,
+    decrypt_blob_to_vec, decrypt_file, decrypt_temp_path, encrypt_file, encrypt_stream,
+    verify_blob, verify_file,
 };
 pub use dek::{
     ContentKek, ContentKey, MasterDek, generate_content_kek, generate_content_key, generate_dek,

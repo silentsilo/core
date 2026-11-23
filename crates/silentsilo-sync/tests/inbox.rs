@@ -542,3 +542,39 @@ async fn an_item_finished_elsewhere_during_the_scan_does_not_stop_the_others() {
     assert_eq!(ready, vec![kept]);
     assert!(scan.refused.is_empty());
 }
+
+/// A flood of envelopes is read a thousand at a time, the first in listing
+/// order, and the rest are counted as left for the next pass.
+#[tokio::test]
+async fn a_flood_of_envelopes_is_read_a_share_at_a_time() {
+    let s = setup().await;
+    let real = s.send().await;
+    let flood = silentsilo_sync::inbox::MAX_ENVELOPES_PER_SCAN + 5;
+    for _ in 0..flood {
+        let junk = format!("{INBOX_ITEMS_PREFIX}{}.env", Uuid::new_v4());
+        s.store.put(&junk, b"{}".to_vec()).await.unwrap();
+    }
+
+    let scan = scan_inbox(&s.store, s.session.vault_id, &s.session.kek)
+        .await
+        .unwrap();
+    assert_eq!(
+        scan.ready.len() + scan.refused.len(),
+        silentsilo_sync::inbox::MAX_ENVELOPES_PER_SCAN
+    );
+    assert_eq!(scan.unread, 6);
+
+    // What the device has already settled is not read at all.
+    let scan = silentsilo_sync::inbox::scan_inbox_skipping(
+        &s.store,
+        s.session.vault_id,
+        &s.session.kek,
+        &|id| id != real,
+    )
+    .await
+    .unwrap();
+    assert_eq!(scan.unread, 0);
+    assert_eq!(scan.ready.len(), 1);
+    assert_eq!(scan.ready[0].item_id, real);
+    assert!(scan.refused.is_empty());
+}

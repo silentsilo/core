@@ -9,6 +9,41 @@ This repository has its own version line, separate from the desktop
 application's. A client pins a tag from here; the tag it pins is what its
 release notes should say.
 
+## [1.11.5] - names, listings and temp files that storage controls
+
+No persisted format changed.
+
+### Security
+
+- A name with a direction override or isolate in it (U+202A to U+202E,
+  U+2066 to U+2069) is repaired to `_` on replay and refused when typed:
+  `invoice<U+202E>fdp.exe` read as `invoiceexe.pdf`. Plain direction marks
+  stay.
+- Restoring a snapshot repairs its names and rebuilds folder paths from
+  them, as replay does. A snapshot is sealed under a key every former member
+  had, and its names went into the index as they were.
+- A join that saves a published key's envelope retires the device secret,
+  as a first enrolment does. Kept, it and an old `master.dek.enc` would
+  still open the copy.
+- A WebDAV listing descends only into collections under the one it asked
+  about, never twice into the same one, and reads one PROPFIND reply up to
+  256 MB. A server that named a sibling as a child kept it listing for ever.
+- A WebDAV address with `user:password@` in it is refused on save, and the
+  settings view never shows one saved earlier.
+- An inbox scan reads at most `MAX_ENVELOPES_PER_SCAN` (1000) envelopes and
+  leaves the rest for the next pass. `scan_inbox_skipping` does not read
+  those of items already settled; the import uses it on copies that keep
+  their items.
+- The extractor's passwords CSV puts an apostrophe before a value a
+  spreadsheet would run as a formula, by the desktop export's rule.
+
+### Fixed
+
+- `decrypt_blob` and `decrypt_file` write to `decrypt_temp_path(dest)`
+  before the rename, not `dest.part`: that truncated a user's own
+  `report.pdf.part` beside the export, and a name near 255 bytes had no
+  room for the suffix.
+
 ## [1.11.4] - rotations from earlier releases, rolled-back joins
 
 No persisted format changed.

@@ -42,7 +42,7 @@ pub fn sanitize(raw: &str) -> String {
     let mut cleaned: String = composed
         .chars()
         .map(|c| {
-            if FORBIDDEN.contains(&c) || c.is_control() {
+            if FORBIDDEN.contains(&c) || c.is_control() || reorders(c) {
                 '_'
             } else {
                 c
@@ -67,6 +67,14 @@ pub fn sanitize(raw: &str) -> String {
         return "unnamed".to_string();
     }
     cleaned
+}
+
+/// A direction override, embedding or isolate. Each reorders the text after
+/// it, so `invoice<U+202E>fdp.exe` reads as `invoiceexe.pdf`. Plain
+/// direction marks (U+200E, U+200F, U+061C) reorder nothing and stay: some
+/// systems put them in names on their own.
+fn reorders(c: char) -> bool {
+    matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
 }
 
 /// Composition alone, for names typed or dropped locally: the same NFC that
@@ -104,6 +112,11 @@ pub fn check(raw: &str) -> CoreResult<()> {
     if trimmed.chars().any(|c| c.is_control()) {
         return Err(CoreError::InvalidName(
             "a name cannot contain control characters".into(),
+        ));
+    }
+    if trimmed.chars().any(reorders) {
+        return Err(CoreError::InvalidName(
+            "a name cannot contain characters that reorder the text".into(),
         ));
     }
     if trimmed.ends_with('.') || trimmed.ends_with(' ') {
@@ -144,6 +157,17 @@ fn truncate_bytes(value: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An override cannot make an `.exe` read as a `.pdf`, while a plain
+    /// direction mark, which some systems add on their own, stays.
+    #[test]
+    fn a_name_cannot_reorder_its_own_extension() {
+        assert_eq!(sanitize("invoice\u{202E}fdp.exe"), "invoice_fdp.exe");
+        assert_eq!(sanitize("a\u{2067}b\u{2069}.txt"), "a_b_.txt");
+        assert_eq!(sanitize("שלום\u{200F}.txt"), "שלום\u{200F}.txt");
+        assert!(check("invoice\u{202E}fdp.exe").is_err());
+        assert!(check("שלום\u{200F}.txt").is_ok());
+    }
 
     #[test]
     fn the_two_spellings_of_one_word_collide() {

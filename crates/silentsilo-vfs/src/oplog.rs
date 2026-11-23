@@ -1916,7 +1916,7 @@ fn folder_path(conn: &Connection, id: Uuid) -> CoreResult<Option<String>> {
     .map_err(|e| CoreError::Database(e.to_string()))
 }
 
-fn join_path(parent_path: &str, name: &str) -> String {
+pub(crate) fn join_path(parent_path: &str, name: &str) -> String {
     if parent_path == "/" {
         format!("/{name}")
     } else {

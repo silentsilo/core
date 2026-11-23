@@ -218,7 +218,9 @@ async fn run(args: Args, from: PathBuf, code: Zeroizing<String>) -> ExitCode {
                 println!(
                     "The password entries are in _passwords/passwords.csv, and whole \
                      (passkeys, cards and all) in _passwords/entries.json, in PLAIN TEXT. \
-                     Import them into a password manager and delete both files."
+                     Import them into a password manager and delete both files. In the \
+                     CSV, a value a spreadsheet would run as a formula starts with an \
+                     apostrophe: remove it from such a password after importing."
                 );
             }
             if out.failed.is_empty() {

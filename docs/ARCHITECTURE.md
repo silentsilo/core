@@ -355,7 +355,9 @@ property:
   `VaultError::SecretsUnprotected` (`err.secrets_unprotected`), which the app
   turns into that question. On an iPhone the keychain entries are "this
   device only" (`keychain.rs`). The device secret is emptied once a key is
-  enrolled (`retire_device_secret`), the record kept.
+  enrolled (`retire_device_secret`), the record kept, and so is it on a
+  join that saves a published key's envelope. A client saves the
+  credentials before `recovery_join_provision`, never after.
   Backup targets of a kind core 1.7.2 does not know live in
   `targets.more.config.json`, never in the list or the single slot an older
   release reads (FORMATS.md). Test runs use the keyring service
@@ -466,7 +468,11 @@ never meets a file really called that. Subtree queries use `GLOB`, not
 `LIKE`: `LIKE` folds ASCII case and would treat `x (2)` and `X (2)` as one
 subtree. Typed names are validated (`names::check`) and NFC-composed at
 the boundary; replayed names are repaired (`names::sanitize`) because a
-record can never be refused. Concurrent edits of one file resolve by total
+record can never be refused. A direction override or isolate (U+202A to
+U+202E, U+2066 to U+2069) becomes `_` there, so a name cannot make an
+`.exe` read as a `.pdf`; plain direction marks stay. A snapshot's names go
+through the same repair on restore, and its folder paths are rebuilt from
+them: the snapshot is sealed under a key every former member had. Concurrent edits of one file resolve by total
 order, with the loser preserved as a deterministic conflict copy (id
 derived from the losing record via UUIDv5, carrying the losing content's
 wrapped key).
@@ -605,7 +611,11 @@ configured target kept every item, and a phone's "waiting" count, in place for
 as long as one copy did not answer. An item recorded earlier in the same pass
 (the same item in two inboxes) stays. One pass records at most
 `INBOX_IMPORT_PER_PASS` items and says `more_to_do` when it left some. An
-archive target keeps its items; they are skipped as already known. With more
+archive target keeps its items; they are skipped as already known, without
+reading their envelopes (`scan_inbox_skipping`). One scan reads at most
+`MAX_ENVELOPES_PER_SCAN` envelopes, in listing order so every device reads
+the same ones, and counts the rest as left: anyone who can write to
+storage can add a million, and each is a GET and a signature check. With more
 than one target the importer fetches the content down, so its next push
 spreads it to the targets the phone did not send to.
 
@@ -1141,12 +1151,22 @@ Read this before "fixing" any of it.
   scheme, host and port, five at most; any other is an error naming it
   (`err.webdav_redirected`), so neither the password nor the silo goes
   wherever a server points. Errors and `describe()` never show a
-  `user:password@` written into the address.
+  `user:password@` written into the address. The settings screen does not
+  either, and saving an address with one in it is refused: the name and
+  password have their own fields. A listing descends only into collections
+  under the one it asked about, never twice into the same one, and a
+  single PROPFIND reply is read up to 256 MB.
 - **A folder target does not follow links out of itself.** A symlink or
   junction inside the root is followed only while it resolves inside the
   root, for listing, reading and writing alike, and anything that is not a
   regular file (a FIFO, a device) is not an object. Whoever can write to a
   shared folder could otherwise point a key at the rest of the disk.
+  The check is made when the key becomes a path, not on the open handle, so
+  a link swapped in between can still redirect one read or write. That is
+  accepted: what is read is checked as a blob, opened as an op or parsed
+  as a record, so an outside file is refused, and a write puts ciphertext
+  under one of this app's names. Closing it would take handle-relative opens on every
+  platform.
 
 ## Changing things
 

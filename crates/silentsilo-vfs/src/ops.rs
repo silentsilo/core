@@ -617,6 +617,25 @@ impl<'a> Vfs<'a> {
         crate::oplog::was_purged(self.conn(), id)
     }
 
+    /// Every id [`Self::file_id_known`] answers yes for, at once.
+    pub fn known_file_ids(&self) -> CoreResult<std::collections::HashSet<Uuid>> {
+        let db = |e: rusqlite::Error| CoreError::Database(e.to_string());
+        let mut statement = self
+            .conn()
+            .prepare("SELECT id FROM files UNION SELECT id FROM purged_ids")
+            .map_err(db)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(db)?;
+        let mut ids = std::collections::HashSet::new();
+        for raw in rows {
+            if let Ok(id) = parse_id(&raw.map_err(db)?) {
+                ids.insert(id);
+            }
+        }
+        Ok(ids)
+    }
+
     /// The folder at `segments` below the root, created where missing. Names
     /// come from another device, so they are repaired, not refused.
     ///

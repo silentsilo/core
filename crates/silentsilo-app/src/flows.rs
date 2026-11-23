@@ -322,6 +322,10 @@ pub async fn recovery_join_provision(
         {
             silentsilo_vault::save_wrapped_dek_bytes(&root, &envelope)
                 .map_err(|e| e.to_string())?;
+            // A key opens the silo here now, so the device secret goes, as
+            // on a first enrolment: kept, it and the `master.dek.enc` it
+            // wrapped (a synced folder's history) would still open it.
+            let _ = silentsilo_vault::retire_device_secret(join.vault_id);
         }
         // Created here from the published envelopes, so nothing is removed.
         let _ = save_fido_keys(

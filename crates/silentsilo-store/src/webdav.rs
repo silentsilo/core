@@ -74,8 +74,8 @@ impl std::fmt::Debug for WebDavConfig {
 }
 
 /// The address with any `user:password@` taken out, for everything that
-/// shows it: errors, logs, the store's description.
-fn without_userinfo(address: &str) -> String {
+/// shows it: errors, logs, the store's description, the settings screen.
+pub fn without_userinfo(address: &str) -> String {
     if let Ok(mut url) = url::Url::parse(address) {
         if url.username().is_empty() && url.password().is_none() {
             return address.to_string();
@@ -636,8 +636,14 @@ impl ObjectStore for WebDavStore {
         // level at a time works everywhere, and the trees here are two deep.
         let mut out = Vec::new();
         let mut queue = vec![prefix.trim_end_matches('/').to_string()];
+        // A server that lists a sibling or a parent as a child would
+        // otherwise send this round the same collections for ever.
+        let mut visited = std::collections::HashSet::new();
 
         while let Some(collection) = queue.pop() {
+            if !visited.insert(collection.clone()) {
+                continue;
+            }
             let response = self
                 .request(
                     Method::from_bytes(b"PROPFIND").unwrap(),
@@ -666,10 +672,19 @@ impl ObjectStore for WebDavStore {
                 return Err(Self::map_status(response.status(), &collection));
             }
 
-            let body = response.text().await.map_err(Self::map_send)?;
+            let body = read_listing(response, &collection).await?;
+            let within = if collection.is_empty() {
+                String::new()
+            } else {
+                format!("{collection}/")
+            };
             for entry in parse_multistatus(&body, &self.base_path)? {
                 // A PROPFIND includes the collection it was asked about.
                 if entry.key == collection || entry.key.is_empty() {
+                    continue;
+                }
+                // Only what is under the collection asked about.
+                if !entry.key.starts_with(&within) {
                     continue;
                 }
                 // A name this app never writes is not one of its objects.
@@ -710,6 +725,28 @@ impl ObjectStore for WebDavStore {
             .await?;
         crate::probe(self).await
     }
+}
+
+/// The most a single PROPFIND reply may hold. About 800,000 entries, far
+/// past any real silo; a server that never stops answering is cut off here
+/// instead of filling the app's memory.
+const MAX_LISTING_BYTES: usize = 256 * 1024 * 1024;
+
+async fn read_listing(
+    mut response: reqwest::Response,
+    collection: &str,
+) -> Result<String, StoreError> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(WebDavStore::map_send)? {
+        if body.len() + chunk.len() > MAX_LISTING_BYTES {
+            return Err(StoreError::Other(format!(
+                "the WebDAV server's listing of '{collection}' is larger than {} MB",
+                MAX_LISTING_BYTES / (1024 * 1024)
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
 struct DavEntry {
@@ -983,6 +1020,52 @@ mod tests {
         ] {
             assert!(!local(far), "{far} must go through the proxy");
         }
+    }
+
+    /// A server that lists a sibling as a child, or an object outside the
+    /// collection asked about, neither loops the listing nor adds the object.
+    #[tokio::test]
+    async fn a_listing_that_names_its_siblings_ends_and_keeps_to_its_prefix() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = server.local_addr().unwrap().port();
+        let asked = Arc::new(AtomicU64::new(0));
+        let count = asked.clone();
+        tokio::spawn(async move {
+            let body = r#"<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">
+<d:response><d:href>/dav/ops/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop></d:propstat></d:response>
+<d:response><d:href>/dav/blobs/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop></d:propstat></d:response>
+<d:response><d:href>/dav/ops/1.op</d:href><d:propstat><d:prop><d:getcontentlength>5</d:getcontentlength><d:resourcetype/></d:prop></d:propstat></d:response>
+<d:response><d:href>/dav/vault.json</d:href><d:propstat><d:prop><d:getcontentlength>9</d:getcontentlength><d:resourcetype/></d:prop></d:propstat></d:response>
+</d:multistatus>"#;
+            while let Ok((mut socket, _)) = server.accept().await {
+                if count.fetch_add(1, Ordering::SeqCst) > 50 {
+                    return;
+                }
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let reply = format!(
+                    "HTTP/1.1 207 Multi-Status\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+            }
+        });
+        let store = WebDavStore::new(WebDavConfig {
+            url: format!("http://127.0.0.1:{port}/dav"),
+            username: "a".into(),
+            password: "b".into(),
+        })
+        .unwrap();
+
+        let listed = store.list("ops/").await.unwrap();
+        let keys: Vec<_> = listed.iter().map(|o| o.key.as_str()).collect();
+        assert_eq!(keys, ["ops/1.op"]);
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            1,
+            "a sibling was listed as a child"
+        );
     }
 
     /// A redirect to another address is not followed: the credentials and

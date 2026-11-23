@@ -453,6 +453,22 @@ pub struct RefusedItem {
 pub struct InboxScan {
     pub ready: Vec<ReadyItem>,
     pub refused: Vec<RefusedItem>,
+    /// Envelopes past [`MAX_ENVELOPES_PER_SCAN`], left for the next pass.
+    pub unread: usize,
+}
+
+/// The most envelopes one scan reads. Each is a GET and a signature check,
+/// and whoever can write to storage can add a million of them. The rest
+/// wait for the next pass, in listing order, so every device reads the same
+/// ones.
+pub const MAX_ENVELOPES_PER_SCAN: usize = 1000;
+
+/// The item an envelope's key names, `inbox/items/<item_id>.env`.
+fn envelope_item(key: &str) -> Option<Uuid> {
+    key.strip_prefix(INBOX_ITEMS_PREFIX)?
+        .strip_suffix(".env")?
+        .parse()
+        .ok()
 }
 
 /// Reads every envelope in the inbox and checks it: version, a registered
@@ -464,13 +480,30 @@ pub async fn scan_inbox(
     vault_id: Uuid,
     kek: &ContentKek,
 ) -> Result<InboxScan, SyncError> {
+    scan_inbox_skipping(client, vault_id, kek, &|_| false).await
+}
+
+/// [`scan_inbox`] without reading the envelopes of the items `known`
+/// names: on a copy that never deletes, every item ever imported stays in
+/// the inbox, and reading them all again on every pass only grows.
+pub async fn scan_inbox_skipping(
+    client: &dyn ObjectStore,
+    vault_id: Uuid,
+    kek: &ContentKek,
+    known: &(dyn Fn(Uuid) -> bool + Sync),
+) -> Result<InboxScan, SyncError> {
     let mut scan = InboxScan::default();
-    let envelopes: Vec<_> = client
+    let mut envelopes: Vec<_> = client
         .list(INBOX_ITEMS_PREFIX)
         .await?
         .into_iter()
         .filter(|entry| entry.key.ends_with(".env"))
+        .filter(|entry| !envelope_item(&entry.key).is_some_and(known))
         .collect();
+    if envelopes.len() > MAX_ENVELOPES_PER_SCAN {
+        scan.unread = envelopes.len() - MAX_ENVELOPES_PER_SCAN;
+        envelopes.truncate(MAX_ENVELOPES_PER_SCAN);
+    }
     if envelopes.is_empty() {
         return Ok(scan);
     }
