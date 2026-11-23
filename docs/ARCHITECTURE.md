@@ -429,7 +429,9 @@ disk) stops the batch rather than carry on in autocommit.
 
 An object that does not open with the silo's key holds back everything at
 or above it for a week from the first pass that met it (dated in
-`vault_meta`, `UNOPENED_HOLD_SECS`), then no longer. Anyone with write access
+`vault_meta`, `UNOPENED_HOLD_SECS`), then no longer. The week also runs per
+copy: from the first pass that met one there without a pass free of them
+since, so a new name every few days does not hold changes back for good. Anyone with write access
 to storage can put one at a low number, and holding for good stopped
 incoming changes for good; a week leaves an interrupted upload or a damaged
 record time to be sent again or repaired. One that opens and is no record at
@@ -959,6 +961,15 @@ Read this before "fixing" any of it.
   for S3 ten pages in a row that say "more" and bring nothing
   (`MAX_LISTED`, `MAX_LIST_DEPTH`). Far above any silo; a server that
   answers without end fails the call instead of filling memory.
+- **An untagged recovery envelope in the silo folder is refused once the
+  silo has had a tagged one.** The silo's database notes the first tagged
+  envelope (`recovery_tagged` in `vault_meta`); from then on the pre-1.6
+  upgrade path no longer tags what it finds in the folder, which anyone who
+  can write the folder (a sync client) could otherwise publish to every
+  device. The newest tagged envelope in storage is taken instead.
+- **A purged file is known.** `file_id_known` counts purged ids, so an inbox
+  item whose file was purged is never recorded again, and a copy that
+  allows it lets the item go.
 - **A recovery envelope that is there and does not read is left alone.**
   The push writes its own only after reading what the copy holds: a newer
   code may be what failed to come down.

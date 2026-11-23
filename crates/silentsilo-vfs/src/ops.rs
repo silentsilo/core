@@ -595,9 +595,12 @@ impl<'a> Vfs<'a> {
         raw.map(|raw| parse_id(&raw)).transpose()
     }
 
-    /// Whether a file with this id was ever recorded here, trashed included.
+    /// Whether a file with this id was ever recorded here, trashed or
+    /// purged included. A purged file has no row left, and taken as unknown
+    /// it was recorded again, each time, from an inbox that still held it.
     pub fn file_id_known(&self, id: Uuid) -> CoreResult<bool> {
-        self.conn()
+        let row = self
+            .conn()
             .query_row(
                 "SELECT 1 FROM files WHERE id = ?1",
                 [id.to_string()],
@@ -605,7 +608,13 @@ impl<'a> Vfs<'a> {
             )
             .optional()
             .map(|found| found.is_some())
-            .map_err(|e| CoreError::Database(e.to_string()))
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        Ok(row || self.was_purged(id)?)
+    }
+
+    /// Whether this id was purged: its row is gone and it never comes back.
+    pub fn was_purged(&self, id: Uuid) -> CoreResult<bool> {
+        crate::oplog::was_purged(self.conn(), id)
     }
 
     /// The folder at `segments` below the root, created where missing. Names

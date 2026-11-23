@@ -9,6 +9,27 @@ This repository has its own version line, separate from the desktop
 application's. A client pins a tag from here; the tag it pins is what its
 release notes should say.
 
+## [1.11.3] - keys and recovery against a writable silo folder
+
+No persisted format changed.
+
+### Security
+
+- An untagged recovery envelope in the silo folder is no longer tagged and
+  published once the silo has had a tagged one: whoever could write the
+  folder could replace the recovery code on every device that way.
+- `OrgProof::verify` takes the open silo's key, and an organisation key's
+  envelope must open to it. An envelope planted in storage under the
+  planter's own key no longer counts as proof.
+- An object among the records that does not open holds changes back for a
+  week per copy as well as per name: a new name every few days held them
+  back for good.
+
+### Fixed
+
+- An inbox item whose file was purged is no longer recorded again on every
+  pass; a copy that allows it removes the item.
+
 ## [1.11.2] - sync: nothing deleted or overwritten on a doubtful read
 
 No persisted format changed.

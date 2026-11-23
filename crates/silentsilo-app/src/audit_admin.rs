@@ -133,18 +133,14 @@ impl AppState {
     /// That `touch` came from one of the open silo's organisation keys: its
     /// wrap key opens that key's envelope.
     fn check_org_touch(&self, id: Uuid, touch: &OrgKeyTouch) -> Result<(), String> {
-        let root = self
-            .sessions
-            .lock()
-            .map_err(|e| e.to_string())?
-            .get(&id)
-            .ok_or(silentsilo_core::coded!(
+        let (root, dek) = {
+            let sessions = self.sessions.lock().map_err(|e| e.to_string())?;
+            let session = sessions.get(&id).ok_or(silentsilo_core::coded!(
                 "err.silo_not_open",
                 "That silo is not open."
-            ))?
-            .paths
-            .root
-            .clone();
+            ))?;
+            (session.paths.root.clone(), session.dek.clone())
+        };
         let not_org = || {
             silentsilo_core::coded!(
                 "err.not_org_key",
@@ -154,7 +150,7 @@ impl AppState {
         };
         let keys = load_fido_keys(&root).map_err(|_| not_org())?;
         let credential = hex::decode(&touch.credential_id).map_err(|_| not_org())?;
-        OrgProof::verify(&keys, &credential, &touch.wrap_key).map_err(|_| not_org())?;
+        OrgProof::verify(&keys, &credential, &touch.wrap_key, &dek).map_err(|_| not_org())?;
         Ok(())
     }
 }

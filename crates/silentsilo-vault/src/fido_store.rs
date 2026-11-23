@@ -253,22 +253,29 @@ pub fn has_backup_key(vault_root: &Path) -> bool {
 pub struct OrgProof(());
 
 impl OrgProof {
-    /// Verifies that `wrap_key` really unwraps that credential's envelope, and
-    /// that the credential is one this silo treats as an organisation key.
+    /// Verifies that `wrap_key` really unwraps that credential's envelope to
+    /// `current`, the open silo's key, and that the credential is one this
+    /// silo treats as an organisation key.
     ///
     /// Takes the whole key set rather than one credential so the membership
     /// half cannot be skipped by a caller passing a credential it made up.
+    /// The key it opens must be the silo's: an envelope planted in storage
+    /// opens under the planter's own key to something else.
     pub fn verify(
         keys: &StoredFidoKeys,
         credential_id: &[u8],
         wrap_key: &[u8; 32],
+        current: &silentsilo_crypto::MasterDek,
     ) -> Result<Self, VaultError> {
         let hex_id = hex::encode(credential_id);
         let key = keys
             .managed()
             .find(|k| k.credential_id == hex_id)
             .ok_or(VaultError::InvalidCredentials)?;
-        crate::dek_store::unwrap_dek_hex(&key.wrapped_dek, wrap_key)?;
+        let opened = crate::dek_store::unwrap_dek_hex(&key.wrapped_dek, wrap_key)?;
+        if opened.as_bytes() != current.as_bytes() {
+            return Err(VaultError::InvalidCredentials);
+        }
         Ok(OrgProof(()))
     }
 }
@@ -874,13 +881,12 @@ mod tests {
             let keys = provisioned(dir.path());
 
             let wrap_key = [7u8; 32];
-            let wrapped =
-                crate::dek_store::wrap_dek_bytes(&silentsilo_crypto::generate_dek(), &wrap_key)
-                    .expect("wraps");
+            let dek = silentsilo_crypto::generate_dek();
+            let wrapped = crate::dek_store::wrap_dek_bytes(&dek, &wrap_key).expect("wraps");
             let mut with_real_envelope = keys.clone();
             with_real_envelope.keys[0].wrapped_dek = hex::encode(&wrapped);
 
-            let proof = OrgProof::verify(&with_real_envelope, &[0xaa, 0x11], &wrap_key)
+            let proof = OrgProof::verify(&with_real_envelope, &[0xaa, 0x11], &wrap_key, &dek)
                 .expect("the key really does unwrap its own envelope");
 
             let handed_over = StoredFidoKeys {
@@ -944,9 +950,8 @@ mod tests {
             // The token is only worth something if it cannot be produced by
             // the employee's own key, or by a credential id somebody invented.
             let wrap_key = [7u8; 32];
-            let wrapped =
-                crate::dek_store::wrap_dek_bytes(&silentsilo_crypto::generate_dek(), &wrap_key)
-                    .expect("wraps");
+            let dek = silentsilo_crypto::generate_dek();
+            let wrapped = crate::dek_store::wrap_dek_bytes(&dek, &wrap_key).expect("wraps");
             let mut keys = StoredFidoKeys {
                 keys: vec![org("aa11"), fido2("bb22")],
             };
@@ -955,15 +960,23 @@ mod tests {
 
             // The employee's key, whose envelope this wrap key does open.
             assert!(
-                OrgProof::verify(&keys, &[0xbb, 0x22], &wrap_key).is_err(),
+                OrgProof::verify(&keys, &[0xbb, 0x22], &wrap_key, &dek).is_err(),
                 "an ordinary key must not authorise anything"
             );
             // A credential that is not enrolled at all.
-            assert!(OrgProof::verify(&keys, &[0xff, 0xff], &wrap_key).is_err());
+            assert!(OrgProof::verify(&keys, &[0xff, 0xff], &wrap_key, &dek).is_err());
             // The right key, the wrong material.
-            assert!(OrgProof::verify(&keys, &[0xaa, 0x11], &[9u8; 32]).is_err());
+            assert!(OrgProof::verify(&keys, &[0xaa, 0x11], &[9u8; 32], &dek).is_err());
+            // An envelope planted in storage: it opens under the planter's
+            // own key, to a key that is not the silo's.
+            let planted =
+                crate::dek_store::wrap_dek_bytes(&silentsilo_crypto::generate_dek(), &wrap_key)
+                    .expect("wraps");
+            let mut with_planted = keys.clone();
+            with_planted.keys[0].wrapped_dek = hex::encode(&planted);
+            assert!(OrgProof::verify(&with_planted, &[0xaa, 0x11], &wrap_key, &dek).is_err());
             // And the one combination that should work.
-            assert!(OrgProof::verify(&keys, &[0xaa, 0x11], &wrap_key).is_ok());
+            assert!(OrgProof::verify(&keys, &[0xaa, 0x11], &wrap_key, &dek).is_ok());
         }
     }
 }

@@ -482,6 +482,63 @@ async fn a_pass_that_could_not_read_every_record_neither_sweeps_nor_compacts() {
 }
 
 #[tokio::test]
+async fn a_new_name_every_few_days_does_not_hold_changes_back_for_good() {
+    // Whoever can write one copy, with no key, puts an object that does not
+    // open below everyone's changes, and gives it a new name before its
+    // week is up. Each name got a week of its own.
+    let storage = tempfile::tempdir().unwrap();
+    let target = || folder_target(storage.path().to_path_buf(), TargetRole::Working);
+    let target_id = target().config.target_id();
+    let a = Device::new(Uuid::new_v4(), None);
+    let b = Device::new(a.vault_id(), Some(a.keys()));
+    *a.host.targets.lock().unwrap() = vec![target()];
+    *b.host.targets.lock().unwrap() = vec![target()];
+    a.make_folder("Shared");
+    a.pass().await;
+    b.pass().await;
+
+    let plant = || {
+        let path = storage.path().join(format!(
+            "ops/00000000000000000001-{}-{}.op",
+            Uuid::new_v4(),
+            Uuid::new_v4()
+        ));
+        std::fs::write(&path, b"not a record").unwrap();
+        path
+    };
+    let first = plant();
+    a.make_folder("Later");
+    a.pass().await;
+    let report = b.pass().await;
+    assert!(report.held_back > 0, "{report:?}");
+
+    // Eight days on for this copy, then a fresh name.
+    {
+        let sessions = b.state.sessions.lock().unwrap();
+        sessions[&b.silo.id]
+            .conn
+            .execute(
+                "UPDATE vault_meta SET value = ?1 WHERE key = ?2",
+                rusqlite::params![
+                    (std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs() as i64
+                        - 8 * 24 * 3600)
+                        .to_string(),
+                    format!("unopened:copy:{target_id}")
+                ],
+            )
+            .unwrap();
+    }
+    std::fs::remove_file(&first).unwrap();
+    plant();
+    let report = b.pass().await;
+    assert_eq!(report.held_back, 0, "{report:?}");
+    assert!(b.folder_names().contains(&"Later".to_string()));
+}
+
+#[tokio::test]
 async fn records_sent_late_and_compacted_at_once_send_the_others_to_rebuild() {
     // C wrote a folder offline, under a Lamport value A and B had long
     // passed. Back online, it pushed and compacted in the same pass, before

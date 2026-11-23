@@ -272,6 +272,80 @@ async fn an_archive_copy_keeps_its_items_and_they_are_not_imported_twice() {
     assert!(store.head(&envelope(item_id)).await.unwrap().is_some());
 }
 
+#[tokio::test]
+async fn a_purged_item_is_not_imported_again_from_an_archive_copy() {
+    // An archive copy keeps the item for good. Once the file was purged its
+    // row was gone, so every pass took the item for new and wrote another
+    // record, which the purge then threw away: the log grew on every pass.
+    let storage = tempfile::tempdir().unwrap();
+    let mut target = folder_target(&storage);
+    target.role = TargetRole::Archive;
+    let host = Targets(vec![target]);
+    let store = FolderStore::new(storage.path().to_path_buf());
+    let device = Device::new(&host).await;
+    let phone = phone(&store, &device, "aa11").await;
+    let item_id = send_photo(&store, &phone, b"a photo").await;
+    assert_eq!(device.pass(&host).await.inbox_imported, 1);
+
+    let records = |device: &Device| -> i64 {
+        device.state.sessions.lock().unwrap()[&device.silo.id]
+            .conn
+            .query_row("SELECT COUNT(*) FROM oplog", [], |r| r.get(0))
+            .unwrap()
+    };
+    {
+        let sessions = device.state.sessions.lock().unwrap();
+        let vfs = Vfs::new(&sessions[&device.silo.id]);
+        vfs.trash_file(item_id).unwrap();
+        vfs.purge_items(&[item_id]).unwrap();
+    }
+    device.pass(&host).await;
+    let after_purge = records(&device);
+    for _ in 0..3 {
+        let report = device.pass(&host).await;
+        assert_eq!(report.inbox_imported, 0, "{report:?}");
+    }
+    assert_eq!(
+        records(&device),
+        after_purge,
+        "a pass wrote records for a purged item"
+    );
+    {
+        let sessions = device.state.sessions.lock().unwrap();
+        assert!(
+            Vfs::new(&sessions[&device.silo.id])
+                .get_file(item_id)
+                .is_err()
+        );
+    }
+    // Kept: that is what an archive copy is for.
+    assert!(
+        store.head(&envelope(item_id)).await.unwrap().is_some(),
+        "an archive keeps it"
+    );
+}
+
+#[tokio::test]
+async fn a_purged_item_leaves_a_working_copy_s_inbox() {
+    let storage = tempfile::tempdir().unwrap();
+    let host = Targets(vec![folder_target(&storage)]);
+    let store = FolderStore::new(storage.path().to_path_buf());
+    let device = Device::new(&host).await;
+    let phone = phone(&store, &device, "aa11").await;
+    let item_id = send_photo(&store, &phone, b"a photo").await;
+    assert_eq!(device.pass(&host).await.inbox_imported, 1);
+    {
+        let sessions = device.state.sessions.lock().unwrap();
+        let vfs = Vfs::new(&sessions[&device.silo.id]);
+        vfs.trash_file(item_id).unwrap();
+        vfs.purge_items(&[item_id]).unwrap();
+    }
+    for _ in 0..2 {
+        assert_eq!(device.pass(&host).await.inbox_imported, 0);
+    }
+    assert!(store.head(&envelope(item_id)).await.unwrap().is_none());
+}
+
 /// A second device on the same silo and the same storage.
 async fn twin(host: &Targets, first: &Device) -> Device {
     let dir = tempfile::tempdir().unwrap();

@@ -44,8 +44,13 @@ impl Silo {
     }
 
     async fn settle(&self) -> silentsilo_sync::RecoverySettlement {
+        self.settle_after(false).await
+    }
+
+    /// `tagged_before`: this device has held a tagged envelope for the silo.
+    async fn settle_after(&self, tagged_before: bool) -> silentsilo_sync::RecoverySettlement {
         let targets: [(&dyn ObjectStore, bool); 1] = [(&self.store, true)];
-        settle_recovery_envelope(&targets, &self.kek, &self.dek, &self.root).await
+        settle_recovery_envelope(&targets, &self.kek, &self.dek, &self.root, tagged_before).await
     }
 }
 
@@ -174,6 +179,34 @@ async fn an_envelope_tagged_with_the_content_key_alone_is_not_adopted() {
     let settled = silo.settle().await;
     assert!(settled.refused_unauthenticated);
     assert_eq!(load_recovery_envelope(&silo.root).unwrap().created_at, 100);
+}
+
+#[tokio::test]
+async fn an_untagged_envelope_put_in_the_silo_folder_is_not_blessed() {
+    // Whoever can write the silo folder (a sync client, another account)
+    // puts an untagged envelope there, dated after the real one. Taken as a
+    // silo from before the tag, it was tagged here and published, and the
+    // code on paper stopped working on every device.
+    let silo = Silo::new();
+    let real = silo.envelope(100);
+    save_recovery_envelope(&silo.root, &real).unwrap();
+    push_recovery_envelope(&silo.store, &real).await.unwrap();
+    let mut planted = silo.envelope(200);
+    planted.auth = None;
+    planted.auth_dek = None;
+    save_recovery_envelope(&silo.root, &planted).unwrap();
+
+    let settled = silo.settle_after(true).await;
+
+    assert!(settled.refused_local);
+    assert_eq!(settled.envelope.unwrap().salt, real.salt);
+    assert_eq!(load_recovery_envelope(&silo.root).unwrap().salt, real.salt);
+
+    // On a silo that never had a tag, the upgrade path still works.
+    save_recovery_envelope(&silo.root, &planted).unwrap();
+    let upgraded = silo.settle_after(false).await;
+    assert!(!upgraded.refused_local);
+    assert!(upgraded.envelope.unwrap().is_authentic(&silo.kek));
 }
 
 /// A folder whose reads fail while its other answers work: a connection

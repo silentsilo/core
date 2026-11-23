@@ -1284,7 +1284,46 @@ async fn pass(
         .iter()
         .map(|t| (&*t.store, t.role.allows_delete()))
         .collect();
-    let settled = sync::settle_recovery_envelope(&recovery_targets, &kek, &dek, &root).await;
+    // Kept in the silo's database, which nothing outside it can write: once
+    // set, an untagged envelope in the silo folder is refused.
+    const RECOVERY_TAGGED: &str = "recovery_tagged";
+    let tagged_before = {
+        let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
+        sessions.get(&silo.id).is_some_and(|s| {
+            s.conn
+                .query_row(
+                    "SELECT 1 FROM vault_meta WHERE key = ?1",
+                    [RECOVERY_TAGGED],
+                    |_| Ok(()),
+                )
+                .is_ok()
+        })
+    };
+    let settled =
+        sync::settle_recovery_envelope(&recovery_targets, &kek, &dek, &root, tagged_before).await;
+    if !tagged_before
+        && settled
+            .envelope
+            .as_ref()
+            .is_some_and(|e| e.is_authentic(&kek))
+    {
+        let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
+        if let Some(session) = sessions.get(&silo.id) {
+            session
+                .conn
+                .execute(
+                    "INSERT OR REPLACE INTO vault_meta(key, value) VALUES (?1, '1')",
+                    [RECOVERY_TAGGED],
+                )
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    if settled.refused_local {
+        host.warn(
+            "recovery",
+            "the recovery envelope in the silo folder carries no tag from this silo,              so it was not used. Something other than SilentSilo wrote it.",
+        );
+    }
     if settled.refused_unauthenticated {
         host.warn(
             "recovery",
@@ -1405,6 +1444,8 @@ async fn pass(
     let mut listed_through = 0u64;
     // What each copy's listing named, to note those records as held there.
     let mut listed_on: Vec<(Uuid, std::collections::HashSet<String>)> = Vec::new();
+    // Which copy each object that did not open came from.
+    let mut unopened_on: std::collections::HashMap<String, Uuid> = std::collections::HashMap::new();
     for target in &targets {
         match sync::fetch_missing_ops_reporting(
             &*target.store,
@@ -1430,6 +1471,9 @@ async fn pass(
         {
             Ok(mut got) => {
                 incoming.append(&mut got.records);
+                for u in got.unreadable.iter().filter(|u| !u.opened) {
+                    unopened_on.entry(u.key.clone()).or_insert(target.id);
+                }
                 unreadable.append(&mut got.unreadable);
                 misplaced.append(&mut got.misplaced);
                 listed_through = listed_through.max(got.listed_through);
@@ -1482,21 +1526,40 @@ async fn pass(
     let fetched_ids: std::collections::HashSet<Uuid> = incoming.iter().map(|r| r.op_id).collect();
     unreadable.retain(|u| u.op_id.is_none_or(|id| !fetched_ids.contains(&id)));
     // One that has not opened for a week stops holding the rest back (see
-    // `UnreadableOp::holds_back`). Dated from the first pass that met it.
+    // `UnreadableOp::holds_back`). Dated from the first pass that met it, or
+    // from the first pass that met one on the same copy without a pass free
+    // of them since, whichever is older: a new name every few days on one
+    // copy otherwise held incoming changes for good.
     {
         let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
         if let Some(session) = sessions.get(&silo.id) {
+            let copy_key = |target: &Uuid| format!("copy:{target}");
             for u in unreadable.iter_mut().filter(|u| !u.opened) {
-                let first =
+                let mut first =
                     silentsilo_vfs::snapshot::first_seen_unopened(&session.conn, &u.key, now)
                         .map_err(|e| e.to_string())?;
+                if let Some(target) = unopened_on.get(&u.key) {
+                    let copy = silentsilo_vfs::snapshot::first_seen_unopened(
+                        &session.conn,
+                        &copy_key(target),
+                        now,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    first = first.min(copy);
+                }
                 u.holds_back = now - first < sync::UNOPENED_HOLD_SECS;
             }
             if !fetch_failed {
+                let copies: Vec<String> = unreadable
+                    .iter()
+                    .filter(|u| !u.opened)
+                    .filter_map(|u| unopened_on.get(&u.key).map(copy_key))
+                    .collect();
                 let still: Vec<&str> = unreadable
                     .iter()
                     .filter(|u| !u.opened)
                     .map(|u| u.key.as_str())
+                    .chain(copies.iter().map(String::as_str))
                     .collect();
                 silentsilo_vfs::snapshot::forget_unopened_except(&session.conn, &still)
                     .map_err(|e| e.to_string())?;

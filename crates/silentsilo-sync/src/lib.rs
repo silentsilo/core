@@ -2828,6 +2828,11 @@ pub struct RecoverySettlement {
     /// to storage did. The two are indistinguishable, so the local envelope
     /// is kept and the caller says so.
     pub refused_unauthenticated: bool,
+    /// The envelope in the silo folder carries no tag, on a silo whose
+    /// envelope this device has already seen tagged. Whoever can write that
+    /// folder (a sync client, another account) put it there; it is not used,
+    /// and the newest tagged one in storage is taken instead.
+    pub refused_local: bool,
 }
 
 /// Brings this device's recovery envelope in line with storage before a push,
@@ -2846,11 +2851,17 @@ pub struct RecoverySettlement {
 /// content KEK, which storage never sees. An untagged envelope is adopted
 /// only while this device's own is untagged too, which is a silo where no
 /// device has run core 1.6.0 yet and nothing has been lost either way.
+///
+/// `tagged_before` says this device has held a tagged envelope for this silo
+/// (the caller keeps that in the silo's own database). From then on an
+/// untagged one in the silo folder is refused rather than tagged: tagging
+/// it would publish to every device whatever someone wrote there.
 pub async fn settle_recovery_envelope(
     targets: &[(&dyn ObjectStore, bool)],
     kek: &ContentKek,
     dek: &MasterDek,
     vault_root: &std::path::Path,
+    tagged_before: bool,
 ) -> RecoverySettlement {
     let mut settlement = RecoverySettlement::default();
     let mut recovery = silentsilo_vault::load_recovery_envelope(vault_root).ok();
@@ -2874,6 +2885,26 @@ pub async fn settle_recovery_envelope(
                 let _ = revoke_recovery_envelope(*store).await;
             }
         }
+    }
+
+    if tagged_before && recovery.as_ref().is_some_and(|r| !r.is_authentic(kek)) {
+        settlement.refused_local = true;
+        let mut tagged: Option<RecoveryEnvelope> = None;
+        for (store, _) in targets {
+            if let Ok(Some(found)) = fetch_recovery_envelope(*store).await
+                && found.is_authentic(kek)
+                && disabled_at.is_none_or(|off| found.created_at > off)
+                && tagged
+                    .as_ref()
+                    .is_none_or(|t| found.created_at > t.created_at)
+            {
+                tagged = Some(found);
+            }
+        }
+        if let Some(found) = tagged.as_ref() {
+            let _ = silentsilo_vault::save_recovery_envelope(vault_root, found);
+        }
+        recovery = tagged;
     }
 
     if let Some(local) = recovery.as_ref() {

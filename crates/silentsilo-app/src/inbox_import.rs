@@ -114,7 +114,9 @@ pub async fn import_inbox(
         if silo
             .with_vfs(&mut |vfs| {
                 for item in &scan.ready {
-                    if vfs.recorded_blob(item.item_id)?.is_none() {
+                    if vfs.recorded_blob(item.item_id)?.is_none()
+                        && !vfs.was_purged(item.item_id)?
+                    {
                         new_here += 1;
                     }
                 }
@@ -131,15 +133,27 @@ pub async fn import_inbox(
         // import at once must record in the same order to agree on names.
         for item in scan.ready.into_iter() {
             let mut recorded = None;
+            let mut purged = false;
             if silo
                 .with_vfs(&mut |vfs| {
                     recorded = vfs.recorded_blob(item.item_id)?;
+                    purged = vfs.was_purged(item.item_id)?;
                     Ok(())
                 })
                 .is_err()
             {
                 // Locked while the pass ran.
                 return outcome;
+            }
+            // Recorded once and purged since: nothing to import, and on a
+            // copy that allows it, nothing to keep in the inbox either.
+            if recorded.is_none() && purged {
+                if target.may_finish
+                    && let Err(e) = finish_item(target.store, item.item_id).await
+                {
+                    warn(&format!("{}: {e}", target.label));
+                }
+                continue;
             }
             if let Some(recorded) = recorded {
                 // Copied back only over the content this item's own record
