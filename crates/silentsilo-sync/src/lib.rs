@@ -2440,6 +2440,13 @@ async fn rotated_if_proven(client: &dyn ObjectStore, dek: &MasterDek) -> KekStat
     }
 }
 
+/// Whether a rotation left its proof for `dek`: some device moved the silo
+/// off this key. True for an interrupted rotation as well, whose storage
+/// still opens under it, so it is a reason to ask, never to refuse.
+pub async fn retired_by_rotation(client: &dyn ObjectStore, dek: &MasterDek) -> bool {
+    rotated_if_proven(client, dek).await == KekState::Rotated
+}
+
 /// Leaves the proof [`kek_envelope_state`] asks for: sealed under the key
 /// being retired, so a device still on it can open it and nobody else can
 /// write one. Releases before 1.5 skip `keys/` objects that are not
@@ -2833,6 +2840,12 @@ pub struct RecoverySettlement {
     /// folder (a sync client, another account) put it there; it is not used,
     /// and the newest tagged one in storage is taken instead.
     pub refused_local: bool,
+    /// The recovery code this device held was dropped because a marker in
+    /// storage says it was turned off. The marker is sealed under the
+    /// content KEK, which a rotation keeps, so a former holder of that key
+    /// can write one too: the caller tells the user rather than keeping it
+    /// quiet.
+    pub turned_off_elsewhere: bool,
 }
 
 /// Brings this device's recovery envelope in line with storage before a push,
@@ -2876,6 +2889,7 @@ pub async fn settle_recovery_envelope(
         if recovery.as_ref().is_some_and(|r| r.created_at <= off) {
             silentsilo_vault::clear_recovery_envelope(vault_root);
             recovery = None;
+            settlement.turned_off_elsewhere = true;
         }
         for (store, allows_delete) in targets {
             if *allows_delete

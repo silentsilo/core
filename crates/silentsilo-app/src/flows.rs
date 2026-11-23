@@ -36,9 +36,20 @@ pub struct RecoveryJoin {
     envelope: Option<RecoveryEnvelope>,
     /// The organisation key that opened this join, proven by its wrap key.
     proven_org_key: Option<String>,
+    /// A rotation retired the key the credential opened.
+    retired: bool,
 }
 
 impl RecoveryJoin {
+    /// Whether a rotation retired the key this credential opened. Either the
+    /// rotation stopped part way, which is safe to join and finish, or the
+    /// storage was put back from an older copy by someone who still holds
+    /// the old key and would read everything this device adds. Only the
+    /// user can tell the two apart, so the caller asks before going on.
+    pub fn retired_by_rotation(&self) -> bool {
+        self.retired
+    }
+
     /// The key the join plan is fetched with.
     pub fn dek(&self) -> &MasterDek {
         &self.dek
@@ -99,11 +110,13 @@ pub async fn recovery_join_begin(
         .map_err(|e| e.to_string())?
         .map_err(code_refused)?
     };
+    let retired = sync::retired_by_rotation(store, &dek).await;
     Ok(RecoveryJoin {
         vault_id: manifest.vault_id,
         dek,
         envelope: Some(envelope),
         proven_org_key: None,
+        retired,
     })
 }
 
@@ -219,10 +232,12 @@ pub async fn key_join_open(
         }
     }
     let envelope = sync::fetch_recovery_envelope(store).await.ok().flatten();
+    let retired = sync::retired_by_rotation(store, &dek).await;
     Ok(RecoveryJoin {
         vault_id: offer.vault_id,
         dek,
         envelope,
+        retired,
         // Whoever holds this key can always prove it, so its policy cannot
         // lock anyone out.
         proven_org_key: key.managed().then(|| key.credential_id.clone()),

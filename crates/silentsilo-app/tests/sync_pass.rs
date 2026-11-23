@@ -803,8 +803,11 @@ async fn a_recovery_code_turned_off_stays_off_on_a_device_that_had_not_heard() {
         .await
         .unwrap();
     silentsilo_vault::clear_recovery_envelope(&a.silo.path);
-    b.pass().await;
-    a.pass().await;
+    // B is told, once: the marker needs only the content key, so it may not
+    // have been the user. A, which turned it off, is not.
+    assert!(b.pass().await.recovery_turned_off);
+    assert!(!a.pass().await.recovery_turned_off);
+    assert!(!b.pass().await.recovery_turned_off);
 
     assert!(
         silentsilo_sync::fetch_recovery_envelope(&store)

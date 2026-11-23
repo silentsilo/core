@@ -173,6 +173,14 @@ enum StagedAt {
     Folder(Vec<u8>),
 }
 
+/// Whether the pending rotation keeps its new key in the silo folder, as
+/// core 1.9 and earlier staged it. Anyone who could write the folder and
+/// held the old key could have put that key there, so the caller finishes
+/// such a rotation and then rotates once more, to a key made on the spot.
+pub fn staged_by_earlier_release(root: &Path) -> bool {
+    matches!(staged_location(root), Ok(StagedAt::Folder(_)))
+}
+
 /// The staged key's sealed bytes, wherever they are.
 fn staged_sealed(root: &Path) -> Result<Vec<u8>, VaultError> {
     match staged_location(root)? {
@@ -405,6 +413,7 @@ mod tests {
             load_staged_dek(dir.path(), &old).unwrap().as_bytes(),
             new.as_bytes()
         );
+        assert!(!staged_by_earlier_release(dir.path()));
         discard_staged(dir.path());
     }
 
@@ -427,11 +436,13 @@ mod tests {
         .unwrap();
 
         assert!(rotation_pending(dir.path()));
+        assert!(staged_by_earlier_release(dir.path()));
         assert_eq!(
             load_staged_dek(dir.path(), &old).unwrap().as_bytes(),
             new.as_bytes()
         );
         commit_rotation(dir.path()).unwrap();
+        assert!(!staged_by_earlier_release(dir.path()));
         assert!(!rotation_pending(dir.path()));
         assert_eq!(
             load_kek(dir.path(), &new).unwrap().as_bytes(),

@@ -9,6 +9,31 @@ This repository has its own version line, separate from the desktop
 application's. A client pins a tag from here; the tag it pins is what its
 release notes should say.
 
+## [1.11.4] - rotations from earlier releases, rolled-back joins
+
+No persisted format changed.
+
+### Security
+
+- `rotation::staged_by_earlier_release` says a pending rotation keeps its
+  key in the silo folder, as core 1.9 staged it. Anyone who held the old key
+  and could write the folder could have put their own key there, so the
+  client rotates once more after finishing it.
+- `RecoveryJoin::retired_by_rotation` says a rotation retired the key a join
+  opened: a rotation that stopped part way, or storage put back by someone
+  who still holds the old key. The client asks before going on.
+- `SyncReport::recovery_turned_off` says a pass dropped this device's
+  recovery code because a marker says another device turned it off. The
+  marker needs only the content key, which a removed device keeps.
+- A snapshot with a folder that is its own parent is refused. The foreign
+  key allows it, no replay makes it, and every walk of the tree went round
+  it without end.
+
+### Fixed
+
+- A warning about an untagged recovery envelope in the silo folder had a run
+  of spaces in the middle.
+
 ## [1.11.3] - keys and recovery against a writable silo folder
 
 No persisted format changed.

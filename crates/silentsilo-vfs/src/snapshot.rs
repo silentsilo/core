@@ -634,7 +634,14 @@ pub fn restore(conn: &Connection, snapshot: &Snapshot) -> CoreResult<()> {
 
     // Parents are written before children, so the foreign key from a folder
     // to its parent holds at every point. The dump preserves that order.
+    // The key does not stop a folder naming itself, which no replay makes
+    // and which sends every walk of the tree round in a circle for good.
     for row in &snapshot.folders {
+        if row.parent_id == Some(row.id) {
+            return Err(CoreError::Invalid(
+                "a folder in this snapshot is its own parent".into(),
+            ));
+        }
         conn.execute(
             "INSERT INTO folders(id, parent_id, name, path, created_at, updated_at, deleted_at, favorite)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -2055,6 +2062,25 @@ mod tests {
         let err = Snapshot::from_bytes(&snapshot.to_bytes().unwrap()).unwrap_err();
 
         assert!(err.to_string().contains("newer version"), "was: {err}");
+    }
+
+    /// The foreign key lets a folder be its own parent. A snapshot is
+    /// written by whoever holds the silo's key, so it is checked.
+    #[test]
+    fn a_folder_that_is_its_own_parent_is_refused() {
+        let (conn, vault_id, _) = populated();
+        let mut snapshot = capture_at(&conn, vault_id, 3).unwrap();
+        let folder = snapshot
+            .folders
+            .iter_mut()
+            .find(|f| f.parent_id.is_some())
+            .unwrap();
+        folder.parent_id = Some(folder.id);
+
+        let fresh = bare_device(vault_id);
+        let err = restore(&fresh, &snapshot).unwrap_err();
+
+        assert!(err.to_string().contains("its own parent"), "was: {err}");
     }
 
     #[test]

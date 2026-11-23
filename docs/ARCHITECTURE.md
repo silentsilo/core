@@ -257,7 +257,10 @@ and kept outside the silo folder (`staged/<id>.dek` under the work base):
 the folder's `master.dek.enc.next` only names it. In the folder, or in a
 synced folder's history of it, it would give the new key to whoever still
 holds the old one, which is who a rotation is for. A rotation staged by core
-1.9 or earlier has the key in the folder and is still resumed from there.
+1.9 or earlier has the key in the folder and is still resumed from there,
+but anyone who held the old key and could write the folder could have put
+their own key there (`staged_by_earlier_release`). So the client finishes
+it and at once rotates again, to a key made on the spot.
 The price: a rotation finishes only on the computer that started it.
 
 The order is forced: the staged key is durable on disk before any object in
@@ -287,6 +290,14 @@ reported with `rotation_unproven`: a release before core 1.10.0 rotates
 without a proof, and garbage written over the envelope and the newest record
 needs no key at all, so the screen has to name both. The join flows say the
 same things (`flows::kek_refusal`).
+
+A join whose credential opens a key the proof names gets as far as the open
+and stops there (`RecoveryJoin::retired_by_rotation`). A rotation that
+stopped part way leaves exactly that, and so does storage put back from an
+older copy by someone who still holds the old key, who would then read all
+the joined device adds. Only the user can tell, so the client asks rather
+than refuses. Whoever can write storage can also delete the proof, so this
+catches a careless rollback, not every one.
 
 With several copies, every copy that answers is asked and the gravest answer
 decides (rotated, then replaced, then current): a copy that missed a rotation
@@ -967,6 +978,12 @@ Read this before "fixing" any of it.
   upgrade path no longer tags what it finds in the folder, which anyone who
   can write the folder (a sync client) could otherwise publish to every
   device. The newest tagged envelope in storage is taken instead.
+- **A recovery code turned off elsewhere is said, not just dropped.** The
+  marker is sealed under the content KEK, which a rotation keeps, so a
+  removed device can write one again after every new code. The pass that
+  drops the local code sets `recovery_turned_off` on its report and the
+  screen tells the user. A signed marker would stop it but needs a format
+  change that older devices would not follow.
 - **A purged file is known.** `file_id_known` counts purged ids, so an inbox
   item whose file was purged is never recorded again, and a copy that
   allows it lets the item go.

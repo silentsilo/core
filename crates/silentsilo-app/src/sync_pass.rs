@@ -119,6 +119,12 @@ pub struct SyncReport {
     /// it is tried again, so one file the copy refuses is not sent every pass.
     #[serde(default)]
     pub blob_errors: Vec<String>,
+    /// This pass dropped the recovery code this device held, because a
+    /// marker in storage says another device turned it off. The screen says
+    /// so: the marker needs only the content key, which a removed device or
+    /// an old recovery code still opens, so it may not have been the user.
+    #[serde(default)]
+    pub recovery_turned_off: bool,
 }
 
 /// Where a running pass is, for a status line and a marker on the file being
@@ -1321,7 +1327,7 @@ async fn pass(
     if settled.refused_local {
         host.warn(
             "recovery",
-            "the recovery envelope in the silo folder carries no tag from this silo,              so it was not used. Something other than SilentSilo wrote it.",
+            "the recovery envelope in the silo folder carries no tag from this silo, \n             so it was not used. Something other than SilentSilo wrote it.",
         );
     }
     if settled.refused_unauthenticated {
@@ -1332,6 +1338,7 @@ async fn pass(
              an older release before changing the recovery code.",
         );
     }
+    let recovery_turned_off = settled.turned_off_elsewhere;
     let recovery = settled.envelope;
     let keys = load_fido_keys(&root).ok();
 
@@ -1942,6 +1949,7 @@ async fn pass(
         reached,
         more_to_do,
         blob_errors,
+        recovery_turned_off,
     };
 
     // The file list is stale the moment remote changes land.

@@ -88,3 +88,38 @@ fn an_earlier_release_neither_restarts_nor_reads_a_change_staged_here() {
         kek.as_bytes()
     );
 }
+
+/// A change an earlier release staged keeps its key in the folder, where
+/// anyone who held the old key could have written their own. It is told
+/// apart, and after it is finished a second change staged here moves the
+/// silo to a key that never was in the folder.
+#[test]
+fn a_change_an_earlier_release_staged_is_finished_and_then_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let (old, kek) = silo(dir.path());
+    let planted = generate_dek();
+    vault_old::rotation::stage_rotation(
+        dir.path(),
+        &old_dek(&planted),
+        &old_kek(&kek),
+        &old_dek(&old),
+    )
+    .unwrap();
+    assert!(rotation::staged_by_earlier_release(dir.path()));
+
+    let staged = rotation::load_staged_dek(dir.path(), &old).unwrap();
+    rotation::commit_rotation(dir.path()).unwrap();
+    let fresh = generate_dek();
+    rotation::stage_rotation(dir.path(), &fresh, &kek, &staged).unwrap();
+    assert!(!rotation::staged_by_earlier_release(dir.path()));
+    rotation::commit_rotation(dir.path()).unwrap();
+
+    assert!(!rotation::rotation_pending(dir.path()));
+    assert!(silentsilo_vault::load_kek(dir.path(), &planted).is_err());
+    assert_eq!(
+        silentsilo_vault::load_kek(dir.path(), &fresh)
+            .unwrap()
+            .as_bytes(),
+        kek.as_bytes()
+    );
+}

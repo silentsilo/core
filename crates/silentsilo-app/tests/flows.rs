@@ -429,3 +429,36 @@ async fn a_key_join_keeps_the_policy_only_of_the_key_that_proved_it() {
     let managed: Vec<_> = keys.managed().map(|k| k.credential_id.clone()).collect();
     assert_eq!(managed, vec!["aa11".to_string()]);
 }
+
+/// A rotation leaves a proof under the key it retires. A join that opens
+/// that key says so, by code and by key alike, so the screen can ask: the
+/// rotation may have stopped part way, or the storage may have been put
+/// back by someone who still holds the old key.
+#[tokio::test]
+async fn a_join_onto_a_key_a_rotation_retired_says_so() {
+    let origin = origin().await;
+    let store = FolderStore::new(origin.storage.clone());
+    let by_code = recovery_join_begin(&store, &origin.code).await.unwrap();
+    let offer = key_join_begin(&store).await.unwrap();
+    let by_key = key_join_open(&store, &offer, "aa11", &[7; 32])
+        .await
+        .unwrap();
+    assert!(!by_code.retired_by_rotation());
+    assert!(!by_key.retired_by_rotation());
+
+    silentsilo_sync::write_rotation_proof(&store, by_code.dek())
+        .await
+        .unwrap();
+    assert!(
+        recovery_join_begin(&store, &origin.code)
+            .await
+            .unwrap()
+            .retired_by_rotation()
+    );
+    assert!(
+        key_join_open(&store, &offer, "aa11", &[7; 32])
+            .await
+            .unwrap()
+            .retired_by_rotation()
+    );
+}
