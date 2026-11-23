@@ -175,3 +175,85 @@ async fn an_envelope_tagged_with_the_content_key_alone_is_not_adopted() {
     assert!(settled.refused_unauthenticated);
     assert_eq!(load_recovery_envelope(&silo.root).unwrap().created_at, 100);
 }
+
+/// A folder whose reads fail while its other answers work: a connection
+/// that drops on the download, or a provider answering 500 for one key.
+struct ReadsFail(FolderStore);
+
+#[async_trait::async_trait]
+impl ObjectStore for ReadsFail {
+    async fn put(&self, key: &str, body: Vec<u8>) -> Result<(), silentsilo_store::StoreError> {
+        self.0.put(key, body).await
+    }
+
+    async fn get(&self, _key: &str) -> Result<Vec<u8>, silentsilo_store::StoreError> {
+        Err(silentsilo_store::StoreError::Other(
+            "connection reset".into(),
+        ))
+    }
+
+    async fn head(&self, key: &str) -> Result<Option<i64>, silentsilo_store::StoreError> {
+        self.0.head(key).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), silentsilo_store::StoreError> {
+        self.0.delete(key).await
+    }
+
+    async fn list(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<silentsilo_store::StoredObject>, silentsilo_store::StoreError> {
+        self.0.list(prefix).await
+    }
+
+    fn describe(&self) -> String {
+        self.0.describe()
+    }
+}
+
+#[tokio::test]
+async fn a_read_that_fails_does_not_put_an_older_code_back() {
+    // A device that had not heard of a new code republishes its old one on
+    // every pass. When the read of the copy's envelope failed, it wrote over
+    // the new one: the code the user had just written down stopped working.
+    let dir = tempfile::tempdir().unwrap();
+    let dek = silentsilo_crypto::generate_dek();
+    let kek = silentsilo_crypto::generate_content_kek();
+    let (_, mut old) = silentsilo_vault::create_recovery_envelope(&dek, &kek).unwrap();
+    let (_, new) = silentsilo_vault::create_recovery_envelope(&dek, &kek).unwrap();
+    old.created_at = new.created_at - 3600;
+
+    let folder = FolderStore::new(dir.path().to_path_buf());
+    assert!(
+        silentsilo_sync::ensure_recovery_envelope(&folder, &new)
+            .await
+            .unwrap()
+    );
+
+    let flaky = ReadsFail(FolderStore::new(dir.path().to_path_buf()));
+    assert!(
+        !silentsilo_sync::ensure_recovery_envelope(&flaky, &old)
+            .await
+            .unwrap()
+    );
+    let held = silentsilo_sync::fetch_recovery_envelope(&folder)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(held.created_at, new.created_at, "the new code was replaced");
+
+    // Read properly, the newer one is still left alone, and a missing one
+    // is still written.
+    assert!(
+        !silentsilo_sync::ensure_recovery_envelope(&folder, &old)
+            .await
+            .unwrap()
+    );
+    folder.delete(silentsilo_sync::RECOVERY_KEY).await.unwrap();
+    assert!(
+        silentsilo_sync::ensure_recovery_envelope(&flaky, &old)
+            .await
+            .unwrap()
+    );
+}

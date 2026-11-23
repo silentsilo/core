@@ -701,8 +701,14 @@ impl S3Client {
     pub async fn list(&self, relative_prefix: &str) -> Result<Vec<ObjectEntry>, S3Error> {
         let full_prefix = self.config.key(relative_prefix);
         let strip = self.config.key("");
+        // A server that answers without end fails the call rather than fill
+        // memory or page for ever: far more objects than any silo holds, or
+        // pages that keep saying "more" and bring nothing.
+        const MAX_LISTED: usize = 10_000_000;
+        const MAX_EMPTY_PAGES: usize = 10;
         let mut entries = Vec::new();
         let mut continuation: Option<String> = None;
+        let mut empty_pages = 0;
 
         loop {
             let mut request = self
@@ -726,6 +732,16 @@ impl S3Client {
                     size: object.size().unwrap_or(0),
                     etag: object.e_tag().map(str::to_string),
                 });
+            }
+            empty_pages = if output.contents().is_empty() {
+                empty_pages + 1
+            } else {
+                0
+            };
+            if entries.len() > MAX_LISTED || empty_pages > MAX_EMPTY_PAGES {
+                return Err(S3Error::Service(format!(
+                    "the listing of {full_prefix} does not end"
+                )));
             }
 
             if output.is_truncated().unwrap_or(false) {

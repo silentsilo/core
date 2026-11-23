@@ -35,8 +35,15 @@ fn s3_store() -> Option<Box<dyn ObjectStore>> {
 }
 
 /// Each run gets its own collection, so a failing test cannot leave state
-/// that makes the next one pass or fail for the wrong reason.
-fn webdav_store() -> Option<Box<dyn ObjectStore>> {
+/// that makes the next one pass or fail for the wrong reason. Checked first,
+/// as the app does when the place is added: that makes the collection.
+async fn webdav_store() -> Option<Box<dyn ObjectStore>> {
+    let store = webdav_unchecked()?;
+    store.check().await.unwrap();
+    Some(store)
+}
+
+fn webdav_unchecked() -> Option<Box<dyn ObjectStore>> {
     let base = std::env::var("SILENTSILO_TEST_WEBDAV_URL").ok()?;
     WebDavStore::new(WebDavConfig {
         url: format!("{}/contract-{}", base.trim_end_matches('/'), Uuid::new_v4()),
@@ -53,6 +60,12 @@ fn webdav_store() -> Option<Box<dyn ObjectStore>> {
 /// means this test would fail if pinning were broken, since a store with no
 /// confirmed fingerprint refuses to be built at all.
 async fn sftp_store() -> Option<Box<dyn ObjectStore>> {
+    let store = sftp_unchecked().await?;
+    store.check().await.unwrap();
+    Some(store)
+}
+
+async fn sftp_unchecked() -> Option<Box<dyn ObjectStore>> {
     let host = std::env::var("SILENTSILO_TEST_SFTP_HOST").ok()?;
     let port: u16 = std::env::var("SILENTSILO_TEST_SFTP_PORT")
         .ok()
@@ -90,7 +103,7 @@ where
         None => silentsilo_testkit::skip_or_fail("S3: SILENTSILO_TEST_S3_ENDPOINT is not set"),
     }
 
-    match webdav_store() {
+    match webdav_store().await {
         Some(dav) => body(dav).await,
         None => silentsilo_testkit::skip_or_fail("WebDAV: SILENTSILO_TEST_WEBDAV_URL is not set"),
     }
@@ -379,4 +392,29 @@ async fn the_s3_sweep_leaves_a_young_upload_alone() {
         .abort_uploads_started_before(key, std::time::SystemTime::now() + hour)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn a_webdav_or_sftp_folder_that_is_gone_is_unreachable_until_checked() {
+    // A share renamed or a disk the server no longer mounts. Listed as
+    // empty it counted as a copy that holds nothing, and a write made a new
+    // one in its place. Only `check` creates the folder.
+    let stores = [
+        ("WebDAV", webdav_unchecked()),
+        ("SFTP", sftp_unchecked().await),
+    ];
+    for (name, store) in stores {
+        let Some(store) = store else {
+            silentsilo_testkit::skip_or_fail(&format!("{name} is not set up"));
+            continue;
+        };
+        let unreachable = |r: Result<(), StoreError>| matches!(r, Err(StoreError::Unreachable(_)));
+        assert!(unreachable(store.list("ops/").await.map(|_| ())), "{name}");
+        assert!(unreachable(store.put("ops/1", vec![1]).await), "{name}");
+        store.check().await.unwrap();
+        assert!(store.list("ops/").await.unwrap().is_empty(), "{name}");
+        store.put("ops/1", vec![1]).await.unwrap();
+        assert_eq!(store.get("ops/1").await.unwrap(), vec![1], "{name}");
+        store.delete("ops/1").await.unwrap();
+    }
 }

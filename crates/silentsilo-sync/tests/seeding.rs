@@ -63,10 +63,11 @@ async fn populate(store: &dyn ObjectStore, dek: &silentsilo_crypto::MasterDek, v
     let records: Vec<OpRecord> = (1..=4).map(|l| record(l, device)).collect();
     push_ops(store, dek, &records).await.unwrap();
     for i in 0..3u8 {
+        let id = Uuid::new_v4();
         store
             .put(
-                &format!("{BLOBS_PREFIX}{}.sslo", Uuid::new_v4()),
-                vec![i; 128],
+                &format!("{BLOBS_PREFIX}{id}.sslo"),
+                silentsilo_testkit::fake_blob(id.as_bytes(), &[i; 128]),
             )
             .await
             .unwrap();
@@ -762,4 +763,37 @@ async fn a_name_that_climbs_out_of_the_source_is_never_copied() {
     );
     assert!(outcome.copied > 0);
     assert!(!dest_dir.path().join(".ssh").exists());
+}
+
+#[tokio::test]
+async fn a_blob_that_is_not_what_its_name_says_is_not_seeded_over_the_real_one() {
+    // The destination holds the genuine blob, the source something else
+    // under its name: a different size, so the seed copied it over.
+    let source_dir = tempfile::tempdir().unwrap();
+    let dest_dir = tempfile::tempdir().unwrap();
+    let source = FolderStore::new(source_dir.path().to_path_buf());
+    let dest = FolderStore::new(dest_dir.path().to_path_buf());
+    let id = Uuid::new_v4();
+    let key = format!("{BLOBS_PREFIX}{id}.sslo");
+    let genuine = silentsilo_testkit::fake_blob(id.as_bytes(), b"the file");
+    dest.put(&key, genuine.clone()).await.unwrap();
+    source
+        .put(
+            &key,
+            silentsilo_testkit::fake_blob(Uuid::new_v4().as_bytes(), b"another, longer file"),
+        )
+        .await
+        .unwrap();
+
+    let outcome = seed_target(
+        &source as &dyn ObjectStore,
+        &dest as &dyn ObjectStore,
+        &mut |_| {},
+        &|| false,
+    )
+    .await
+    .unwrap();
+
+    assert!(outcome.failed.iter().any(|(k, _)| *k == key), "{outcome:?}");
+    assert_eq!(dest.get(&key).await.unwrap(), genuine);
 }

@@ -793,6 +793,13 @@ async fn three_devices_on_webdav_agree_and_lose_nothing() {
             password: std::env::var("SILENTSILO_TEST_WEBDAV_PASSWORD")
                 .unwrap_or_else(|_| "silentsilo123".into()),
         };
+        // As the app adds a place: the check makes the folder.
+        StoreConfig::WebDav(config.clone())
+            .open()
+            .unwrap()
+            .check()
+            .await
+            .unwrap();
         run(seed, 120, || {
             vec![BackupTarget {
                 config: StoreConfig::WebDav(config.clone()),
@@ -830,6 +837,12 @@ async fn three_devices_on_sftp_agree_and_lose_nothing() {
             path: format!("silo/fleet-{}", Uuid::new_v4()),
             host_fingerprint: Some(fingerprint.clone()),
         };
+        StoreConfig::Sftp(config.clone())
+            .open()
+            .unwrap()
+            .check()
+            .await
+            .unwrap();
         run(seed, 100, || {
             vec![BackupTarget {
                 config: StoreConfig::Sftp(config.clone()),

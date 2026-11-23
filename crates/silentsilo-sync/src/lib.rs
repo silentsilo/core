@@ -119,8 +119,9 @@ pub struct UnreadableOp {
     pub op_id: Option<Uuid>,
     pub lamport: Option<u64>,
     pub error: String,
-    /// It opened with this silo's key and still could not be used: a newer
-    /// build's record, or one beyond the change counter.
+    /// It opened with this silo's key and still could not be used: one
+    /// beyond the change counter. An object that opens and is no record is
+    /// counted as not opened, and holds back for a week only.
     pub opened: bool,
     /// Whether it holds the records above it back. True as fetched. The
     /// pass lets go of one that has not opened for a week
@@ -261,7 +262,13 @@ pub async fn fetch_missing_ops_reporting(
                         true,
                     ),
                     Ok(record) => out.records.push(record),
-                    Err(e) => unreadable(entry.key, e.to_string(), true),
+                    // Opened and is no record at all: another object sealed
+                    // under the same key (the KEK envelope, a snapshot) put
+                    // here by whoever can write to storage. A newer build's
+                    // record still reads, as an operation this one does not
+                    // know. Held a week like one that does not open; held
+                    // for good it stopped incoming changes for good.
+                    Err(e) => unreadable(entry.key, e.to_string(), false),
                 },
                 Err(_) => unreadable(
                     entry.key,
@@ -847,7 +854,12 @@ pub async fn push_blobs_within(
         }
 
         let key = blob_key(*blob_id);
+        let local_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         match client.head(&key).await {
+            // A size that differs is an upload cut short or a damaged copy,
+            // sent again. Zero is a server that did not say (WebDAV without
+            // Content-Length); no blob is empty.
+            Ok(Some(size)) if size > 0 && size as u64 != local_len => {}
             Ok(Some(_)) => {
                 // Already up there. Record that so eviction is allowed to
                 // reclaim the space — without this the local copy would be
@@ -867,7 +879,7 @@ pub async fn push_blobs_within(
 
         // Streamed from disk: a blob is whatever size the user stored, and
         // holding it whole in memory capped file size at available RAM.
-        step.bytes_total = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        step.bytes_total = local_len;
         let sent = {
             let mut last = std::time::Instant::now();
             let mut watch = |moved: u64| {
@@ -1191,6 +1203,15 @@ async fn seed(
                     && !opens_under(&staged, &entry.key, dek)
                 {
                     outcome.stale += 1;
+                    reporter.finish_object();
+                    continue;
+                }
+                // A blob that is not the one its name says would replace
+                // whatever the destination holds under that name.
+                if let Some(blob_id) = blob_id_from_key(&entry.key)
+                    && let Err(e) = check_blob_header(&staged, blob_id)
+                {
+                    outcome.failed.push((entry.key.clone(), e.to_string()));
                     reporter.finish_object();
                     continue;
                 }
@@ -1784,6 +1805,13 @@ pub async fn fetch_blob(
     let final_path = blobs_dir.join(format!("{blob_id}.sslo"));
     let temp_path = blobs_dir.join(format!("{blob_id}.sslo.part"));
     client.get_to_file(&blob_key(blob_id), &temp_path).await?;
+    // What can be checked without the file's key: that it is a blob, and
+    // this one. Anything else stays out of the cache, where it would be
+    // opened, and sent to every copy that lacks it, as if it were the file.
+    if let Err(e) = check_blob_header(&temp_path, blob_id) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(e);
+    }
     let size = std::fs::metadata(&temp_path)
         .map_err(|e| SyncError::Vault(e.to_string()))?
         .len() as i64;
@@ -1796,6 +1824,31 @@ pub async fn fetch_blob(
     record_blob_present(vault_root, blob_id, size, false)
         .map_err(|e| SyncError::Vault(e.to_string()))?;
     Ok(size as u64)
+}
+
+/// Whether the file at `path` starts with a blob header naming `blob_id`.
+/// A header of a version this build does not know passes: a newer build's
+/// blob is still that blob, and refusing it would stop this device copying
+/// it to a copy that lacks it.
+fn check_blob_header(path: &Path, blob_id: Uuid) -> Result<(), SyncError> {
+    use std::io::Read;
+    let key = blob_key(blob_id);
+    let mut header = [0u8; silentsilo_crypto::HEADER_SIZE];
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut header))
+        .map_err(|_| SyncError::Storage(format!("{key} is shorter than a blob header")))?;
+    if &header[0..4] != silentsilo_crypto::SSLO_MAGIC {
+        return Err(SyncError::Storage(format!("{key} is not a blob")));
+    }
+    if u16::from_be_bytes([header[4], header[5]]) != silentsilo_crypto::SSLO_VERSION {
+        return Ok(());
+    }
+    let parsed = silentsilo_crypto::BlobHeader::from_bytes(&header)
+        .map_err(|e| SyncError::Storage(format!("{key} is not a blob: {e}")))?;
+    if parsed.blob_id != blob_id {
+        return Err(SyncError::Storage(format!("{key} holds another blob")));
+    }
+    Ok(())
 }
 
 /// [`fetch_blob`] tried against every copy in turn: content is the same
@@ -2733,8 +2786,12 @@ pub async fn ensure_recovery_envelope(
         .head(RECOVERY_KEY)
         .await?
         .is_some_and(|size| !too_large(size))
-        && let Ok(held) = client.get(RECOVERY_KEY).await
     {
+        // There and unread: a newer code may be what failed to come down,
+        // so nothing is written over it until a later pass reads it.
+        let Ok(held) = client.get(RECOVERY_KEY).await else {
+            return Ok(false);
+        };
         if held == bytes {
             return Ok(false);
         }

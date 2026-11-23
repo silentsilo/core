@@ -121,6 +121,14 @@ async fn objects_of_another_kind_under_a_record_name_are_never_applied() {
         .await
         .unwrap();
     assert_eq!(got.records.len(), 3, "only the records themselves");
+    // They open, and are no record: held a week, like an object that does
+    // not open, never for good. Held for good, a copy of the KEK envelope
+    // put among the records stopped incoming changes for good.
+    assert!(
+        got.unreadable.iter().all(|u| !u.opened),
+        "{:?}",
+        got.unreadable
+    );
     let unreadable: HashSet<String> = got.unreadable.into_iter().map(|u| u.key).collect();
     assert_eq!(unreadable, HashSet::from([as_snapshot, as_kek]));
     assert!(fetch_all_ops_above(&store, &dek, 0).await.is_err());

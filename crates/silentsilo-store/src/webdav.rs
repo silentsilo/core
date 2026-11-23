@@ -343,15 +343,40 @@ impl WebDavStore {
             .is_ok_and(|r| r.status().is_success())
     }
 
-    /// Creates every collection a key needs, outermost first.
-    ///
-    /// Including the base itself. The user points us at a collection that
-    /// usually exists, but "usually" is not a contract — and a `PUT` into a
-    /// missing collection answers 403 or 409, which reads as a permissions
-    /// problem and sends people to check credentials that were fine.
+    /// The base collection must already be there. Gone, it is a share that
+    /// was renamed or unmounted: a listing would read it as an empty copy
+    /// and a write would make a new one beside the real one. Only `check`,
+    /// which runs while the user adds or tests the place, creates it.
+    async fn base_present(&self) -> Result<(), StoreError> {
+        if self
+            .known_collections
+            .lock()
+            .map(|seen| seen.contains(""))
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        if !self
+            .collection_exists(self.base.trim_end_matches('/'))
+            .await
+        {
+            return Err(StoreError::Unreachable(format!(
+                "{} is not available",
+                self.describe()
+            )));
+        }
+        if let Ok(mut seen) = self.known_collections.lock() {
+            seen.insert(String::new());
+        }
+        Ok(())
+    }
+
+    /// Creates every collection a key needs below the base, outermost
+    /// first. A `PUT` into a missing collection answers 403 or 409, which
+    /// reads as a permissions problem and sends people to check credentials
+    /// that were fine.
     async fn ensure_parents(&self, key: &str) -> Result<(), StoreError> {
-        self.ensure_collection("", self.base.trim_end_matches('/'))
-            .await?;
+        self.base_present().await?;
 
         let mut prefix = String::new();
         let segments: Vec<&str> = key.split('/').collect();
@@ -631,8 +656,10 @@ impl ObjectStore for WebDavStore {
                 .map_err(Self::map_send)?;
 
             // A prefix nothing has been written to yet is an empty listing,
-            // not a failure — the normal state of fresh storage.
+            // not a failure: the normal state of fresh storage. A missing
+            // base is not.
             if response.status() == StatusCode::NOT_FOUND {
+                self.base_present().await?;
                 continue;
             }
             if !response.status().is_success() {
@@ -650,12 +677,17 @@ impl ObjectStore for WebDavStore {
                     continue;
                 }
                 if entry.is_collection {
-                    queue.push(entry.key);
+                    if entry.key.split('/').count() < crate::MAX_LIST_DEPTH {
+                        queue.push(entry.key);
+                    }
                 } else {
                     out.push(StoredObject {
                         key: entry.key,
                         size: entry.size,
                     });
+                    if out.len() > crate::MAX_LISTED {
+                        return Err(crate::listed_too_many(&self.describe()));
+                    }
                 }
             }
         }
@@ -669,6 +701,14 @@ impl ObjectStore for WebDavStore {
 
     fn describe(&self) -> String {
         without_userinfo(self.base.trim_end_matches('/'))
+    }
+
+    /// The one call that creates the base: the user is adding or testing
+    /// this place, so a collection not made yet is expected.
+    async fn check(&self) -> Result<(), StoreError> {
+        self.ensure_collection("", self.base.trim_end_matches('/'))
+            .await?;
+        crate::probe(self).await
     }
 }
 

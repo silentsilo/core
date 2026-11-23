@@ -366,11 +366,37 @@ impl SftpStore {
         Ok(Connection { ssh: session, sftp })
     }
 
-    /// Creates every directory a key needs, outermost first.
+    /// The silo's folder must already be there. Gone, it is a disk the
+    /// server no longer mounts or a folder renamed: a listing would read it
+    /// as an empty copy and a write would make a new one in its place. Only
+    /// `check`, which runs while the user adds or tests the place, creates
+    /// it. An empty base is the login folder, always there.
+    async fn base_present(&self, sftp: &SftpSession) -> Result<(), StoreError> {
+        if self.base.is_empty() {
+            return Ok(());
+        }
+        match sftp.metadata(self.base.clone()).await {
+            Ok(meta) if meta.is_dir() => Ok(()),
+            _ => Err(StoreError::Unreachable(format!(
+                "{} is not available",
+                self.describe()
+            ))),
+        }
+    }
+
+    /// Creates every directory a key needs below the silo's folder,
+    /// outermost first.
     ///
     /// Like WebDAV and unlike a bucket, directories are real here: writing
     /// `ops/000001.op` into a missing `ops/` fails.
     async fn ensure_parents(&self, sftp: &SftpSession, key: &str) -> Result<(), StoreError> {
+        self.base_present(sftp).await?;
+        self.make_dirs(sftp, key).await
+    }
+
+    /// Creates every directory up to the one `key` sits in, the silo's
+    /// folder included.
+    async fn make_dirs(&self, sftp: &SftpSession, key: &str) -> Result<(), StoreError> {
         let full = self.path_for(key)?;
         let Some((dir, _)) = full.rsplit_once('/') else {
             return Ok(());
@@ -699,7 +725,11 @@ impl ObjectStore for SftpStore {
                     Ok(entries) => entries,
                     // A prefix nothing has been written to yet is an empty
                     // listing, which is the normal state of fresh storage.
-                    Err(e) if missing(&e) => continue,
+                    // A missing silo folder is not.
+                    Err(e) if missing(&e) => {
+                        self.base_present(&sftp).await?;
+                        continue;
+                    }
                     Err(e) => return Err(StoreError::Other(format!("{relative}: {e}"))),
                 };
 
@@ -719,7 +749,9 @@ impl ObjectStore for SftpStore {
                     }
 
                     if entry.metadata().is_dir() {
-                        queue.push(key);
+                        if key.split('/').count() < crate::MAX_LIST_DEPTH {
+                            queue.push(key);
+                        }
                     } else if !name.ends_with(".part") && !name.ends_with(".old") {
                         // A rename that never completed, or an overwritten
                         // object set aside. Reporting either as an object
@@ -728,6 +760,9 @@ impl ObjectStore for SftpStore {
                             key,
                             size: entry.metadata().size.unwrap_or(0) as i64,
                         });
+                        if out.len() > crate::MAX_LISTED {
+                            return Err(crate::listed_too_many(&self.describe()));
+                        }
                     }
                 }
             }
@@ -751,6 +786,14 @@ impl ObjectStore for SftpStore {
                 &self.base
             }
         )
+    }
+
+    /// The one call that creates the silo's folder: the user is adding or
+    /// testing this place, so a folder not made yet is expected.
+    async fn check(&self) -> Result<(), StoreError> {
+        self.run(|sftp| async move { self.make_dirs(&sftp, "probe").await })
+            .await?;
+        crate::probe(self).await
     }
 }
 

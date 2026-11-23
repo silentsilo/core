@@ -9,6 +9,29 @@ This repository has its own version line, separate from the desktop
 application's. A client pins a tag from here; the tag it pins is what its
 release notes should say.
 
+## [1.11.2] - sync: nothing deleted or overwritten on a doubtful read
+
+No persisted format changed.
+
+### Fixed
+
+- A device that may be behind a snapshot no copy lets it read neither
+  compacts nor sweeps until one reads. Its sweep could delete content only
+  that snapshot referred to.
+- A recovery envelope a copy holds and that fails to download is no longer
+  overwritten by this device's older one.
+- A push that finds a blob on a copy at a size other than its own sends it
+  again, so a cut-off upload is not counted as delivered.
+- A downloaded blob whose header names another blob, or that is no blob,
+  stays out of the cache and the next copy is tried. A seed does not copy
+  such a blob over the destination's.
+- WebDAV and SFTP treat a missing base folder as unreachable instead of an
+  empty copy to fill; only the check run when a place is added creates it.
+- An object among the records that opens and is no record holds back
+  incoming changes for a week, as one that does not open, not for good.
+- Listings stop at ten million objects, four folders deep, and after ten
+  empty S3 pages in a row.
+
 ## [1.11.1] - shredding stays inside the scratch folder
 
 No persisted format changed.

@@ -39,6 +39,17 @@ impl Vault {
         id
     }
 
+    /// [`Self::add_local_blob`] with a blob header naming it, for content
+    /// that comes back down: a download checks the header. Returns the bytes
+    /// as stored.
+    fn add_downloadable_blob(&self, body: &[u8]) -> (Uuid, Vec<u8>) {
+        let id = Uuid::new_v4();
+        let bytes = silentsilo_testkit::fake_blob(id.as_bytes(), body);
+        std::fs::write(self.root.join("blobs").join(format!("{id}.sslo")), &bytes).unwrap();
+        record_blob_present(&self.root, id, bytes.len() as i64, false).unwrap();
+        (id, bytes)
+    }
+
     fn blob_bytes(&self, id: Uuid) -> Option<Vec<u8>> {
         std::fs::read(self.root.join("blobs").join(format!("{id}.sslo"))).ok()
     }
@@ -82,8 +93,8 @@ async fn a_blob_survives_the_round_trip_byte_for_byte() {
     let source = Vault::new();
     // Binary with NULs and high bytes: blobs are ciphertext, and a transfer
     // that mangled either would corrupt the file beyond recovery.
-    let content: Vec<u8> = (0u8..=255).cycle().take(9000).collect();
-    let id = source.add_local_blob(&content);
+    let body: Vec<u8> = (0u8..=255).cycle().take(9000).collect();
+    let (id, content) = source.add_downloadable_blob(&body);
 
     push_blobs(&client as &dyn ObjectStore, &source.root, target(), &[id])
         .await
@@ -165,8 +176,7 @@ async fn a_second_push_skips_what_is_already_there() {
 async fn an_evicted_blob_can_be_fetched_back() {
     let client = client_or_skip!();
     let vault = Vault::new();
-    let content = b"the original bytes".to_vec();
-    let id = vault.add_local_blob(&content);
+    let (id, content) = vault.add_downloadable_blob(b"the original bytes");
     push_blobs(&client as &dyn ObjectStore, &vault.root, target(), &[id])
         .await
         .unwrap();
@@ -374,4 +384,87 @@ async fn every_blob_is_named_before_it_is_looked_at() {
         vec![(0, 3, already, 0), (1, 3, fresh, 0), (2, 3, gone, 0)],
         "each blob is named once, in order, before it is looked at"
     );
+}
+
+#[tokio::test]
+async fn a_copy_shorter_than_the_blob_is_sent_again() {
+    // An upload cut off half way (WebDAV writes in place) left a short
+    // object, and a HEAD that found it marked the blob delivered: the local
+    // copy could then be evicted while storage held half of it.
+    let storage = tempfile::tempdir().unwrap();
+    let store = silentsilo_store::FolderStore::new(storage.path().to_path_buf());
+    let vault = Vault::new();
+    let content = vec![7u8; 4096];
+    let id = vault.add_local_blob(&content);
+    push_blobs(&store as &dyn ObjectStore, &vault.root, target(), &[id])
+        .await
+        .unwrap();
+
+    let remote = storage.path().join("blobs").join(format!("{id}.sslo"));
+    std::fs::write(&remote, &content[..1000]).unwrap();
+    record_blob_present(&vault.root, id, content.len() as i64, false).unwrap();
+    let again = push_blobs(&store as &dyn ObjectStore, &vault.root, target(), &[id])
+        .await
+        .unwrap();
+    assert_eq!(again.uploaded, 1, "{again:?}");
+    assert_eq!(std::fs::read(&remote).unwrap(), content);
+
+    // Whole: skipped as before.
+    record_blob_present(&vault.root, id, content.len() as i64, false).unwrap();
+    let skipped = push_blobs(&store as &dyn ObjectStore, &vault.root, target(), &[id])
+        .await
+        .unwrap();
+    assert_eq!((skipped.uploaded, skipped.already_present), (0, 1));
+}
+
+/// A WebDAV server that sends no Content-Length: its HEAD says 0.
+struct NoLength(silentsilo_store::FolderStore);
+
+#[async_trait::async_trait]
+impl ObjectStore for NoLength {
+    async fn put(&self, key: &str, body: Vec<u8>) -> Result<(), silentsilo_store::StoreError> {
+        self.0.put(key, body).await
+    }
+
+    async fn get(&self, key: &str) -> Result<Vec<u8>, silentsilo_store::StoreError> {
+        self.0.get(key).await
+    }
+
+    async fn head(&self, key: &str) -> Result<Option<i64>, silentsilo_store::StoreError> {
+        Ok(self.0.head(key).await?.map(|_| 0))
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), silentsilo_store::StoreError> {
+        self.0.delete(key).await
+    }
+
+    async fn list(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<silentsilo_store::StoredObject>, silentsilo_store::StoreError> {
+        self.0.list(prefix).await
+    }
+
+    fn describe(&self) -> String {
+        self.0.describe()
+    }
+}
+
+#[tokio::test]
+async fn a_server_that_gives_no_size_is_not_sent_everything_again() {
+    let storage = tempfile::tempdir().unwrap();
+    let store = NoLength(silentsilo_store::FolderStore::new(
+        storage.path().to_path_buf(),
+    ));
+    let vault = Vault::new();
+    let id = vault.add_local_blob(&[7u8; 4096]);
+    let first = push_blobs(&store as &dyn ObjectStore, &vault.root, target(), &[id])
+        .await
+        .unwrap();
+    assert_eq!(first.uploaded, 1);
+    record_blob_present(&vault.root, id, 4096, false).unwrap();
+    let second = push_blobs(&store as &dyn ObjectStore, &vault.root, target(), &[id])
+        .await
+        .unwrap();
+    assert_eq!((second.uploaded, second.already_present), (0, 1));
 }

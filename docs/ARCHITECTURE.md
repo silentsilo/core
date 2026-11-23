@@ -432,7 +432,9 @@ or above it for a week from the first pass that met it (dated in
 `vault_meta`, `UNOPENED_HOLD_SECS`), then no longer. Anyone with write access
 to storage can put one at a low number, and holding for good stopped
 incoming changes for good; a week leaves an interrupted upload or a damaged
-record time to be sent again or repaired. One that opens and still cannot be
+record time to be sent again or repaired. One that opens and is no record at
+all (the KEK envelope or a snapshot copied there) counts the same way: anyone
+who can write to storage can copy one. One that opens and still cannot be
 used (a newer build's, or a Lamport value above `LAMPORT_CEILING`, 2^53)
 holds back for as long as it is there. That includes a record naming an
 operation this build does not know and may not skip: replay refuses it, and
@@ -482,8 +484,10 @@ were compacted has a low horizon because it is stale, and it does not hold
 what they pruned. A folder target whose root is gone (an unplugged drive)
 is `Unreachable` for every call, never an empty listing and never a write
 that recreates the root and fills it as a new copy; a missing prefix under
-an existing root is still an empty listing. Only `check`, which runs while
-the user adds or tests the place, creates the root.
+an existing root is still an empty listing. WebDAV and SFTP do the same for
+their base folder (a share renamed, a disk the server no longer mounts) on
+listings and writes. Only `check`, which runs while the user adds or tests
+the place, creates the root.
 
 The received mark alone cannot see one case. A device that wrote offline for
 a month sends records whose Lamport values the others passed long ago; they
@@ -529,7 +533,13 @@ holds a whole blob in memory.
 
 A blob is written under `<id>.sslo.part` and renamed when whole, both by an
 import (`encrypt_stream`) and by a download (`fetch_blob`), so nothing reads
-a half-written file as stored content. A `.part` older than a day is what a
+a half-written file as stored content. A download, and a seed before it
+writes, also checks the header names that blob (`check_blob_header`): other
+bytes under its name never reach the cache, where they would be opened and
+sent to the copies that lack it, and the next copy is tried. A header of a
+version this build does not know passes. A push that finds the blob on a
+copy at another size than its own sends it again; a size of 0 is a server
+that did not say (WebDAV without Content-Length). A `.part` older than a day is what a
 closed app left behind, and opening the silo deletes it
 (`cache_store::sweep_partial_blobs`). The day is for another process that
 opens the silo while the app is still writing one: AutoFill on a phone.
@@ -777,7 +787,11 @@ Read this before "fixing" any of it.
   holds the bytes in its cache.
 - **Compaction and the sweep skip a partial pass.** A record held back, an
   unreadable object or a copy that could not be read means this device's
-  idea of what is referenced is short, so neither runs. The same complete
+  idea of what is referenced is short, so neither runs. So does a device that
+  may be behind a snapshot no copy lets it read (`SNAPSHOT_UNREAD`), with no
+  time limit, unlike an unopened record: a sweep on a short view deletes
+  content, and waiting only costs space. A device past that horizon compacts
+  as usual, and its newer snapshot ends the wait. The same complete
   passes record `received_through` (`vfs::snapshot`), and the horizon check
   compares that, not the highest local Lamport value, which counts this
   device's own offline writes.
@@ -941,6 +955,13 @@ Read this before "fixing" any of it.
 - **`is_skippable` is a per-variant decision**, carried on the record,
   because it is all an older build has to go on when it meets an operation
   from a newer one. Decoration skips; structure refuses.
+- **A listing has a ceiling.** Ten million objects, four folders deep, and
+  for S3 ten pages in a row that say "more" and bring nothing
+  (`MAX_LISTED`, `MAX_LIST_DEPTH`). Far above any silo; a server that
+  answers without end fails the call instead of filling memory.
+- **A recovery envelope that is there and does not read is left alone.**
+  The push writes its own only after reading what the copy holds: a newer
+  code may be what failed to come down.
 - **`MAX_OP_BYTES` rejects from the listing**, before download: storage is
   untrusted and an object sized to exhaust memory must never be fetched.
   Same posture as the Argon2 parameter ceiling on `recovery.env`.

@@ -272,6 +272,23 @@ pub fn too_large(key: &str, size: u64) -> StoreError {
     StoreError::Other(format!("{key} is {size} bytes, far larger than it can be"))
 }
 
+/// The most objects one listing takes before it gives up, far above any
+/// silo, so a server that answers without end fails the call instead of
+/// filling memory.
+pub const MAX_LISTED: usize = 10_000_000;
+
+/// The deepest a listing descends. This app's keys are at most three parts
+/// (`audit/<device>/<seq>.seg`); a server nesting folders without end stops
+/// here.
+pub const MAX_LIST_DEPTH: usize = 4;
+
+/// [`MAX_LISTED`] as an error.
+pub(crate) fn listed_too_many(what: &str) -> StoreError {
+    StoreError::Other(format!(
+        "{what} lists more than {MAX_LISTED} objects, far more than any silo holds"
+    ))
+}
+
 /// Whether a key is one this app could have written: relative, split by
 /// `/`, with no empty, `.` or `..` part, no backslash and no control
 /// character. Names come back from listings, and a listing is whatever the

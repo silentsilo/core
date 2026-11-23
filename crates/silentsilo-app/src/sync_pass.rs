@@ -987,6 +987,13 @@ async fn pass(
     };
     let known_through = received.unwrap_or(applied_through);
     let mut behind = false;
+    // A device that may be behind and could read no snapshot to say so:
+    // its view may lack what the snapshot holds, so it neither compacts nor
+    // sweeps until one reads. No time limit, unlike an unopened record: a
+    // sweep on a short view deletes content, and waiting only costs space.
+    // A device past the horizon compacts as usual and its newer snapshot
+    // ends the wait.
+    let mut snapshot_unread = false;
     if horizon > local_horizon && known_through <= horizon {
         // The listing's word for the horizon is only a name. Checked against
         // the snapshots themselves before a rebuild is asked for: a copy
@@ -1003,6 +1010,13 @@ async fn pass(
             }
         }
         behind = verified.is_some_and(|v| v > local_horizon && known_through <= v);
+        snapshot_unread = verified.is_none();
+    }
+    if snapshot_unread {
+        host.warn(
+            "sync",
+            "no copy's newest snapshot could be read; compaction and cleanup wait",
+        );
     }
     // The received mark can pass a horizon that still hides records this
     // device never saw: written offline long ago, sent late, and folded into
@@ -1492,6 +1506,7 @@ async fn pass(
     let (incoming, held_back) = sync::usable_prefix(incoming, &unreadable);
     // Everything every copy holds was read and nothing is held back.
     let view_complete = !fetch_failed
+        && !snapshot_unread
         && unreadable.is_empty()
         && held_back == 0
         && required
@@ -1854,6 +1869,7 @@ async fn pass(
         unreadable: unreadable
             .iter()
             .map(|u| format!("{}: {}", u.key, u.error))
+            .chain(snapshot_unread.then(|| SNAPSHOT_UNREAD.to_string()))
             .collect(),
         held_back,
         inbox_imported: inbox.imported,
@@ -1954,6 +1970,10 @@ async fn missed_below_horizon(
     }
     Ok(false)
 }
+
+/// What the report lists when no copy's newest snapshot could be read.
+pub const SNAPSHOT_UNREAD: &str =
+    "snapshots: the newest snapshot could not be read on any copy, so compaction and cleanup wait";
 
 /// Why a never-delete copy left under a replaced key gets nothing.
 pub const RETIRED_COPY: &str = "Kept under the encryption key that was replaced, so it gets no new \

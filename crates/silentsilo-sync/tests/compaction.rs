@@ -547,7 +547,10 @@ use silentsilo_sync::sweep_orphan_blobs;
 
 async fn put_blob(store: &FolderStore, id: Uuid) {
     store
-        .put(&format!("blobs/{id}.sslo"), b"ciphertext".to_vec())
+        .put(
+            &format!("blobs/{id}.sslo"),
+            silentsilo_testkit::fake_blob(id.as_bytes(), b"ciphertext"),
+        )
         .await
         .unwrap();
 }
@@ -572,7 +575,7 @@ async fn a_blob_comes_from_whichever_copy_holds_it() {
         .await
         .unwrap();
 
-    assert_eq!(size, b"ciphertext".len() as u64);
+    assert_eq!(size, 82 + b"ciphertext".len() as u64);
     assert!(
         vault
             .path()

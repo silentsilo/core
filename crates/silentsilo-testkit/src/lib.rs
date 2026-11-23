@@ -63,3 +63,18 @@ impl Drop for BlockedPath {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
+
+/// Stand-in content for a blob: a version 1 header naming `blob_id` (its
+/// bytes) and `body` after it. Enough for code that checks the header and
+/// never decrypts. The layout is `silentsilo-crypto`'s `BlobHeader`.
+pub fn fake_blob(blob_id: &[u8; 16], body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(82 + body.len());
+    out.extend_from_slice(b"SSLO");
+    out.extend_from_slice(&1u16.to_be_bytes());
+    out.extend_from_slice(&(4u32 << 20).to_be_bytes());
+    out.extend_from_slice(&[0u8; 16]);
+    out.extend_from_slice(blob_id);
+    out.extend_from_slice(&[0u8; 32 + 8]);
+    out.extend_from_slice(body);
+    out
+}

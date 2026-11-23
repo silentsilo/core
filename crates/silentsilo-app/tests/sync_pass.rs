@@ -593,6 +593,90 @@ async fn a_device_that_wrote_a_lot_offline_still_sees_it_fell_behind_a_snapshot(
 }
 
 #[tokio::test]
+async fn a_device_behind_a_snapshot_it_cannot_read_neither_sweeps_nor_compacts() {
+    // B fell behind A's snapshot, and the snapshot does not open. B cannot
+    // tell what it lacks, so content only the snapshot refers to would look
+    // orphaned to its sweep. It waits, with no time limit, until a snapshot
+    // reads; A's next one ends the wait.
+    let storage = tempfile::tempdir().unwrap();
+    let target = || folder_target(storage.path().to_path_buf(), TargetRole::Working);
+    let target_id = target().config.target_id();
+    let a = Device::new(Uuid::new_v4(), None);
+    let b = Device::new(a.vault_id(), Some(a.keys()));
+    *a.host.targets.lock().unwrap() = vec![target()];
+    *b.host.targets.lock().unwrap() = vec![target()];
+    a.make_folder("Shared");
+    a.pass().await;
+    assert!(!b.pass().await.needs_rebuild);
+
+    let dek = a.keys().0;
+    let store = silentsilo_store::FolderStore::new(storage.path().to_path_buf());
+    let compact = |device: &Device| {
+        let sessions = device.state.sessions.lock().unwrap();
+        let session = &sessions[&device.silo.id];
+        let policy = silentsilo_vfs::CompactionPolicy {
+            retain_seconds: 0,
+            keep_recent: 1,
+            min_records: 0,
+        };
+        silentsilo_sync::plan_compaction(&session.conn, session.vault_id, &policy, i64::MAX / 4)
+            .unwrap()
+            .expect("a horizon")
+    };
+    for i in 0..5 {
+        a.make_folder(&format!("A{i}"));
+    }
+    a.pass().await;
+    let snapshot = compact(&a);
+    silentsilo_sync::publish_compaction(&store, &dek, &snapshot, true)
+        .await
+        .unwrap();
+    let snap_file = storage
+        .path()
+        .join(format!("snapshots/{:020}.snap", snapshot.horizon));
+    std::fs::write(&snap_file, b"does not open").unwrap();
+
+    let orphan = Uuid::new_v4();
+    std::fs::create_dir_all(storage.path().join("blobs")).unwrap();
+    std::fs::write(storage.path().join(format!("blobs/{orphan}.sslo")), b"x").unwrap();
+    let candidates = || {
+        silentsilo_vfs::snapshot::gc_candidates(
+            &b.state.sessions.lock().unwrap()[&b.silo.id].conn,
+            target_id,
+        )
+        .unwrap()
+    };
+
+    for _ in 0..2 {
+        let report = b.pass().await;
+        assert!(!report.needs_rebuild, "{report:?}");
+        assert!(
+            report
+                .unreadable
+                .iter()
+                .any(|u| u == silentsilo_app::SNAPSHOT_UNREAD),
+            "{report:?}"
+        );
+        assert_eq!(report.compacted, 0);
+        assert!(candidates().is_empty(), "the sweep ran on a short view");
+    }
+
+    // A is past the horizon, so it is not held, and its newer snapshot
+    // reads: B now knows it is behind.
+    for i in 0..5 {
+        a.make_folder(&format!("A2-{i}"));
+    }
+    a.pass().await;
+    let newer = compact(&a);
+    assert!(newer.horizon > snapshot.horizon);
+    silentsilo_sync::publish_compaction(&store, &dek, &newer, true)
+        .await
+        .unwrap();
+    let report = b.pass().await;
+    assert!(report.needs_rebuild, "{report:?}");
+}
+
+#[tokio::test]
 async fn a_device_that_missed_a_new_recovery_code_does_not_put_the_old_one_back() {
     let storage = tempfile::tempdir().unwrap();
     let target = || folder_target(storage.path().to_path_buf(), TargetRole::Working);
