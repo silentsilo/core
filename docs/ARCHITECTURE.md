@@ -929,8 +929,12 @@ Read this before "fixing" any of it.
   `purge_groups`). 1.0.0 ranks name groups with no gaps; while no group
   needs a suffix another group asked for, both rankings agree, so a record
   joining a group asks for the name shown where they would not, and asking
-  for a taken suffix renames its holders first. Emptying the trash moves
-  live entries out of trashed folders before the purge, a purge names the
+  for a taken suffix renames its holders first. Replay keeps a name's
+  direction overrides, as every release did: `check` refuses them when
+  typed and `without_reordering` drops them on the way to disk or screen,
+  never `sanitize`, which would give old and new devices different names
+  from the same records. Emptying the trash moves live entries out of
+  trashed folders before the purge, a purge names the
   conflict copies it takes along (a copy still out of the trash is recorded
   again under a new id first, as a move is, so emptying the trash never
   takes a file the person kept: `Vfs::keep_live_copies`), and the last entry of each group a purge

@@ -786,3 +786,32 @@ fn what_is_done_with_a_kept_edit_applies_on_1_0_0() {
     vfs.empty_trash().unwrap();
     applies_on_1_0_0(&old, &new);
 }
+
+#[test]
+fn a_name_with_a_direction_override_reads_the_same_on_1_0_0() {
+    // Typed names with these characters are refused, but every release
+    // before 1.11.5 accepted them and replay must keep giving the name every
+    // other version gives: the same records, the same tree.
+    let (old, new) = side_by_side();
+    let root = silentsilo_vfs::root_folder_id_for(new.vault_id);
+    let record = silentsilo_vfs::OpRecord::authored(
+        Uuid::from_u128(0x400),
+        1,
+        Uuid::from_u128(9),
+        1_700_000_000,
+        0,
+        None,
+        silentsilo_vfs::VaultOp::AddFile {
+            id: Uuid::from_u128(0x401),
+            folder_id: root,
+            name: "invoice\u{202E}fdp.exe".into(),
+            blob_id: Uuid::from_u128(0x402),
+            size_bytes: 1,
+            content_hash: "h".into(),
+            mime_type: None,
+            blob_key: "k".into(),
+        },
+    );
+    silentsilo_vfs::replay(&new.conn, vec![record]).unwrap();
+    applies_on_1_0_0(&old, &new);
+}

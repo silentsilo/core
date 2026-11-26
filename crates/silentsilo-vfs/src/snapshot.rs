@@ -2134,7 +2134,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(!file_name.contains(['\\', '\u{202E}']), "{file_name}");
+        assert!(!file_name.contains('\\'), "{file_name}");
     }
 
     #[test]

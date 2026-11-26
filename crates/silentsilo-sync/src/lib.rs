@@ -746,6 +746,10 @@ pub async fn uncovered_below(
         .list(OPS_PREFIX)
         .await?
         .iter()
+        // Only what reads as a record: an object under `ops/` without a
+        // record's name is never fetched by any device, and waiting for it
+        // held compaction back for good.
+        .filter(|entry| op_id_from_key(&entry.key).is_some())
         .filter(|entry| {
             lamport_from_key(&entry.key)
                 .is_some_and(|lamport| lamport <= horizon && !covered.covers(&entry.key, lamport))

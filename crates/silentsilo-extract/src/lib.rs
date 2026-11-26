@@ -624,8 +624,11 @@ fn safe_join(dest: &Path, relative: &str) -> Option<PathBuf> {
         if part.contains('\\') || part.contains(':') {
             return None;
         }
+        // Direction overrides would let `invoice<U+202E>fdp.exe` land as
+        // what reads like `invoiceexe.pdf`.
+        let part = silentsilo_vfs::without_reordering(part);
         // `CON` or `nul.txt` is a device on Windows, not a file.
-        if cfg!(windows) && reserved_on_windows(part) {
+        if cfg!(windows) && reserved_on_windows(&part) {
             out.push(format!("_{part}"));
         } else {
             out.push(part);
@@ -733,6 +736,13 @@ mod safe_join_tests {
         let joined = safe_join(dest, "Acte/2026/contract.pdf").expect("an ordinary path");
         assert!(joined.starts_with(dest));
         assert!(joined.ends_with("Acte/2026/contract.pdf"));
+    }
+
+    #[test]
+    fn a_direction_override_does_not_reach_the_disk() {
+        let dest = Path::new("/home/sam/recovered");
+        let joined = safe_join(dest, "Acte/invoice\u{202E}fdp.exe").unwrap();
+        assert!(joined.ends_with("Acte/invoice_fdp.exe"), "{joined:?}");
     }
 }
 

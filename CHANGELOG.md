@@ -9,6 +9,22 @@ This repository has its own version line, separate from the desktop
 application's. A client pins a tag from here; the tag it pins is what its
 release notes should say.
 
+## [Unreleased]
+
+No persisted format changed.
+
+### Fixed
+
+- Replay names an entry with a direction override (U+202A to U+202E,
+  U+2066 to U+2069) as every earlier release does again. 1.11.5 replaced
+  them with `_` on replay, so the same records gave a device on 1.11.5 or
+  later a different name from one on 1.10.4, and a snapshot restore could
+  meet two siblings that collided only after the repair. Typing such a name
+  is still refused, and `names::without_reordering` replaces them where a
+  name reaches the disk (the extraction tool) or the screen.
+- Compaction no longer waits for good on an object under `ops/` that does
+  not carry a record's name.
+
 ## [1.11.7] - rotation reseals late records
 
 No persisted format changed.

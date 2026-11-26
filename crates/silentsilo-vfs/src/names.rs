@@ -42,7 +42,7 @@ pub fn sanitize(raw: &str) -> String {
     let mut cleaned: String = composed
         .chars()
         .map(|c| {
-            if FORBIDDEN.contains(&c) || c.is_control() || reorders(c) {
+            if FORBIDDEN.contains(&c) || c.is_control() {
                 '_'
             } else {
                 c
@@ -75,6 +75,17 @@ pub fn sanitize(raw: &str) -> String {
 /// systems put them in names on their own.
 fn reorders(c: char) -> bool {
     matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
+/// `name` with direction overrides and isolates replaced by `_`, for where
+/// a name reaches the disk or the screen: `invoice<U+202E>fdp.exe` read as
+/// `invoiceexe.pdf`. Not part of [`sanitize`]: replay must give every
+/// version the same name from the same records, and releases before 1.11.5
+/// kept these characters. Typing one is refused by [`check`].
+pub fn without_reordering(name: &str) -> String {
+    name.chars()
+        .map(|c| if reorders(c) { '_' } else { c })
+        .collect()
 }
 
 /// Composition alone, for names typed or dropped locally: the same NFC that
@@ -162,9 +173,15 @@ mod tests {
     /// direction mark, which some systems add on their own, stays.
     #[test]
     fn a_name_cannot_reorder_its_own_extension() {
-        assert_eq!(sanitize("invoice\u{202E}fdp.exe"), "invoice_fdp.exe");
-        assert_eq!(sanitize("a\u{2067}b\u{2069}.txt"), "a_b_.txt");
-        assert_eq!(sanitize("שלום\u{200F}.txt"), "שלום\u{200F}.txt");
+        // Replay keeps them, as every release before 1.11.5 did; the disk
+        // and the screen do not.
+        assert_eq!(sanitize("invoice\u{202E}fdp.exe"), "invoice\u{202E}fdp.exe");
+        assert_eq!(
+            without_reordering("invoice\u{202E}fdp.exe"),
+            "invoice_fdp.exe"
+        );
+        assert_eq!(without_reordering("a\u{2067}b\u{2069}.txt"), "a_b_.txt");
+        assert_eq!(without_reordering("שלום\u{200F}.txt"), "שלום\u{200F}.txt");
         assert!(check("invoice\u{202E}fdp.exe").is_err());
         assert!(check("שלום\u{200F}.txt").is_ok());
     }

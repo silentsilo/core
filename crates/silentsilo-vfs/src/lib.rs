@@ -11,7 +11,9 @@ pub mod snapshot;
 
 pub use activity::{ActivityEntry, ActivityPage};
 pub use digest::{digest, digest_difference};
-pub use names::{MAX_NAME_BYTES, check as check_name, sanitize as sanitize_name};
+pub use names::{
+    MAX_NAME_BYTES, check as check_name, sanitize as sanitize_name, without_reordering,
+};
 pub use oplog::{
     ApplyOutcome, LAMPORT_CEILING, OpBody, OpRecord, ReplayReport, VaultOp, all_op_ids, all_ops,
     apply_op, chain_holes, chain_tip, clear_pushed, delivered_but_unlisted, device_id, emit,
