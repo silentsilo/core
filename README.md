@@ -46,10 +46,12 @@ without showing it, or reads it from standard input; `--help` has the rest.
 
 Binaries for all three ship with every desktop release, on the
 [silentsilo/desktop releases page](https://github.com/silentsilo/desktop/releases),
-built from the core tag that release pins and signed with the same minisign
-key the updater checks. The public half is in
-[`SIGNING-PUBKEY.txt`](SIGNING-PUBKEY.txt). This repository publishes tags,
-not releases.
+built from the core tag that release pins. From the desktop release after
+1.5.2, each release carries `SHA256SUMS` signed with the checksums key;
+[Verifying a download](https://github.com/silentsilo/desktop/blob/main/SECURITY.md#verifying-a-download)
+says how to check it. Releases up to 1.5.2 are checked with the updater key
+in [`SIGNING-PUBKEY.txt`](SIGNING-PUBKEY.txt). This repository publishes
+tags, not releases.
 
 ## Unfinished uploads on S3
 

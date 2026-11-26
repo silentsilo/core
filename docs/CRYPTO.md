@@ -1,12 +1,14 @@
 # SilentSilo Cryptography Specification (v1)
 
-Public reference for auditors and contributors. Describes what the desktop
-app does. Everything below happens on the user's machine: there is no server
-component and no account. The only network calls are the optional backup and
-sync against storage the user configures (OneDrive, Dropbox or Google Drive,
+Public reference for auditors and contributors. Describes what the core
+engine does on every client (desktop and phones). Everything below happens
+on the user's device: there is no server component and no account. The
+engine's only network calls are the optional backup and sync against
+storage the user configures (OneDrive, Dropbox, Google Drive, iCloud Drive,
 an S3-compatible bucket, WebDAV, SFTP or a folder), which carry the same
 ciphertext described here, plus the sign-in and token calls of the three
-account providers. The
+account providers. What an app adds on top (the update check, the breach
+check, site icons) is in its own SECURITY.md. The
 storage provider sees opaque blobs, encrypted operation records, per-key
 envelopes whose wrapped DEK is ciphertext but whose surrounding fields are
 not, and one small manifest naming a random vault id. "What the storage
@@ -350,10 +352,16 @@ One record per enrolled credential, stored locally alongside the vault:
 | `key_slot` | Enrollment order, `0` for the first key |
 | `public_key` | Hex. COSE/DER for `fido2`, the enclave key's uncompressed SEC1 point for `secure-enclave`, empty for `android-keystore` |
 | `policy` | Empty, or `org` for a key an organisation administers |
+| `rp_id` | The FIDO relying party the credential was made for |
+| `label` | The name the user typed, in the clear |
+| `platform` | Whether it is a built-in authenticator (Windows Hello, Touch ID, a phone), which goes with the device |
+| `revoked` | A removed key, kept as a tombstone so every sync pass retries deleting its envelope from storage until storage confirms it; it opens nothing here |
+| `unconfirmed` | Local only, never published: taken in from storage and not yet used to unlock on this device, so it does not count as a way in |
 
 Each record independently wraps the same Master DEK, which is what lets any
-enrolled key open the vault on its own. Removing a key deletes its record, so
-that key can no longer unwrap the DEK.
+enrolled key open the vault on its own. Removing a key marks its record
+revoked and drops its envelope, so that key can no longer unwrap the DEK
+from this device.
 
 `policy` is the one field here that is not about cryptography, and it is worth
 being precise about what it does and does not do. It does not restrict what a
@@ -461,6 +469,7 @@ strong as its weakest envelope, and a memorable phrase is roughly forty bits.
 | Wrapped DEK | Sealed envelope, above |
 | Envelope version | `1` |
 | `auth` | BLAKE3 keyed by `derive_key("silentsilo recovery envelope auth v1", content KEK)` over the fields above, hex. Optional, added in core 1.6.0 |
+| `auth_dek` | The same tag keyed by the content KEK and the Master DEK together. Optional, added in core 1.10.0 |
 
 The tag is not what protects the code: the wrapped DEK is already AEAD
 ciphertext, and a wrong envelope simply fails to open. What it protects is the
@@ -469,7 +478,9 @@ decision ran on `created_at`, a number whoever can write to the bucket
 chooses, so they could bring back a code that had been turned off, or replace
 the envelope each device keeps locally with one that opens nothing, found out
 only when someone reached for it. The content KEK never leaves a device and
-never rotates, so a tag under it is something storage cannot produce.
+never rotates, so `auth` is something storage alone cannot produce. A former
+member who kept the KEK still can after a rotation, which is why `auth_dek`
+also takes the Master DEK, which a rotation does replace.
 Untagged envelopes still open, and a device adopts one only while its own is
 untagged too. [FORMATS.md](../FORMATS.md), "The recovery envelope", has the
 exact rules and what an older client does with the field.
@@ -507,7 +518,7 @@ encrypt and decrypt reconstruct it from a simple running counter.
 |--------|------|-------|
 | 0 | 4 | Magic `SSLO` |
 | 4 | 2 | Version `1` |
-| 6 | 4 | Chunk size (default 4 194 304) |
+| 6 | 4 | Chunk size: always 4 194 304 in version 1; any other value is refused |
 | 10 | 16 | `file_id` UUID |
 | 26 | 16 | `blob_id` UUID |
 | 42 | 32 | BLAKE3 content hash (plaintext) |
@@ -553,14 +564,17 @@ Stated here rather than left to be discovered, because the app uses the word
 "permanently" and this is where that word stops being complete.
 
 Deleting a file and purging it removes the blob the index points at, which is
-its current content. Replacing a file's content writes a **new** blob and
-leaves the previous one where it is, and nothing collects those. They stay in
-the silo, and in storage if one is configured, readable with the Master DEK,
-for as long as the vault exists.
+its current content. Replacing a file's content writes a **new** blob. The
+previous one stays until the sweep collects it: a device holding the whole
+log deletes content nothing references once it has gone unreferenced for 30
+days, from copies that accept deletes. Until then it is readable with the
+Master DEK, and on a never-delete copy, or in anything copied before, it
+stays for good.
 
 So a file edited three times and then deleted leaves two earlier versions
-behind. Someone who replaces a document to remove something from it, then
-deletes the file, has not removed what they thought they had.
+behind for a month, and for good on a never-delete copy. Someone who
+replaces a document to remove something from it, then deletes the file, has
+not removed what they thought they had.
 
 An edit another device made to the file before it received the purge is not
 removed either. It comes back as a new file at the top of the silo, because
@@ -568,17 +582,19 @@ the device that purged never had it.
 
 The password store behaves the same way for a different reason: replacing a
 password writes a new operation record, and the previous value stays in the
-log. Records are never pruned today.
+log until compaction prunes records older than 30 days into a snapshot of
+the current state. A never-delete copy keeps every record, and the entry's
+own history keeps earlier passwords if history is on.
 
 | Action | Removed | Left behind |
 |--------|---------|-------------|
-| Purge a file | Its current blob | Blobs superseded by earlier content replacements; an edit another device made before it received the purge, kept as a new file |
-| Change a password | Nothing | The previous value, in the operation log |
+| Purge a file | Its current blob | Blobs superseded by earlier content replacements, until the 30-day sweep and for good on a never-delete copy; an edit another device made before it received the purge, kept as a new file |
+| Change a password | Nothing at once | The previous value, in the operation log until compaction (30 days) and for good on a never-delete copy; in the entry's history if history is on |
 | Revoke a security key | Its envelope | The DEK it wrapped, unchanged |
 | Disable the recovery code | Its envelope, locally and in storage | The DEK it wrapped, unchanged |
 
 The last two rows are the ones that read as stronger than they are. Deleting an
-envelope closes a door; it does not change the lock. Whoever derived the wrap
+envelope removes one way in; the DEK stays the same. Whoever derived the wrap
 key while the key was enrolled, or kept a copy of the vault directory or the
 bucket from before, still holds a working path to the DEK and therefore to
 everything in the silo, past and future. See the threat model above.
@@ -587,9 +603,10 @@ Revocation also depends on reaching storage. Removing a key marks it locally
 straight away and keeps retrying the deletion of its published envelope on
 every sync pass until storage confirms it; the app says so when the first
 attempt does not get through. Until it does, that key still opens the silo from
-another machine. And a second device that has not yet learned of the removal
-republishes the envelope on its own next pass, so revocation converges on one
-device rather than all of them until a shared revocation record exists.
+another machine. The removal also leaves a marker in storage
+(`keys/revoked/<credential_id>.sealed`, sealed under the content KEK), so the
+other devices drop the key too instead of publishing its envelope again. A
+1.0.0 client does not read the markers and can still publish it.
 
 On storage that keeps what it is asked to delete, revocation does not happen
 at all. A versioned S3 bucket answers a DELETE by writing a delete marker and
@@ -802,6 +819,7 @@ obtains a copy of the bucket, reads all of the following without any key:
 | `snapshots/<horizon>.snap` | That the log was compacted, when, and the Lamport value it was compacted at, which bounds how many operations came before; the snapshot's size |
 | `keys/revoked/<credential_id>.sealed` | The credential id of every key removed from the silo, and when; `keys/revoked/recovery.sealed` says the recovery code was turned off |
 | `keys/content.kek` | When it was last written, which a rotation of the silo key does |
+| `keys/rotated/<fingerprint>.sealed` | That the silo key was rotated, and when |
 | `audit/<device>/<seq>.seg` | That the silo keeps an activity log, which device ids write to it, and per segment, in its header: the device id, the number, the hash of the one before, when it was closed to the millisecond, how many events it holds and the length of each. Each record names the 8-byte id of the key it was sealed to and its cipher suite. Not what the events are |
 | `audit/keys/<key id>.json` | The log's public key, its suite, when it was made, whether it is an organisation's or a personal log (`scope`), and on an organisation's the credential ids of the keys that read it (`by`) |
 | `audit/policy.sealed` | That a policy exists, and when it changes; not what it says |
@@ -871,11 +889,9 @@ machine](#malware-on-the-users-machine).
   bucket keep their old envelopes, so a revoked key still opens the copies
   someone already took. The storage guide in the desktop repository says
   which targets behave this way.
-- Requiring user verification (PIN or biometric) at unlock. Ceremonies ask for
-  it as `discouraged` today, which is a UX choice with the consequence
-  described in the threat model.
-- A shared revocation record, so a removed key converges across every device
-  rather than only the one it was removed on.
+- Refusing an unlock from a key enrolled before 1.10.1 without a PIN. Such a
+  key still opens with one touch; keys enrolled since must have a PIN (see
+  the threat model).
 - Padding, label encryption and device-id pseudonyms, which are what would
   narrow "What the storage provider learns".
 
@@ -891,10 +907,8 @@ machine](#malware-on-the-users-machine).
 | Key derivation parameters | `crates/silentsilo-vault/src/kdf.rs` |
 | Settings file envelope | `crates/silentsilo-vault/src/format.rs` |
 | Format versions and rules | `FORMATS.md` |
-| DEK wrap | `crates/silentsilo-vault/src/dek_store.rs` |
 | vault.db at-rest encryption | `crates/silentsilo-vault/src/vault_file_crypto.rs` |
 | Working copy (SQLCipher), page key | `crates/silentsilo-vault/src/session.rs` |
-| Argon2 KDF | `crates/silentsilo-vault/src/kdf.rs` |
 | FIDO hmac-secret (Windows) | `crates/silentsilo-fido/src/backend/win.rs` |
 | FIDO hmac-secret (Linux/macOS) | `crates/silentsilo-fido/src/backend/ctap.rs` |
 | Secure Enclave agreement and KDF | `crates/silentsilo-fido/src/enclave.rs` |

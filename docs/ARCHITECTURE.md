@@ -78,8 +78,8 @@ from the desktop's command layer one area at a time: so far the session map,
 closing a silo, the sync pass, the recovery and device key flows, and file
 previews. A client gives it a `Host` for events, diagnostics and its saved
 storage settings. The order and invariants of the pass are described in the
-desktop repository's `docs/ARCHITECTURE.md` until the move is done, with one
-two steps that exist only here so far: before pushing, the pass reconciles
+desktop repository's `docs/ARCHITECTURE.md` until the move is done, with two
+steps that exist only here so far: before pushing, the pass reconciles
 the enrolled keys with `keys/` (`silentsilo-sync/key_sync.rs`, `FORMATS.md`),
 and after pulling it imports the inbox (below). After its own records it
 delivers the activity log (`deliver_audit`): it reads the log's policy every
@@ -737,7 +737,7 @@ bucket):
 | Local index corrupt beyond both snapshots | `vault_repair_from_storage`, offered by the unlock screen, in place, blobs kept |
 | Device below the compaction horizon | `vault_rebuild_from_snapshot` (any copy that holds one), fresh device id |
 | Device rotated away | `needs_rejoin`: remove and rejoin with a current credential |
-| Bit rot in a copy | `vault_verify` deep read finds and names it; nothing replaces it yet. `restore_missing_blobs` puts back only objects that are gone: a damaged one has the right key and size, so every pass takes it as present |
+| Bit rot in a copy | `vault_verify` deep read finds and names it, and `repair_from` puts proven bytes back from another copy or the local cache ("Repairing a copy"). The pass itself does not: `restore_missing_blobs` puts back only objects that are gone: a damaged one has the right key and size, so every pass takes it as present |
 
 ## Looks wrong, is deliberate
 
@@ -800,11 +800,12 @@ Read this before "fixing" any of it.
   as `chain_holes` and to the warnings. A tail cut off, or the newest
   snapshot deleted before a join, still needs the checkpoint.
 - **`derivation` on key envelopes decides more than it looks.** It shipped
-  before anything varied, as groundwork for platform authenticators, and the
-  macOS build is the first to use it: `ecdh-p256-hkdf-sha256-v1` alongside
-  `hmac-secret-v1`. Every device reads every other device's envelopes, and a
-  device skips the ones whose derivation it cannot perform. Mobile will add
-  to the list rather than change it.
+  before anything varied, as groundwork for platform authenticators. Three
+  are in use: `hmac-secret-v1` (FIDO2), `ecdh-p256-hkdf-sha256-v1` (the
+  Secure Enclave on macOS and iOS) and `keystore-aes-256-gcm-v1` (the
+  Android Keystore). Every device reads every other device's envelopes, and
+  a device skips the ones whose derivation it cannot perform. A new one is
+  added to the list, never a change to one already there.
 - **Activity segments are tagged under the content KEK, the policy under
   the DEK.** The DEK rotates and the KEK does not, so a key from the DEK
   keeps a former holder out. A segment is never rewritten and must check

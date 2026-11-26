@@ -23,7 +23,7 @@ Anything else needs a version discriminator first.
 | Operation record | `ops/…` | `skippable` flag per record, plus `seq` and `prev`, `silentsilo-vfs/oplog.rs` | Skips a record marked ignorable, refuses on anything else. A record without `seq` is refused outright. `ReplaceFileContent.replaces` is optional and absent when unset, so a record without it decodes and is applied the old way, without conflict detection |
 | Sealed payload | wraps every op record | `SEAL_VERSION = 1`, `silentsilo-crypto/sealed.rs` | Refuses, naming the version |
 | Blob | `blobs/….sslo` | `SSLO_VERSION = 1`, `silentsilo-crypto/blob.rs` | Refuses, naming the version |
-| Recovery envelope | `recovery.env` | `RECOVERY_ENVELOPE_VERSION = 1`, plus stored KDF parameters and an optional `auth` tag | Refuses on a newer structure; a parameter change needs no bump. `auth` is absent from the JSON when there is none, so a client that does not know it reads and rewrites the rest unchanged (below) |
+| Recovery envelope | `recovery.env` | `RECOVERY_ENVELOPE_VERSION = 1`, plus stored KDF parameters and the optional `auth` and `auth_dek` tags | Refuses on a newer structure; a parameter change needs no bump. Each tag is absent from the JSON when there is none, so a client that does not know it reads and rewrites the rest unchanged (below) |
 | Key envelopes | `keys/….env` | **No file version.** Plain JSON of one enrolled key, carrying `kind` (what unwraps its `wrapped_dek`) and `derivation` (how that key was derived from the authenticator) | Ignores an envelope whose `kind` or `derivation` it does not know, and refuses by name when none is left it can use |
 | Content KEK | `keys/content.kek` | Sealed payload under the vault DEK | Refuses, naming the version |
 | Inbox key | `inbox/keys/….sealed` | `INBOX_VERSION = 1` inside a sealed payload under the content KEK, `silentsilo-sync/inbox.rs` | 1.0.0 never lists `inbox/`. A build with the inbox skips a key it cannot read |
@@ -287,9 +287,9 @@ test runs the 1.0.0 vault code itself against them and against a
 `keys/fido.json` it loads and saves back.
 
 The field is not for this build. It is for the one that meets a key it has
-never heard of, and that is not a hypothetical: a macOS build would enrol
-Touch ID keys through the Secure Enclave, and a Linux one may use a TPM.
-Neither derives anything a FIDO2 backend can produce, and every device on a
+never heard of. Touch ID and Face ID keys go through the Secure Enclave, an
+Android key through the Keystore, and a Linux build may one day use a TPM.
+None derives anything a FIDO2 backend can produce, and every device on a
 silo reads every other device's envelopes.
 
 So the rule for anything reading these:
@@ -377,7 +377,8 @@ which is the behaviour a version field would have been for.
 
 `recovery.env` in the bucket and `keys/recovery.json` in the silo folder hold
 the same JSON: the version, the Argon2id parameters, the salt, the wrapped
-DEK, `created_at`, and since core 1.6.0 an optional `auth`.
+DEK, `created_at`, since core 1.6.0 an optional `auth`, and since core
+1.10.0 an optional `auth_dek`.
 
 `auth` is a tag over every other field, hex, 32 bytes: BLAKE3 keyed by
 `blake3::derive_key("silentsilo recovery envelope auth v1", content_kek)`
@@ -983,12 +984,6 @@ directory appends its lines, printed by `cargo run -p silentsilo-fixture --
 sums <directory>`; a changed line is a regenerated fixture and fails. The
 crate's `.gitattributes` marks the fixtures binary, so no checkout rewrites
 their line endings.
-
-The one exception, and it expires with this release: while nothing had
-shipped, the formats iterated freely and the fixture was regenerated to match,
-because no silo written by an older iteration existed outside this repository.
-From 1.0.0 onward that reasoning is gone and the rule above is the whole
-rule.
 
 ## Per-blob content keys
 
