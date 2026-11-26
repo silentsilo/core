@@ -487,7 +487,11 @@ synced everything may compact. Order, one way only: capture, publish the
 snapshot to every target, read it back and refuse to prune unless the bytes
 in storage are the bytes written (it is about to become the only copy of
 everything below the horizon), delete covered ops from targets that allow
-it, prune locally (unpushed records are never dropped and are reported as
+it. "Covered" means held in this device's log or named by
+the listing its pass already read (`sync::Covered`): a record a device
+back from a long time offline pushed under the horizon after that listing
+is in no snapshot, so it is kept, and while one is there compaction waits
+for the next pass to fetch it (`uncovered_below`). Then prune locally (unpushed records are never dropped and are reported as
 stranded). A snapshot is captured from this device's base plus its log,
 never from the log alone: after a rebuild or an earlier compaction the log
 starts at the base, and a snapshot of the log alone left out everything
@@ -746,6 +750,14 @@ Read this before "fixing" any of it.
   before it skips a record, so storage is trusted no further. Without it a
   record that came from storage had no row for the copy it came from, so it
   read as "changes waiting" and the next pass asked the copy for it again.
+- **A record a copy stops listing is sent to it again.** The other way
+  round: a record marked as held by a copy, above that copy's newest
+  snapshot, that its listing no longer names (the folder deleted at the
+  provider, a record lost there) has its row dropped and goes out on the
+  next pass (`delivered_but_unlisted`, `forget_delivered`). Trusted for
+  good, a wiped cloud folder was rewritten empty and read as synced, and a
+  device joining from it got a silo with holes. The copy's snapshot horizon
+  is asked only when something is missing.
 - **Passes are per silo, and a key operation holds them all.** Two passes
   over one silo would read the same pending queue and send it twice; two
   silos share nothing a pass writes. A key operation (rotation, a key added
@@ -903,7 +915,9 @@ Read this before "fixing" any of it.
   joining a group asks for the name shown where they would not, and asking
   for a taken suffix renames its holders first. Emptying the trash moves
   live entries out of trashed folders before the purge, a purge names the
-  conflict copies it takes along, and the last entry of each group a purge
+  conflict copies it takes along (a copy still out of the trash is recorded
+  again under a new id first, as a move is, so emptying the trash never
+  takes a file the person kept: `Vfs::keep_live_copies`), and the last entry of each group a purge
   left gaps in is renamed to the name it already asked for, because 1.0.0
   does not rank a group again on purge. The extra renames look redundant
   here and are not. Changes made at once on two devices can still meet on

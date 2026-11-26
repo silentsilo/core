@@ -554,10 +554,17 @@ impl Walk<'_> {
             Err(e) => return Err(FolderStore::map_io(e, &dir.display().to_string())),
         };
 
-        for entry in entries.flatten() {
+        // An entry that cannot be read fails the listing. Skipped, it made a
+        // short listing look complete, and a compaction pruned against it.
+        for entry in entries {
+            let entry = entry.map_err(|e| FolderStore::map_io(e, &dir.display().to_string()))?;
             let path = entry.path();
-            let Ok(mut kind) = entry.file_type() else {
-                continue;
+            let mut kind = match entry.file_type() {
+                Ok(kind) => kind,
+                // Gone since the directory was read: renamed into place or
+                // deleted by another writer, not something missed.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(FolderStore::map_io(e, &path.display().to_string())),
             };
             // A link is followed only where it stays inside the root: one
             // planted to point at the rest of the disk lists nothing.

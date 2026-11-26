@@ -442,8 +442,17 @@ pub fn release_purged_blob(
                 |row| row.get(0),
             )
             .optional()?;
-        if synced == Some(0) {
-            return Ok(());
+        match synced {
+            Some(0) => return Ok(()),
+            // No row: whether a copy holds it is unknown, and this may be
+            // the only one. Recorded as unsent, so the push takes it first.
+            None => {
+                let path = blobs_dir(vault_root).join(format!("{blob_id}.sslo"));
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    return record_blob_present(vault_root, blob_id, meta.len() as i64, false);
+                }
+            }
+            Some(_) => {}
         }
     }
     remove_blob_from_cache(vault_root, blob_id)
@@ -553,6 +562,28 @@ mod tests {
             params![blob_id.to_string(), at],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn a_purged_blob_with_no_row_is_kept_for_the_push() {
+        // An import whose row was never written: nothing says a copy has it.
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::create_dir_all(blobs_dir(&root)).unwrap();
+        let id = Uuid::new_v4();
+        let path = blobs_dir(&root).join(format!("{id}.sslo"));
+        std::fs::write(&path, vec![0u8; 100]).unwrap();
+
+        release_purged_blob(&root, id, true).unwrap();
+        assert!(path.exists(), "the only copy stays");
+        assert!(
+            list_unsynced_blob_ids(&root).contains(&id),
+            "and waits to be sent"
+        );
+
+        record_blob_present(&root, id, 100, true).unwrap();
+        release_purged_blob(&root, id, true).unwrap();
+        assert!(!path.exists(), "once sent, it goes");
     }
 
     #[test]

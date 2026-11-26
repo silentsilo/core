@@ -36,6 +36,10 @@ pub struct Backup {
     /// Every password entry, decrypted. Someone reaching for this tool has
     /// lost the machine, and the logins are as much theirs as the files.
     pub passwords: Vec<serde_json::Value>,
+    /// Records in storage that would not open, as `key: why`. The rest is
+    /// still read: this tool is the last way out, and one damaged record,
+    /// or one a key rotation left behind, must not keep everything else in.
+    pub unreadable: Vec<String>,
     /// Kept so extraction can open content without asking again. The vault
     /// key is not: it opened the records, and content is under keys of its
     /// own wrapped by this one.
@@ -246,9 +250,16 @@ pub async fn open(store: &dyn ObjectStore, code: &str) -> Result<Backup, Extract
     // Only what the snapshot does not already cover: a record below the
     // horizon must never be applied on top of it.
     let horizon = snapshot.as_ref().map(|s| s.horizon).unwrap_or(0);
-    let records = silentsilo_sync::fetch_all_ops_above(store, &dek, horizon)
-        .await
-        .map_err(|e| ExtractError::Storage(e.to_string()))?;
+    let fetched =
+        silentsilo_sync::fetch_missing_ops(store, &dek, &std::collections::HashSet::new(), horizon)
+            .await
+            .map_err(|e| ExtractError::Storage(e.to_string()))?;
+    let records = fetched.records;
+    let unreadable: Vec<String> = fetched
+        .unreadable
+        .iter()
+        .map(|u| format!("{}: {}", u.key, u.error))
+        .collect();
 
     silentsilo_vault::init_openssl();
     let conn =
@@ -267,6 +278,7 @@ pub async fn open(store: &dyn ObjectStore, code: &str) -> Result<Backup, Extract
         vault_id: manifest.vault_id,
         entries: read_entries(&conn).map_err(|e| ExtractError::Vault(e.to_string()))?,
         passwords: read_passwords(&conn, &kek)?,
+        unreadable,
         kek,
     })
 }

@@ -14,13 +14,13 @@ pub use digest::{digest, digest_difference};
 pub use names::{MAX_NAME_BYTES, check as check_name, sanitize as sanitize_name};
 pub use oplog::{
     ApplyOutcome, LAMPORT_CEILING, OpBody, OpRecord, ReplayReport, VaultOp, all_op_ids, all_ops,
-    apply_op, chain_holes, chain_tip, clear_pushed, device_id, emit, highest_applied_lamport,
-    init_delivery, init_oplog_core, init_oplog_derived, mark_delivered, mark_listed_delivered,
-    next_lamport, observe_lamport, pending_count, pending_count_for, pending_ops, pending_ops_for,
-    rebuild_derived, record_target_failure, record_target_success, replay, reset_target_backoff,
-    set_target_retired, settle_delivery, settle_delivery_among, target_failures,
-    target_last_success, target_ready, target_retired, target_retry_in, undelivered_own_ops,
-    verify_chains,
+    apply_op, chain_holes, chain_tip, clear_pushed, delivered_but_unlisted, device_id, emit,
+    forget_delivered, highest_applied_lamport, init_delivery, init_oplog_core, init_oplog_derived,
+    mark_delivered, mark_listed_delivered, next_lamport, observe_lamport, pending_count,
+    pending_count_for, pending_ops, pending_ops_for, rebuild_derived, record_target_failure,
+    record_target_success, replay, reset_target_backoff, set_target_retired, settle_delivery,
+    settle_delivery_among, target_failures, target_last_success, target_ready, target_retired,
+    target_retry_in, undelivered_own_ops, verify_chains,
 };
 pub use ops::{AttachmentBlob, MAX_ENTRY_BYTES, Vfs, guess_mime};
 pub use schema::{SCHEMA_VERSION, init_schema, root_folder_id_for};

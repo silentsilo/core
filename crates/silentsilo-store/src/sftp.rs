@@ -478,6 +478,14 @@ async fn replace(
     }
 }
 
+/// The key an object set aside by [`replace`] belongs to: `<name>.<32 hex>.old`.
+fn set_aside_from(name: &str) -> Option<&str> {
+    let rest = name.strip_suffix(".old")?;
+    let (base, tag) = rest.rsplit_once('.')?;
+    (tag.len() == 32 && tag.bytes().all(|b| b.is_ascii_hexdigit()) && !base.is_empty())
+        .then_some(base)
+}
+
 fn missing(err: &russh_sftp::client::error::Error) -> bool {
     matches!(
         err,
@@ -733,11 +741,22 @@ impl ObjectStore for SftpStore {
                     Err(e) => return Err(StoreError::Other(format!("{relative}: {e}"))),
                 };
 
+                let mut set_aside: Vec<(String, String, i64)> = Vec::new();
+                let mut here = std::collections::HashSet::new();
                 for entry in entries {
                     let name = entry.file_name();
                     if name == "." || name == ".." {
                         continue;
                     }
+                    if let Some(base) = set_aside_from(&name) {
+                        set_aside.push((
+                            name.clone(),
+                            base.to_string(),
+                            entry.metadata().size.unwrap_or(0) as i64,
+                        ));
+                        continue;
+                    }
+                    here.insert(name.clone());
                     let key = if relative.is_empty() {
                         name.clone()
                     } else {
@@ -763,6 +782,31 @@ impl ObjectStore for SftpStore {
                         if out.len() > crate::MAX_LISTED {
                             return Err(crate::listed_too_many(&self.describe()));
                         }
+                    }
+                }
+                // An object set aside by an overwrite that was cut off before
+                // the new one landed: the only copy, under a name nothing
+                // reads. Put back and listed.
+                for (aside, base, size) in set_aside {
+                    if here.contains(&base) {
+                        continue;
+                    }
+                    let key = if relative.is_empty() {
+                        base.clone()
+                    } else {
+                        format!("{relative}/{base}")
+                    };
+                    if !crate::is_safe_key(&key) {
+                        continue;
+                    }
+                    let from = self.path_for(&if relative.is_empty() {
+                        aside.clone()
+                    } else {
+                        format!("{relative}/{aside}")
+                    })?;
+                    if sftp.rename(from, self.path_for(&key)?).await.is_ok() {
+                        here.insert(base);
+                        out.push(StoredObject { key, size });
                     }
                 }
             }
@@ -800,6 +844,19 @@ impl ObjectStore for SftpStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_name_replace_set_aside_reads_as_set_aside() {
+        let tag = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            set_aside_from(&format!("1-a-b.op.{tag}.old")),
+            Some("1-a-b.op")
+        );
+        assert_eq!(set_aside_from("1-a-b.op.old"), None);
+        assert_eq!(set_aside_from(&format!("{tag}.old")), None);
+        assert_eq!(set_aside_from(&format!("x.{}.old", &tag[..31])), None);
+        assert_eq!(set_aside_from("x.op"), None);
+    }
 
     fn config() -> SftpConfig {
         SftpConfig {

@@ -148,6 +148,66 @@ async fn pruning_removes_the_records_at_and_below_the_horizon() {
 }
 
 #[tokio::test]
+async fn a_record_pushed_late_under_the_horizon_is_neither_pruned_nor_compacted_over() {
+    // C listed, then D (back from a long time offline) pushed a record under
+    // the horizon C was about to compact at. C's snapshot does not hold it.
+    let (_dir, store) = store();
+    let dek = generate_dek();
+    let (c, d) = (Uuid::new_v4(), Uuid::new_v4());
+    let held: Vec<OpRecord> = (1..=4).map(|lamport| record(lamport, c)).collect();
+    push_ops(&store, &dek, &held).await.unwrap();
+    let listed: std::collections::HashSet<String> = store
+        .list("ops/")
+        .await
+        .unwrap()
+        .iter()
+        .map(|e| {
+            e.key
+                .trim_start_matches("ops/")
+                .trim_end_matches(".op")
+                .to_string()
+        })
+        .collect();
+    let late = record(2, d);
+    push_ops(&store, &dek, std::slice::from_ref(&late))
+        .await
+        .unwrap();
+
+    let held_ids: std::collections::HashSet<Uuid> = held.iter().map(|r| r.op_id).collect();
+    let covered = silentsilo_sync::Covered {
+        held: &held_ids,
+        listed: &listed,
+        below: 0,
+    };
+    assert_eq!(
+        silentsilo_sync::uncovered_below(&store, 3, &covered)
+            .await
+            .unwrap(),
+        1,
+        "compaction waits for the late record"
+    );
+
+    let snapshot = snapshot_at(Uuid::new_v4(), 3);
+    let outcome =
+        silentsilo_sync::publish_compaction_covering(&store, &dek, &snapshot, true, &covered)
+            .await
+            .unwrap();
+    assert_eq!(outcome.deleted, 3, "C's own records under the horizon go");
+    let left: Vec<String> = store
+        .list("ops/")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.key)
+        .collect();
+    assert!(
+        left.iter()
+            .any(|k| k.ends_with(&format!("{}.op", late.op_id))),
+        "the late record stays: {left:?}"
+    );
+}
+
+#[tokio::test]
 async fn pruning_leaves_objects_this_build_cannot_read() {
     // An object under `ops/` whose key says nothing this version recognises
     // belongs to a newer format. Deleting it would be this build throwing

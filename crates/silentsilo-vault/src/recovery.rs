@@ -124,6 +124,17 @@ impl RecoveryEnvelope {
         self.auth_dek = Some(self.tag_with_dek(kek, dek).to_hex().to_string());
     }
 
+    /// Dates a new envelope at `earliest` or later and stamps it again. A
+    /// code made on a device whose clock is behind the one that made the
+    /// last code, or turned it off, must still be the newer one, and the
+    /// date is inside both tags.
+    pub fn date_after(&mut self, earliest: i64, kek: &ContentKek, dek: &MasterDek) {
+        if self.created_at < earliest {
+            self.created_at = earliest;
+            self.authenticate(kek, dek);
+        }
+    }
+
     /// Whether this envelope carries the tag only a holder of the current
     /// vault key can make. False without one: core before 1.10.0 wrote none.
     pub fn is_authentic_now(&self, kek: &ContentKek, dek: &MasterDek) -> bool {
@@ -313,6 +324,18 @@ mod tests {
     /// never rotates, which is why it is what the tag is keyed by.
     fn kek() -> ContentKek {
         generate_content_kek()
+    }
+
+    #[test]
+    fn an_envelope_dated_later_still_carries_tags_that_verify() {
+        let (dek, kek) = (generate_dek(), kek());
+        let (_, mut envelope) = create_recovery_envelope(&dek, &kek).unwrap();
+        let later = envelope.created_at + 86_400;
+        envelope.date_after(later, &kek, &dek);
+        assert_eq!(envelope.created_at, later);
+        assert!(envelope.is_authentic_now(&kek, &dek));
+        envelope.date_after(later - 10, &kek, &dek);
+        assert_eq!(envelope.created_at, later, "never moved back");
     }
 
     #[test]

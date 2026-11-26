@@ -2144,6 +2144,7 @@ impl<'a> Vfs<'a> {
     /// (`oplog::touches_after_purge`).
     fn emit_purge(&self, folder_ids: Vec<Uuid>, file_ids: Vec<Uuid>) -> CoreResult<()> {
         let tx = self.begin()?;
+        self.keep_live_copies(&file_ids)?;
         // Copies named, not implied: 1.0.0 keeps what a purge does not name.
         let groups = crate::oplog::purge_groups(self.conn(), &file_ids)?;
         let file_ids: Vec<Uuid> = groups.iter().flatten().copied().collect();
@@ -2160,6 +2161,37 @@ impl<'a> Vfs<'a> {
             )?;
         }
         Self::commit(tx)
+    }
+
+    /// A purge takes a file's conflict copies along, on every version. A
+    /// copy still out of the trash is a file the person kept, so it is
+    /// recorded again under a new id first, as a move is, and its old row
+    /// goes to the trash and then with the purge. Copies of that copy too.
+    fn keep_live_copies(&self, file_ids: &[Uuid]) -> CoreResult<()> {
+        let db = |e: rusqlite::Error| CoreError::Database(e.to_string());
+        let mut queue: Vec<Uuid> = file_ids.to_vec();
+        while let Some(id) = queue.pop() {
+            let live: Vec<(String, String)> = self
+                .conn()
+                .prepare(
+                    "SELECT c.copy_id, f.folder_id FROM conflict_copies c
+                       JOIN files f ON f.id = c.copy_id
+                      WHERE c.file_id = ?1 AND f.deleted_at IS NULL
+                      ORDER BY c.copy_id",
+                )
+                .map_err(db)?
+                .query_map([id.to_string()], |row| Ok((row.get(0)?, row.get(1)?)))
+                .map_err(db)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(db)?;
+            for (copy, folder) in live {
+                let copy = parse_id(&copy)?;
+                self.trash_file(copy)?;
+                self.copy_file_row(copy, parse_id(&folder)?)?;
+                queue.push(copy);
+            }
+        }
+        Ok(())
     }
 
     fn emit_purge_records(&self, folder_ids: Vec<Uuid>, groups: Vec<Vec<Uuid>>) -> CoreResult<()> {

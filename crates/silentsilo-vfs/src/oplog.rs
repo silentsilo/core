@@ -4237,6 +4237,55 @@ pub fn mark_listed_delivered(
     }
 }
 
+/// Records marked as held by `target` that its listing no longer names,
+/// above `above`, as `(op_id, lamport)`. A folder deleted at the provider or
+/// a record lost there reads as delivered for good otherwise, and a device
+/// joining from that copy got a silo with holes. At or below a snapshot's
+/// horizon a record may be pruned, so those are left alone.
+pub fn delivered_but_unlisted(
+    conn: &Connection,
+    target: Uuid,
+    listed: &std::collections::HashSet<String>,
+    above: u64,
+) -> CoreResult<Vec<(Uuid, u64)>> {
+    let db = |e: rusqlite::Error| CoreError::Database(e.to_string());
+    let rows: Vec<(String, i64, String)> = conn
+        .prepare(
+            "SELECT o.op_id, o.lamport, o.device_id FROM oplog o
+               JOIN op_delivery d ON d.op_id = o.op_id AND d.target = ?1
+              WHERE o.lamport > ?2",
+        )
+        .map_err(db)?
+        .query_map(
+            params![target.to_string(), above.min(i64::MAX as u64) as i64],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(db)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(db)?;
+    let mut out = Vec::new();
+    for (id, lamport, device) in rows {
+        if !listed.contains(&format!("{lamport:020}-{device}-{id}")) {
+            out.push((parse_uuid(&id)?, lamport.max(0) as u64));
+        }
+    }
+    Ok(out)
+}
+
+/// Drops `target`'s delivery rows for `ops`, so the next pass sends them.
+pub fn forget_delivered(conn: &Connection, target: Uuid, ops: &[Uuid]) -> CoreResult<usize> {
+    let db = |e: rusqlite::Error| CoreError::Database(e.to_string());
+    let mut stmt = conn
+        .prepare_cached("DELETE FROM op_delivery WHERE target = ?1 AND op_id = ?2")
+        .map_err(db)?;
+    let target = target.to_string();
+    let mut dropped = 0;
+    for id in ops {
+        dropped += stmt.execute(params![target, id.to_string()]).map_err(db)?;
+    }
+    Ok(dropped)
+}
+
 /// Records this device still owes one particular target.
 pub fn pending_ops_for(conn: &Connection, target: Uuid) -> CoreResult<Vec<OpRecord>> {
     let mut stmt = conn

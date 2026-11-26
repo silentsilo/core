@@ -480,3 +480,32 @@ async fn an_organisation_s_log_is_named_and_left_alone() {
     assert!(matches!(log, silentsilo_extract::ActivityLog::Organisation));
     assert!(!out_dir.path().join("_activity").exists());
 }
+
+#[tokio::test]
+async fn a_record_that_will_not_open_leaves_the_rest_readable() {
+    // A rotation leaves records it could not reseal, and junk can be written
+    // under ops/. The last way out must still give back everything else.
+    let silo_dir = tempfile::tempdir().unwrap();
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = FolderStore::new(store_dir.path().to_path_buf());
+    let session = silo(silo_dir.path());
+    let root = Vfs::new(&session).root_folder_id().unwrap();
+    let a = add_file(&session, root, "notes.txt", b"still here");
+    let code = publish(&session, &store as &dyn ObjectStore, &[a]).await;
+    let junk = format!(
+        "ops/{:020}-{}-{}.op",
+        u64::MAX / 4,
+        Uuid::new_v4(),
+        Uuid::new_v4()
+    );
+    store
+        .put(&junk, b"not a sealed record".to_vec())
+        .await
+        .unwrap();
+
+    let backup = silentsilo_extract::open(&store as &dyn ObjectStore, &code)
+        .await
+        .expect("one bad record does not close the backup");
+    assert_eq!(backup.file_count(), 1);
+    assert_eq!(backup.unreadable.len(), 1, "{:?}", backup.unreadable);
+}

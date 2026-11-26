@@ -206,6 +206,119 @@ fn a_purge_leaves_1_0_0_names_ranked_as_here() {
     applies_on_1_0_0(&old, &new);
 }
 
+/// Two devices edit a.txt in F at once, so F holds a.txt and its conflict
+/// copy. Returns the session, F's id, a.txt's id and the copy's id.
+fn with_a_conflict_copy(old: &vault_v1::VaultSession, new: &VaultSession) -> (Uuid, Uuid, Uuid) {
+    let _ = old;
+    let other = VaultSession {
+        paths: silentsilo_vault::VaultPaths::new(PathBuf::from("unused")),
+        conn: Connection::open_in_memory().unwrap(),
+        vault_id: new.vault_id,
+        dek: silentsilo_crypto::MasterDek::from_bytes(*new.dek.as_bytes()),
+        kek: silentsilo_crypto::ContentKek::from_bytes(*new.kek.as_bytes()),
+    };
+    other.conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+    Vfs::new(&other).ensure_initialized().unwrap();
+    let exchange = |from: &VaultSession, to: &VaultSession| {
+        silentsilo_vfs::replay(&to.conn, silentsilo_vfs::all_ops(&from.conn).unwrap()).unwrap();
+    };
+    let vfs = Vfs::new(new);
+    let root = vfs.root_folder_id().unwrap();
+    let folder = vfs.create_folder(root, "F").unwrap();
+    vfs.add_file(folder.id, "a.txt", Uuid::new_v4(), 1, "h", None, "k")
+        .unwrap();
+    exchange(new, &other);
+    vfs.add_file(folder.id, "a.txt", Uuid::new_v4(), 2, "h2", None, "k")
+        .unwrap();
+    Vfs::new(&other)
+        .add_file(folder.id, "a.txt", Uuid::new_v4(), 3, "h3", None, "k")
+        .unwrap();
+    exchange(&other, new);
+    let listed = vfs.list_folder(folder.id).unwrap();
+    let files: Vec<_> = listed
+        .iter()
+        .filter_map(|e| match e {
+            silentsilo_core::VaultEntry::File(f) => Some(f.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(files.len(), 2, "a copy");
+    let original = files.iter().find(|f| f.name == "a.txt").unwrap().id;
+    let copy = files.iter().find(|f| f.name != "a.txt").unwrap().id;
+    (folder.id, original, copy)
+}
+
+/// The copy's content, still live under the name it had.
+fn copy_survives(new: &VaultSession, copy_blob: Uuid, name: &str) {
+    let live: Vec<String> = new
+        .conn
+        .prepare("SELECT name FROM files WHERE blob_id = ?1 AND deleted_at IS NULL")
+        .unwrap()
+        .query_map([copy_blob.to_string()], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        live,
+        vec![name.to_string()],
+        "the conflict copy was purged with its file"
+    );
+}
+
+fn name_of(new: &VaultSession, id: Uuid) -> String {
+    new.conn
+        .query_row(
+            "SELECT name FROM files WHERE id = ?1",
+            [id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+fn blob_of(new: &VaultSession, id: Uuid) -> Uuid {
+    let blob: String = new
+        .conn
+        .query_row(
+            "SELECT blob_id FROM files WHERE id = ?1",
+            [id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    Uuid::parse_str(&blob).unwrap()
+}
+
+#[test]
+fn emptying_the_trash_keeps_a_conflict_copy_that_was_not_trashed() {
+    for _ in 0..8 {
+        let (old, new) = side_by_side();
+        let (_, original, copy) = with_a_conflict_copy(&old, &new);
+        let copy_blob = blob_of(&new, copy);
+        let copy_name = name_of(&new, copy);
+        let vfs = Vfs::new(&new);
+        vfs.trash_file(original).unwrap();
+        vfs.empty_trash().unwrap();
+        copy_survives(&new, copy_blob, &copy_name);
+        applies_on_1_0_0(&old, &new);
+    }
+}
+
+#[test]
+fn moving_a_file_then_emptying_the_trash_keeps_its_conflict_copy() {
+    for _ in 0..8 {
+        let (old, new) = side_by_side();
+        let (_, original, copy) = with_a_conflict_copy(&old, &new);
+        let copy_blob = blob_of(&new, copy);
+        let copy_name = name_of(&new, copy);
+        let vfs = Vfs::new(&new);
+        let root = vfs.root_folder_id().unwrap();
+        let elsewhere = vfs.create_folder(root, "G").unwrap();
+        vfs.move_file(original, elsewhere.id).unwrap();
+        vfs.empty_trash().unwrap();
+        copy_survives(&new, copy_blob, &copy_name);
+        applies_on_1_0_0(&old, &new);
+    }
+}
+
 #[test]
 fn a_purge_names_the_conflict_copies_it_takes_along() {
     // Which device's edit sorts first depends on the random device ids, and

@@ -192,6 +192,7 @@ impl Silo {
                 &silentsilo_sync::SiloState {
                     vault_id: self.vault_id,
                     dek: &self.dek,
+                    kek: &self.session.kek,
                     kek_envelope: &kek_envelope,
                     recovery: None,
                     keys: None,

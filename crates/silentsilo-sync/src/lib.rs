@@ -704,6 +704,90 @@ pub async fn publish_compaction(
     prune_ops_below(client, snapshot.horizon).await
 }
 
+/// What a compacting device may delete below its horizon: records it holds,
+/// which its snapshot accounts for, and records its pass had already listed
+/// (an object that does not open, which it was going to prune anyway). A
+/// record pushed late by a device back from a long time offline, after this
+/// pass listed and before it pruned, is neither, and is kept.
+pub struct Covered<'a> {
+    /// Op ids in the compacting device's log.
+    pub held: &'a std::collections::HashSet<Uuid>,
+    /// Object names the pass listed on this target ([`MissingOps::listed`]).
+    pub listed: &'a std::collections::HashSet<String>,
+    /// The device's previous horizon: everything at or below it is covered
+    /// by the snapshot before.
+    pub below: u64,
+}
+
+impl Covered<'_> {
+    fn covers(&self, key: &str, lamport: u64) -> bool {
+        if lamport <= self.below {
+            return true;
+        }
+        let Some(name) = key
+            .strip_prefix(OPS_PREFIX)
+            .and_then(|k| k.strip_suffix(".op"))
+        else {
+            return false;
+        };
+        self.listed.contains(name) || op_id_from_key(key).is_some_and(|id| self.held.contains(&id))
+    }
+}
+
+/// How many records at or below `horizon` a snapshot there would not
+/// account for. Compaction waits while there are any: the next pass fetches
+/// them and the snapshot after it holds them.
+pub async fn uncovered_below(
+    client: &dyn ObjectStore,
+    horizon: u64,
+    covered: &Covered<'_>,
+) -> Result<usize, SyncError> {
+    Ok(client
+        .list(OPS_PREFIX)
+        .await?
+        .iter()
+        .filter(|entry| {
+            lamport_from_key(&entry.key)
+                .is_some_and(|lamport| lamport <= horizon && !covered.covers(&entry.key, lamport))
+        })
+        .count())
+}
+
+/// [`publish_compaction`] for a device that compacts a log storage may add
+/// to meanwhile: the prune deletes only what `covered` accounts for.
+pub async fn publish_compaction_covering(
+    client: &dyn ObjectStore,
+    dek: &MasterDek,
+    snapshot: &Snapshot,
+    prune: bool,
+    covered: &Covered<'_>,
+) -> Result<PruneOutcome, SyncError> {
+    put_snapshot(client, dek, snapshot).await?;
+    if !prune {
+        return Ok(PruneOutcome::default());
+    }
+    let echoed = client.get(&snapshot_key(snapshot.horizon)).await?;
+    let echoed = Snapshot::from_bytes(&unseal(&echoed, dek)?)?;
+    if echoed != *snapshot {
+        return Err(SyncError::Storage(
+            "the snapshot did not read back as written, so nothing was pruned".into(),
+        ));
+    }
+    let mut outcome = PruneOutcome::default();
+    for entry in client.list(OPS_PREFIX).await? {
+        match lamport_from_key(&entry.key) {
+            Some(lamport) if lamport <= snapshot.horizon && covered.covers(&entry.key, lamport) => {
+            }
+            _ => continue,
+        }
+        match client.delete(&entry.key).await {
+            Ok(()) => outcome.deleted += 1,
+            Err(e) => outcome.failed.push((entry.key.clone(), e.to_string())),
+        }
+    }
+    Ok(outcome)
+}
+
 /// Step three: record the snapshot locally and drop the records it covers.
 ///
 /// Safe to skip if the process dies first: the device simply keeps a log it
@@ -2787,6 +2871,8 @@ pub async fn push_recovery_envelope(
 pub async fn ensure_recovery_envelope(
     client: &dyn ObjectStore,
     envelope: &RecoveryEnvelope,
+    kek: &ContentKek,
+    dek: &MasterDek,
 ) -> Result<bool, SyncError> {
     let bytes = serde_json::to_vec(envelope).map_err(|e| SyncError::Vault(e.to_string()))?;
     if client
@@ -2802,9 +2888,15 @@ pub async fn ensure_recovery_envelope(
         if held == bytes {
             return Ok(false);
         }
-        if serde_json::from_slice::<RecoveryEnvelope>(&held)
-            .is_ok_and(|stored| stored.created_at > envelope.created_at)
-        {
+        // Newer is kept, unless it carries the tag a 1.10.0 client stamps
+        // and that tag fails under this vault key: a code made under a key a
+        // rotation retired, which the code written down now does not match.
+        // An envelope with no such tag may come from an older client and is
+        // left alone.
+        if serde_json::from_slice::<RecoveryEnvelope>(&held).is_ok_and(|stored| {
+            stored.created_at > envelope.created_at
+                && (stored.auth_dek.is_none() || stored.is_authentic_now(kek, dek))
+        }) {
             return Ok(false);
         }
     }
@@ -3132,6 +3224,7 @@ pub struct TargetPush<'a> {
 pub struct SiloState<'a> {
     pub vault_id: Uuid,
     pub dek: &'a MasterDek,
+    pub kek: &'a ContentKek,
     /// Wrapped under the DEK before it goes up.
     pub kek_envelope: &'a [u8],
     pub recovery: Option<&'a RecoveryEnvelope>,
@@ -3242,7 +3335,12 @@ pub async fn push_records_to_reporting(
         silo.kek_envelope
     ));
     if let Some(recovery) = silo.recovery {
-        attempt!(ensure_recovery_envelope(target.store, recovery));
+        attempt!(ensure_recovery_envelope(
+            target.store,
+            recovery,
+            silo.kek,
+            silo.dek
+        ));
     }
     if let Some(base) = silo.base {
         attempt!(publish_base_if_missing(target.store, silo.dek, base));

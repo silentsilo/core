@@ -259,14 +259,14 @@ async fn a_read_that_fails_does_not_put_an_older_code_back() {
 
     let folder = FolderStore::new(dir.path().to_path_buf());
     assert!(
-        silentsilo_sync::ensure_recovery_envelope(&folder, &new)
+        silentsilo_sync::ensure_recovery_envelope(&folder, &new, &kek, &dek)
             .await
             .unwrap()
     );
 
     let flaky = ReadsFail(FolderStore::new(dir.path().to_path_buf()));
     assert!(
-        !silentsilo_sync::ensure_recovery_envelope(&flaky, &old)
+        !silentsilo_sync::ensure_recovery_envelope(&flaky, &old, &kek, &dek)
             .await
             .unwrap()
     );
@@ -279,14 +279,49 @@ async fn a_read_that_fails_does_not_put_an_older_code_back() {
     // Read properly, the newer one is still left alone, and a missing one
     // is still written.
     assert!(
-        !silentsilo_sync::ensure_recovery_envelope(&folder, &old)
+        !silentsilo_sync::ensure_recovery_envelope(&folder, &old, &kek, &dek)
             .await
             .unwrap()
     );
     folder.delete(silentsilo_sync::RECOVERY_KEY).await.unwrap();
     assert!(
-        silentsilo_sync::ensure_recovery_envelope(&flaky, &old)
+        silentsilo_sync::ensure_recovery_envelope(&flaky, &old, &kek, &dek)
             .await
             .unwrap()
     );
+}
+
+#[tokio::test]
+async fn a_newer_code_under_a_retired_key_gives_way_to_the_current_one() {
+    // A rotation replaced the vault key. A copy still holds a code made
+    // under the old one, dated later by a clock that ran ahead: the code
+    // written down after the rotation must still reach it.
+    let dir = tempfile::tempdir().unwrap();
+    let kek = silentsilo_crypto::generate_content_kek();
+    let (old_dek, dek) = (
+        silentsilo_crypto::generate_dek(),
+        silentsilo_crypto::generate_dek(),
+    );
+    let (_, mut retired) = silentsilo_vault::create_recovery_envelope(&old_dek, &kek).unwrap();
+    let (_, current) = silentsilo_vault::create_recovery_envelope(&dek, &kek).unwrap();
+    retired.date_after(current.created_at + 3600, &kek, &old_dek);
+
+    let folder = FolderStore::new(dir.path().to_path_buf());
+    folder
+        .put(
+            silentsilo_sync::RECOVERY_KEY,
+            serde_json::to_vec(&retired).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        silentsilo_sync::ensure_recovery_envelope(&folder, &current, &kek, &dek)
+            .await
+            .unwrap()
+    );
+    let held = silentsilo_sync::fetch_recovery_envelope(&folder)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(held.is_authentic_now(&kek, &dek));
 }

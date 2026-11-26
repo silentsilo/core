@@ -950,6 +950,35 @@ async fn records_that_came_from_storage_are_not_waiting_to_be_sent_back() {
 }
 
 #[tokio::test]
+async fn records_a_copy_lost_are_sent_to_it_again() {
+    // A folder deleted at the provider, or records lost there: the copy no
+    // longer lists them, and the device that sent them must send them again
+    // instead of trusting that they were delivered once.
+    let storage = tempfile::tempdir().unwrap();
+    let target = folder_target(storage.path().to_path_buf(), TargetRole::Working);
+
+    let a = Device::new(Uuid::new_v4(), None);
+    *a.host.targets.lock().unwrap() = vec![target.clone()];
+    a.make_folder("Kept");
+    a.make_folder("Also kept");
+    a.pass().await;
+    assert_eq!(a.pending(), 0);
+
+    let ops = storage.path().join("ops");
+    std::fs::remove_dir_all(&ops).unwrap();
+    std::fs::create_dir_all(&ops).unwrap();
+    a.pass().await;
+    a.pass().await;
+
+    let b = Device::new(a.vault_id(), Some(a.keys()));
+    *b.host.targets.lock().unwrap() = vec![target];
+    b.pass().await;
+    let names = b.folder_names();
+    assert!(names.contains(&"Kept".to_string()), "{names:?}");
+    assert!(names.contains(&"Also kept".to_string()), "{names:?}");
+}
+
+#[tokio::test]
 async fn a_resting_copy_is_not_a_reason_for_another_pass() {
     let good = tempfile::tempdir().unwrap();
     let dir = tempfile::tempdir().unwrap();

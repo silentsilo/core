@@ -181,6 +181,30 @@ async fn the_write_check_round_trips_and_leaves_nothing_behind() {
 }
 
 #[tokio::test]
+async fn sftp_puts_back_an_object_an_overwrite_left_set_aside() {
+    // Killed between moving the old object aside and renaming the new one
+    // in: only `<key>.<uuid>.old` is left, and a listing hid it for good.
+    let Some(store) = sftp_store().await else {
+        return;
+    };
+    let prefix = format!("aside-{}/", uuid::Uuid::new_v4().simple());
+    let key = format!("{prefix}00000000000000000001-a-b");
+    let aside = format!("{key}.{}.old", uuid::Uuid::new_v4().simple());
+    store.put(&aside, b"the only copy".to_vec()).await.unwrap();
+
+    let listed: Vec<String> = store
+        .list(&prefix)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|o| o.key)
+        .collect();
+    assert_eq!(listed, vec![key.clone()]);
+    assert_eq!(store.get(&key).await.unwrap(), b"the only copy");
+    store.delete(&key).await.unwrap();
+}
+
+#[tokio::test]
 async fn sftp_refuses_a_server_whose_key_is_not_the_pinned_one() {
     // The unit tests cover refusing to build a store with no fingerprint.
     // This covers the case that actually protects the user: a real server,

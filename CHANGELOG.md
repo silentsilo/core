@@ -9,6 +9,34 @@ This repository has its own version line, separate from the desktop
 application's. A client pins a tag from here; the tag it pins is what its
 release notes should say.
 
+## [Unreleased]
+
+No persisted format changed.
+
+### Fixed
+
+- Emptying the trash no longer deletes conflict copies that were not in it.
+  A purge takes a file's copies along on every version, so a live copy is
+  recorded again under a new id first. Moving a file left its copies tied
+  to the trashed row, and the next empty trash took them.
+- A record a copy no longer lists is sent to it again. A silo folder
+  deleted at OneDrive, Dropbox or Google Drive was rewritten empty and
+  read as synced, and a device joining from it got an empty silo.
+- Compaction deletes only records its snapshot holds, and waits while a
+  record pushed late under its horizon is in storage.
+- Content imported while its cache row could not be written is no longer
+  deleted as delivered when it is purged.
+- A new recovery code is dated after the last one and after any "turned
+  off", with its tags stamped again (`RecoveryEnvelope::date_after`). A
+  stored code made under a key a rotation retired gives way to the current
+  one.
+- A folder or S3 listing that comes back short is an error, not a smaller
+  listing.
+- SFTP: an object an overwrite set aside, when the app was stopped before
+  the new one landed, is put back at the next listing.
+- The extractor reads past a record that will not open and names it,
+  instead of refusing the whole backup.
+
 ## [1.11.5] - names, listings and temp files that storage controls
 
 No persisted format changed.

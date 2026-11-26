@@ -1351,6 +1351,7 @@ async fn pass(
         let silo_state = sync::SiloState {
             vault_id,
             dek: &dek,
+            kek: &kek,
             kek_envelope: &kek_envelope,
             recovery: recovery.as_ref(),
             keys: keys.as_ref(),
@@ -1493,6 +1494,57 @@ async fn pass(
                 {
                     status.failed = Some(format!("Could not read changes from it: {e}"));
                 }
+            }
+        }
+    }
+    // Records marked as held by a copy whose listing no longer names them,
+    // above that copy's newest snapshot: its folder was deleted at the
+    // provider or they were lost there. Sent again from the next pass.
+    let mut lost_on: Vec<(Uuid, Vec<Uuid>)> = Vec::new();
+    {
+        let candidates: Vec<(Uuid, Vec<(Uuid, u64)>)> = {
+            let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
+            match sessions.get(&silo.id) {
+                Some(session) => listed_on
+                    .iter()
+                    .map(|(target, listed)| {
+                        silentsilo_vfs::delivered_but_unlisted(
+                            &session.conn,
+                            *target,
+                            listed,
+                            local_horizon,
+                        )
+                        .map(|ops| (*target, ops))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| e.to_string())?,
+                None => Vec::new(),
+            }
+        };
+        for (id, ops) in candidates {
+            if ops.is_empty() {
+                continue;
+            }
+            let Some(target) = targets.iter().find(|t| t.id == id) else {
+                continue;
+            };
+            let Ok(horizon) = sync::snapshot_horizon(&*target.store).await else {
+                continue;
+            };
+            let lost: Vec<Uuid> = ops
+                .into_iter()
+                .filter(|(_, lamport)| *lamport > horizon)
+                .map(|(op, _)| op)
+                .collect();
+            if !lost.is_empty() {
+                host.warn(
+                    "sync",
+                    &format!(
+                        "{} records are missing from a copy that had them; sending them again",
+                        lost.len()
+                    ),
+                );
+                lost_on.push((id, lost));
             }
         }
     }
@@ -1669,6 +1721,10 @@ async fn pass(
             .conn
             .unchecked_transaction()
             .map_err(|e| e.to_string())?;
+        for (target, lost) in &lost_on {
+            silentsilo_vfs::forget_delivered(&session.conn, *target, lost)
+                .map_err(|e| e.to_string())?;
+        }
         for target in &targets {
             if pushed_to.contains(&target.id) {
                 mark_delivered(&session.conn, target.id, &target.owed)
@@ -1896,7 +1952,19 @@ async fn pass(
     // that fails keeps its whole log, which is safe: it simply has more
     // history than it needs.
     let compacted = if view_complete {
-        run_compaction(state, host, silo, &targets, &dek, vault_id).await?
+        run_compaction(
+            state,
+            host,
+            silo,
+            &targets,
+            &dek,
+            vault_id,
+            &PassListing {
+                listed_on: &listed_on,
+                local_horizon,
+            },
+        )
+        .await?
     } else {
         0
     };
@@ -2201,6 +2269,14 @@ const FULL_COPY_FETCH_PER_PASS: usize = 50;
 /// declare records deletable. Three phases because the vault connection
 /// cannot be held across an await. Failures are swallowed: compaction is
 /// housekeeping and the next pass proposes the same work again.
+/// What this pass read from storage, which a compaction may prune against.
+struct PassListing<'a> {
+    /// The object names each copy listed.
+    listed_on: &'a [(Uuid, std::collections::HashSet<String>)],
+    /// This device's horizon before the pass.
+    local_horizon: u64,
+}
+
 async fn run_compaction(
     state: &AppState,
     host: &dyn Host,
@@ -2208,6 +2284,7 @@ async fn run_compaction(
     targets: &[OpenTarget],
     dek: &silentsilo_crypto::MasterDek,
     vault_id: uuid::Uuid,
+    listing: &PassListing<'_>,
 ) -> Result<usize, String> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2220,11 +2297,34 @@ async fn run_compaction(
         let Some(session) = sessions.get(&silo.id) else {
             return Ok(0);
         };
-        sync::plan_compaction(&session.conn, vault_id, &policy, now)
+        sync::plan_compaction(&session.conn, vault_id, &policy, now).and_then(|planned| {
+            let held = silentsilo_vfs::all_op_ids(&session.conn)?;
+            Ok(planned.map(|snapshot| (snapshot, held)))
+        })
     };
-    let Ok(Some(snapshot)) = planned else {
+    let Ok(Some((snapshot, held))) = planned else {
         return Ok(0);
     };
+    let no_listing = std::collections::HashSet::new();
+    let covered_on = |id: Uuid| sync::Covered {
+        held: &held,
+        listed: listing
+            .listed_on
+            .iter()
+            .find(|(target, _)| *target == id)
+            .map_or(&no_listing, |(_, listed)| listed),
+        below: listing.local_horizon,
+    };
+    // A record pushed under the horizon since this pass listed, by a device
+    // back from a long time offline, is in no snapshot this device can make
+    // now. The next pass fetches it; compacting waits for that.
+    for target in targets {
+        match sync::uncovered_below(&*target.store, snapshot.horizon, &covered_on(target.id)).await
+        {
+            Ok(0) => {}
+            _ => return Ok(0),
+        }
+    }
     report_progress(
         state,
         host,
@@ -2245,9 +2345,15 @@ async fn run_compaction(
         // An append-only target takes the snapshot and keeps its whole log.
         // The snapshot still helps: it is a PUT on a fresh key and it is
         // what a joining device replays from instead of the log's start.
-        if sync::publish_compaction(&*target.store, dek, &snapshot, target.role.allows_delete())
-            .await
-            .is_ok()
+        if sync::publish_compaction_covering(
+            &*target.store,
+            dek,
+            &snapshot,
+            target.role.allows_delete(),
+            &covered_on(target.id),
+        )
+        .await
+        .is_ok()
         {
             published_anywhere = true;
         }

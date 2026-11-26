@@ -157,6 +157,15 @@ async fn run(args: Args, from: PathBuf, code: Zeroizing<String>) -> ExitCode {
         }
     };
 
+    if !backup.unreadable.is_empty() {
+        eprintln!(
+            "{} records in this backup would not open and were left out; what they changed may be missing:",
+            backup.unreadable.len()
+        );
+        for line in &backup.unreadable {
+            eprintln!("  {line}");
+        }
+    }
     println!(
         "Silo {} · {} files, {} in the trash, {} password entries",
         backup.vault_id,

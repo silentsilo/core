@@ -194,7 +194,10 @@ pub fn import_file(
         blob_id,
     )
     .map_err(|e| e.to_string())?;
-    let _ = silentsilo_vault::record_blob_present(root, blob_id, sealed.size_bytes as i64, false);
+    // Without its row the content reads as delivered, and a purge would
+    // delete the only copy.
+    silentsilo_vault::record_blob_present(root, blob_id, sealed.size_bytes as i64, false)
+        .map_err(|e| e.to_string())?;
     let mime = mime_type
         .filter(|m| !m.is_empty())
         .map(str::to_string)

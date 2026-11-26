@@ -746,8 +746,12 @@ impl S3Client {
 
             if output.is_truncated().unwrap_or(false) {
                 continuation = output.next_continuation_token().map(str::to_string);
+                // More to come and no way to ask for it: a short listing
+                // that looked complete is what a compaction prunes against.
                 if continuation.is_none() {
-                    break;
+                    return Err(S3Error::Service(format!(
+                        "the listing of {full_prefix} was cut short"
+                    )));
                 }
             } else {
                 break;
