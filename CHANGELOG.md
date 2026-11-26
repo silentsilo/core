@@ -9,7 +9,7 @@ This repository has its own version line, separate from the desktop
 application's. A client pins a tag from here; the tag it pins is what its
 release notes should say.
 
-## [Unreleased]
+## [1.11.7] - rotation reseals late records
 
 No persisted format changed.
 
