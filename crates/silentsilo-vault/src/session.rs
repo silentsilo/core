@@ -283,11 +283,13 @@ impl VaultSession {
 
         let vault_key = derive_vault_key(device_secret, &salt)?;
         let dek = load_dek(&paths.root, &vault_key.wrap_key)?;
+        // Before the working copy is touched: a key a rotation retired can
+        // still open an old `vault.db.enc`, and opening rewrites the copy.
+        let kek = load_kek(&paths.root, &dek)?;
 
         let conn = open_database(&paths, &dek)?;
 
         let vault_id = read_vault_id(&conn).ok_or(VaultError::NotFound)?;
-        let kek = load_kek(&paths.root, &dek)?;
 
         Ok(Self {
             paths,
@@ -316,11 +318,12 @@ impl VaultSession {
         }
 
         let dek = crate::dek_store::unwrap_dek_hex(wrapped_dek_hex, fido_wrap_key)?;
+        // Before the working copy is touched, as in `open`.
+        let kek = load_kek(&paths.root, &dek)?;
 
         let conn = open_database(&paths, &dek)?;
 
         let vault_id = read_vault_id(&conn).ok_or(VaultError::NotFound)?;
-        let kek = load_kek(&paths.root, &dek)?;
 
         // A key opens this silo, so the device secret earlier releases kept
         // after enrolment has nothing left to do. Best effort: it opens
@@ -347,9 +350,11 @@ impl VaultSession {
         if !paths.exists() {
             return Err(VaultError::NotFound);
         }
+        // Before the working copy is touched: an old recovery code can still
+        // open an old `vault.db.enc` after a rotation.
+        let kek = load_kek(&paths.root, &dek)?;
         let conn = open_database(&paths, &dek)?;
         let vault_id = read_vault_id(&conn).ok_or(VaultError::NotFound)?;
-        let kek = load_kek(&paths.root, &dek)?;
         Ok(Self {
             paths,
             conn,
@@ -416,8 +421,14 @@ impl VaultSession {
         let _ = self.flush_wal();
         let image = export_image(&self.conn)?;
         let sealed = encrypt_vault_bytes(&image, &self.paths.db_enc_path(), &self.dek)?;
-        std::fs::copy(self.paths.db_enc_path(), self.paths.db_enc_backup_path())?;
+        // Recorded before the shadow copy: with the snapshot replaced and its
+        // fingerprint unrecorded, the next unlock read the working copy as
+        // stale and dropped it, unpushed records included.
         record_fingerprint(&self.conn, STATE_SNAPSHOT, &sealed)?;
+        let bytes = std::fs::read(self.paths.db_enc_path())?;
+        silentsilo_core::write_replacing(&self.paths.db_enc_backup_path(), &bytes, |at| {
+            std::fs::File::create(at)
+        })?;
         mark_unchanged(&self.conn);
         Ok(sealed)
     }
@@ -1682,6 +1693,41 @@ mod tests {
         drop(reopened);
         let again = VaultSession::open_with_dek(root, new_dek).unwrap();
         assert_eq!(marker(&again.conn), "after");
+    }
+
+    /// A retired key that still opens an old `vault.db.enc` is refused before
+    /// the working copy is touched: opening rewrote it, and the changes made
+    /// since the last seal were lost.
+    #[test]
+    fn a_retired_key_leaves_the_working_copy_alone() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let session = silo_with_marker(&root, "secret", "before");
+        session.backup_locally().unwrap();
+        let paths = session.paths.clone();
+        let new_dek = generate_dek();
+        crate::rotation::stage_rotation(&root, &new_dek, &session.kek, &session.dek).unwrap();
+        crate::rotation::commit_rotation(&root).unwrap();
+        let old_dek = session.dek.clone();
+        drop(session);
+
+        let read_work = || {
+            let mut files: Vec<(std::path::PathBuf, Vec<u8>)> = std::fs::read_dir(paths.work_dir())
+                .unwrap()
+                .flatten()
+                .filter(|e| e.path().is_file())
+                .map(|e| (e.path(), std::fs::read(e.path()).unwrap()))
+                .collect();
+            files.sort();
+            files
+        };
+        let before = read_work();
+        assert!(VaultSession::open_with_dek(root.clone(), old_dek).is_err());
+        assert_eq!(
+            read_work(),
+            before,
+            "a retired key rewrote the working copy"
+        );
     }
 
     /// After a rotation commits, nothing in the work directory opens with

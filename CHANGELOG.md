@@ -9,7 +9,7 @@ This repository has its own version line, separate from the desktop
 application's. A client pins a tag from here; the tag it pins is what its
 release notes should say.
 
-## [Unreleased]
+## [1.11.6] - data loss fixes from the November review
 
 No persisted format changed.
 
@@ -36,6 +36,13 @@ No persisted format changed.
   the new one landed, is put back at the next listing.
 - The extractor reads past a record that will not open and names it,
   instead of refusing the whole backup.
+- Opening with a key a rotation retired is refused before the working copy
+  is touched. An old recovery code could still open an old `vault.db.enc`,
+  and opening rewrote the copy, losing the changes since the last seal.
+- A discarded rotation whose staged key could not be removed keeps its
+  staged KEK, so it is not taken for an interrupted commit.
+- The local snapshot's fingerprint is recorded before its shadow copy is
+  written, and the shadow copy is written by rename.
 
 ## [1.11.5] - names, listings and temp files that storage controls
 

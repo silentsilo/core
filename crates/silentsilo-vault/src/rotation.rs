@@ -332,8 +332,13 @@ fn retire_page_key(root: &Path) {
 /// discarding it is the loss this whole module exists to prevent.
 pub fn discard_staged(root: &Path) {
     let local = local_id(root);
-    if std::fs::remove_file(staged_dek_path(root)).is_ok() {
-        remove_local_staged(local);
+    match std::fs::remove_file(staged_dek_path(root)) {
+        Ok(()) => remove_local_staged(local),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        // Still there, the staged KEK must stay too: the key without it is
+        // what an interrupted commit looks like, and finishing one would put
+        // keys wrapped under a key never in force into place.
+        Err(_) => return,
     }
     let _ = std::fs::remove_file(staged_kek_path(root));
     let _ = std::fs::remove_file(staged_keys_path(root));
@@ -346,6 +351,20 @@ mod tests {
     use crate::dek_store::{load_dek, save_dek};
     use crate::kek_store::{load_kek, save_kek};
     use silentsilo_crypto::{generate_content_kek, generate_dek};
+
+    #[test]
+    fn a_discard_that_cannot_remove_the_staged_key_does_not_look_committed() {
+        // A scanner or a sync client holding the staged key: it stays, and so
+        // must the staged KEK, or the next read finishes a commit that never
+        // happened.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(staged_dek_path(root)).unwrap();
+        std::fs::write(staged_kek_path(root), b"staged").unwrap();
+        discard_staged(root);
+        assert!(staged_kek_path(root).exists());
+        assert!(!finish_interrupted_commit(root).unwrap());
+    }
 
     /// A silo as it stands before a rotation: a key, a KEK under it.
     fn silo(dir: &Path, wrap_key: &[u8; 32]) -> (MasterDek, ContentKek) {
