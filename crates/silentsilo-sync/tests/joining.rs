@@ -61,7 +61,7 @@ fn credential(id: &str, slot: u8, label: &str) -> StoredFidoCredential {
 
 #[tokio::test]
 async fn an_empty_prefix_has_no_manifest() {
-    // The normal state when someone points the app at a fresh bucket —
+    // The normal state when someone points the app at a fresh bucket,
     // not an error to report.
     let client = client_or_skip!();
     assert!(
@@ -131,7 +131,7 @@ async fn enrolled_keys_reach_a_joining_device() {
     assert_eq!(fetched[0].credential_id, "aa11");
     assert_eq!(
         fetched[0].wrapped_dek, "deadbeef",
-        "the wrapped DEK is the whole point — without it a joining device cannot unlock"
+        "the wrapped DEK is the whole point, without it a joining device cannot unlock"
     );
     assert_eq!(fetched[1].label, "Backup");
 }
@@ -262,7 +262,7 @@ async fn a_bucket_with_no_recovery_code_says_so_rather_than_failing() {
 #[tokio::test]
 async fn revoking_recovery_stops_the_written_down_code_everywhere() {
     // Clearing only the local copy would leave the paper copy working from
-    // any other machine — the opposite of what turning it off means.
+    // any other machine, the opposite of what turning it off means.
     let client = client_or_skip!();
     let (_, envelope) = silentsilo_vault::create_recovery_envelope(
         &silentsilo_crypto::generate_dek(),

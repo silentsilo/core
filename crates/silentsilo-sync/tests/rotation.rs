@@ -427,3 +427,77 @@ async fn a_pass_leaves_a_current_content_key_alone_and_never_writes_over_a_rotat
     );
     assert_eq!(store.get(CONTENT_KEK_KEY).await.unwrap(), first);
 }
+
+/// A store where another device, still on the old key, pushes a record
+/// just before the rotation writes the new content key envelope: the last
+/// moment it still reads its key as current.
+struct LatePush {
+    inner: FolderStore,
+    old: MasterDek,
+    late: OpRecord,
+    pushed: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for LatePush {
+    async fn put(&self, key: &str, body: Vec<u8>) -> Result<(), silentsilo_store::StoreError> {
+        if key == CONTENT_KEK_KEY && !self.pushed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            push_ops(&self.inner, &self.old, std::slice::from_ref(&self.late))
+                .await
+                .unwrap();
+        }
+        self.inner.put(key, body).await
+    }
+    async fn get(&self, key: &str) -> Result<Vec<u8>, silentsilo_store::StoreError> {
+        self.inner.get(key).await
+    }
+    async fn head(&self, key: &str) -> Result<Option<i64>, silentsilo_store::StoreError> {
+        self.inner.head(key).await
+    }
+    async fn delete(&self, key: &str) -> Result<(), silentsilo_store::StoreError> {
+        self.inner.delete(key).await
+    }
+    async fn list(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<silentsilo_store::StoredObject>, silentsilo_store::StoreError> {
+        self.inner.list(prefix).await
+    }
+    fn describe(&self) -> String {
+        self.inner.describe()
+    }
+}
+
+#[tokio::test]
+async fn a_record_pushed_under_the_old_key_during_the_reseal_is_resealed_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let old = generate_dek();
+    let new = generate_dek();
+    let inner = FolderStore::new(dir.path().to_path_buf());
+    populate(&inner, &old).await;
+    let late = record(9, Uuid::new_v4());
+    let store = LatePush {
+        inner: FolderStore::new(dir.path().to_path_buf()),
+        old: old.clone(),
+        late: late.clone(),
+        pushed: std::sync::atomic::AtomicBool::new(false),
+    };
+
+    reseal_under_new_key(&store, &old, &new, &mut |_, _| {})
+        .await
+        .unwrap();
+
+    let all = fetch_all_ops_above(&inner as &dyn ObjectStore, &new, 0)
+        .await
+        .unwrap();
+    assert!(
+        all.iter().any(|r| r.op_id == late.op_id),
+        "the late record is under a key nobody holds"
+    );
+    // The device that pushed it is told to rejoin, not that storage was
+    // tampered with.
+    assert_eq!(
+        state(&inner, &old).await,
+        silentsilo_sync::KekState::Rotated
+    );
+}

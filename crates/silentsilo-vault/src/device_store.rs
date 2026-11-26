@@ -95,7 +95,7 @@ pub fn save_credentials(creds: &LocalVaultAuth) -> Result<(), VaultError> {
         return Ok(());
     }
 
-    // Keyring write didn't verifiably persist on this machine — fall back to
+    // Keyring write didn't verifiably persist on this machine, fall back to
     // a local file so provisioning still succeeds. `load_credentials` already
     // supports this path (and retries the keyring next time it's called).
     //
@@ -162,7 +162,7 @@ pub fn load_credentials(silo_id: Uuid) -> Result<LocalVaultAuth, VaultError> {
     }
 
     // Try to migrate the fallback file into the keyring, but only remove it
-    // if the keyring can actually be read back afterward — otherwise these
+    // if the keyring can actually be read back afterward, otherwise these
     // credentials would be silently lost on a machine where the keyring
     // write never verifiably persists (see `keyring_roundtrips`).
     let _ = save_credentials(&creds);
@@ -214,7 +214,7 @@ pub fn retire_device_secret(silo_id: Uuid) -> Result<(), VaultError> {
 }
 
 /// Forget this vault's credentials entirely (keyring entry and fallback
-/// file) — used when resetting the app back to an unprovisioned state.
+/// file), used when resetting the app back to an unprovisioned state.
 /// Best-effort: a missing entry isn't an error.
 pub fn clear_credentials(silo_id: Uuid) {
     if let Ok(entry) = keyring_entry(silo_id) {
@@ -224,7 +224,7 @@ pub fn clear_credentials(silo_id: Uuid) {
 }
 
 /// Keyed by silo, so several silos on one machine don't overwrite each
-/// other's secret in the keyring — which is what a fixed entry name would
+/// other's secret in the keyring, which is what a fixed entry name would
 /// do, silently, leaving every silo but the last one unopenable.
 fn keyring_entry(silo_id: Uuid) -> Result<Entry, keyring::Error> {
     Entry::new(crate::keychain::service(), &keyring_user(silo_id))

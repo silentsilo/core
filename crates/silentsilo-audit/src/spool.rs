@@ -1292,7 +1292,16 @@ mod tests {
                 let public = keys.public.clone();
                 std::thread::spawn(move || {
                     for n in 0..25 {
-                        let mut spool = open(&root, device);
+                        // Four threads taking the lock in a tight loop can
+                        // starve one past LOCK_WAIT on a slow runner. What is
+                        // checked is that they take turns, not how long one
+                        // waits, so a Busy is tried again.
+                        let mut spool = loop {
+                            match Spool::open(&root, device, &KEK, Unchecked::Refuse) {
+                                Err(SpoolError::Busy) => continue,
+                                other => break other.unwrap(),
+                            }
+                        };
                         spool.record_to(&public, Event::new(1, n)).unwrap();
                         if (w + n) % 7 == 0 {
                             spool.close(n).unwrap();

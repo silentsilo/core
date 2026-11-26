@@ -2,7 +2,7 @@
 //!
 //! The model lives in `silentsilo-vfs::oplog`; this crate is only transport.
 //! Every operation becomes one immutable object under `ops/`, so a push is
-//! always a create and never an overwrite — which is what lets this work on
+//! always a create and never an overwrite, which is what lets this work on
 //! providers with no conditional-write support, and why two devices pushing
 //! at the same moment cannot lose each other's work.
 //!
@@ -176,7 +176,7 @@ pub async fn fetch_missing_ops(
 /// An object that will not open is reported rather than raised, so one bad
 /// object cannot wedge sync for good; transport errors still fail the pass,
 /// because they say nothing about the object. The caller decides how far
-/// replay may proceed — see [`usable_prefix`].
+/// replay may proceed, see [`usable_prefix`].
 pub async fn fetch_missing_ops_reporting(
     client: &dyn ObjectStore,
     dek: &MasterDek,
@@ -371,7 +371,7 @@ pub(crate) async fn fetch_small(
 /// One full pass: push what is local-only, pull what is new, replay it.
 ///
 /// Replaying a contiguous run above the local high-water mark is exactly the
-/// condition the operation log's convergence guarantee needs — see the
+/// condition the operation log's convergence guarantee needs, see the
 /// `oplog` module docs.
 pub async fn sync_ops(
     conn: &Connection,
@@ -946,7 +946,7 @@ pub async fn push_blobs_within(
             Ok(Some(size)) if size > 0 && size as u64 != local_len => {}
             Ok(Some(_)) => {
                 // Already up there. Record that so eviction is allowed to
-                // reclaim the space — without this the local copy would be
+                // reclaim the space, without this the local copy would be
                 // pinned forever.
                 record_blob_delivered(vault_root, *blob_id, target)
                     .map_err(|e| SyncError::Vault(e.to_string()))?;
@@ -1811,6 +1811,7 @@ pub async fn reseal_under_new_key(
 
     let total = work.len();
     progress(0, total);
+    let mut seen: std::collections::HashSet<String> = work.iter().cloned().collect();
 
     for (done, key) in work.into_iter().enumerate() {
         let sealed = match client.get(&key).await {
@@ -1848,6 +1849,48 @@ pub async fn reseal_under_new_key(
         progress(done + 1, total);
     }
 
+    // Another device still on the old key may have pushed while this ran:
+    // it read the KEK envelope as current until that was written, last. Its
+    // records would stay under a key nobody holds after the commit, and it
+    // would never send them again. Listed once more after the envelope, and
+    // again while new ones turn up, a few times at most.
+    for _ in 0..3 {
+        let mut late = Vec::new();
+        for prefix in SEALED_PREFIXES {
+            for entry in client.list(prefix).await? {
+                if seen.insert(entry.key.clone()) {
+                    late.push(entry.key);
+                }
+            }
+        }
+        if late.is_empty() {
+            break;
+        }
+        for key in late {
+            let sealed = match client.get(&key).await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    outcome.failed.push((key, e.to_string()));
+                    continue;
+                }
+            };
+            if unseal(&sealed, new).is_ok() {
+                outcome.already += 1;
+                continue;
+            }
+            match unseal(&sealed, old) {
+                Ok(plain) => match seal(&plain, new) {
+                    Ok(resealed) => match client.put(&key, resealed).await {
+                        Ok(()) => outcome.resealed += 1,
+                        Err(e) => outcome.failed.push((key, e.to_string())),
+                    },
+                    Err(e) => outcome.failed.push((key, e.to_string())),
+                },
+                Err(_) => outcome.unreadable.push(key),
+            }
+        }
+    }
+
     Ok(outcome)
 }
 
@@ -1874,7 +1917,7 @@ pub async fn fetch_blob_to_file(
 
 /// Downloads one blob into the local cache.
 ///
-/// Called when a file is opened whose content isn't here — either because
+/// Called when a file is opened whose content isn't here, either because
 /// another device uploaded it, or because eviction reclaimed the space.
 pub async fn fetch_blob(
     client: &dyn ObjectStore,
@@ -2446,6 +2489,13 @@ pub async fn kek_envelope_state(
     if opens_as_kek(&envelope, dek) {
         return Ok(KekState::Current);
     }
+    // A proof under this key says it was rotated, whatever the records say.
+    // A device that pushed under its old key while the rotation ran leaves
+    // newest records that still open for it, and read as "replaced" it was
+    // told storage had been tampered with instead of to rejoin.
+    if matches!(rotated_if_proven(client, dek).await, KekState::Rotated) {
+        return Ok(KekState::Rotated);
+    }
 
     // The newest records, because a rotation that reached the envelope had
     // already been through all of them. An unreadable one is taken as a
@@ -2608,7 +2658,7 @@ pub const MANIFEST_KEY: &str = "vault.json";
 /// The only object in the bucket that is not ciphertext.
 ///
 /// It cannot be: a joining device has to know which vault it is looking at
-/// *before* it can unwrap anything. A random UUID is all it discloses —
+/// *before* it can unwrap anything. A random UUID is all it discloses,
 /// nothing about the contents, the owner, or how much is stored.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct VaultManifest {
@@ -2668,7 +2718,7 @@ pub async fn refuse_foreign_vault(
     }
 }
 
-/// `None` when the prefix holds no vault yet — the normal state when
+/// `None` when the prefix holds no vault yet, the normal state when
 /// connecting a fresh bucket, not a failure.
 pub async fn read_manifest(client: &dyn ObjectStore) -> Result<Option<VaultManifest>, SyncError> {
     let Some(bytes) = fetch_small(client, MANIFEST_KEY).await? else {

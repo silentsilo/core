@@ -16,7 +16,7 @@ const REGISTRY_FILE: &str = "silos.json";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SiloEntry {
     pub id: Uuid,
-    /// What the user calls it. Purely a label — nothing keys off it.
+    /// What the user calls it. Purely a label, nothing keys off it.
     pub name: String,
     pub path: PathBuf,
     /// Unix seconds, so the picker can lead with the one they actually use.
@@ -78,7 +78,7 @@ impl SiloRegistry {
 
     /// Whether `name` is already taken by a different silo.
     ///
-    /// Not a correctness problem — silos are keyed by id — but two entries
+    /// Not a correctness problem, silos are keyed by id, but two entries
     /// called "Work" in the picker is a way to open the wrong one.
     pub fn name_taken(&self, name: &str, except: Option<Uuid>) -> bool {
         let name = name.trim().to_lowercase();
@@ -132,7 +132,7 @@ pub fn registry_path(app_data: &Path) -> PathBuf {
     app_data.join(REGISTRY_FILE)
 }
 
-/// An empty registry when there is no file yet — a fresh install, not an
+/// An empty registry when there is no file yet, a fresh install, not an
 /// error.
 pub fn load_registry(app_data: &Path) -> SiloRegistry {
     let Ok(raw) = std::fs::read(registry_path(app_data)) else {
@@ -144,7 +144,7 @@ pub fn load_registry(app_data: &Path) -> SiloRegistry {
     crate::format::decode("the silo list", &bytes).unwrap_or_default()
 }
 
-/// Names and paths only — but those describe a person, so this gets the
+/// Names and paths only, but those describe a person, so this gets the
 /// same DPAPI treatment as the credentials file rather than sitting in the
 /// clear next to it. "Divorce", "Second family" is a filename nobody wants
 /// readable by everything that can read their app data. A protector that
@@ -160,7 +160,7 @@ pub fn save_registry(app_data: &Path, registry: &SiloRegistry) -> Result<(), Vau
 /// Turns a silo name into something safe to use as a directory name.
 ///
 /// The user's name for a silo is free text and ends up as a folder, so
-/// separators and the Windows reserved characters have to go — otherwise
+/// separators and the Windows reserved characters have to go, otherwise
 /// "Work/2026" would silently create a nested directory, and a trailing dot
 /// would produce a folder Explorer cannot delete.
 pub fn folder_name_for(name: &str) -> String {
@@ -214,7 +214,7 @@ mod tests {
     }
 
     /// Registries written before per-silo auto-lock existed have to keep
-    /// loading — the field is a preference, and its absence means "use the
+    /// loading, the field is a preference, and its absence means "use the
     /// app-wide default", which is exactly what `None` says.
     #[test]
     fn a_registry_written_without_an_auto_lock_setting_still_loads() {
@@ -392,7 +392,7 @@ mod tests {
     fn a_folder_identifies_its_own_silo_without_any_secret() {
         // The whole point: adding a folder back has to work on a machine
         // whose keyring holds nothing for it, and normally the credentials
-        // file does not exist at all — the keyring took it.
+        // file does not exist at all, the keyring took it.
         let tmp = tempfile::tempdir().unwrap();
         let id = Uuid::new_v4();
         write_marker(tmp.path(), id).unwrap();

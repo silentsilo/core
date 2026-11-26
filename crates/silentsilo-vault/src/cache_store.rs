@@ -1,4 +1,4 @@
-//! Local blob cache bookkeeping — separate from `vault.db`, never synced to the cloud.
+//! Local blob cache bookkeeping, separate from `vault.db`, never synced to the cloud.
 //!
 //! Tracks which encrypted blobs currently sit on local disk, when they were last
 //! accessed, and whether they're already backed up to the cloud (only synced blobs
@@ -25,7 +25,7 @@ pub const DEFAULT_CACHE_LIMIT_BYTES: u64 = u64::MAX;
 /// reason: it lists how many blobs there are and how big they are, which is
 /// not content but is not nothing either.
 ///
-/// Unlike the working copy this survives a lock — it is this machine's
+/// Unlike the working copy this survives a lock, it is this machine's
 /// record of what has already reached the bucket, and throwing it away
 /// would make the next sync re-check every blob.
 fn cache_db_path(vault_root: &Path) -> PathBuf {
@@ -48,7 +48,7 @@ fn open_cache_db(vault_root: &Path) -> Result<Connection, VaultError> {
     crate::init_openssl();
     let conn = Connection::open(cache_db_path(vault_root))?;
     // Parallel uploads (mapPool in the frontend) open this file from multiple
-    // threads at once — without a busy timeout a concurrent writer gets an
+    // threads at once, without a busy timeout a concurrent writer gets an
     // immediate "database is locked" instead of waiting its turn.
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.execute_batch(
@@ -417,7 +417,7 @@ pub fn enforce_cache_limit(vault_root: &Path, max_bytes: u64) -> Result<Vec<Uuid
     Ok(evicted)
 }
 
-/// Remove a blob's local cache file and bookkeeping row outright — used when
+/// Remove a blob's local cache file and bookkeeping row outright, used when
 /// a file has been permanently deleted (trash emptied) and its blob no
 /// longer belongs anywhere, unlike `enforce_cache_limit` which only evicts
 /// already-synced blobs to free up space.

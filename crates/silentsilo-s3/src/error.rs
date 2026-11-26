@@ -3,7 +3,7 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum S3Error {
-    /// Bad or incomplete connection details — the user can fix these.
+    /// Bad or incomplete connection details, the user can fix these.
     #[error("{0}")]
     Config(String),
 
@@ -26,7 +26,7 @@ impl S3Error {
     ///
     /// The SDK's own Display is a wrapper like "service error" with the
     /// useful part buried in the source chain, so this walks to the innermost
-    /// cause and leads with the HTTP status where there is one — the
+    /// cause and leads with the HTTP status where there is one, the
     /// difference between 403 and 404 is exactly what tells someone whether
     /// their keys or their bucket name is wrong.
     pub fn from_sdk<E>(operation: &str, err: aws_sdk_s3::error::SdkError<E, HttpResponse>) -> Self

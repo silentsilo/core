@@ -77,7 +77,7 @@ pub struct SearchHit {
 /// A trashed entry plus the path of the folder it was trashed out of, so
 /// the Trash view can show where each item came from (its own name already
 /// appears separately, so this is the *containing* folder's path, e.g.
-/// "/Documents/Receipts" — not the item's own full path).
+/// "/Documents/Receipts", not the item's own full path).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrashItem {
     #[serde(flatten)]
@@ -147,7 +147,7 @@ impl S3Config {
     }
 }
 
-/// The same connection details minus the secret, for sending to the UI —
+/// The same connection details minus the secret, for sending to the UI,
 /// the secret access key is write-only from the frontend's perspective.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct S3ConfigView {

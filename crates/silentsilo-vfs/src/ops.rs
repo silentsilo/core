@@ -508,7 +508,7 @@ impl<'a> Vfs<'a> {
     ) -> CoreResult<FileEntry> {
         let name = &normalized_input(name)?;
 
-        // Uploading over an existing name replaces its content in place —
+        // Uploading over an existing name replaces its content in place,
         // what Explorer and Finder do on a drag-and-drop overwrite. That is
         // a different operation from adding a file, because it targets a
         // known id and so can never collide with anything.
@@ -1195,7 +1195,7 @@ impl<'a> Vfs<'a> {
             return Ok(Vec::new());
         }
         // LIKE's own wildcards have to be neutralised, or searching for "%"
-        // would match every file in the vault — which reads as broken search
+        // would match every file in the vault, which reads as broken search
         // rather than as anything clever.
         let pattern = crate::like::containing(query);
 
@@ -1859,13 +1859,13 @@ impl<'a> Vfs<'a> {
         Ok(())
     }
 
-    /// Trashed folders/files whose parent isn't *also* trashed — i.e. the
+    /// Trashed folders/files whose parent isn't *also* trashed, i.e. the
     /// items the user actually deleted, not their cascaded children.
     pub fn list_trash(&self) -> CoreResult<Vec<TrashItem>> {
         let mut entries = Vec::new();
 
         // Trashed folders: `original_path` is the *parent's* path (where the
-        // folder used to live), not its own — its own name/path is already
+        // folder used to live), not its own, its own name/path is already
         // shown via the entry itself, so showing that again here would be
         // redundant with the Name column in the UI.
         let mut folder_stmt = self
@@ -1912,7 +1912,7 @@ impl<'a> Vfs<'a> {
         }
 
         // Trashed files: `original_path` is the containing (still-live)
-        // folder's path — files whose folder was *also* trashed are covered
+        // folder's path, files whose folder was *also* trashed are covered
         // by that folder's own entry above instead, per the NOT IN below.
         let mut file_stmt = self
             .conn()
@@ -2062,7 +2062,7 @@ impl<'a> Vfs<'a> {
     /// Permanently remove all trashed items from the local index. Returns
     /// the number of rows removed and the blob IDs of the files among them,
     /// so the caller can also delete the corresponding blob objects (local
-    /// cache and/or cloud) — this function only ever touches `vault.db`.
+    /// cache and/or cloud), this function only ever touches `vault.db`.
     pub fn empty_trash(&self) -> CoreResult<(u64, Vec<Uuid>)> {
         let tx = self.begin()?;
         self.move_out_of_trashed_folders()?;
@@ -3058,7 +3058,7 @@ mod tests {
         assert_eq!(replaced.size_bytes, 250);
         assert_eq!(replaced.content_hash.as_deref(), Some("hash-v2"));
 
-        // No duplicate row was created — the folder still lists exactly one
+        // No duplicate row was created, the folder still lists exactly one
         // "report.pdf".
         let entries = vfs.list_folder(root).unwrap();
         assert_eq!(entries.len(), 1);
@@ -3416,7 +3416,7 @@ mod tests {
             .find(|t| matches!(&t.entry, VaultEntry::Folder(f) if f.id == old_reports.id))
             .expect("trashed folder present");
         // A folder's own path ("/Documents/OldReports") already appears via
-        // the entry itself — original_path is its *parent's* path instead.
+        // the entry itself, original_path is its *parent's* path instead.
         assert_eq!(folder_item.original_path, "/Documents");
     }
 
@@ -3927,7 +3927,7 @@ mod tests {
 
     #[test]
     fn subtree_blob_ids_does_not_leak_into_a_sibling_with_a_shared_prefix() {
-        // "/Work" must not match "/Workshop" — the whole reason the LIKE
+        // "/Work" must not match "/Workshop", the whole reason the LIKE
         // pattern carries a trailing slash.
         let (_dir, session) = new_session();
         let vfs = Vfs::new(&session);
@@ -4164,7 +4164,7 @@ mod tests {
 
     #[test]
     fn a_wildcard_in_the_query_matches_itself_and_nothing_else() {
-        // Unescaped, "%" would match every file in the vault — which reads
+        // Unescaped, "%" would match every file in the vault, which reads
         // as "search is broken" rather than as an injection.
         let (_dir, session) = new_session();
         let vfs = Vfs::new(&session);

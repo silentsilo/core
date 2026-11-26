@@ -94,7 +94,7 @@ pub fn unwrap_content_key(wrapped: &str, kek: &ContentKek) -> Result<ContentKey,
 }
 
 /// Reverses [`seal`]. Fails on a truncated payload, an unknown format, the
-/// wrong key, or any tampering — GCM authenticates, so a modified record
+/// wrong key, or any tampering, GCM authenticates, so a modified record
 /// cannot be decrypted into something that merely looks wrong.
 pub fn unseal(sealed: &[u8], dek: &MasterDek) -> Result<Vec<u8>, CryptoError> {
     unseal_with_key(sealed, dek.as_bytes())

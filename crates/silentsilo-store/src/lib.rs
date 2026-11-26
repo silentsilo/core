@@ -133,7 +133,7 @@ pub trait ObjectStore: Send + Sync {
     async fn put(&self, key: &str, body: Vec<u8>) -> Result<(), StoreError>;
 
     /// Reads an object whole. Everything stored here is small enough for
-    /// that — blobs are chunk-encrypted files, not streams.
+    /// that, blobs are chunk-encrypted files, not streams.
     async fn get(&self, key: &str) -> Result<Vec<u8>, StoreError>;
 
     /// The first `len` bytes of an object, or all of it when shorter: a
@@ -361,7 +361,7 @@ pub fn set_cloud_opener(opener: CloudOpener) {
 ///
 /// An enum rather than a trait object at the config layer, because this is
 /// what gets serialised into the silo's settings and round-tripped through
-/// the UI — and a closed set is exactly what lets the UI show the right
+/// the UI, and a closed set is exactly what lets the UI show the right
 /// fields for the chosen kind.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]

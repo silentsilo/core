@@ -1,6 +1,6 @@
 //! Object-storage client for any S3-compatible provider.
 //!
-//! Everything this crate uploads is already ciphertext — encryption happens
+//! Everything this crate uploads is already ciphertext, encryption happens
 //! before it gets here (see `silentsilo-crypto`). Its only job is putting
 //! opaque bytes at a key and getting them back.
 
@@ -147,7 +147,7 @@ impl S3Client {
     /// and addressing style all actually work together.
     ///
     /// A read-only check would pass with credentials that can list but not
-    /// write, which would then fail on the first real sync — so this writes,
+    /// write, which would then fail on the first real sync, so this writes,
     /// reads back and deletes.
     pub async fn test_connection(&self) -> Result<(), S3Error> {
         const PROBE: &str = ".silentsilo-connection-test";
@@ -695,7 +695,7 @@ impl S3Client {
     }
 
     /// Lists everything under `relative_prefix`, following continuation
-    /// tokens — a vault can hold far more than the 1000 keys one page
+    /// tokens, a vault can hold far more than the 1000 keys one page
     /// returns, and a truncated listing would read as "these blobs don't
     /// exist remotely".
     pub async fn list(&self, relative_prefix: &str) -> Result<Vec<ObjectEntry>, S3Error> {

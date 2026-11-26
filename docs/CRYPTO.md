@@ -53,7 +53,7 @@ without a usable keyring, a secret is written in the clear (0600, outside
 the folder) only after the user agrees to it (`allow_unprotected_secrets`);
 until then the write fails with `err.secrets_unprotected` and the app asks.
 
-Two limits of that sentence, stated here rather than left to be discovered:
+Two limits of that sentence:
 
 **A removable key and its PIN are enough on their own.** Since 1.10.1 a key
 without a PIN is not enrolled, and every platform verifies a key that has
@@ -560,8 +560,7 @@ matching value cannot be written in for tampered content.
 
 ## What deleting does not remove
 
-Stated here rather than left to be discovered, because the app uses the word
-"permanently" and this is where that word stops being complete.
+The app uses the word "permanently". This is what it does not cover.
 
 Deleting a file and purging it removes the blob the index points at, which is
 its current content. Replacing a file's content writes a **new** blob. The
@@ -774,7 +773,7 @@ already covers it.
 
 The remaining path worth naming is a **tampered binary**, which can wait for the next unlock and take the key. Nothing inside the program can detect that reliably. Releases are code-signed, which ties a download to its publisher; reproducible builds are the other half, so that a user can check the binary against the published source, and they are not done.
 
-Deliberately not attempted: anti-debugging, obfuscation and similar. They add real complexity, stop nobody who is serious, and make no sense in a project whose source is published.
+Deliberately not attempted: anti-debugging, obfuscation and similar. They add complexity and would not slow down anyone reading published source.
 
 ## Test vectors
 
@@ -832,8 +831,7 @@ YubiKey" is the user's own words leaving their machine unencrypted.
 Reducing the exposure is possible and is not done today: sealing labels under
 the DEK, using a per-pass pseudonym instead of a stable device id, padding
 blobs to a fixed granularity, and keying the header hash with the content key
-(a new blob format version, which readers have to know before writers use it). Each costs something, none is free, and none is
-implemented in v1.
+(a new blob format version, which readers have to know before writers use it). None is implemented in v1.
 
 Anyone using plain HTTP for S3 or WebDAV also exposes the access key and the
 signature on the wire, on top of everything above. Use TLS.

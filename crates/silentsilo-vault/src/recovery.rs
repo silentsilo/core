@@ -222,7 +222,7 @@ pub fn normalize_code(input: &str) -> String {
 
 /// Wraps the vault's DEK under a freshly generated code.
 ///
-/// Returns the code, which is the only time it exists in readable form —
+/// Returns the code, which is the only time it exists in readable form,
 /// nothing derived from it is stored except the envelope, so an app that
 /// fails to show it to the user has lost it too.
 ///

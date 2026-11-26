@@ -116,7 +116,7 @@ const _: () = assert!(
 
 const ES256_ALG: i32 = -7;
 const TIMEOUT_MS: u32 = 120_000;
-/// webauthn.h — not yet in windows crate 0.61.
+/// webauthn.h, not yet in windows crate 0.61.
 const MAKE_CRED_OPTIONS_VERSION_8: u32 = 8;
 /// The first WebAuthn API that returns a security key's hmac-secret.
 const API_VERSION_4: u32 = 4;
@@ -379,7 +379,7 @@ pub fn complete_enrollment(challenge: &EnrollmentChallenge) -> Result<Enrollment
         // id it needs to present.
         bRequireResidentKey: BOOL::from(platform),
         // For a removable key: touch only, avoiding the PIN/passkey UV paths
-        // that confuse Win11 + YubiKey. For Hello the opposite — user
+        // that confuse Win11 + YubiKey. For Hello the opposite, user
         // verification *is* the authentication, and asking for it discouraged
         // would be asking Windows to unlock the vault with no check at all.
         dwUserVerificationRequirement: if platform {

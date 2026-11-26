@@ -371,7 +371,18 @@ pub fn decrypt_blob_to_vec(
         .metadata()?
         .len()
         .saturating_sub(HEADER_SIZE as u64);
-    let mut out = zeroize::Zeroizing::new(Vec::with_capacity(capacity as usize));
+    // Asked for, not assumed: an attachment of several GB, or an object of
+    // that size under its name, aborted the whole process on allocation.
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(usize::try_from(capacity).unwrap_or(usize::MAX))
+        .map_err(|_| {
+            CryptoError::Io(std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                "this file is too large to open in memory",
+            ))
+        })?;
+    let mut out = zeroize::Zeroizing::new(buffer);
     let cipher = Aes256Gcm::new_from_slice(key.as_bytes()).expect("valid key length");
     decrypt_chunks(&mut source_file, &mut *out, &header, &cipher)?;
     Ok(out)
@@ -655,7 +666,7 @@ mod tests {
     }
 
     /// Two files encrypted with the same vault DEK must never reuse the same
-    /// (key, nonce) pair — that's what makes chunk 0 of every file "safe" to
+    /// (key, nonce) pair, that's what makes chunk 0 of every file "safe" to
     /// encrypt under one shared key. Regression test for the nonce-reuse fix.
     #[test]
     fn different_files_get_different_nonce_prefixes() {

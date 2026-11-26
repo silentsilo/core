@@ -2,7 +2,7 @@
 //!
 //! The unit tests in `oplog` prove convergence given a set of operations;
 //! these prove the transport actually delivers that set. Skipped unless
-//! `SILENTSILO_TEST_S3_ENDPOINT` is set — see `silentsilo-s3`'s
+//! `SILENTSILO_TEST_S3_ENDPOINT` is set, see `silentsilo-s3`'s
 //! `live_roundtrip` tests for how to bring a server up.
 
 use rusqlite::Connection;
@@ -15,7 +15,7 @@ use silentsilo_vfs::{OpRecord, VaultOp, Vfs, next_lamport};
 use uuid::Uuid;
 
 /// A device with its own local vault, sharing one bucket prefix and one DEK
-/// with the others in a test — which is what devices in a real vault share.
+/// with the others in a test, which is what devices in a real vault share.
 struct Device {
     _dir: tempfile::TempDir,
     session: VaultSession,
@@ -161,7 +161,7 @@ async fn concurrent_edits_from_both_devices_converge() {
     let b = Device::joining(vault);
     let root = a.root();
 
-    // Both add a file with the same name without having seen each other —
+    // Both add a file with the same name without having seen each other,
     // the case that must not lose either upload.
     let a_ops = vec![a.author(add_file(root, "report.txt"))];
     let b_ops = vec![b.author(add_file(root, "report.txt"))];

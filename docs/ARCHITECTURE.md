@@ -16,8 +16,7 @@ persisted bytes and [CRYPTO.md](CRYPTO.md) owns the cryptography as an
 auditor reads it. This page owns the moving parts and the reasoning.
 
 **Keep it true.** A change that alters anything described here updates this
-page in the same commit. A stale map is worse than none: it answers with
-confidence and it answers wrong.
+page in the same commit.
 
 ## The one-paragraph model
 
@@ -81,93 +80,103 @@ storage settings. The order and invariants of the pass are described in the
 desktop repository's `docs/ARCHITECTURE.md` until the move is done, with two
 steps that exist only here so far: before pushing, the pass reconciles
 the enrolled keys with `keys/` (`silentsilo-sync/key_sync.rs`, `FORMATS.md`),
-and after pulling it imports the inbox (below). After its own records it
-delivers the activity log (`deliver_audit`): it reads the log's policy every
-ten minutes and pins the key the policy names, closes a segment once the
-oldest queued event is fifteen minutes old, and sends what waits to every
-copy. A segment leaves the device only once every configured copy holds it,
-as a record does, so a copy in a drawer keeps it queued; a failure warns
-and never stops the sync. A policy that later names another key than an
-organisation's pinned one is not followed, and nothing of it is taken in:
-the device goes on sealing to the key it pinned, with the setting, scope and
-retention it had, and says so. A personal log follows the newest policy.
-A policy from a copy is taken in only when it is dated at most a day ahead
-of this computer's clock, is an organisation's only on a silo an
-organisation administers and names one of its keys, and, once the device
-trusts a policy (`Pinned::proven`: made here, or read with an `auth` that
-checks under the current DEK), carries an `auth` that checks. A device that
-trusts its policy writes it tagged, puts it back over a copy holding one it
-refused, dated after that one, and tags again a copy holding it with a tag
-from before a key change. FORMATS.md, "The activity log", has the rules.
-An organisation's log (`audit_admin`) is started and given another reading
-key with the wrap key a touch of one of its keys gave, which the client
-asks for; core checks each touch against the silo's enrolled organisation
-keys (`OrgProof`), so the log starts only on a silo an organisation
-administers. Changing its retention and removing old segments need the
-organisation's key pinned on this device; the client asks for a touch
-before either. A retention under 90 days (`MIN_RETENTION_DAYS`) is refused
-when set, and removal never goes below it whatever a policy says, since
-anyone with the content key can seal a policy. Removal leaves a segment
-whose tag does not check.
-The queue's pin and kept policy carry a check under a key from the content
-KEK, so whoever can write to the silo folder cannot choose the key events
-are sealed to. The first open by a build that checks takes in a queue as
-1.9 left it, and notes that in the index (`vault_meta`,
-`audit_queue_checked`, `state::queue_unchecked`); after that a pin without
-its check is made again from the checked policy, or dropped until the next
-pass. Segments are tagged as they close.
-A personal log is turned on and off on the device (`AppState::set_audit_log`),
-copies or not: the queue keeps the key and the policy, and the pass writes
-the newest policy, by `changed_at`, to every copy that lacks it
-(`settle_audit_policy`), so turning it on never waits for storage. It is
-on by default: when neither this device nor any copy holds a policy, and
-every copy the silo has answered (`required`, those resting after a failure
-included), the pass starts it (`start_silo_log`); a silo with no copies
-starts it when opened (`AppState::start_audit_by_default`, which the client
-calls). Waiting for every copy is what keeps a new device from starting a
-log over a copy's "off" with a newer "on", and a copy holding a policy whose
-key did not read counts as holding one. Off chosen before the log ever
-started is written as a policy saying off. A policy read from the copies is
-not applied over one changed on this device while they were being read:
-the newer local one is spread at the next pass instead. A key file is
-merged with the one on this device, never written over it, so a reading key
-added meanwhile stays.
-Gathering is the caller's and reading is shared: the app and the extract
-tool both hand their segments to `silentsilo_audit::reading::read_log`.
-Reading (`audit_read::read_audit_log`) takes every segment from the cache
-beside the silo, this device's outbox and its pending records, and every
-copy it can reach, keeping what it fetched. It checks each device's chain
-and event count from the oldest segment present (a retention may have
-removed what came before) and names what is missing, records that do not
-open with the log's key, and copies it could not read. It refuses by name a
-segment whose tag does not check under the content KEK, and an untagged one
-after a device's first tagged one; untagged segments no tagged one vouches
-for through an unbroken chain are read and named unproven. A gap in the
-numbering is named up to 10,000 numbers and counted past that. A cached
-segment that does not read or whose tag does not check is removed and
-fetched again; a forged one is never cached. A personal silo's
-log opens with the content key, with every personal key in `audit/keys/`
-it unwraps: two devices that started the log at once each sealed some
-records to their own key. An organisation's opens only with an
-organisation key's wrap key. The cache is never pruned to match storage:
-a segment deleted from every copy stays readable here, so whoever can
-delete in storage cannot erase what this computer already read. Opening a record is about 150 microseconds of
-X25519 and AES-GCM, so records are opened on every core
-(`reading::read_log_with`), and what was opened is kept in `AppState` per
-silo (`audit_opened`), matched by each segment's bytes: the next read opens
-only new segments. That is the log in clear, so it stays in memory and is
-dropped by every path that closes the silo (`forget_audit_read`, which a
-client with its own close path calls too). 100,000 events read in about
-half a second the first time on 28 threads, and in a tenth of that after.
-The device's queue (`Spool`) is held under a file lock while it is open, so
-a command recording an event and the pass closing a segment take turns
-instead of numbering two events alike. The pass opens it for each local step
-and never across a network call, which keeps a recording command's wait
-short.
+and after pulling it imports the inbox (below). It also delivers the
+activity log after its own records ("Activity log" below).
 
 The extract binary deliberately reuses the same crates rather than
 reimplementing the read path: a second interpretation of the log is a second
 thing that can be wrong.
+
+## Activity log
+
+- **Delivery.** The sync pass delivers the log after its own records
+  (`deliver_audit`): it reads the log's policy every ten minutes and pins
+  the key the policy names, closes a segment once the oldest queued event is
+  fifteen minutes old, and sends what waits to every copy. A segment leaves
+  the device only once every configured copy holds it, as a record does, so
+  a copy in a drawer keeps it queued; a failure warns and never stops the
+  sync.
+- **Policy.** A policy that later names another key than an organisation's
+  pinned one is not followed, and nothing of it is taken in: the device goes
+  on sealing to the key it pinned, with the setting, scope and retention it
+  had, and says so. A personal log follows the newest policy. A policy from
+  a copy is taken in only when it is dated at most a day ahead of this
+  computer's clock, is an organisation's only on a silo an organisation
+  administers and names one of its keys, and, once the device trusts a
+  policy (`Pinned::proven`: made here, or read with an `auth` that checks
+  under the current DEK), carries an `auth` that checks. A device that
+  trusts its policy writes it tagged, puts it back over a copy holding one
+  it refused, dated after that one, and tags again a copy holding it with a
+  tag from before a key change. FORMATS.md, "The activity log", has the
+  rules.
+- **An organisation's log.** An organisation's log (`audit_admin`) is
+  started and given another reading key with the wrap key a touch of one of
+  its keys gave, which the client asks for; core checks each touch against
+  the silo's enrolled organisation keys (`OrgProof`), so the log starts only
+  on a silo an organisation administers. Changing its retention and removing
+  old segments need the organisation's key pinned on this device; the client
+  asks for a touch before either. A retention under 90 days
+  (`MIN_RETENTION_DAYS`) is refused when set, and removal never goes below
+  it whatever a policy says, since anyone with the content key can seal a
+  policy. Removal leaves a segment whose tag does not check.
+- **The queue's integrity.** The queue's pin and kept policy carry a check
+  under a key from the content KEK, so whoever can write to the silo folder
+  cannot choose the key events are sealed to. The first open by a build that
+  checks takes in a queue as 1.9 left it, and notes that in the index
+  (`vault_meta`, `audit_queue_checked`, `state::queue_unchecked`); after
+  that a pin without its check is made again from the checked policy, or
+  dropped until the next pass. Segments are tagged as they close.
+- **A personal log.** A personal log is turned on and off on the device
+  (`AppState::set_audit_log`), copies or not: the queue keeps the key and
+  the policy, and the pass writes the newest policy, by `changed_at`, to
+  every copy that lacks it (`settle_audit_policy`), so turning it on never
+  waits for storage. It is on by default: when neither this device nor any
+  copy holds a policy, and every copy the silo has answered (`required`,
+  those resting after a failure included), the pass starts it
+  (`start_silo_log`); a silo with no copies starts it when opened
+  (`AppState::start_audit_by_default`, which the client calls). Waiting for
+  every copy is what keeps a new device from starting a log over a copy's
+  "off" with a newer "on", and a copy holding a policy whose key did not
+  read counts as holding one. Off chosen before the log ever started is
+  written as a policy saying off. A policy read from the copies is not
+  applied over one changed on this device while they were being read: the
+  newer local one is spread at the next pass instead. A key file is merged
+  with the one on this device, never written over it, so a reading key added
+  meanwhile stays.
+- **Reading.** Gathering is the caller's and reading is shared: the app and
+  the extract tool both hand their segments to
+  `silentsilo_audit::reading::read_log`. Reading
+  (`audit_read::read_audit_log`) takes every segment from the cache beside
+  the silo, this device's outbox and its pending records, and every copy it
+  can reach, keeping what it fetched. It checks each device's chain and
+  event count from the oldest segment present (a retention may have removed
+  what came before) and names what is missing, records that do not open with
+  the log's key, and copies it could not read. It refuses by name a segment
+  whose tag does not check under the content KEK, and an untagged one after
+  a device's first tagged one; untagged segments no tagged one vouches for
+  through an unbroken chain are read and named unproven. A gap in the
+  numbering is named up to 10,000 numbers and counted past that. A cached
+  segment that does not read or whose tag does not check is removed and
+  fetched again; a forged one is never cached. A personal silo's log opens
+  with the content key, with every personal key in `audit/keys/` it unwraps:
+  two devices that started the log at once each sealed some records to their
+  own key. An organisation's opens only with an organisation key's wrap key.
+  The cache is never pruned to match storage: a segment deleted from every
+  copy stays readable here, so whoever can delete in storage cannot erase
+  what this computer already read. Opening a record is about 150
+  microseconds of X25519 and AES-GCM, so records are opened on every core
+  (`reading::read_log_with`), and what was opened is kept in `AppState` per
+  silo (`audit_opened`), matched by each segment's bytes: the next read
+  opens only new segments. That is the log in clear, so it stays in memory
+  and is dropped by every path that closes the silo (`forget_audit_read`,
+  which a client with its own close path calls too). 100,000 events read in
+  about half a second the first time on 28 threads, and in a tenth of that
+  after.
+- **The queue's lock.** The device's queue (`Spool`) is held under a file
+  lock while it is open, so a command recording an event and the pass
+  closing a segment take turns instead of numbering two events alike. The
+  pass opens it for each local step and never across a network call, which
+  keeps a recording command's wait short.
 
 ## Key hierarchy
 
@@ -750,6 +759,12 @@ Read this before "fixing" any of it.
   before it skips a record, so storage is trusted no further. Without it a
   record that came from storage had no row for the copy it came from, so it
   read as "changes waiting" and the next pass asked the copy for it again.
+- **A rotation lists storage once more after the envelope.**
+  `reseal_under_new_key` writes the content key envelope last, so a device
+  still on the old key keeps pushing until then. Its records are found by
+  listing again afterwards and resealed, up to three rounds. A device whose
+  key no longer opens the envelope is told `Rotated` whenever the rotation
+  proof for its key opens, before the records are asked.
 - **A record a copy stops listing is sent to it again.** The other way
   round: a record marked as held by a copy, above that copy's newest
   snapshot, that its listing no longer names (the folder deleted at the

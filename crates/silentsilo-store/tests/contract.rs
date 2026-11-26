@@ -56,7 +56,7 @@ fn webdav_unchecked() -> Option<Box<dyn ObjectStore>> {
     .map(|s| Box::new(s) as Box<dyn ObjectStore>)
 }
 
-/// The host key is learned first, exactly as the app does it — which also
+/// The host key is learned first, exactly as the app does it, which also
 /// means this test would fail if pinning were broken, since a store with no
 /// confirmed fingerprint refuses to be built at all.
 async fn sftp_store() -> Option<Box<dyn ObjectStore>> {

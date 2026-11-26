@@ -9,6 +9,24 @@ This repository has its own version line, separate from the desktop
 application's. A client pins a tag from here; the tag it pins is what its
 release notes should say.
 
+## [Unreleased]
+
+No persisted format changed.
+
+### Fixed
+
+- A rotation lists storage again after it writes the new content key
+  envelope and reseals records another device pushed under the old key
+  meanwhile. They stayed under a key nobody held after the commit.
+- A device whose key a rotation retired is told to rejoin when the proof
+  of that rotation opens for it, even if its own newest records still open.
+  It was told storage had been tampered with.
+- S3 errors are told apart by the HTTP status, not by any "404" in the
+  message: a request id could turn a server error into "not found".
+- Decrypting a file into memory asks for the memory first and says the
+  file is too large, instead of aborting the process.
+- Record sequence numbers no longer overflow on a value from storage.
+
 ## [1.11.6] - data loss fixes from the November review
 
 No persisted format changed.

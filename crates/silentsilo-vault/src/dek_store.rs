@@ -76,7 +76,7 @@ mod tests {
 
         let wrapped_a = wrap_dek_bytes(&dek, &wrap_key).unwrap();
         let wrapped_b = wrap_dek_bytes(&dek, &wrap_key).unwrap();
-        // Same DEK, same key, wrapped twice — must not reuse the nonce.
+        // Same DEK, same key, wrapped twice, must not reuse the nonce.
         assert_ne!(wrapped_a, wrapped_b);
 
         let unwrapped = unwrap_dek_bytes(&wrapped_a, &wrap_key).unwrap();

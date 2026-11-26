@@ -125,7 +125,7 @@ async fn pushing_marks_blobs_as_synced() {
 #[tokio::test]
 async fn a_failed_upload_leaves_the_blob_unsynced_for_the_next_attempt() {
     // Marking before the upload lands would make the blob evictable while
-    // the bucket has no copy — that is how a file is lost for good.
+    // the bucket has no copy, that is how a file is lost for good.
     let Some(mut cfg) = client().map(|c| c.config().clone()) else {
         silentsilo_testkit::skip_or_fail("SILENTSILO_TEST_S3_ENDPOINT is not set");
         return;
@@ -213,7 +213,7 @@ async fn a_missing_blob_reports_an_error_rather_than_writing_an_empty_file() {
 
 #[tokio::test]
 async fn pushing_a_blob_whose_file_is_gone_is_skipped_quietly() {
-    // Trashed and purged between listing and upload — nothing to send, and
+    // Trashed and purged between listing and upload, nothing to send, and
     // nothing worth failing the pass over.
     let client = client_or_skip!();
     let vault = Vault::new();

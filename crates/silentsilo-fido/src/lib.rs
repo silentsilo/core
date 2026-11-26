@@ -1,6 +1,6 @@
 //! FIDO2 security-key integration.
 //!
-//! - **Windows**: OS WebAuthn API (`webauthn.dll`) — no administrator rights.
+//! - **Windows**: OS WebAuthn API (`webauthn.dll`), no administrator rights.
 //! - **Linux / macOS**: CTAP2 over USB HID.
 
 // A constant in place of a security key, for end-to-end tests. Never in a

@@ -174,7 +174,7 @@ pub struct WebDavStore {
     /// Collections already created in this session.
     ///
     /// Without it every `put` costs an extra round trip to `MKCOL` a
-    /// collection that has existed since the first one — which on a sync
+    /// collection that has existed since the first one, which on a sync
     /// pass of a thousand operations is a thousand pointless requests.
     known_collections: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Always with a trailing slash, so joining a key is concatenation.
@@ -297,7 +297,7 @@ impl WebDavStore {
     /// Creates one collection if it isn't already there.
     ///
     /// `MKCOL` on an existing collection answers 405, which is success here
-    /// — the goal is that it exists, not that we made it. A 409 is *not*
+    ///, the goal is that it exists, not that we made it. A 409 is *not*
     /// tolerated: it means the parent is missing, which since these are
     /// created outermost-first would be a real structural problem rather
     /// than a race.
@@ -783,7 +783,7 @@ fn parse_multistatus(xml: &str, base_path: &str) -> Result<Vec<DavEntry>, StoreE
                 "href" => field = Some("href"),
                 "getcontentlength" => field = Some("size"),
                 // `<collection/>` is usually empty, so it arrives as an
-                // Empty event — but some servers emit it with whitespace.
+                // Empty event, but some servers emit it with whitespace.
                 "collection" => {
                     if let Some(entry) = current.as_mut() {
                         entry.is_collection = true;
@@ -801,7 +801,7 @@ fn parse_multistatus(xml: &str, base_path: &str) -> Result<Vec<DavEntry>, StoreE
             Ok(Event::Text(e)) => {
                 let raw = e.decode().unwrap_or_default().to_string();
                 // Hrefs are percent-encoded, so the only XML entities that
-                // realistically appear are `&amp;` in a path — decoded here
+                // realistically appear are `&amp;` in a path, decoded here
                 // rather than left to become a literal "&amp;" in a key.
                 let text = raw
                     .replace("&amp;", "&")

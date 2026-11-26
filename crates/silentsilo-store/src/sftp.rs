@@ -29,7 +29,7 @@ pub enum SftpAuth {
     ///
     /// The silo's settings are already stored in the OS keyring, and keeping
     /// the key there means the silo keeps working when the file is moved or
-    /// the machine is rebuilt — a path would be a second thing to get right.
+    /// the machine is rebuilt, a path would be a second thing to get right.
     Key {
         private_key: String,
         passphrase: Option<String>,
@@ -60,7 +60,7 @@ pub struct SftpConfig {
     /// The server key this silo expects, as `SHA256:…`.
     ///
     /// `None` means the key has never been confirmed by a person, and no
-    /// connection will be made — see the module note.
+    /// connection will be made, see the module note.
     pub host_fingerprint: Option<String>,
 }
 
@@ -132,7 +132,7 @@ impl client::Handler for PinnedHandler {
 ///
 /// These have to be held together. Dropping the russh handle tears down the
 /// transport, and the SFTP session on top of it then fails mid-operation with
-/// nothing but "disconnected" to say why — which is exactly what happened
+/// nothing but "disconnected" to say why, which is exactly what happened
 /// when only the session was returned: small writes completed before the
 /// teardown landed and larger ones did not.
 struct Connection {
@@ -211,7 +211,7 @@ pub struct SftpStore {
     /// One handshake per object was the first design, and it was wrong twice
     /// over: key exchange costs more than the transfers a sync pass makes,
     /// and sshd caps how many connections may be mid-handshake at once
-    /// (`MaxStartups`, ten by default) — so a pass with a few files in flight
+    /// (`MaxStartups`, ten by default), so a pass with a few files in flight
     /// gets connections dropped at random by the server's own defence.
     live: tokio::sync::Mutex<Option<Arc<Connection>>>,
 }
@@ -257,7 +257,7 @@ impl SftpStore {
         Ok(conn)
     }
 
-    /// Forgets `dead` so the next call dials again — unless something else
+    /// Forgets `dead` so the next call dials again, unless something else
     /// already replaced it, in which case the newer one is the good one.
     async fn retire(&self, dead: &Arc<Connection>) {
         let mut live = self.live.lock().await;
@@ -269,8 +269,8 @@ impl SftpStore {
     /// Runs an operation, dialling again and retrying once if the connection
     /// turned out to be dead.
     ///
-    /// A reused connection can be closed between the check and the call — by
-    /// an idle timeout, a NAT table, a server restart — and that is a normal
+    /// A reused connection can be closed between the check and the call, by
+    /// an idle timeout, a NAT table, a server restart, and that is a normal
     /// event rather than a failure to report. Only a second failure on a
     /// connection that was definitely fresh is worth telling the user about.
     async fn run<T, F, Fut>(&self, op: F) -> Result<T, StoreError>
@@ -307,7 +307,7 @@ impl SftpStore {
         .await
         .map_err(|e| {
             // A rejected key surfaces here as a generic handshake failure,
-            // so the specific message has to be reconstructed — otherwise
+            // so the specific message has to be reconstructed, otherwise
             // the most security-relevant error in the whole backend reads as
             // "connection closed".
             let seen = offered.lock().ok().and_then(|o| o.clone());
@@ -504,7 +504,7 @@ impl ObjectStore for SftpStore {
                 self.ensure_parents(&sftp, key).await?;
 
                 // Written under a temporary name and renamed, so another
-                // device reading the directory never sees a partial object —
+                // device reading the directory never sees a partial object,
                 // the same reasoning as the folder backend, and it matters
                 // more here because the reader is on a different machine.
                 let final_path = self.path_for(key)?;

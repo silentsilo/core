@@ -1,7 +1,7 @@
 //! The S3 client, seen through the common contract.
 //!
 //! A thin adaptation rather than a rewrite: `S3Client` already had exactly
-//! these five operations, which is what made the trait worth extracting —
+//! these five operations, which is what made the trait worth extracting,
 //! the shape was right before it had a name.
 
 use async_trait::async_trait;
@@ -33,9 +33,9 @@ fn map(err: S3Error) -> StoreError {
              Check the bucket's lifecycle rules. ({text})"
         ));
     }
-    if lower.contains("nosuchkey") || lower.contains("not found") || lower.contains("404") {
+    if lower.contains("nosuchkey") || lower.contains("not found") || lower.contains("(404)") {
         StoreError::NotFound(text)
-    } else if lower.contains("403")
+    } else if lower.contains("(403)")
         || lower.contains("accessdenied")
         || lower.contains("signaturedoesnotmatch")
         || lower.contains("invalidaccesskeyid")
