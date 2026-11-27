@@ -4024,21 +4024,21 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-app"
-version = "1.12.0-beta.1"
+version = "1.12.0-beta.2"
 dependencies = [
  "async-trait",
  "hex",
  "rusqlite 0.43.0",
  "serde",
  "serde_json",
- "silentsilo-audit 1.12.0-beta.1",
- "silentsilo-core 1.12.0-beta.1",
- "silentsilo-crypto 1.12.0-beta.1",
- "silentsilo-store 1.12.0-beta.1",
- "silentsilo-sync 1.12.0-beta.1",
+ "silentsilo-audit 1.12.0-beta.2",
+ "silentsilo-core 1.12.0-beta.2",
+ "silentsilo-crypto 1.12.0-beta.2",
+ "silentsilo-store 1.12.0-beta.2",
+ "silentsilo-sync 1.12.0-beta.2",
  "silentsilo-testkit",
- "silentsilo-vault 1.12.0-beta.1",
- "silentsilo-vfs 1.12.0-beta.1",
+ "silentsilo-vault 1.12.0-beta.2",
+ "silentsilo-vfs 1.12.0-beta.2",
  "tempfile",
  "tokio",
  "uuid",
@@ -4114,7 +4114,7 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-audit"
-version = "1.12.0-beta.1"
+version = "1.12.0-beta.2"
 dependencies = [
  "blake3",
  "hex",
@@ -4122,7 +4122,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
- "silentsilo-crypto 1.12.0-beta.1",
+ "silentsilo-crypto 1.12.0-beta.2",
  "tempfile",
  "thiserror",
  "uuid",
@@ -4194,7 +4194,7 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-cloud"
-version = "1.12.0-beta.1"
+version = "1.12.0-beta.2"
 dependencies = [
  "async-trait",
  "base64",
@@ -4204,8 +4204,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "silentsilo-s3 1.12.0-beta.1",
- "silentsilo-store 1.12.0-beta.1",
+ "silentsilo-s3 1.12.0-beta.2",
+ "silentsilo-store 1.12.0-beta.2",
  "tempfile",
  "thiserror",
  "tokio",
@@ -4275,7 +4275,7 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-core"
-version = "1.12.0-beta.1"
+version = "1.12.0-beta.2"
 dependencies = [
  "serde",
  "tempfile",
@@ -4390,7 +4390,7 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-crypto"
-version = "1.12.0-beta.1"
+version = "1.12.0-beta.2"
 dependencies = [
  "aes-gcm 0.10.3",
  "blake3",
@@ -4399,7 +4399,7 @@ dependencies = [
  "p256",
  "rand 0.9.5",
  "sha2 0.10.9",
- "silentsilo-core 1.12.0-beta.1",
+ "silentsilo-core 1.12.0-beta.2",
  "tempfile",
  "thiserror",
  "uuid",
@@ -4408,7 +4408,7 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-extract"
-version = "1.12.0-beta.1"
+version = "1.12.0-beta.2"
 dependencies = [
  "base64",
  "blake3",
@@ -4416,14 +4416,14 @@ dependencies = [
  "libc",
  "rusqlite 0.43.0",
  "serde_json",
- "silentsilo-audit 1.12.0-beta.1",
- "silentsilo-core 1.12.0-beta.1",
- "silentsilo-crypto 1.12.0-beta.1",
+ "silentsilo-audit 1.12.0-beta.2",
+ "silentsilo-core 1.12.0-beta.2",
+ "silentsilo-crypto 1.12.0-beta.2",
  "silentsilo-fixture",
- "silentsilo-store 1.12.0-beta.1",
- "silentsilo-sync 1.12.0-beta.1",
- "silentsilo-vault 1.12.0-beta.1",
- "silentsilo-vfs 1.12.0-beta.1",
+ "silentsilo-store 1.12.0-beta.2",
+ "silentsilo-sync 1.12.0-beta.2",
+ "silentsilo-vault 1.12.0-beta.2",
+ "silentsilo-vfs 1.12.0-beta.2",
  "tempfile",
  "tokio",
  "uuid",
@@ -4433,7 +4433,7 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-fido"
-version = "1.12.0-beta.1"
+version = "1.12.0-beta.2"
 dependencies = [
  "aes 0.8.4",
  "base64",
@@ -4461,7 +4461,7 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-fixture"
-version = "1.12.0-beta.1"
+version = "1.12.0-beta.2"
 dependencies = [
  "blake3",
  "hex",
@@ -4469,36 +4469,36 @@ dependencies = [
  "rusqlite 0.43.0",
  "serde_json",
  "sha2 0.10.9",
- "silentsilo-app 1.12.0-beta.1",
+ "silentsilo-app 1.12.0-beta.2",
  "silentsilo-app 1.6.1",
- "silentsilo-audit 1.12.0-beta.1",
+ "silentsilo-audit 1.12.0-beta.2",
  "silentsilo-audit 1.9.0",
- "silentsilo-core 1.12.0-beta.1",
+ "silentsilo-core 1.12.0-beta.2",
  "silentsilo-crypto 1.0.0",
  "silentsilo-crypto 1.10.0",
- "silentsilo-crypto 1.12.0-beta.1",
+ "silentsilo-crypto 1.12.0-beta.2",
  "silentsilo-crypto 1.6.1",
  "silentsilo-store 1.0.0",
  "silentsilo-store 1.10.0",
  "silentsilo-store 1.10.4",
  "silentsilo-store 1.11.8",
- "silentsilo-store 1.12.0-beta.1",
+ "silentsilo-store 1.12.0-beta.2",
  "silentsilo-store 1.6.1",
  "silentsilo-sync 1.0.0",
  "silentsilo-sync 1.10.0",
  "silentsilo-sync 1.10.4",
  "silentsilo-sync 1.11.8",
- "silentsilo-sync 1.12.0-beta.1",
+ "silentsilo-sync 1.12.0-beta.2",
  "silentsilo-sync 1.6.1",
  "silentsilo-vault 1.0.0",
  "silentsilo-vault 1.10.0",
  "silentsilo-vault 1.10.4",
  "silentsilo-vault 1.11.8",
- "silentsilo-vault 1.12.0-beta.1",
+ "silentsilo-vault 1.12.0-beta.2",
  "silentsilo-vault 1.6.1",
  "silentsilo-vfs 1.0.0",
  "silentsilo-vfs 1.10.0",
- "silentsilo-vfs 1.12.0-beta.1",
+ "silentsilo-vfs 1.12.0-beta.2",
  "silentsilo-vfs 1.6.1",
  "tempfile",
  "tokio",
@@ -4596,7 +4596,7 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-s3"
-version = "1.12.0-beta.1"
+version = "1.12.0-beta.2"
 dependencies = [
  "aws-credential-types",
  "aws-sdk-s3",
@@ -4607,7 +4607,7 @@ dependencies = [
  "jni",
  "rustls",
  "rustls-platform-verifier",
- "silentsilo-core 1.12.0-beta.1",
+ "silentsilo-core 1.12.0-beta.2",
  "silentsilo-testkit",
  "tempfile",
  "thiserror",
@@ -4617,17 +4617,17 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-soak"
-version = "1.12.0-beta.1"
+version = "1.12.0-beta.2"
 dependencies = [
  "libc",
  "rusqlite 0.43.0",
  "serde",
  "serde_json",
- "silentsilo-app 1.12.0-beta.1",
- "silentsilo-store 1.12.0-beta.1",
- "silentsilo-sync 1.12.0-beta.1",
- "silentsilo-vault 1.12.0-beta.1",
- "silentsilo-vfs 1.12.0-beta.1",
+ "silentsilo-app 1.12.0-beta.2",
+ "silentsilo-store 1.12.0-beta.2",
+ "silentsilo-sync 1.12.0-beta.2",
+ "silentsilo-vault 1.12.0-beta.2",
+ "silentsilo-vfs 1.12.0-beta.2",
  "tokio",
  "uuid",
  "windows-sys 0.61.2",
@@ -4747,7 +4747,7 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-store"
-version = "1.12.0-beta.1"
+version = "1.12.0-beta.2"
 dependencies = [
  "async-trait",
  "objc2-foundation",
@@ -4758,8 +4758,8 @@ dependencies = [
  "russh-sftp",
  "serde",
  "serde_json",
- "silentsilo-core 1.12.0-beta.1",
- "silentsilo-s3 1.12.0-beta.1",
+ "silentsilo-core 1.12.0-beta.2",
+ "silentsilo-s3 1.12.0-beta.2",
  "silentsilo-testkit",
  "tempfile",
  "thiserror",
@@ -4875,7 +4875,7 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-sync"
-version = "1.12.0-beta.1"
+version = "1.12.0-beta.2"
 dependencies = [
  "async-trait",
  "blake3",
@@ -4883,14 +4883,14 @@ dependencies = [
  "rusqlite 0.43.0",
  "serde",
  "serde_json",
- "silentsilo-audit 1.12.0-beta.1",
- "silentsilo-core 1.12.0-beta.1",
- "silentsilo-crypto 1.12.0-beta.1",
- "silentsilo-s3 1.12.0-beta.1",
- "silentsilo-store 1.12.0-beta.1",
+ "silentsilo-audit 1.12.0-beta.2",
+ "silentsilo-core 1.12.0-beta.2",
+ "silentsilo-crypto 1.12.0-beta.2",
+ "silentsilo-s3 1.12.0-beta.2",
+ "silentsilo-store 1.12.0-beta.2",
  "silentsilo-testkit",
- "silentsilo-vault 1.12.0-beta.1",
- "silentsilo-vfs 1.12.0-beta.1",
+ "silentsilo-vault 1.12.0-beta.2",
+ "silentsilo-vfs 1.12.0-beta.2",
  "tempfile",
  "thiserror",
  "tokio",
@@ -4900,7 +4900,7 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-testkit"
-version = "1.12.0-beta.1"
+version = "1.12.0-beta.2"
 
 [[package]]
 name = "silentsilo-vault"
@@ -5037,7 +5037,7 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-vault"
-version = "1.12.0-beta.1"
+version = "1.12.0-beta.2"
 dependencies = [
  "aes-gcm 0.10.3",
  "argon2 0.5.3",
@@ -5053,10 +5053,10 @@ dependencies = [
  "security-framework-sys",
  "serde",
  "serde_json",
- "silentsilo-cloud 1.12.0-beta.1",
- "silentsilo-core 1.12.0-beta.1",
- "silentsilo-crypto 1.12.0-beta.1",
- "silentsilo-store 1.12.0-beta.1",
+ "silentsilo-cloud 1.12.0-beta.2",
+ "silentsilo-core 1.12.0-beta.2",
+ "silentsilo-crypto 1.12.0-beta.2",
+ "silentsilo-store 1.12.0-beta.2",
  "silentsilo-testkit",
  "tempfile",
  "thiserror",
@@ -5165,7 +5165,7 @@ dependencies = [
 
 [[package]]
 name = "silentsilo-vfs"
-version = "1.12.0-beta.1"
+version = "1.12.0-beta.2"
 dependencies = [
  "base64",
  "blake3",
@@ -5174,9 +5174,9 @@ dependencies = [
  "rusqlite 0.43.0",
  "serde",
  "serde_json",
- "silentsilo-core 1.12.0-beta.1",
- "silentsilo-crypto 1.12.0-beta.1",
- "silentsilo-vault 1.12.0-beta.1",
+ "silentsilo-core 1.12.0-beta.2",
+ "silentsilo-crypto 1.12.0-beta.2",
+ "silentsilo-vault 1.12.0-beta.2",
  "tempfile",
  "unicode-normalization",
  "uuid",
