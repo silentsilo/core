@@ -113,6 +113,10 @@ pub mod codes {
     pub const RECOVERY_CODE_USED: u16 = 52;
     pub const RECOVERY_CODE_CHANGED: u16 = 53;
     pub const SILO_KEY_ROTATED: u16 = 54;
+    /// From core 1.12: the unlock password set or changed.
+    pub const PASSWORD_SET: u16 = 55;
+    /// From core 1.12: the unlock password removed.
+    pub const PASSWORD_REMOVED: u16 = 56;
 
     pub const LOG_STARTED: u16 = 60;
     pub const LOG_STOPPED: u16 = 61;
@@ -159,6 +163,8 @@ pub fn describe(code: u16) -> String {
         RECOVERY_CODE_USED => "Recovery code used",
         RECOVERY_CODE_CHANGED => "Recovery code changed",
         SILO_KEY_ROTATED => "Silo key changed",
+        PASSWORD_SET => "Unlock password set",
+        PASSWORD_REMOVED => "Unlock password removed",
         LOG_STARTED => "Activity log started",
         LOG_STOPPED => "Activity log stopped",
         RETENTION_CHANGED => "Log retention changed",
@@ -231,6 +237,8 @@ mod tests {
             (RECOVERY_CODE_USED, 52),
             (RECOVERY_CODE_CHANGED, 53),
             (SILO_KEY_ROTATED, 54),
+            (PASSWORD_SET, 55),
+            (PASSWORD_REMOVED, 56),
             (LOG_STARTED, 60),
             (LOG_STOPPED, 61),
             (RETENTION_CHANGED, 62),

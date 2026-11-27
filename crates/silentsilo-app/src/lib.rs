@@ -19,6 +19,7 @@ pub mod inbox_import;
 mod state;
 mod store_config;
 mod sync_pass;
+mod unlock;
 
 pub use host::{AppEvent, Host};
 pub use state::{
@@ -27,6 +28,10 @@ pub use state::{
 };
 pub use store_config::{SftpAuthInput, StoreConfigInput, StoreConfigView};
 pub use sync_pass::{
-    MISSED_ROTATION, RETIRED_COPY, SNAPSHOT_UNREAD, SyncProgress, SyncReport, TargetStatus,
-    clear_backoff, owed_now, run_sync_pass, sync_now,
+    MISSED_ROTATION, PasswordChange, RETIRED_COPY, SNAPSHOT_UNREAD, SyncProgress, SyncReport,
+    TargetStatus, clear_backoff, owed_now, run_sync_pass, sync_now,
+};
+pub use unlock::{
+    Action, Confirmation, DeviceMeans, Unlocked, VIA_PASSWORD, VIA_RECOVERY_CODE, confirmation_for,
+    within_grace,
 };

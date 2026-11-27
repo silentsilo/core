@@ -67,6 +67,9 @@ pub struct AppState {
     /// only new segments. The log in clear: forgotten when the silo closes
     /// ([`AppState::forget_audit_read`]), never written anywhere.
     pub(crate) audit_opened: Mutex<HashMap<Uuid, silentsilo_audit::reading::Opened>>,
+    /// How each open silo was unlocked, and when the user last proved they
+    /// were there (the unlock itself, or a confirmation since).
+    pub(crate) unlocked: Mutex<HashMap<Uuid, (crate::Unlocked, Instant)>>,
 }
 
 /// What [`AppState::sync_locks`] holds.
@@ -249,12 +252,16 @@ impl AppState {
                     close_one(host, old);
                 }
                 self.forget_audit_read(*stale);
+                self.forget_unlocked(*stale);
                 touched.remove(stale);
             })
         };
 
         sessions.insert(id, session);
         touched.insert(id, Instant::now());
+        // Whatever an earlier session of this silo was opened with does not
+        // carry over; the caller records this one with `set_unlocked`.
+        self.forget_unlocked(id);
         Ok(evicted)
     }
 
@@ -262,6 +269,7 @@ impl AppState {
     pub fn close_session(&self, host: &dyn Host, id: Uuid) -> Result<(), String> {
         let closed = self.sessions.lock().map_err(|e| e.to_string())?.remove(&id);
         self.forget_audit_read(id);
+        self.forget_unlocked(id);
         if let Ok(mut touched) = self.last_touched.lock() {
             touched.remove(&id);
         }
@@ -269,6 +277,62 @@ impl AppState {
             close_one(host, session);
         }
         Ok(())
+    }
+
+    /// Records how silo `id` was opened, after its session entered the
+    /// state. The unlock counts as the first confirmation.
+    pub fn set_unlocked(&self, id: Uuid, how: crate::Unlocked) {
+        self.unlocked_map().insert(id, (how, Instant::now()));
+    }
+
+    /// How silo `id` was opened. [`crate::Unlocked::Fresh`] when nothing
+    /// was recorded, which never skips a check a credential would need.
+    pub fn unlocked(&self, id: Uuid) -> crate::Unlocked {
+        self.unlocked_map()
+            .get(&id)
+            .map(|(how, _)| how.clone())
+            .unwrap_or(crate::Unlocked::Fresh)
+    }
+
+    /// Notes that the user just confirmed something on silo `id`.
+    pub fn note_confirmed(&self, id: Uuid) {
+        if let Some((_, at)) = self.unlocked_map().get_mut(&id) {
+            *at = Instant::now();
+        }
+    }
+
+    /// When the user last proved they were there on silo `id`.
+    pub fn last_confirmed(&self, id: Uuid) -> Option<Instant> {
+        self.unlocked_map().get(&id).map(|(_, at)| *at)
+    }
+
+    /// What `action` needs on silo `id` right now: [`crate::confirmation_for`]
+    /// for how it was opened, unless a confirmation inside `grace` covers it.
+    pub fn confirmation_needed(
+        &self,
+        id: Uuid,
+        action: crate::Action,
+        means: crate::DeviceMeans,
+        grace: std::time::Duration,
+    ) -> crate::Confirmation {
+        let needed = crate::confirmation_for(action, &self.unlocked(id), means);
+        if needed != crate::Confirmation::None
+            && crate::within_grace(self.last_confirmed(id), Instant::now(), grace)
+        {
+            return crate::Confirmation::None;
+        }
+        needed
+    }
+
+    fn forget_unlocked(&self, id: Uuid) {
+        self.unlocked_map().remove(&id);
+    }
+
+    fn unlocked_map(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, (crate::Unlocked, Instant)>> {
+        // A plain map no panic leaves half written.
+        self.unlocked
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Drops what was read of a silo's activity log. Every path that closes

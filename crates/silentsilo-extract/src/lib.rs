@@ -188,6 +188,8 @@ pub enum ExtractError {
     NoSilo,
     NoRecoveryCode,
     WrongCode,
+    NoPassword,
+    WrongPassword,
     NoContentKey,
     Vault(String),
     Io(String),
@@ -203,6 +205,11 @@ impl std::fmt::Display for ExtractError {
                 "this backup has no recovery code published, so a code alone cannot open it"
             ),
             Self::WrongCode => write!(f, "that recovery code does not open this backup"),
+            Self::NoPassword => write!(
+                f,
+                "this backup has no unlock password, so open it with the recovery code"
+            ),
+            Self::WrongPassword => write!(f, "that password does not open this backup"),
             Self::NoContentKey => write!(
                 f,
                 "this backup has no content key, so its files cannot be opened"
@@ -221,18 +228,56 @@ impl std::error::Error for ExtractError {}
 /// call: reading a backup must not leave a silo behind on the machine doing
 /// the reading, which may well not be the owner's.
 pub async fn open(store: &dyn ObjectStore, code: &str) -> Result<Backup, ExtractError> {
+    open_with(store, Secret::RecoveryCode(code)).await
+}
+
+/// What opens a backup: the recovery code, or the unlock password when the
+/// silo has one.
+#[derive(Clone, Copy)]
+pub enum Secret<'a> {
+    RecoveryCode(&'a str),
+    Password(&'a str),
+}
+
+/// [`open`], with the recovery code or the unlock password.
+pub async fn open_with(
+    store: &dyn ObjectStore,
+    secret: Secret<'_>,
+) -> Result<Backup, ExtractError> {
     let manifest = silentsilo_sync::read_manifest(store)
         .await
         .map_err(|e| ExtractError::Storage(e.to_string()))?
         .ok_or(ExtractError::NoSilo)?;
 
-    let envelope = silentsilo_sync::fetch_recovery_envelope(store)
-        .await
-        .map_err(|e| ExtractError::Storage(e.to_string()))?
-        .ok_or(ExtractError::NoRecoveryCode)?;
-
-    let dek =
-        silentsilo_vault::unwrap_with_code(&envelope, code).map_err(|_| ExtractError::WrongCode)?;
+    let dek = match secret {
+        Secret::RecoveryCode(code) => {
+            let envelope = silentsilo_sync::fetch_recovery_envelope(store)
+                .await
+                .map_err(|e| ExtractError::Storage(e.to_string()))?
+                .ok_or(ExtractError::NoRecoveryCode)?;
+            silentsilo_vault::unwrap_with_code(&envelope, code)
+                .map_err(|_| ExtractError::WrongCode)?
+        }
+        Secret::Password(password) => {
+            use silentsilo_sync::unlock_password::{StoredPassword, fetch_password_envelope};
+            let envelope = match fetch_password_envelope(store)
+                .await
+                .map_err(|e| ExtractError::Storage(e.to_string()))?
+            {
+                StoredPassword::Envelope(envelope) => envelope,
+                StoredPassword::NeedsNewer => {
+                    return Err(ExtractError::Storage(
+                        "the unlock password was set by a newer SilentSilo: use a newer version of this tool, or the recovery code".into(),
+                    ));
+                }
+                StoredPassword::Absent | StoredPassword::Junk => {
+                    return Err(ExtractError::NoPassword);
+                }
+            };
+            silentsilo_vault::password::unwrap_with_password(&envelope, password)
+                .map_err(|_| ExtractError::WrongPassword)?
+        }
+    };
 
     let kek_bytes = silentsilo_sync::fetch_content_kek(store)
         .await

@@ -136,8 +136,8 @@ struct OldDevice {
 }
 
 enum Kind {
-    Old(OldDevice),
-    New(NewDevice),
+    Old(Box<OldDevice>),
+    New(Box<NewDevice>),
 }
 
 struct Device {
@@ -228,12 +228,12 @@ impl Device {
             _dir: dir,
             root,
             storage: storage.to_path_buf(),
-            kind: Kind::Old(OldDevice {
+            kind: Kind::Old(Box::new(OldDevice {
                 session: Mutex::new(session),
                 target: store_v1::StoreConfig::Folder {
                     path: storage.to_path_buf(),
                 },
-            }),
+            })),
         }
     }
 
@@ -248,14 +248,14 @@ impl Device {
             session.seal_for_lock().unwrap();
             *session.dek.as_bytes()
         };
-        let placeholder = Kind::New(NewDevice {
+        let placeholder = Kind::New(Box::new(NewDevice {
             state: AppState::default(),
             silo: silo_entry(&self.root, silo_index),
             host: FleetHost {
                 targets: Vec::new(),
             },
             swept_on: AtomicUsize::new(DAY.load(Ordering::SeqCst)),
-        });
+        }));
         let Kind::Old(old) = std::mem::replace(&mut self.kind, placeholder) else {
             unreachable!()
         };

@@ -1,4 +1,4 @@
-//! Reading the recovery code without leaving it anywhere: typed at a prompt
+//! Reading the recovery code, or the unlock password, without leaving it anywhere: typed at a prompt
 //! that does not echo it, or piped in on standard input. On the command
 //! line it would stay in the shell's history and show in the list of
 //! running programs for as long as the extraction runs.
@@ -7,17 +7,26 @@ use std::io::{BufRead, IsTerminal, Write};
 
 use zeroize::Zeroizing;
 
-/// Asks for the code on the terminal with echo off, or reads the first line
-/// of standard input when that is not a terminal.
-pub fn read_code() -> Result<Zeroizing<String>, String> {
+/// Asks for the code, or the password, on the terminal with echo off, or
+/// reads the first line of standard input when that is not a terminal.
+pub fn read_secret(password: bool) -> Result<Zeroizing<String>, String> {
+    let what = if password {
+        "unlock password"
+    } else {
+        "recovery code"
+    };
     let stdin = std::io::stdin();
     if !stdin.is_terminal() {
-        return first_line(&mut stdin.lock());
+        return first_line(&mut stdin.lock(), what);
     }
-    eprint!("Recovery code (not shown as you type): ");
+    if password {
+        eprint!("Unlock password (not shown as you type): ");
+    } else {
+        eprint!("Recovery code (not shown as you type): ");
+    }
     let _ = std::io::stderr().flush();
     let echo = EchoOff::new();
-    let code = first_line(&mut stdin.lock());
+    let code = first_line(&mut stdin.lock(), what);
     drop(echo);
     eprintln!();
     code
@@ -55,14 +64,16 @@ Press Enter to close this window."
     }
 }
 
-fn first_line(input: &mut impl BufRead) -> Result<Zeroizing<String>, String> {
+fn first_line(input: &mut impl BufRead, what: &str) -> Result<Zeroizing<String>, String> {
     let mut line = Zeroizing::new(String::new());
     input
         .read_line(&mut line)
-        .map_err(|e| format!("Could not read the recovery code: {e}"))?;
+        .map_err(|e| format!("Could not read the {what}: {e}"))?;
+    // A password cannot start or end with a space, and a code's spaces do
+    // not count, so trimming loses nothing.
     let code = Zeroizing::new(line.trim().to_string());
     if code.is_empty() {
-        return Err("No recovery code was given.".into());
+        return Err(format!("No {what} was given."));
     }
     Ok(code)
 }
@@ -154,14 +165,17 @@ mod tests {
     #[test]
     fn a_piped_code_is_its_first_line_trimmed() {
         let mut input = std::io::Cursor::new("  ABCD-EFGH \nsomething else\n");
-        assert_eq!(first_line(&mut input).unwrap().as_str(), "ABCD-EFGH");
+        assert_eq!(
+            first_line(&mut input, "recovery code").unwrap().as_str(),
+            "ABCD-EFGH"
+        );
     }
 
     #[test]
     fn nothing_piped_is_an_error_not_an_empty_code() {
         let mut input = std::io::Cursor::new("\n");
-        assert!(first_line(&mut input).is_err());
+        assert!(first_line(&mut input, "recovery code").is_err());
         let mut input = std::io::Cursor::new("");
-        assert!(first_line(&mut input).is_err());
+        assert!(first_line(&mut input, "recovery code").is_err());
     }
 }

@@ -52,6 +52,46 @@ fn staged_recovery_path(root: &Path) -> PathBuf {
     staged(crate::recovery::recovery_path(root))
 }
 
+fn staged_password_path(root: &Path) -> PathBuf {
+    staged(crate::password::password_path(root))
+}
+
+/// [`commit_rotation_with`], and the unlock password with it: `Some` is the
+/// envelope sealed under the new key, put in force with the rest; `None`
+/// drops the local copy, which opens only the old key. On a silo no key
+/// opens, the local key envelope follows the new password.
+pub fn commit_rotation_with_password(
+    root: &Path,
+    keys: &crate::StoredFidoKeys,
+    authority: crate::Authority<'_>,
+    recovery: Option<&crate::RecoveryEnvelope>,
+    password: Option<&crate::password::PasswordEnvelope>,
+) -> Result<(), VaultError> {
+    match password {
+        Some(envelope) => {
+            let json = serde_json::to_vec_pretty(envelope)
+                .map_err(|e| VaultError::Crypto(e.to_string()))?;
+            crate::workdir::write_private(&staged_password_path(root), &json)?;
+        }
+        None => {
+            let _ = std::fs::remove_file(staged_password_path(root));
+        }
+    }
+    commit_rotation_with(root, keys, authority, recovery)?;
+    match password {
+        Some(envelope) => {
+            if !keys.active().any(|k| !k.wrapped_dek.is_empty())
+                && let Ok(wrapped) = hex::decode(&envelope.wrapped_dek)
+            {
+                // Past the point of no return: best effort, as the renames.
+                let _ = crate::dek_store::save_wrapped_dek_bytes(root, &wrapped);
+            }
+        }
+        None => crate::password::clear_password_envelope(root),
+    }
+    Ok(())
+}
+
 /// Puts a staged rotation in force together with the files that go with it:
 /// the enrolled keys re-wrapped under the new key, and the recovery envelope
 /// made for it.
@@ -117,6 +157,10 @@ fn finish_committed(root: &Path) -> Result<(), VaultError> {
         (
             staged_recovery_path(root),
             crate::recovery::recovery_path(root),
+        ),
+        (
+            staged_password_path(root),
+            crate::password::password_path(root),
         ),
     ] {
         if staged.is_file() {
@@ -343,6 +387,7 @@ pub fn discard_staged(root: &Path) {
     let _ = std::fs::remove_file(staged_kek_path(root));
     let _ = std::fs::remove_file(staged_keys_path(root));
     let _ = std::fs::remove_file(staged_recovery_path(root));
+    let _ = std::fs::remove_file(staged_password_path(root));
 }
 
 #[cfg(test)]
@@ -872,5 +917,105 @@ mod tests {
             load_kek(dir.path(), &second).unwrap().as_bytes(),
             kek.as_bytes()
         );
+    }
+
+    const PASSWORD: &str = "lantern-gravel-oxidize-tuba";
+
+    /// A silo only a password opens: its local key envelope is the
+    /// password's own.
+    fn password_silo(dir: &Path) -> (MasterDek, ContentKek) {
+        let dek = generate_dek();
+        let kek = generate_content_kek();
+        save_kek(dir, &kek, &dek).unwrap();
+        let envelope =
+            crate::password::seal_under_password(&dek, &kek, PASSWORD, &[], false).unwrap();
+        crate::password::save_password_envelope(dir, &envelope).unwrap();
+        crate::dek_store::save_wrapped_dek_bytes(dir, &hex::decode(&envelope.wrapped_dek).unwrap())
+            .unwrap();
+        (dek, kek)
+    }
+
+    fn opens_with_password(dir: &Path) -> MasterDek {
+        let envelope = crate::password::load_password_envelope(dir).unwrap();
+        crate::password::unwrap_with_password(&envelope, PASSWORD).unwrap()
+    }
+
+    #[test]
+    fn a_rotation_keeping_the_password_leaves_it_opening_the_new_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let (old, kek) = password_silo(dir.path());
+        let new = generate_dek();
+        stage_rotation(dir.path(), &new, &kek, &old).unwrap();
+        let resealed =
+            crate::password::seal_under_password(&new, &kek, PASSWORD, &[], false).unwrap();
+        let empty = crate::StoredFidoKeys { keys: Vec::new() };
+        commit_rotation_with_password(
+            dir.path(),
+            &empty,
+            crate::Authority::Machine,
+            None,
+            Some(&resealed),
+        )
+        .unwrap();
+
+        assert!(!rotation_pending(dir.path()));
+        assert_eq!(opens_with_password(dir.path()).as_bytes(), new.as_bytes());
+        assert!(
+            crate::password::load_password_envelope(dir.path())
+                .unwrap()
+                .is_authentic_now(&kek, &new)
+        );
+        // The local key envelope moved with it: the old one is gone.
+        let envelope = crate::password::load_password_envelope(dir.path()).unwrap();
+        let salt = hex::decode(&envelope.salt).unwrap();
+        let wrap = envelope.kdf.derive(PASSWORD.as_bytes(), &salt).unwrap();
+        assert_eq!(
+            load_dek(dir.path(), &wrap).unwrap().as_bytes(),
+            new.as_bytes()
+        );
+        assert!(load_kek(dir.path(), &new).is_ok());
+    }
+
+    #[test]
+    fn a_rotation_dropping_the_password_leaves_no_copy_of_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (old, kek) = password_silo(dir.path());
+        stage_rotation(dir.path(), &generate_dek(), &kek, &old).unwrap();
+        let empty = crate::StoredFidoKeys { keys: Vec::new() };
+        commit_rotation_with_password(dir.path(), &empty, crate::Authority::Machine, None, None)
+            .unwrap();
+        assert!(!crate::password::has_unlock_password(dir.path()));
+    }
+
+    #[test]
+    fn a_commit_stopped_after_the_kek_moved_puts_the_password_in_place_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let (old, kek) = password_silo(dir.path());
+        let new = generate_dek();
+        stage_rotation(dir.path(), &new, &kek, &old).unwrap();
+        let resealed =
+            crate::password::seal_under_password(&new, &kek, PASSWORD, &[], false).unwrap();
+        // What the commit wrote before it stopped, just past the KEK.
+        std::fs::write(
+            staged_password_path(dir.path()),
+            serde_json::to_vec(&resealed).unwrap(),
+        )
+        .unwrap();
+        silentsilo_core::rename_with_retry(&staged_kek_path(dir.path()), &kek_path(dir.path()))
+            .unwrap();
+
+        assert!(finish_interrupted_commit(dir.path()).unwrap());
+        assert_eq!(opens_with_password(dir.path()).as_bytes(), new.as_bytes());
+    }
+
+    #[test]
+    fn discarding_takes_a_staged_password_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (old, kek) = password_silo(dir.path());
+        stage_rotation(dir.path(), &generate_dek(), &kek, &old).unwrap();
+        std::fs::write(staged_password_path(dir.path()), b"{}").unwrap();
+        discard_staged(dir.path());
+        assert!(!staged_password_path(dir.path()).exists());
+        assert_eq!(opens_with_password(dir.path()).as_bytes(), old.as_bytes());
     }
 }

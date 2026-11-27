@@ -61,3 +61,11 @@ aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", 
 aws-credential-types = "1"
 aws-smithy-types = "1"
 aws-smithy-runtime-api = "1"
+
+# The unlock password's Argon2id uses 256 MiB; unoptimised, the tests that
+# run it take seconds each. Release builds are unchanged.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3

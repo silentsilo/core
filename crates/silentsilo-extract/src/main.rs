@@ -1,10 +1,10 @@
-//! `silentsilo-extract`: get your files out with a recovery code and nothing
-//! else.
+//! `silentsilo-extract`: get your files out with a recovery code, or the
+//! unlock password, and nothing else.
 //!
 //! Arguments are parsed by hand rather than with a library. This binary is
 //! the answer to "what if the project disappears", so its dependency list is
 //! part of what it promises: the fewer things between a person and their
-//! files, the more of that promise survives. Six flags do not need a parser.
+//! files, the more of that promise survives. Seven flags do not need a parser.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -16,8 +16,8 @@ mod prompt;
 const USAGE: &str = "\
 silentsilo-extract  ·  read a SilentSilo backup with only a recovery code
 
-  silentsilo-extract list    --from <folder>
-  silentsilo-extract extract --from <folder> --to <folder>
+  silentsilo-extract list    --from <folder> [--password]
+  silentsilo-extract extract --from <folder> --to <folder> [--password]
 
   --from   the backup: a folder holding vault.json, recovery.env, keys/,
            snapshots/, ops/ and blobs/. All of them are needed. A bucket
@@ -32,6 +32,9 @@ first line is read.
 
 --code <recovery code> still works, but warns: on the command line the code
 stays in your shell history and shows in the list of running programs.
+
+--password opens the backup with the silo's unlock password instead, when it
+has one. It is asked for, or read from standard input, in the same way.
 
 A personal activity log, when the silo keeps one, is written to _activity/
 under --to, as CSV and as JSON lines. An organisation's is not: only its
@@ -59,6 +62,7 @@ struct Args {
     command: String,
     from: Option<PathBuf>,
     code: Option<Zeroizing<String>>,
+    password: bool,
     to: Option<PathBuf>,
 }
 
@@ -69,6 +73,7 @@ fn parse() -> Result<Args, String> {
         command,
         from: None,
         code: None,
+        password: false,
         to: None,
     };
     while let Some(flag) = raw.next() {
@@ -76,6 +81,10 @@ fn parse() -> Result<Args, String> {
             raw.next()
                 .ok_or_else(|| format!("{flag} needs a value after it"))
         };
+        if flag == "--password" {
+            args.password = true;
+            continue;
+        }
         match flag.as_str() {
             "--from" => args.from = Some(PathBuf::from(value()?)),
             "--code" => args.code = Some(Zeroizing::new(value()?)),
@@ -119,12 +128,16 @@ fn main() -> ExitCode {
         eprintln!("Extracting needs --to, a folder to write into.\n\n{USAGE}");
         return ExitCode::FAILURE;
     }
+    if args.password && args.code.is_some() {
+        eprintln!("Give either --code or --password, not both.");
+        return ExitCode::FAILURE;
+    }
     let code = match args.code.clone() {
         Some(code) => {
             eprintln!("{CODE_ON_COMMAND_LINE}");
             code
         }
-        None => match prompt::read_code() {
+        None => match prompt::read_secret(args.password) {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("{e}");
@@ -149,7 +162,12 @@ async fn run(args: Args, from: PathBuf, code: Zeroizing<String>) -> ExitCode {
     // Reading and replaying the history comes first and prints nothing of
     // its own, for minutes on a large silo.
     println!("Reading the silo's history. A large silo takes a few minutes.");
-    let backup = match silentsilo_extract::open(&*store, code.as_str()).await {
+    let secret = if args.password {
+        silentsilo_extract::Secret::Password(code.as_str())
+    } else {
+        silentsilo_extract::Secret::RecoveryCode(code.as_str())
+    };
+    let backup = match silentsilo_extract::open_with(&*store, secret).await {
         Ok(backup) => backup,
         Err(e) => {
             eprintln!("{e}");

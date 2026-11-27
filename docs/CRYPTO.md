@@ -529,6 +529,19 @@ Keyloggers and malware on an unlocked device are outside the model, as for
 every way in; a hardware key is the recommendation for anything of high
 value.
 
+Whoever learns the password can do what the owner can: add a key, change
+the password, turn the recovery code off. Every such change is in the
+activity log. On a device with a usable key, those changes still ask for the
+key, not the password. Removing the password stops new devices from joining
+with it, but a copy of the old envelope (a versioned bucket, a provider's
+history) still opens the vault key it wrapped; if the password may have
+leaked, rotate the vault key.
+
+On a silo no key opens on a device, the local DEK envelope (`master.dek.enc`)
+is wrapped under the password's key and the device secret is retired, so an
+old copy of the folder plus the keyring does not open it without the
+password. The extraction tool takes the password too (`--password`).
+
 ## Blob format (`.sslo` v1)
 
 On-disk layout:

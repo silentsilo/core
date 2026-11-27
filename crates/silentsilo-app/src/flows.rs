@@ -13,6 +13,10 @@
 //!
 //! Joining with a security key replaces step 1 with [`key_join_begin`], the
 //! key's ceremony against the envelopes it lists, and [`key_join_open`].
+//! Joining with the unlock password replaces it with [`password_join_begin`].
+//!
+//! The unlock password on an open silo: [`set_unlock_password`] (also a
+//! change), [`remove_unlock_password`], and [`open_with_password`] to unlock.
 
 use std::path::{Path, PathBuf};
 
@@ -20,6 +24,10 @@ use silentsilo_core::VaultMeta;
 use silentsilo_crypto::MasterDek;
 use silentsilo_store::ObjectStore;
 use silentsilo_sync as sync;
+use silentsilo_vault::password::{
+    PasswordEnvelope, has_unlock_password, load_password_envelope, save_password_envelope,
+    seal_under_password, unwrap_with_password,
+};
 use silentsilo_vault::{
     RecoveryEnvelope, StoredFidoCredential, StoredFidoKeys, VaultSession, load_fido_keys,
     save_fido_keys, save_recovery_envelope, unwrap_with_code, wrap_dek_bytes,
@@ -34,6 +42,9 @@ pub struct RecoveryJoin {
     dek: MasterDek,
     /// Absent for a key join on a silo that never set up a code.
     envelope: Option<RecoveryEnvelope>,
+    /// The unlock password's envelope, when the join was made with it.
+    /// Otherwise provisioning looks for one in storage.
+    password: Option<PasswordEnvelope>,
     /// The organisation key that opened this join, proven by its wrap key.
     proven_org_key: Option<String>,
     /// A rotation retired the key the credential opened.
@@ -115,6 +126,7 @@ pub async fn recovery_join_begin(
         vault_id: manifest.vault_id,
         dek,
         envelope: Some(envelope),
+        password: None,
         proven_org_key: None,
         retired,
     })
@@ -237,6 +249,7 @@ pub async fn key_join_open(
         vault_id: offer.vault_id,
         dek,
         envelope,
+        password: None,
         retired,
         // Whoever holds this key can always prove it, so its policy cannot
         // lock anyone out.
@@ -334,12 +347,404 @@ pub async fn recovery_join_provision(
             silentsilo_vault::Authority::Machine,
         );
     }
-    if let Some(envelope) = &join.envelope {
+    // Checked before it is kept: one whose tags fail was not made on this
+    // silo's current key, whatever opened it. One with none is what releases
+    // before 1.10.0 wrote, which the passes after this one settle.
+    if let Some(envelope) = &join.envelope
+        && (envelope.auth_dek.is_none() || envelope.is_authentic_now(&kek, &join.dek))
+    {
         save_recovery_envelope(&root, envelope).map_err(|e| e.to_string())?;
+    }
+
+    // The unlock password comes too, so it opens this copy from the start.
+    let password = match &join.password {
+        Some(envelope) => Some(envelope.clone()),
+        None => adoptable_password(store, &kek, &join.dek).await,
+    };
+    if let Some(envelope) = password {
+        save_password_envelope(&root, &envelope).map_err(|e| e.to_string())?;
+        if !opened_by_a_key(&root) {
+            guard_with_password(&root, join.vault_id, &envelope)?;
+        }
     }
 
     session.backup_locally().map_err(|e| e.to_string())?;
     Ok(session)
+}
+
+/// Whether one of the silo's keys holds the local DEK envelope here.
+fn opened_by_a_key(root: &Path) -> bool {
+    load_fido_keys(root).is_ok_and(|keys| keys.active().any(|k| !k.wrapped_dek.is_empty()))
+}
+
+/// Puts the local DEK envelope under the password and retires the device
+/// secret, as a first key does: kept, the secret and an old
+/// `master.dek.enc` (a synced folder's history) would open the silo without
+/// the password. For a silo no key opens here.
+pub fn guard_with_password(
+    root: &Path,
+    vault_id: Uuid,
+    envelope: &PasswordEnvelope,
+) -> Result<(), String> {
+    let wrapped = hex::decode(&envelope.wrapped_dek).map_err(|e| e.to_string())?;
+    silentsilo_vault::save_wrapped_dek_bytes(root, &wrapped).map_err(|e| e.to_string())?;
+    silentsilo_vault::retire_device_secret(vault_id).map_err(|e| e.to_string())
+}
+
+/// The password envelope a store holds, when a device on the current vault
+/// key made it and no removal covers it.
+async fn adoptable_password(
+    store: &dyn ObjectStore,
+    kek: &silentsilo_crypto::ContentKek,
+    dek: &MasterDek,
+) -> Option<PasswordEnvelope> {
+    let Ok(sync::unlock_password::StoredPassword::Envelope(envelope)) =
+        sync::unlock_password::fetch_password_envelope(store).await
+    else {
+        return None;
+    };
+    if !envelope.is_authentic_now(kek, dek) {
+        return None;
+    }
+    match sync::revoked_at(store, kek, sync::PASSWORD_MARKER_ID).await {
+        Ok(Some(off)) if envelope.created_at <= off => None,
+        Ok(_) => Some(envelope),
+        Err(_) => None,
+    }
+}
+
+/// What a refused unlock password says. One set by a newer version is told
+/// apart from a wrong one, as for the recovery code.
+fn password_refused(e: silentsilo_vault::VaultError) -> String {
+    if e.to_string().contains("needs a newer SilentSilo") {
+        silentsilo_core::coded!(
+            "err.password_needs_update",
+            "This unlock password was set by a newer version of SilentSilo. Update SilentSilo, then try again."
+        )
+        .into()
+    } else {
+        silentsilo_core::coded!(
+            "err.password_wrong",
+            "That password does not open this silo."
+        )
+        .into()
+    }
+}
+
+fn password_not_of_silo() -> String {
+    silentsilo_core::coded!(
+        "err.password_not_of_silo",
+        "This silo's unlock password was not set on its current key. Use the recovery code or a key."
+    )
+    .into()
+}
+
+/// Reads the silo a store holds and opens it with the unlock password.
+/// Nothing local is touched. The envelope's tags are checked before
+/// anything is kept: storage is not trusted, and only a device holding the
+/// current vault key can make them.
+pub async fn password_join_begin(
+    store: &dyn ObjectStore,
+    password: &str,
+) -> Result<RecoveryJoin, String> {
+    use sync::unlock_password::{StoredPassword, fetch_password_envelope};
+
+    let manifest = sync::read_manifest(store)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| {
+            silentsilo_core::coded!(
+                "err.storage_no_silo",
+                "That backup storage does not hold a silo."
+            )
+            .to_string()
+        })?;
+    let envelope = match fetch_password_envelope(store)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        StoredPassword::Envelope(envelope) => envelope,
+        StoredPassword::NeedsNewer => {
+            return Err(password_refused(silentsilo_vault::VaultError::Corrupted(
+                "needs a newer SilentSilo".into(),
+            )));
+        }
+        StoredPassword::Absent | StoredPassword::Junk => {
+            return Err(silentsilo_core::coded!(
+                "err.no_unlock_password",
+                "No unlock password was set up for this silo."
+            )
+            .into());
+        }
+    };
+
+    // Argon2id at 256 MiB, off the async workers.
+    let (dek, envelope) = {
+        let password = zeroize::Zeroizing::new(password.to_string());
+        tokio::task::spawn_blocking(move || {
+            unwrap_with_password(&envelope, &password).map(|dek| (dek, envelope))
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(password_refused)?
+    };
+
+    let sealed = sync::fetch_content_kek(store)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| {
+            silentsilo_core::coded!(
+                "err.storage_no_content_key",
+                "This storage has no content key yet, so there is nothing here to recover."
+            )
+            .to_string()
+        })?;
+    let kek = match silentsilo_vault::unwrap_kek_bytes(&sealed, &dek) {
+        Ok(kek) => kek,
+        Err(_) => return Err(kek_refusal(store, &dek).await),
+    };
+    if !envelope.is_authentic_now(&kek, &dek) {
+        return Err(password_not_of_silo());
+    }
+    if let Some(off) = sync::revoked_at(store, &kek, sync::PASSWORD_MARKER_ID)
+        .await
+        .map_err(|e| e.to_string())?
+        && envelope.created_at <= off
+    {
+        return Err(silentsilo_core::coded!(
+            "err.password_removed",
+            "The unlock password was removed from this silo. Use the recovery code or a key."
+        )
+        .into());
+    }
+
+    let recovery = sync::fetch_recovery_envelope(store).await.ok().flatten();
+    let retired = sync::retired_by_rotation(store, &dek).await;
+    Ok(RecoveryJoin {
+        vault_id: manifest.vault_id,
+        dek,
+        envelope: recovery,
+        password: Some(envelope),
+        proven_org_key: None,
+        retired,
+    })
+}
+
+/// Opens a silo on this device with the unlock password. Disk work and
+/// Argon2id: blocking thread.
+pub fn open_with_password(
+    root: PathBuf,
+    password: &str,
+    expected_vault_id: Uuid,
+) -> Result<(VaultSession, VaultMeta), String> {
+    let envelope = load_password_envelope(&root).map_err(|_| {
+        silentsilo_core::coded!(
+            "err.no_unlock_password",
+            "No unlock password was set up for this silo."
+        )
+        .to_string()
+    })?;
+    open_with(root, &envelope, password, expected_vault_id)
+}
+
+/// [`open_with_password`] with the envelope a copy holds, for a password
+/// changed on another device since this one last synced. Kept as this
+/// device's copy once it opened the silo and its tag is the silo's.
+pub fn open_with_stored_password(
+    root: PathBuf,
+    envelope: &PasswordEnvelope,
+    password: &str,
+    expected_vault_id: Uuid,
+) -> Result<(VaultSession, VaultMeta), String> {
+    let opened = open_with(root, envelope, password, expected_vault_id)?;
+    let root = &opened.0.paths.root;
+    save_password_envelope(root, envelope).map_err(|e| e.to_string())?;
+    if !opened_by_a_key(root) {
+        guard_with_password(root, expected_vault_id, envelope)?;
+    }
+    Ok(opened)
+}
+
+/// Whether an unlock error is a wrong password, the one worth trying the
+/// copy in storage for and counting towards the wait.
+pub fn is_wrong_password(error: &str) -> bool {
+    error.contains("err.password_wrong")
+}
+
+fn open_with(
+    root: PathBuf,
+    envelope: &PasswordEnvelope,
+    password: &str,
+    expected_vault_id: Uuid,
+) -> Result<(VaultSession, VaultMeta), String> {
+    let dek = unwrap_with_password(envelope, password).map_err(password_refused)?;
+    let session = VaultSession::open_with_dek(root, dek).map_err(|e| e.to_string())?;
+    // The copy in the silo folder is held to the same rule as storage's:
+    // whoever can write there cannot make the tag.
+    if !envelope.is_authentic_now(&session.kek, &session.dek) {
+        return Err(password_not_of_silo());
+    }
+    if session.vault_id != expected_vault_id {
+        return Err(silentsilo_core::coded!(
+            "err.password_other_silo",
+            "That password opens a different silo."
+        )
+        .into());
+    }
+    // It opens the silo without a key, so the secret has nothing left to do.
+    if !opened_by_a_key(&session.paths.root) {
+        let _ = silentsilo_vault::retire_device_secret(session.vault_id);
+    }
+    let vfs = Vfs::new(&session);
+    vfs.ensure_initialized().map_err(|e| e.to_string())?;
+    let meta = vfs.meta().map_err(|e| e.to_string())?;
+    crate::wipe_open_scratch(&session.paths.root);
+    Ok((session, meta))
+}
+
+/// Whether the silo at `root` has an unlock password on this device.
+pub fn has_password(root: &Path) -> bool {
+    has_unlock_password(root)
+}
+
+/// Checks a password the user typed again to confirm an action, against
+/// the envelope this device holds. Argon2id: blocking thread.
+pub fn check_password(
+    root: &Path,
+    password: &str,
+    kek: &silentsilo_crypto::ContentKek,
+    dek: &MasterDek,
+) -> Result<(), String> {
+    let envelope = load_password_envelope(root).map_err(|_| {
+        silentsilo_core::coded!(
+            "err.no_unlock_password",
+            "No unlock password was set up for this silo."
+        )
+        .to_string()
+    })?;
+    let opened = unwrap_with_password(&envelope, password).map_err(password_refused)?;
+    // Both tags equal only if the key it opened is the session's: the
+    // comparison is the tag's, in constant time.
+    if !envelope.is_authentic_now(kek, dek) || !envelope.is_authentic_now(kek, &opened) {
+        return Err(password_refused(
+            silentsilo_vault::VaultError::InvalidCredentials,
+        ));
+    }
+    Ok(())
+}
+
+/// The words the strength check holds against a new password: the silo's
+/// name, its keys' labels, and whatever else the app knows (the device's
+/// name). The check adds "silentsilo" itself.
+pub fn password_context(root: &Path, silo_name: &str, extra: &[&str]) -> Vec<String> {
+    let mut words: Vec<String> = vec![silo_name.to_string()];
+    if let Ok(keys) = load_fido_keys(root) {
+        words.extend(keys.active().map(|k| k.label.clone()));
+    }
+    words.extend(extra.iter().map(|w| w.to_string()));
+    words.retain(|w| !w.trim().is_empty());
+    words
+}
+
+/// An open silo, as the password flows need it.
+pub struct OpenSilo<'a> {
+    pub root: &'a Path,
+    pub vault_id: Uuid,
+    pub dek: &'a MasterDek,
+    pub kek: &'a silentsilo_crypto::ContentKek,
+}
+
+impl<'a> OpenSilo<'a> {
+    pub fn of(session: &'a VaultSession) -> Self {
+        Self {
+            root: &session.paths.root,
+            vault_id: session.vault_id,
+            dek: &session.dek,
+            kek: &session.kek,
+        }
+    }
+}
+
+/// Sets the unlock password on an open silo, or changes it. `stores` are the
+/// silo's copies, read for the date the new envelope has to be after.
+///
+/// Sealed here and saved locally; the next sync pass publishes it. On a silo
+/// no key opens here, the local DEK envelope goes under the password and the
+/// device secret is retired. The caller has already asked for what
+/// [`crate::confirmation_for`] says, the old password included on a change.
+///
+/// On a silo an organisation administers, a password is another way in the
+/// organisation did not hand out: refused without the touch of one of its
+/// keys ([`silentsilo_vault::Authority::Organisation`]).
+pub async fn set_unlock_password(
+    silo: OpenSilo<'_>,
+    stores: &[&dyn ObjectStore],
+    password: &str,
+    context: &[String],
+    confirmed_weak: bool,
+    authority: silentsilo_vault::Authority<'_>,
+) -> Result<PasswordEnvelope, String> {
+    if matches!(authority, silentsilo_vault::Authority::Machine)
+        && load_fido_keys(silo.root).is_ok_and(|keys| keys.is_org_controlled())
+    {
+        return Err(silentsilo_core::coded!(
+            "err.password_needs_org_key",
+            "This silo is administered by an organisation, so a password needs one of its keys."
+        )
+        .into());
+    }
+    let floor = sync::unlock_password::password_date_floor(stores, silo.kek).await;
+    let mut envelope = {
+        let dek = silo.dek.clone();
+        let kek = silo.kek.clone();
+        let password = zeroize::Zeroizing::new(password.to_string());
+        let context = context.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let inputs: Vec<&str> = context.iter().map(String::as_str).collect();
+            seal_under_password(&dek, &kek, &password, &inputs, confirmed_weak)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?
+    };
+    // After the one it replaces and after the newest marker or envelope any
+    // copy holds, whatever this clock says.
+    if let Ok(local) = load_password_envelope(silo.root) {
+        envelope.date_after(local.created_at + 1, silo.kek, silo.dek);
+    }
+    envelope.date_after(floor, silo.kek, silo.dek);
+    save_password_envelope(silo.root, &envelope).map_err(|e| e.to_string())?;
+    if !opened_by_a_key(silo.root) {
+        guard_with_password(silo.root, silo.vault_id, &envelope)?;
+    }
+    Ok(envelope)
+}
+
+/// Removes the unlock password everywhere: a marker on every copy, the
+/// envelope deleted where deleting is allowed, the local copy gone.
+///
+/// Refused while no key opens the silo here: a silo needs a key or a
+/// password on top of the recovery code. `targets` pairs each copy with
+/// whether it allows deletes.
+pub async fn remove_unlock_password(
+    root: &Path,
+    kek: &silentsilo_crypto::ContentKek,
+    targets: &[(&dyn ObjectStore, bool)],
+) -> Result<(), String> {
+    if !has_unlock_password(root) {
+        return Ok(());
+    }
+    if !opened_by_a_key(root) {
+        return Err(silentsilo_core::coded!(
+            "err.password_last_way_in",
+            "The password is this silo's only way in besides the recovery code. Add a key first."
+        )
+        .into());
+    }
+    sync::unlock_password::remove_password(targets, kek, root)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// Replays a fetched join plan into the new session and snapshots it. Heavy

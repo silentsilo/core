@@ -125,6 +125,24 @@ pub struct SyncReport {
     /// an old recovery code still opens, so it may not have been the user.
     #[serde(default)]
     pub recovery_turned_off: bool,
+    /// The unlock password changed here because of another device: set or
+    /// changed there (`Adopted`), or removed there, or dropped because a
+    /// rotation by a release without passwords left it opening nothing.
+    /// The last two are said on screen: a former holder of the content key
+    /// can write a removal marker.
+    #[serde(default)]
+    pub password: PasswordChange,
+}
+
+/// What a pass did to the unlock password this device holds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PasswordChange {
+    #[default]
+    None,
+    Adopted,
+    RemovedElsewhere,
+    DroppedAfterRotation,
 }
 
 /// Where a running pass is, for a status line and a marker on the file being
@@ -1340,6 +1358,36 @@ async fn pass(
     }
     let recovery_turned_off = settled.turned_off_elsewhere;
     let recovery = settled.envelope;
+
+    // The unlock password, by the same rules. Never in the way of the
+    // records: nothing here can fail the pass.
+    let password_settled =
+        sync::unlock_password::settle_password_envelope(&recovery_targets, &kek, &dek, &root).await;
+    if password_settled.refused {
+        host.warn(
+            "password",
+            "an unlock password envelope no device on this silo's current key made was found,              so it was not used",
+        );
+    }
+    let password_change = if password_settled.removed_elsewhere {
+        PasswordChange::RemovedElsewhere
+    } else if password_settled.dropped_after_rotation {
+        PasswordChange::DroppedAfterRotation
+    } else if password_settled.adopted {
+        PasswordChange::Adopted
+    } else {
+        PasswordChange::None
+    };
+    if password_settled.adopted
+        && let Some(envelope) = &password_settled.envelope
+        && !load_fido_keys(&root).is_ok_and(|k| k.active().any(|k| !k.wrapped_dek.is_empty()))
+        && let Err(e) = crate::flows::guard_with_password(&root, vault_id, envelope)
+    {
+        host.warn(
+            "password",
+            &format!("the device secret could not be retired: {e}"),
+        );
+    }
     let keys = load_fido_keys(&root).ok();
 
     let several_copies = targets.len() > 1;
@@ -1415,6 +1463,29 @@ async fn pass(
             waiting: false,
             retired: false,
         });
+    }
+
+    // The password envelope goes to every copy that lacks it, after the
+    // records. A copy that fails here still took them.
+    if let Some(envelope) = &password_settled.envelope {
+        for target in &targets {
+            if let Err(e) = sync::unlock_password::ensure_password_envelope(
+                &*target.store,
+                envelope,
+                &kek,
+                &dek,
+            )
+            .await
+            {
+                host.warn(
+                    "password",
+                    &format!(
+                        "{}: the unlock password was not published: {e}",
+                        target.label
+                    ),
+                );
+            }
+        }
     }
 
     // The activity log rides on the same copies, after this device's own
@@ -2018,6 +2089,7 @@ async fn pass(
         more_to_do,
         blob_errors,
         recovery_turned_off,
+        password: password_change,
     };
 
     // The file list is stale the moment remote changes land.

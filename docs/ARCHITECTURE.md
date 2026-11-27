@@ -254,6 +254,11 @@ nothing on disk opened it. Past the KEK the commit reports success whatever
 the renames do: an error there hid the new recovery code while the old one
 no longer worked. A rename refused because something holds the file falls
 back to writing it in place, as every other key file does.
+`commit_rotation_with_password` stages the unlock password sealed under the
+new key the same way, or drops the local copy when the user chose not to
+keep it. A rotation by a release without passwords leaves the envelope
+under the old key; the next pass on a current client drops it and says so
+(`PasswordChange::DroppedAfterRotation`).
 
 A rotation reaches every target or does not start: a target whose settings
 will not open stops it before the first touch, since one skipped keeps the
@@ -340,6 +345,44 @@ storage, or a genuine record copied under a newer name, cannot tip the
 answer towards pushing on a retired key; a name planted on the rotated side
 only makes it more careful. The witnesses `kek_envelope_state` reads are
 held to the same rule.
+
+### The unlock password
+
+From core 1.12 a silo may have an unlock password, with the rights of a key,
+and may have it and the recovery code alone, with no key at all. The
+envelope is published to the root of storage (`unlock-password.env`), which
+no release lists, so an older client never meets it. FORMATS.md has the
+format and the tests on older releases.
+
+- The flows are in `silentsilo_app::flows` so the desktop and the phones do
+  the same thing: `set_unlock_password`, `remove_unlock_password`,
+  `open_with_password`, `password_join_begin`, `check_password`.
+- On a silo no key opens here, setting or adopting a password puts
+  `master.dek.enc` under it and retires the device secret
+  (`guard_with_password`), as a first key does. A key, once enrolled, takes
+  `master.dek.enc` over as before.
+- Removing the password is refused while no key opens the silo here: a silo
+  keeps a key or a password on top of the recovery code. Removal writes a
+  dated marker on every copy (`keys/revoked/unlock-password.sealed`), so a
+  device that has not heard drops its copy at its next pass.
+- The pass settles the password after the recovery code and before the
+  records, and publishes it after them. Nothing there fails the pass: a copy
+  that refuses the envelope still takes the records.
+- Only an envelope carrying `auth_dek`, which only a holder of the current
+  vault key can make, is adopted, joined with or opened with, the copy in
+  the silo folder included.
+- On an organisation's silo a password needs the touch of one of its keys
+  (`Authority::Organisation`): it is a way in the organisation did not hand
+  out.
+
+How a session was opened is `silentsilo_app::Unlocked`, kept in `AppState`
+and reset on every open. `confirmation_for` decides what a lasting change
+asks for: a device with a usable key asks for the key, whatever opened the
+session, since a typed password is something a keylogger can replay; a
+device without one asks for the password typed again; the recovery code
+asks for nothing, as before, since it is what someone who lost every key
+has. The phone's two minutes after an unlock are `within_grace`, with the
+app's own grace (none on the desktop).
 
 ## Data at rest
 
@@ -743,7 +786,9 @@ bucket):
 |---|---|
 | Lost the security key, machine fine | `vault_unlock_with_recovery` (code, local or bucket envelope) |
 | Machine gone entirely | `vault_join_with_recovery`, or a key on a new machine via `vault_join_from_storage` |
-| Machine gone, project gone | `silentsilo-extract`: files, trash to one side, passwords as CSV, attachments |
+| Forgot the unlock password | The recovery code, then set a new password |
+| Machine gone, silo has a password | `password_join_begin` on a new machine, with the password |
+| Machine gone, project gone | `silentsilo-extract`: files, trash to one side, passwords as CSV, attachments; `--password` for a silo with an unlock password |
 | Local index corrupt beyond both snapshots | `vault_repair_from_storage`, offered by the unlock screen, in place, blobs kept |
 | Device below the compaction horizon | `vault_rebuild_from_snapshot` (any copy that holds one), fresh device id |
 | Device rotated away | `needs_rejoin`: remove and rejoin with a current credential |

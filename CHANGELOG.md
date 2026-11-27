@@ -25,12 +25,40 @@ changed.
   decided in core with zxcvbn. Removed everywhere through the sealed marker
   `keys/revoked/unlock-password.sealed`. See FORMATS.md, "The unlock
   password envelope".
+- The password flows in `silentsilo_app::flows`, so the desktop and the
+  phones share them: `set_unlock_password` (also a change),
+  `remove_unlock_password`, `open_with_password`, `password_join_begin`,
+  `check_password`, and `open_with_stored_password` for a password changed
+  on another device since this one synced. A silo no key opens gets its local key envelope under
+  the password and loses its device secret, as with a first key. Removing
+  the password is refused while it is the only way in besides the recovery
+  code. On an organisation's silo a password needs one of its keys.
+- `silentsilo_app::Unlocked` and `confirmation_for`: how a silo was opened
+  and what a lasting change asks for because of it, one rule for every
+  client. A device with a usable key asks for the key, a device without one
+  asks for the password again, the recovery code asks for nothing.
+- The sync pass settles and publishes the password, and reports in
+  `SyncReport::password` when another device set, changed or removed it.
+  Nothing there can fail the pass.
+- `rotation::commit_rotation_with_password` carries the password through a
+  rotation, or drops it.
+- The extraction tool opens a backup with the unlock password:
+  `silentsilo-extract list --from <folder> --password`, and
+  `silentsilo_extract::open_with`.
+- Activity log events 55 (unlock password set) and 56 (removed). Earlier
+  releases show them as "Unknown event".
 - `crates/silentsilo-fixture/tests/password_on_old_clients.rs`: core 1.0.0,
   1.6.1, 1.10.0 and 1.10.4 leave the envelope and its marker alone through a
   join, compaction, the blob sweep and seeding, take neither for a key, and
   open a silo with no key at all with the recovery code. The rich fixture
   written today carries a password, so every older-release test reads
   storage that holds one.
+
+### Fixed
+
+- A recovery-code join keeps the recovery envelope only when its tags are
+  the silo's, or when it has none (written before 1.10.0). It used to keep
+  whatever opened.
 
 ## [1.11.8] - replay names as every release does
 
