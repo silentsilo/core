@@ -91,6 +91,27 @@ changed.
   the silo's, or when it has none (written before 1.10.0). It used to keep
   whatever opened.
 
+### Security
+
+- rusqlite 0.43, so SQLCipher 4.20.0 on SQLite 3.54.1 (RUSTSEC-2026-0459:
+  stale memory from a crafted `-wal`). Every release before this one built
+  SQLCipher 4.14.0 on SQLite 3.51.3. The defaults and pragmas core uses are
+  the same, and a working copy either one wrote opens in the other.
+- russh 0.65.4 and rsa 0.10.0 (RUSTSEC-2023-0071, the Marvin timing side
+  channel). `silentsilo-store` requires 0.65.4.
+- `.cargo/audit.toml` ignores nothing. The old core tags the compat fixture
+  builds resolve to stand-ins in `compat/` (see `compat/README.md`).
+
+### Changed
+
+- The snapshot image is copied out of the attached plaintext database
+  through a backup into an in-memory connection, because rusqlite 0.43's
+  `serialize` takes the connection mutably.
+- `working-copies/` in `silentsilo-fixture`: a crashed and a locked working
+  copy SQLCipher 4.14.0 wrote, which this build must adopt and reuse as they
+  are (`tests/working_copies.rs`).
+- `deny.toml` allows `blessing` and `WTFPL` for `sqlcipher-src` alone.
+
 ## [1.11.8] - replay names as every release does
 
 No persisted format changed.

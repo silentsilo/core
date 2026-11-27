@@ -1,0 +1,18 @@
+[package]
+name = "russh"
+version = "0.63.99"
+edition = "2021"
+publish = false
+
+[dependencies]
+real = { package = "russh", version = "0.65.4", default-features = false }
+
+[features]
+default = ["real/default"]
+"_bench" = ["real/_bench"]
+"aws-lc-rs" = ["real/aws-lc-rs"]
+"des" = ["real/des"]
+"dsa" = ["real/dsa"]
+"ring" = ["real/ring"]
+"rsa" = ["real/rsa"]
+"serde" = ["real/serde"]

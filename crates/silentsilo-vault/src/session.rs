@@ -630,7 +630,7 @@ fn reuse_working_copy(paths: &VaultPaths, dek: &MasterDek) -> Option<Connection>
 fn adopt_plaintext_working_copy(paths: &VaultPaths, dek: &MasterDek) -> Option<Connection> {
     crate::init_openssl();
     let image = {
-        let conn = Connection::open(paths.legacy_db_path()).ok()?;
+        let mut conn = Connection::open(paths.legacy_db_path()).ok()?;
         conn.execute_batch("PRAGMA busy_timeout=5000;").ok()?;
         verify_integrity(&conn).ok()?;
         let id = read_vault_id(&conn)?;
@@ -855,12 +855,30 @@ fn export_image(conn: &Connection) -> Result<Zeroizing<Vec<u8>>, VaultError> {
     let image = conn
         .query_row("SELECT sqlcipher_export('plain')", [], |_| Ok(()))
         .and_then(|()| conn.execute_batch(&format!("DROP TABLE IF EXISTS plain.{STATE_TABLE};")))
-        .and_then(|()| conn.serialize(c"plain"))
-        .map(|data| Zeroizing::new(data.to_vec()));
+        .and_then(|()| serialize_attached(conn, c"plain"));
     let detached = conn.execute_batch("DETACH DATABASE plain;");
     let image = image?;
     detached?;
     Ok(image)
+}
+
+/// The image of the plaintext database attached to `conn` as `name`.
+/// `serialize` needs the connection mutably, and the session holds it
+/// shared, so the pages go through a backup into an in-memory connection
+/// owned here.
+fn serialize_attached(
+    conn: &Connection,
+    name: &std::ffi::CStr,
+) -> rusqlite::Result<Zeroizing<Vec<u8>>> {
+    crate::init_openssl();
+    let mut out = Connection::open_in_memory()?;
+    rusqlite::backup::Backup::new_with_names(conn, name, &mut out, MAIN_DB)?.run_to_completion(
+        i32::MAX,
+        std::time::Duration::ZERO,
+        None,
+    )?;
+    let data = out.serialize(MAIN_DB)?;
+    Ok(Zeroizing::new(data.to_vec()))
 }
 
 /// BLAKE3 of a sealed snapshot's bytes. It names one snapshot: the

@@ -1263,6 +1263,17 @@ Read this before "fixing" any of it.
   as a record, so an outside file is refused, and a write puts ciphertext
   under one of this app's names. Closing it would take handle-relative opens on every
   platform.
+- **Old rusqlite and russh in `compat/`.** The fixture builds six old core
+  tags beside this build in one lockfile. They pin `rusqlite ^0.40`
+  (libsqlite3-sys 0.38, and cargo allows one `links = "sqlite3"` per graph)
+  and russh releases that pin prereleases of `rsa` exactly. Without the
+  stand-ins in `compat/`, wired in by `[patch.crates-io]` for this workspace
+  only, the extractor would stay on SQLCipher 4.14 and rsa 0.10.0-rc.18. The
+  old tags keep their own rusqlite API on this build's libsqlite3-sys; a
+  test that hands one connection to both crosses with
+  `silentsilo_fixture::old_sqlite`. The price is that the old tags run on
+  this build's SQLite, so `working-copies/` keeps what an earlier SQLCipher
+  wrote and `tests/working_copies.rs` opens it. See `compat/README.md`.
 
 ## Changing things
 

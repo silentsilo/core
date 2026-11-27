@@ -20,6 +20,11 @@
 //!
 //! `sums` prints the `SHA256SUMS` lines of a new fixture directory, to be
 //! appended to `fixtures/SHA256SUMS` in the commit that adds it.
+//!
+//! `create-working-copies` writes a crashed and a locked working copy with
+//! the SQLCipher this build links, into `working-copies/sqlcipher-<version>`
+//! (see `working_copies.rs`); `sums` prints its lines for
+//! `working-copies/SHA256SUMS`.
 
 use std::path::PathBuf;
 
@@ -60,6 +65,13 @@ async fn main() -> Result<(), String> {
                 println!("wrote its content ({} lines)", lines.len());
             }
         }
+        "create-working-copies" => {
+            if dir.exists() {
+                return Err(format!("{} already exists", dir.display()));
+            }
+            silentsilo_fixture::working_copies::create_working_copies(&dir)?;
+            println!("wrote {}", dir.display());
+        }
         "digest" => {
             let lines =
                 silentsilo_fixture::digest_from_store(&dir, silentsilo_fixture::FIXTURE_CODE)
@@ -88,7 +100,7 @@ async fn main() -> Result<(), String> {
 fn usage(problem: &str) -> String {
     format!(
         "{problem}\n\nusage: silentsilo-fixture \
-         <create|create-compacted|create-rich|create-rich-compacted|digest|content|sums> \
+         <create|create-compacted|create-rich|create-rich-compacted|create-working-copies|digest|content|sums> \
          <directory>"
     )
 }

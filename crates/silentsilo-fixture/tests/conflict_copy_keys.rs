@@ -9,6 +9,7 @@
 //! either order.
 
 use rusqlite::Connection;
+use silentsilo_fixture::old_sqlite::with_old;
 use silentsilo_vfs::{OpRecord, VaultOp};
 use silentsilo_vfs_v1_0_0 as vfs_v1;
 use uuid::Uuid;
@@ -98,11 +99,12 @@ fn a_losing_edit_received_after_the_winner_keeps_its_own_key() {
         let new = db();
         silentsilo_vfs::init_schema(&new, vault_id).unwrap();
         let old = db();
-        vfs_v1::init_schema(&old, vault_id).unwrap();
+        with_old(&old, |old| vfs_v1::init_schema(old, vault_id)).unwrap();
         for record in &order {
             silentsilo_vfs::apply_op(&new, record).unwrap();
             let bytes = record.to_bytes().unwrap();
-            vfs_v1::apply_op(&old, &vfs_v1::OpRecord::from_bytes(&bytes).unwrap()).unwrap();
+            let record = vfs_v1::OpRecord::from_bytes(&bytes).unwrap();
+            with_old(&old, |old| vfs_v1::apply_op(old, &record)).unwrap();
         }
 
         let count = |conn: &Connection| -> i64 {

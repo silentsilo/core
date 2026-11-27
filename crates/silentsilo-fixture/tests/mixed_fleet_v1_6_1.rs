@@ -326,7 +326,8 @@ macro_rules! version {
                 }
 
                 pub fn conn<T>(&self, f: impl FnOnce(&rusqlite::Connection) -> T) -> T {
-                    self.with(|s| f(&s.conn))
+                    use silentsilo_fixture::old_sqlite::AsThisBuild as _;
+                    self.with(|s| s.conn.as_this_build(f))
                 }
 
                 pub fn vfs<T>(&self, f: impl FnOnce(vfs::Vfs<'_>) -> T) -> T {

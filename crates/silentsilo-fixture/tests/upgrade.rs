@@ -18,6 +18,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
+use silentsilo_fixture::old_sqlite::{OldConnection, with_new};
 use silentsilo_vault_v1_0_0 as vault_v1;
 use silentsilo_vfs_v1_0_0 as vfs_v1;
 use uuid::Uuid;
@@ -79,16 +80,23 @@ const FILE_NAMES: &[&str] = &[
     "nota\u{0306}.md",
 ];
 
+/// How the app opens its working copy.
+const OPEN_PRAGMAS: &str = "PRAGMA journal_mode=WAL;
+     PRAGMA synchronous=NORMAL;
+     PRAGMA busy_timeout=5000;
+     PRAGMA foreign_keys=ON;";
+
+/// The database file as 1.0.0 opens it, through the rusqlite it builds on.
+fn open_old_db(path: &Path) -> OldConnection {
+    let conn = OldConnection::open(path).unwrap();
+    conn.execute_batch(OPEN_PRAGMAS).unwrap();
+    conn
+}
+
 /// A database the way the app opens its working copy.
 fn open_db(path: &Path) -> Connection {
     let conn = Connection::open(path).unwrap();
-    conn.execute_batch(
-        "PRAGMA journal_mode=WAL;
-         PRAGMA synchronous=NORMAL;
-         PRAGMA busy_timeout=5000;
-         PRAGMA foreign_keys=ON;",
-    )
-    .unwrap();
+    conn.execute_batch(OPEN_PRAGMAS).unwrap();
     conn
 }
 
@@ -107,7 +115,7 @@ fn ids(conn: &Connection, sql: &str) -> Vec<Uuid> {
 fn old_session(dir: &Path, vault_id: Uuid) -> vault_v1::VaultSession {
     let session = vault_v1::VaultSession {
         paths: vault_v1::VaultPaths::new(dir.join("silo")),
-        conn: open_db(&dir.join("vault.db")),
+        conn: open_old_db(&dir.join("vault.db")),
         vault_id,
         dek: silentsilo_crypto_v1_0_0::generate_dek(),
         kek: silentsilo_crypto_v1_0_0::generate_content_kek(),
@@ -125,8 +133,21 @@ fn write_history(
     records: usize,
     folder_names: &[&str],
 ) -> HashSet<String> {
+    with_new(&session.conn, |conn| {
+        write_history_on(session, conn, seed, records, folder_names)
+    })
+}
+
+/// [`write_history`], with the session's connection seen as this build's
+/// for the queries that pick what to change.
+fn write_history_on(
+    session: &vault_v1::VaultSession,
+    conn: &Connection,
+    seed: u64,
+    records: usize,
+    folder_names: &[&str],
+) -> HashSet<String> {
     let vfs = vfs_v1::Vfs::new(session);
-    let conn = &session.conn;
     let mut rng = Rng::new(seed);
     let mut folded = HashSet::new();
     let count = |conn: &Connection| -> usize {
@@ -614,7 +635,7 @@ fn compare_with_1_0_0(
 
 /// The records 1.0.0 wrote, as this build reads them: through the bytes
 /// that went to storage.
-fn records_for_this_build(conn: &Connection) -> Vec<silentsilo_vfs::OpRecord> {
+fn records_for_this_build(conn: &OldConnection) -> Vec<silentsilo_vfs::OpRecord> {
     vfs_v1::all_ops(conn)
         .unwrap()
         .iter()
@@ -647,9 +668,9 @@ fn upgrade(seed: u64, records: usize, folder_names: &[&str]) -> Upgrade {
     let vault_id = Uuid::from_u64_pair(seed, 0x0100);
     let session = old_session(dir.path(), vault_id);
     let folded = write_history(&session, seed, records, folder_names);
-    let old = picture_as_stored(&session.conn);
+    let old = with_new(&session.conn, picture_as_stored);
     let log = records_for_this_build(&session.conn);
-    assert_eq!(schema_version(&session.conn), "1");
+    assert_eq!(with_new(&session.conn, schema_version), "1");
     // Locked, as the app is when it updates.
     session
         .conn

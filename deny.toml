@@ -35,6 +35,13 @@ confidence-threshold = 0.9
 # not a warning in the others.
 unused-allowed-license = "allow"
 
+[[licenses.exceptions]]
+# SQLite's public-domain blessing, and libtomcrypt (WTFPL or Unlicense),
+# which this build does not compile: SQLCipher uses the vendored OpenSSL.
+# Both permissive, both fine beside the AGPL.
+crate = "sqlcipher-src"
+allow = ["blessing", "WTFPL"]
+
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"

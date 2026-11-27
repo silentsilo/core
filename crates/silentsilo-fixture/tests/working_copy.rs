@@ -9,6 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use silentsilo_fixture::old_sqlite::with_new;
 use silentsilo_vault::{VaultSession, wipe_plaintext_working_copy};
 use silentsilo_vault_v1_0_0 as vault_v1;
 use silentsilo_vfs::Vfs;
@@ -79,7 +80,7 @@ fn after_a_crash_1_0_0_opens_the_silo_from_the_snapshot() {
     let root = crashed_silo(dir.path(), "vault.sqlcipher");
 
     let old = vault_v1::VaultSession::open_with_device_secret(root.clone(), "secret").unwrap();
-    let names = live_names(&old.conn);
+    let names = with_new(&old.conn, live_names);
     let paths = old.paths.clone();
     drop(old);
     vault_v1::wipe_plaintext_working_copy(&paths);
@@ -116,7 +117,10 @@ fn after_a_lock_1_0_0_and_this_build_take_turns() {
     }
 
     let old = vault_v1::VaultSession::open_with_device_secret(root.clone(), "secret").unwrap();
-    assert_eq!(live_names(&old.conn), ["written by this build.pdf"]);
+    assert_eq!(
+        with_new(&old.conn, live_names),
+        ["written by this build.pdf"]
+    );
     let old_vfs = vfs_v1::Vfs::new(&old);
     let top = old_vfs.root_folder_id().unwrap();
     old_vfs

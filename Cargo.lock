@@ -127,12 +127,12 @@ dependencies = [
 
 [[package]]
 name = "argon2"
-version = "0.6.0-rc.8"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7af50940b73bf4e16c15c448a2b121c63f2d68e3e54b6a8731673cb4aa0cdff5"
+checksum = "134c52ddac6d63c576bef8168db10c83c49c26444ecbc68060fef078925a901c"
 dependencies = [
  "base64ct",
- "blake2 0.11.0-rc.6",
+ "blake2 0.11.0",
  "cpufeatures 0.3.0",
  "password-hash 0.6.1",
 ]
@@ -704,9 +704,9 @@ dependencies = [
 
 [[package]]
 name = "blake2"
-version = "0.11.0-rc.6"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "061f1a09225e328e1ffbb378d2d49923c0ca5fee19fb5ac1cc9c1e9d52b93690"
+checksum = "5b5d4d889834ee8ecfc0f8426ad30faf7cdcb10f741a8e6d7224d95325479f6f"
 dependencies = [
  "digest 0.11.3",
 ]
@@ -1234,9 +1234,9 @@ dependencies = [
 
 [[package]]
 name = "der"
-version = "0.8.1"
+version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a69dedd701da44b0536442edf09c81a64b0ab97a7a4a5e3d1971f00027cbc63d"
+checksum = "6a996a108feb8b427a6e12fcf6af4aa83409b79d72c15337d7741368131ee004"
 dependencies = [
  "const-oid",
  "pem-rfc7468",
@@ -1279,6 +1279,7 @@ dependencies = [
  "const-oid",
  "crypto-common 0.2.2",
  "ctutils",
+ "zeroize",
 ]
 
 [[package]]
@@ -2348,13 +2349,14 @@ dependencies = [
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.38.1"
+version = "0.40.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6c19a05435c21ac299d71b6a9c13db3e3f47c520517d58990a462a1397a61db"
+checksum = "b06e69070b7e12262b0cd90832f0a7396f142a2b330181255562decf9f0c6215"
 dependencies = [
  "cc",
  "openssl-sys",
  "pkg-config",
+ "sqlcipher-src",
  "vcpkg",
 ]
 
@@ -2893,9 +2895,9 @@ dependencies = [
 
 [[package]]
 name = "pkcs1"
-version = "0.8.0-rc.4"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "986d2e952779af96ea048f160fd9194e1751b4faea78bcf3ceb456efe008088e"
+checksum = "6250dd7321adbe93d12b750aee0ced159fd13e77f625edcdf1cb6f83cd99f650"
 dependencies = [
  "der",
  "spki",
@@ -3348,14 +3350,16 @@ dependencies = [
 
 [[package]]
 name = "rsa"
-version = "0.10.0-rc.18"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30b2aa4ba0d89f73d1e332df05be0eeab8840351c36ca5654341dfdb57bb3caf"
+checksum = "23e77fd77e0dea28b3011fd62d15445b7de7959333b0276d930e03be0f755699"
 dependencies = [
  "const-oid",
  "crypto-bigint",
+ "crypto-common 0.2.2",
  "crypto-primes",
  "digest 0.11.3",
+ "hmac 0.13.0",
  "pkcs1",
  "pkcs8",
  "rand_core 0.10.1",
@@ -3367,19 +3371,31 @@ dependencies = [
 
 [[package]]
 name = "rsqlite-vfs"
-version = "0.1.1"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c51c9ae4df8a7fba42103df5c621fa3c37eccf3a3c650879e90fc48b11cc192c"
+checksum = "353b74f9810d5b085b6c42c9d86a5f0fdb795553235cdd48753b32e3809d18a7"
 dependencies = [
- "hashbrown 0.16.1",
  "thiserror",
 ]
 
 [[package]]
 name = "rusqlite"
-version = "0.40.1"
+version = "0.40.99"
+dependencies = [
+ "bitflags",
+ "fallible-iterator",
+ "fallible-streaming-iterator",
+ "hashlink",
+ "libsqlite3-sys",
+ "smallvec",
+ "sqlite-wasm-rs",
+]
+
+[[package]]
+name = "rusqlite"
+version = "0.43.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11438310b19e3109b6446c33d1ed5e889428cf2e278407bc7896bc4aaea43323"
+checksum = "f172c4812a19b26d1c23cdb0070e69db335503dfa378b910eb857386e5b8beba"
 dependencies = [
  "bitflags",
  "fallible-iterator",
@@ -3393,8 +3409,6 @@ dependencies = [
 [[package]]
 name = "russh"
 version = "0.62.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9decb68e4e44e1079700e54f17c8f23806ec53d7e0db73ab1c71d9dabc666812"
 dependencies = [
  "aes 0.9.1",
  "aws-lc-rs",
@@ -3464,80 +3478,16 @@ dependencies = [
 
 [[package]]
 name = "russh"
-version = "0.63.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "036204edbd199552a5b3832f63c60dcdf395dc44c7f06b4af1c0e8139cc11bce"
+version = "0.63.99"
 dependencies = [
- "aes 0.9.1",
- "aws-lc-rs",
- "bitflags",
- "block-padding 0.4.2",
- "byteorder",
- "bytes",
- "cbc 0.2.1",
- "cipher 0.5.2",
- "crypto-bigint",
- "ctr 0.10.1",
- "curve25519-dalek",
- "data-encoding",
- "delegate",
- "der",
- "digest 0.11.3",
- "ecdsa",
- "ed25519-dalek",
- "elliptic-curve",
- "enum_dispatch",
- "flate2",
- "futures",
- "generic-array 1.4.4",
- "getrandom 0.4.3",
- "ghash 0.6.0",
- "hex-literal",
- "hmac 0.13.0",
- "inout 0.2.2",
- "keccak",
- "log",
- "md5",
- "ml-kem",
- "module-lattice",
- "num-bigint 0.5.1",
- "p256",
- "p384",
- "p521",
- "pageant",
- "pbkdf2",
- "pkcs1",
- "pkcs5",
- "pkcs8",
- "polyval 0.7.3",
- "rand 0.10.2",
- "rand_core 0.10.1",
- "rsa",
- "russh-cryptovec",
- "russh-util",
- "salsa20",
- "scrypt",
- "sec1",
- "sha1 0.11.0",
- "sha2 0.11.0",
- "sha3 0.12.0",
- "signature",
- "spki",
- "ssh-encoding",
- "ssh-key",
- "subtle",
- "thiserror",
- "tokio",
- "typenum",
- "universal-hash 0.6.1",
- "zeroize",
+ "russh 0.65.4",
 ]
 
 [[package]]
 name = "russh"
-version = "0.65.1"
+version = "0.65.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94be3d86c71b9ed220a675c405e35c7a02565a009bf8da2e9cc13a700320a5c5"
+checksum = "569d8c45e20c123af2fc5ecb4803fde0a98572449ba4c24ed97741d7b02fedf7"
 dependencies = [
  "aes 0.9.1",
  "aws-lc-rs",
@@ -3560,7 +3510,6 @@ dependencies = [
  "enum_dispatch",
  "flate2",
  "futures",
- "generic-array 1.4.4",
  "getrandom 0.4.3",
  "ghash 0.6.0",
  "hex-literal",
@@ -4079,7 +4028,7 @@ version = "1.12.0-beta.1"
 dependencies = [
  "async-trait",
  "hex",
- "rusqlite",
+ "rusqlite 0.43.0",
  "serde",
  "serde_json",
  "silentsilo-audit 1.12.0-beta.1",
@@ -4465,7 +4414,7 @@ dependencies = [
  "blake3",
  "hex",
  "libc",
- "rusqlite",
+ "rusqlite 0.43.0",
  "serde_json",
  "silentsilo-audit 1.12.0-beta.1",
  "silentsilo-core 1.12.0-beta.1",
@@ -4516,7 +4465,8 @@ version = "1.12.0-beta.1"
 dependencies = [
  "blake3",
  "hex",
- "rusqlite",
+ "rusqlite 0.40.99",
+ "rusqlite 0.43.0",
  "serde_json",
  "sha2 0.10.9",
  "silentsilo-app 1.12.0-beta.1",
@@ -4670,7 +4620,7 @@ name = "silentsilo-soak"
 version = "1.12.0-beta.1"
 dependencies = [
  "libc",
- "rusqlite",
+ "rusqlite 0.43.0",
  "serde",
  "serde_json",
  "silentsilo-app 1.12.0-beta.1",
@@ -4736,7 +4686,7 @@ dependencies = [
  "percent-encoding",
  "quick-xml",
  "reqwest",
- "russh 0.63.3",
+ "russh 0.63.99",
  "russh-sftp",
  "serde",
  "silentsilo-core 1.10.0",
@@ -4759,7 +4709,7 @@ dependencies = [
  "percent-encoding",
  "quick-xml",
  "reqwest",
- "russh 0.65.1",
+ "russh 0.65.4",
  "russh-sftp",
  "serde",
  "silentsilo-core 1.10.4",
@@ -4782,7 +4732,7 @@ dependencies = [
  "percent-encoding",
  "quick-xml",
  "reqwest",
- "russh 0.65.1",
+ "russh 0.65.4",
  "russh-sftp",
  "serde",
  "silentsilo-core 1.11.8",
@@ -4804,7 +4754,7 @@ dependencies = [
  "percent-encoding",
  "quick-xml",
  "reqwest",
- "russh 0.65.1",
+ "russh 0.65.4",
  "russh-sftp",
  "serde",
  "serde_json",
@@ -4824,7 +4774,7 @@ name = "silentsilo-sync"
 version = "1.0.0"
 source = "git+https://github.com/silentsilo/core?tag=v1.0.0#c6694cc193e3210638a2f8cf9562884993a9c1c5"
 dependencies = [
- "rusqlite",
+ "rusqlite 0.40.99",
  "serde",
  "serde_json",
  "silentsilo-core 1.0.0",
@@ -4843,7 +4793,7 @@ version = "1.6.1"
 source = "git+https://github.com/silentsilo/core?tag=v1.6.1#0203237acff90535af3eb83c1f8f62dd5c2d1aaf"
 dependencies = [
  "hex",
- "rusqlite",
+ "rusqlite 0.40.99",
  "serde",
  "serde_json",
  "silentsilo-core 1.6.1",
@@ -4864,7 +4814,7 @@ source = "git+https://github.com/silentsilo/core?tag=v1.10.0#b8b126aab9e5bf247a7
 dependencies = [
  "blake3",
  "hex",
- "rusqlite",
+ "rusqlite 0.40.99",
  "serde",
  "serde_json",
  "silentsilo-audit 1.10.0",
@@ -4886,7 +4836,7 @@ source = "git+https://github.com/silentsilo/core?tag=v1.10.4#880393dd08ed7330dee
 dependencies = [
  "blake3",
  "hex",
- "rusqlite",
+ "rusqlite 0.40.99",
  "serde",
  "serde_json",
  "silentsilo-audit 1.10.4",
@@ -4908,7 +4858,7 @@ source = "git+https://github.com/silentsilo/core?tag=v1.11.8#f0c030e9dd7633526d6
 dependencies = [
  "blake3",
  "hex",
- "rusqlite",
+ "rusqlite 0.40.99",
  "serde",
  "serde_json",
  "silentsilo-audit 1.11.8",
@@ -4930,7 +4880,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "hex",
- "rusqlite",
+ "rusqlite 0.43.0",
  "serde",
  "serde_json",
  "silentsilo-audit 1.12.0-beta.1",
@@ -4962,7 +4912,7 @@ dependencies = [
  "hex",
  "keyring",
  "rand 0.9.5",
- "rusqlite",
+ "rusqlite 0.40.99",
  "serde",
  "serde_json",
  "silentsilo-core 1.0.0",
@@ -4986,7 +4936,7 @@ dependencies = [
  "keyring",
  "openssl-sys",
  "rand 0.9.5",
- "rusqlite",
+ "rusqlite 0.40.99",
  "serde",
  "serde_json",
  "silentsilo-core 1.6.1",
@@ -5013,7 +4963,7 @@ dependencies = [
  "libc",
  "openssl-sys",
  "rand 0.9.5",
- "rusqlite",
+ "rusqlite 0.40.99",
  "security-framework-sys",
  "serde",
  "serde_json",
@@ -5042,7 +4992,7 @@ dependencies = [
  "libc",
  "openssl-sys",
  "rand 0.9.5",
- "rusqlite",
+ "rusqlite 0.40.99",
  "security-framework-sys",
  "serde",
  "serde_json",
@@ -5071,7 +5021,7 @@ dependencies = [
  "libc",
  "openssl-sys",
  "rand 0.9.5",
- "rusqlite",
+ "rusqlite 0.40.99",
  "security-framework-sys",
  "serde",
  "serde_json",
@@ -5099,7 +5049,7 @@ dependencies = [
  "libc",
  "openssl-sys",
  "rand 0.9.5",
- "rusqlite",
+ "rusqlite 0.43.0",
  "security-framework-sys",
  "serde",
  "serde_json",
@@ -5127,7 +5077,7 @@ dependencies = [
  "blake3",
  "chrono",
  "mime_guess",
- "rusqlite",
+ "rusqlite 0.40.99",
  "serde",
  "serde_json",
  "silentsilo-core 1.0.0",
@@ -5146,7 +5096,7 @@ dependencies = [
  "blake3",
  "chrono",
  "mime_guess",
- "rusqlite",
+ "rusqlite 0.40.99",
  "serde",
  "serde_json",
  "silentsilo-core 1.6.1",
@@ -5165,7 +5115,7 @@ dependencies = [
  "blake3",
  "chrono",
  "mime_guess",
- "rusqlite",
+ "rusqlite 0.40.99",
  "serde",
  "serde_json",
  "silentsilo-core 1.10.0",
@@ -5184,7 +5134,7 @@ dependencies = [
  "blake3",
  "chrono",
  "mime_guess",
- "rusqlite",
+ "rusqlite 0.40.99",
  "serde",
  "serde_json",
  "silentsilo-core 1.10.4",
@@ -5203,7 +5153,7 @@ dependencies = [
  "blake3",
  "chrono",
  "mime_guess",
- "rusqlite",
+ "rusqlite 0.40.99",
  "serde",
  "serde_json",
  "silentsilo-core 1.11.8",
@@ -5221,7 +5171,7 @@ dependencies = [
  "blake3",
  "chrono",
  "mime_guess",
- "rusqlite",
+ "rusqlite 0.43.0",
  "serde",
  "serde_json",
  "silentsilo-core 1.12.0-beta.1",
@@ -5284,9 +5234,9 @@ checksum = "023a211cb3138dbc438680b32560ad89f699977624c9f8dbb95a47d5b4c07dd3"
 
 [[package]]
 name = "spki"
-version = "0.8.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d9efca8738c78ee9484207732f728b1ef517bbb1833d6fc0879ca898a522f6f"
+checksum = "7ef958a98b9d5da290cfc78946e9f3e61e1e62a18db0d92cac0b83cc161491a9"
 dependencies = [
  "base64ct",
  "der",
@@ -5299,15 +5249,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a0219bd7d979d58245a4f41f695e1ac9f8befdffadd7f61f1bae9e39abc6620"
 
 [[package]]
-name = "sqlite-wasm-rs"
-version = "0.5.5"
+name = "sqlcipher-src"
+version = "420.0.0+sqlcipher-4.20.0-sqlite-3.54.1-libtomcrypt-1.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc3efc0da82635d7e1ced0053bbbfa8c7ab9645d0bf36ceb4f7127bb85315d75"
+checksum = "fd6b5280ed2593d07b2816ec531821c15c306903bcca224716f1fbcc2bbfedfe"
+
+[[package]]
+name = "sqlite-wasm-rs"
+version = "0.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6cd504cecbfe7eef649988840f9a6cb768d11085efec138f8e99f160632d867"
 dependencies = [
  "cc",
- "js-sys",
  "rsqlite-vfs",
- "wasm-bindgen",
+ "sqlcipher-src",
 ]
 
 [[package]]
@@ -5345,11 +5300,11 @@ dependencies = [
 
 [[package]]
 name = "ssh-key"
-version = "0.7.0-rc.11"
+version = "0.7.0-rc.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9a32fae177b74a22aa9c5b01bf7e68b33545be32d9e381e248058d2adc15ce3"
+checksum = "0701b552e6bd8f13a6e07bde25307c32d7daad80a79b65832d110c0416e7b638"
 dependencies = [
- "argon2 0.6.0-rc.8",
+ "argon2 0.6.0",
  "bcrypt-pbkdf",
  "ctutils",
  "ed25519-dalek",
@@ -5465,18 +5420,18 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "2.0.19"
+version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09a43598840e33d5b0331f38c5e30d13bb11c11210a4b58f0d9b18a5a5eefcd9"
+checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
 dependencies = [
  "thiserror-impl",
 ]
 
 [[package]]
 name = "thiserror-impl"
-version = "2.0.19"
+version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43cbfe0cf76104d42a574802844187e84a305e531ed54455f11fbde0f10541cd"
+checksum = "fe5197923287db20a58125f0bc85c062f7f2c892de97b18c356f9efb14b28524"
 dependencies = [
  "proc-macro2",
  "quote",

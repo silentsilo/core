@@ -1029,6 +1029,19 @@ A change that alters a fixture's output is a break. The fixture is the
 released format; updating it to match new behaviour only hides the problem
 from the people who will hit it.
 
+`crates/silentsilo-fixture/working-copies/sqlcipher-<version>/` is not a
+format (the working copy is not one, see above) and is pinned the same way,
+by its own `SHA256SUMS`. It holds a crashed and a locked working copy written
+by that SQLCipher, each with its silo folder. This build must adopt the
+crashed one with what only its WAL holds and reuse the locked one under its
+own page key, not rebuild either (`tests/working_copies.rs`). The old core
+tags in the fixture run on this build's SQLite (`compat/README.md`), so this
+is what answers whether a new SQLCipher opens what the previous one left on
+every machine. A new directory comes before each SQLCipher upgrade, written
+with the release still on the old one:
+`cargo run -p silentsilo-fixture -- create-working-copies crates/silentsilo-fixture/working-copies/sqlcipher-<version>`,
+then `-- sums` on it for `working-copies/SHA256SUMS`.
+
 `v1.9.0` and its twin are the first whose storage holds an activity log (a
 personal key, its sealed policy and two chained segments) and an entry with
 custom fields, history and `ssh_agent`. Their `expected.txt` lists the log

@@ -16,6 +16,9 @@ silentsilo-sync = { workspace = true }
 silentsilo-vault = { workspace = true, features = ["fixture-support"] }
 silentsilo-vfs = { workspace = true }
 rusqlite = { workspace = true }
+# The rusqlite the old core tags build against (compat/rusqlite-0.40), on
+# the same libsqlite3-sys, for tests that hand one connection to both.
+rusqlite-old = { package = "rusqlite", version = "0.40" }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tempfile = { workspace = true }

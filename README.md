@@ -99,6 +99,11 @@ from its storage, using only a recovery code, and compares what comes out. A
 fixture whose output changes means released data no longer reads the same
 way. The fix goes in the code, never in the fixture.
 
+`working-copies/` beside the fixtures holds working copies an earlier SQLCipher
+wrote, which this build has to open as they are. The old releases the tests
+run next to this one build against stand-ins in `compat/`, so the whole
+workspace shares one SQLite; `compat/README.md` says why.
+
 ### A note for Windows
 
 The fixture corpus has file names long enough that a clone into a deeply

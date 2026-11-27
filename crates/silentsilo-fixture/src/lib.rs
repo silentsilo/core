@@ -45,6 +45,9 @@ use silentsilo_vault::{
 use silentsilo_vfs::{Vfs, all_ops, pending_ops, replay};
 use uuid::Uuid;
 
+pub mod old_sqlite;
+pub mod working_copies;
+
 /// A stand-in for a wrapped content key.
 ///
 /// The fixtures before `v1.10.1` never decrypt content, and a real wrapping

@@ -60,6 +60,7 @@ use rusqlite::Connection;
 use silentsilo_app::files::{import_file, read_file};
 use silentsilo_app::{AppEvent, AppState, Host, SyncReport, run_sync_pass};
 use silentsilo_crypto_v1_0_0 as crypto_v1;
+use silentsilo_fixture::old_sqlite::{OldConnection, old_in_memory, with_new, with_old};
 use silentsilo_store_v1_0_0 as store_v1;
 use silentsilo_sync_v1_0_0 as sync_v1;
 use silentsilo_vault::{BackupTarget, SiloEntry, TargetRole, VaultSession};
@@ -190,7 +191,7 @@ impl Device {
 
     fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> T) -> T {
         match &self.kind {
-            Kind::Old(old) => f(&old.session.lock().unwrap().conn),
+            Kind::Old(old) => with_new(&old.session.lock().unwrap().conn, f),
             Kind::New(new) => {
                 let sessions = new.state.sessions.lock().unwrap();
                 f(&sessions[&new.silo.id].conn)
@@ -910,12 +911,12 @@ impl Ledger {
             conn
         };
         let (old, new) = (db(), db());
-        vfs_v1::init_schema(&old, self.vault_id).unwrap();
+        with_old(&old, |old| vfs_v1::init_schema(old, self.vault_id)).unwrap();
         silentsilo_vfs::init_schema(&new, self.vault_id).unwrap();
         silentsilo_vfs::replay(&new, records.clone()).unwrap();
         for record in &records {
             let record = vfs_v1::OpRecord::from_bytes(&record.to_bytes().unwrap()).unwrap();
-            if vfs_v1::apply_op(&old, &record).is_err() {
+            if with_old(&old, |old| vfs_v1::apply_op(old, &record)).is_err() {
                 // An earlier record of this build: judged from what its own
                 // author held.
                 let ours = self
@@ -977,7 +978,7 @@ impl Ledger {
             ));
         }
         let refused = vfs_v1::OpRecord::from_bytes(&refused.to_bytes().unwrap()).unwrap();
-        match vfs_v1::apply_op(&old, &refused) {
+        match with_old(&old, |old| vfs_v1::apply_op(old, &refused)) {
             Err(_) if self.unrenamable_on_1_0_0(&records, &refused) => Verdict::Unrenamable,
             Err(e) => Verdict::Ours(format!("{e}: {:?}", refused.op)),
             Ok(_) => Verdict::Concurrent,
@@ -997,11 +998,9 @@ impl Ledger {
             _ => return false,
         };
         [name.as_str(), "unclaimed probe"].iter().all(|to| {
-            let conn = Connection::open_in_memory().unwrap();
-            conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
             let session = vault_v1::VaultSession {
                 paths: vault_v1::VaultPaths::new(PathBuf::from("unused")),
-                conn,
+                conn: old_in_memory(),
                 vault_id: self.vault_id,
                 dek: crypto_v1::generate_dek(),
                 kek: crypto_v1::generate_content_kek(),
@@ -1311,7 +1310,7 @@ async fn run(seed: u64, before: usize, after: usize) -> OldDivergence {
     };
     settle(&devices, seed, &mut ledger).await;
     for (i, d) in devices.iter().enumerate() {
-        let id = d.with_conn(|conn| vfs_v1::device_id(conn).unwrap());
+        let id = d.with_conn(|conn| with_old(conn, |conn| vfs_v1::device_id(conn).unwrap()));
         ledger.note(format!("device {i} is {id}"));
     }
 
@@ -1322,8 +1321,10 @@ async fn run(seed: u64, before: usize, after: usize) -> OldDivergence {
     settle(&devices, seed, &mut ledger).await;
     for (i, d) in devices.iter_mut().enumerate().skip(1) {
         let (author, from) = d.with_conn(|conn| {
-            let id = vfs_v1::device_id(conn).unwrap();
-            (id, vfs_v1::chain_tip(conn, id).unwrap().0)
+            with_old(conn, |conn| {
+                let id = vfs_v1::device_id(conn).unwrap();
+                (id, vfs_v1::chain_tip(conn, id).unwrap().0)
+            })
         });
         ledger.updated_from.insert(author, from);
         d.update(i);
@@ -1591,7 +1592,7 @@ fn work_dirs_for_this_test() {
 /// Which record a failed 1.0.0 replay stopped on. The failed replay kept
 /// what it applied before that record, so this applies the batch again one
 /// record at a time.
-fn failing_record(conn: &Connection, mut records: Vec<vfs_v1::OpRecord>) -> Option<Refusal> {
+fn failing_record(conn: &OldConnection, mut records: Vec<vfs_v1::OpRecord>) -> Option<Refusal> {
     records.sort_by_key(|r| r.sort_key());
     records.iter().find_map(|record| {
         vfs_v1::apply_op(conn, record).err().map(|e| Refusal {

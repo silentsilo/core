@@ -12,6 +12,7 @@ use std::path::PathBuf;
 
 use rusqlite::Connection;
 use silentsilo_crypto_v1_0_0 as crypto_v1;
+use silentsilo_fixture::old_sqlite::{old_in_memory, with_new};
 use silentsilo_vault::VaultSession;
 use silentsilo_vault_v1_0_0 as vault_v1;
 use silentsilo_vfs::Vfs;
@@ -29,7 +30,7 @@ fn side_by_side() -> (vault_v1::VaultSession, VaultSession) {
     };
     let old = vault_v1::VaultSession {
         paths: vault_v1::VaultPaths::new(PathBuf::from("unused")),
-        conn: db(),
+        conn: old_in_memory(),
         vault_id,
         dek: crypto_v1::generate_dek(),
         kek: crypto_v1::generate_content_kek(),
@@ -61,7 +62,7 @@ fn applies_on_1_0_0(old: &vault_v1::VaultSession, new: &VaultSession) {
         as_1_0_0(silentsilo_vfs::all_ops(&new.conn).unwrap()),
     )
     .expect("1.0.0 applies every record");
-    assert_eq!(tree(&old.conn), tree(&new.conn));
+    assert_eq!(with_new(&old.conn, tree), tree(&new.conn));
 }
 
 #[test]
@@ -432,7 +433,11 @@ fn a_group_a_1_0_0_purge_left_unranked_refuses_every_rename_on_1_0_0_too() {
     for record in as_1_0_0(records) {
         vfs_v1::apply_op(&old.conn, &record).unwrap();
     }
-    assert_eq!(tree(&old.conn), tree(&new.conn), "both show the same names");
+    assert_eq!(
+        with_new(&old.conn, tree),
+        tree(&new.conn),
+        "both show the same names"
+    );
 
     let old_vfs = vfs_v1::Vfs::new(&old);
     for name in ["a.txt", "a (4).txt", "b.txt"] {
@@ -664,11 +669,11 @@ fn a_1_0_0_device_applies_every_record_this_build_writes() {
                 panic!(
                     "seed {seed}: 1.0.0 refused {shown}\n  {e}\n  after:\n    {}\n  differing since {first_differ:?}\n  1.0.0 had:\n    {}\n  this build has:\n    {}",
                     history.join("\n    "),
-                    tree(&old.conn).join("\n    "),
+                    with_new(&old.conn, tree).join("\n    "),
                     tree(&new.conn).join("\n    "),
                 );
             }
-            let (a, b) = (tree(&old.conn), tree(&new.conn));
+            let (a, b) = (with_new(&old.conn, tree), tree(&new.conn));
             if first_differ.is_none() && a != b {
                 first_differ = Some(format!(
                     "step {step}: only on 1.0.0 {:?}, only here {:?}",

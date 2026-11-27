@@ -17,6 +17,8 @@ members = [
     "crates/silentsilo-soak",
     "crates/silentsilo-audit",
 ]
+# Stand-ins for what the old core tags pin; see compat/README.md.
+exclude = ["compat"]
 
 [workspace.package]
 version = "1.12.0-beta.1"
@@ -37,7 +39,7 @@ zeroize = { version = "1", features = ["derive"] }
 argon2 = "0.5"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-rusqlite = { version = "0.40", features = ["bundled-sqlcipher-vendored-openssl", "serialize"] }
+rusqlite = { version = "0.43", features = ["bundled-sqlcipher-vendored-openssl", "serialize", "backup"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 silentsilo-core = { path = "crates/silentsilo-core" }
 silentsilo-crypto = { path = "crates/silentsilo-crypto" }
@@ -69,3 +71,11 @@ opt-level = 3
 
 [profile.dev.package.blake2]
 opt-level = 3
+
+# Only the old core tags in silentsilo-fixture's dev-dependencies resolve to
+# these, so their rusqlite and russh share this build's libsqlite3-sys and
+# rsa. This workspace only: desktop and mobile never see them.
+[patch.crates-io]
+rusqlite-040 = { path = "compat/rusqlite-0.40", package = "rusqlite" }
+russh-062 = { path = "compat/russh-0.62", package = "russh" }
+russh-063 = { path = "compat/russh-0.63", package = "russh" }

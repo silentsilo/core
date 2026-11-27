@@ -26,7 +26,7 @@ fn db() -> Connection {
 fn v1_session(vault_id: Uuid, dek: [u8; 32], kek: [u8; 32]) -> vault_v1::VaultSession {
     let session = vault_v1::VaultSession {
         paths: vault_v1::VaultPaths::new(PathBuf::from("unused")),
-        conn: db(),
+        conn: silentsilo_fixture::old_sqlite::old_in_memory(),
         vault_id,
         dek: crypto_v1::MasterDek::from_bytes(dek),
         kek: crypto_v1::ContentKek::from_bytes(kek),
