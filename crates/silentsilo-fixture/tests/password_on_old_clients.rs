@@ -1,7 +1,8 @@
 //! What every release before the unlock password makes of storage that holds
 //! one. Answered by each release's own code, pulled in by tag: core 1.0.0
 //! (desktop 1.0.0), 1.6.1 (desktop 1.1.0, Android 1.1.0), 1.10.0 (desktop
-//! 1.5.0) and 1.10.4 (desktop 1.5.2, the phone apps up to 1.4.x).
+//! 1.5.0), 1.10.4 (desktop 1.5.2, the phone apps up to 1.4.x) and 1.11.8
+//! (desktop 1.6.0, the bridge).
 //!
 //! The promise: an older client leaves the envelope and its removal marker
 //! alone, does not take either for a key, and reads, joins, compacts, sweeps
@@ -296,6 +297,171 @@ async fn core_1_10_4_leaves_the_password_alone_and_takes_nothing_for_a_key() {
     republished_on(copy.path(), &root).await;
 }
 
+#[tokio::test]
+async fn core_1_11_8_leaves_the_password_alone_and_takes_nothing_for_a_key() {
+    use silentsilo_store_v1_11_8 as store_old;
+    use silentsilo_sync_v1_11_8 as sync_old;
+
+    let (_dir, root) = rich_with_password().await;
+    let (envelope, marker) = (bytes_of(&root, PASSWORD_KEY), bytes_of(&root, MARKER));
+    let old: Box<dyn store_old::ObjectStore> = store_old::StoreConfig::Folder {
+        path: store_dir(&root),
+    }
+    .open()
+    .unwrap();
+
+    let keys = sync_old::fetch_key_envelopes(&*old).await.unwrap();
+    assert_eq!(
+        keys.len(),
+        3,
+        "1.11.8 took the password or its marker for a key"
+    );
+    assert!(sync_old::read_manifest(&*old).await.unwrap().is_some());
+    assert!(
+        sync_old::fetch_recovery_envelope(&*old)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    sync_old::prune_ops_below(&*old, u64::MAX).await.unwrap();
+    sync_old::sweep_orphan_blobs(&*old, &HashSet::new(), &HashSet::new())
+        .await
+        .unwrap();
+    assert_untouched(&root, &envelope, &marker, "1.11.8");
+
+    let copy = tempfile::tempdir().unwrap();
+    let to: Box<dyn store_old::ObjectStore> = store_old::StoreConfig::Folder {
+        path: copy.path().to_path_buf(),
+    }
+    .open()
+    .unwrap();
+    sync_old::seed_target(&*old, &*to, &mut |_| {}, &|| false)
+        .await
+        .unwrap();
+    assert_untouched(&root, &envelope, &marker, "1.11.8 seeding");
+    republished_on(copy.path(), &root).await;
+}
+
+/// What an older release's key reconciliation, the part of its pass that
+/// reads `keys/revoked/`, does with the password's marker: opens it, finds
+/// it names no key, and changes nothing because of it.
+macro_rules! reconciles_keys_past_the_password_marker {
+    ($name:ident, $store:ident, $sync:ident, $vault:ident, $label:literal) => {
+        #[tokio::test]
+        async fn $name() {
+            use $store as store_old;
+            use $sync as sync_old;
+            use $vault as vault_old;
+
+            let (_dir, root) = rich_with_password().await;
+            let (envelope, marker) = (bytes_of(&root, PASSWORD_KEY), bytes_of(&root, MARKER));
+            let old: Box<dyn store_old::ObjectStore> = store_old::StoreConfig::Folder {
+                path: store_dir(&root),
+            }
+            .open()
+            .unwrap();
+            let recovery = sync_old::fetch_recovery_envelope(&*old)
+                .await
+                .unwrap()
+                .unwrap();
+            let dek = vault_old::unwrap_with_code(&recovery, FIXTURE_CODE).unwrap();
+            let kek = vault_old::unwrap_kek_bytes(
+                &sync_old::fetch_content_kek(&*old).await.unwrap().unwrap(),
+                &dek,
+            )
+            .unwrap();
+
+            let marks = sync_old::revocation_marks(&*old, &kek).await.unwrap();
+            let mut local = vault_old::StoredFidoKeys {
+                keys: sync_old::fetch_key_envelopes(&*old).await.unwrap(),
+            };
+            let before: Vec<String> = local.keys.iter().map(|k| k.credential_id.clone()).collect();
+            let outcome = sync_old::reconcile_key_envelopes(&*old, &kek, &mut local, 0, &marks)
+                .await
+                .unwrap_or_else(|e| panic!("{}: reconcile failed: {e}", $label));
+            assert!(
+                outcome.revoked.is_empty(),
+                "{}: {:?}",
+                $label,
+                outcome.revoked
+            );
+            assert!(outcome.added.is_empty(), "{}: {:?}", $label, outcome.added);
+            let after: Vec<String> = local.keys.iter().map(|k| k.credential_id.clone()).collect();
+            assert_eq!(before, after, "{}", $label);
+            assert!(local.keys.iter().all(|k| !k.revoked), "{}", $label);
+            assert_untouched(&root, &envelope, &marker, $label);
+        }
+    };
+}
+
+reconciles_keys_past_the_password_marker!(
+    core_1_10_4_reconciles_keys_past_the_password_marker,
+    silentsilo_store_v1_10_4,
+    silentsilo_sync_v1_10_4,
+    silentsilo_vault_v1_10_4,
+    "1.10.4"
+);
+reconciles_keys_past_the_password_marker!(
+    core_1_11_8_reconciles_keys_past_the_password_marker,
+    silentsilo_store_v1_11_8,
+    silentsilo_sync_v1_11_8,
+    silentsilo_vault_v1_11_8,
+    "1.11.8"
+);
+
+/// A silo folder this build put under the password, opened by 1.11.8 on the
+/// same machine (a downgrade): the device secret opens nothing, so it never
+/// reads the silo as something else; the recovery code still opens it, and
+/// the password still does once the user is back on this build.
+#[tokio::test]
+async fn core_1_11_8_opens_a_folder_put_under_the_password_with_the_code_only() {
+    use silentsilo_fixture::{FIXTURE_DEVICE_SECRET, silo_dir};
+    use silentsilo_store_v1_11_8 as store_old;
+    use silentsilo_sync_v1_11_8 as sync_old;
+    use silentsilo_vault_v1_11_8 as vault_old;
+
+    let (_dir, root) = password_only().await;
+    let folder = silo_dir(&root);
+    let StoredPassword::Envelope(envelope) = fetch_password_envelope(&*store(&root)).await.unwrap()
+    else {
+        panic!("no password");
+    };
+    // What setting the password does on a silo no key opens.
+    silentsilo_vault::password::save_password_envelope(&folder, &envelope).unwrap();
+    silentsilo_vault::save_wrapped_dek_bytes(&folder, &hex::decode(&envelope.wrapped_dek).unwrap())
+        .unwrap();
+
+    assert!(
+        vault_old::VaultSession::open_with_device_secret(folder.clone(), FIXTURE_DEVICE_SECRET)
+            .is_err(),
+        "1.11.8 opened a password silo with the device secret"
+    );
+    let old: Box<dyn store_old::ObjectStore> = store_old::StoreConfig::Folder {
+        path: store_dir(&root),
+    }
+    .open()
+    .unwrap();
+    let recovery = sync_old::fetch_recovery_envelope(&*old)
+        .await
+        .unwrap()
+        .unwrap();
+    let dek = vault_old::unwrap_with_code(&recovery, FIXTURE_CODE).unwrap();
+    drop(
+        vault_old::VaultSession::open_with_dek(folder.clone(), dek)
+            .unwrap_or_else(|e| panic!("1.11.8 cannot open it with the code: {e}")),
+    );
+
+    let manifest = silentsilo_sync::read_manifest(&*store(&root))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        silentsilo_app::flows::open_with_password(folder, FIXTURE_PASSWORD, manifest.vault_id)
+            .is_ok()
+    );
+}
+
 /// A copy an older release seeded has no password at the root; a current
 /// client's pass publishes it there, and it opens with the password.
 async fn republished_on(copy: &Path, root: &Path) {
@@ -399,6 +565,13 @@ joins_a_password_only_silo_with_the_code!(
     silentsilo_sync_v1_10_4,
     silentsilo_vault_v1_10_4,
     "1.10.4"
+);
+joins_a_password_only_silo_with_the_code!(
+    core_1_11_8_joins_a_password_only_silo_with_the_code,
+    silentsilo_store_v1_11_8,
+    silentsilo_sync_v1_11_8,
+    silentsilo_vault_v1_11_8,
+    "1.11.8"
 );
 
 #[tokio::test]

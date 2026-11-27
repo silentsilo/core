@@ -54,4 +54,9 @@ silentsilo-vfs-v1_10_0 = { package = "silentsilo-vfs", git = "https://github.com
 silentsilo-vault-v1_10_4 = { package = "silentsilo-vault", git = "https://github.com/silentsilo/core", tag = "v1.10.4" }
 silentsilo-sync-v1_10_4 = { package = "silentsilo-sync", git = "https://github.com/silentsilo/core", tag = "v1.10.4" }
 silentsilo-store-v1_10_4 = { package = "silentsilo-store", git = "https://github.com/silentsilo/core", tag = "v1.10.4" }
+# The core desktop 1.6.0 ships, the bridge release most desktops will sit on
+# when the password arrives.
+silentsilo-vault-v1_11_8 = { package = "silentsilo-vault", git = "https://github.com/silentsilo/core", tag = "v1.11.8" }
+silentsilo-sync-v1_11_8 = { package = "silentsilo-sync", git = "https://github.com/silentsilo/core", tag = "v1.11.8" }
+silentsilo-store-v1_11_8 = { package = "silentsilo-store", git = "https://github.com/silentsilo/core", tag = "v1.11.8" }
 silentsilo-app = { workspace = true }

@@ -212,14 +212,14 @@ fn key(wrap_key: [u8; 32], id: &str) -> DeviceKey {
 }
 
 #[tokio::test]
-async fn a_password_only_silo_opens_with_the_password_and_not_the_device_secret() {
+async fn a_password_only_silo_opens_with_the_password_and_the_secret_opens_nothing() {
     let origin = origin().await;
     let root = origin.a.root().to_path_buf();
     origin.a.close();
 
-    // Setting the password retired the secret and moved the local envelope.
-    // A keyring read can fail under parallel tests; what matters is that no
-    // secret comes back.
+    // Setting the password moved the local envelope under it, so the device
+    // secret opens nothing whether or not the keyring dropped it. A keyring
+    // read can fail under parallel tests; when it works, no secret is left.
     assert!(
         !matches!(silentsilo_vault::load_credentials(origin.vault_id),
             Ok(c) if !c.device_secret.is_empty())
@@ -350,12 +350,21 @@ async fn the_last_way_in_cannot_be_removed_and_a_removal_reaches_the_other_devic
     let b_root = dir.path().join("joined");
     let session = join_with_password(&origin, b_root.clone(), PASSWORD).await;
     let b = Device::new(&origin.storage, origin.vault_id, b_root.clone(), session);
+    // B gets a key of its own, so the password is not its only way in.
+    {
+        let sessions = b.state.sessions.lock().unwrap();
+        enrol_device_key(
+            sessions.get(&origin.vault_id).unwrap(),
+            &key([8; 32], "bb22"),
+        )
+        .unwrap();
+    }
 
     let (_, kek) = origin.a.keys();
     let targets: Vec<(&dyn ObjectStore, bool)> = vec![(&store, true)];
     assert_eq!(
         english(
-            &remove_unlock_password(origin.a.root(), &kek, &targets)
+            &remove_unlock_password(origin.a.root(), &kek, &targets, true)
                 .await
                 .err()
                 .unwrap()
@@ -372,7 +381,15 @@ async fn the_last_way_in_cannot_be_removed_and_a_removal_reaches_the_other_devic
         )
         .unwrap();
     }
-    remove_unlock_password(origin.a.root(), &kek, &targets)
+    // The app says this device cannot use the key (a phone key whose
+    // fingerprint changed): refused all the same.
+    assert!(
+        remove_unlock_password(origin.a.root(), &kek, &targets, false)
+            .await
+            .is_err()
+    );
+    assert!(has_password(origin.a.root()));
+    remove_unlock_password(origin.a.root(), &kek, &targets, true)
         .await
         .unwrap();
     assert!(!has_password(origin.a.root()));
@@ -384,6 +401,116 @@ async fn the_last_way_in_cannot_be_removed_and_a_removal_reaches_the_other_devic
     // The pass after that has nothing more to say.
     assert_eq!(b.pass().await.password, PasswordChange::None);
     assert!(store.head("unlock-password.env").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn a_removal_leaves_the_password_on_a_device_no_key_opens() {
+    // B joined with the password and has no key of its own. A removal made
+    // on A (or a marker a former member wrote) must not leave B with only
+    // the recovery code.
+    let origin = origin().await;
+    let store = FolderStore::new(origin.storage.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let b_root = dir.path().join("joined");
+    let session = join_with_password(&origin, b_root.clone(), PASSWORD).await;
+    let b = Device::new(&origin.storage, origin.vault_id, b_root.clone(), session);
+    {
+        let sessions = origin.a.state.sessions.lock().unwrap();
+        enrol_device_key(
+            sessions.get(&origin.vault_id).unwrap(),
+            &key([7; 32], "aa11"),
+        )
+        .unwrap();
+    }
+    origin.a.pass().await;
+    let (_, kek) = origin.a.keys();
+    remove_unlock_password(origin.a.root(), &kek, &[(&store, true)], true)
+        .await
+        .unwrap();
+
+    assert_eq!(b.pass().await.password, PasswordChange::KeptAfterRemoval);
+    assert!(has_password(&b_root));
+    assert!(
+        store.head("unlock-password.env").await.unwrap().is_none(),
+        "not published again"
+    );
+    // A's key came down too, unconfirmed: it is not B's way in.
+    let keys = silentsilo_vault::load_fido_keys(&b_root).unwrap();
+    assert!(keys.active().all(|k| k.unconfirmed));
+    b.close();
+    assert!(open_with_password(b_root, PASSWORD, origin.vault_id).is_ok());
+}
+
+#[tokio::test]
+async fn a_key_added_elsewhere_reaches_a_device_the_password_opens() {
+    // B has no keys file at all. Before, it never heard of keys added on
+    // other devices, and was stranded when the password went.
+    let origin = origin().await;
+    let dir = tempfile::tempdir().unwrap();
+    let b_root = dir.path().join("joined");
+    let session = join_with_password(&origin, b_root.clone(), PASSWORD).await;
+    let b = Device::new(&origin.storage, origin.vault_id, b_root.clone(), session);
+    assert!(!silentsilo_vault::is_fido_enrolled(&b_root));
+    b.pass().await;
+    assert!(
+        !silentsilo_vault::is_fido_enrolled(&b_root),
+        "no empty keys file written"
+    );
+
+    {
+        let sessions = origin.a.state.sessions.lock().unwrap();
+        enrol_device_key(
+            sessions.get(&origin.vault_id).unwrap(),
+            &key([7; 32], "aa11"),
+        )
+        .unwrap();
+    }
+    origin.a.pass().await;
+    b.pass().await;
+    let keys = silentsilo_vault::load_fido_keys(&b_root).unwrap();
+    assert_eq!(
+        keys.active()
+            .map(|k| k.credential_id.as_str())
+            .collect::<Vec<_>>(),
+        ["aa11"]
+    );
+    // It opens B's copy with the key, which proves it here.
+    b.close();
+    let opened = silentsilo_app::flows::open_with_device_key(
+        b_root.clone(),
+        "aa11",
+        &[7; 32],
+        origin.vault_id,
+    );
+    assert!(opened.is_ok(), "{:?}", opened.err());
+    assert!(silentsilo_app::flows::key_opens_here(&b_root));
+}
+
+#[tokio::test]
+async fn a_guard_that_did_not_happen_is_done_by_the_next_pass() {
+    // A set that stopped after the envelope was saved: the local DEK
+    // envelope is still the device secret's.
+    let origin = origin().await;
+    let root = origin.a.root().to_path_buf();
+    let envelope = silentsilo_vault::password::load_password_envelope(&root).unwrap();
+    assert!(!silentsilo_app::flows::password_guard_missing(
+        &root, &envelope
+    ));
+    std::fs::write(
+        silentsilo_vault::dek_store::dek_path(&root),
+        b"what was there before",
+    )
+    .unwrap();
+    assert!(silentsilo_app::flows::password_guard_missing(
+        &root, &envelope
+    ));
+
+    origin.a.pass().await;
+    assert!(!silentsilo_app::flows::password_guard_missing(
+        &root, &envelope
+    ));
+    origin.a.close();
+    assert!(open_with_password(root, PASSWORD, origin.vault_id).is_ok());
 }
 
 #[tokio::test]
@@ -400,7 +527,7 @@ async fn an_envelope_put_back_after_a_removal_does_not_join_or_come_back() {
         .unwrap();
     }
     let (_, kek) = origin.a.keys();
-    remove_unlock_password(origin.a.root(), &kek, &[(&store, true)])
+    remove_unlock_password(origin.a.root(), &kek, &[(&store, true)], true)
         .await
         .unwrap();
 
@@ -641,11 +768,26 @@ fn the_state_says_how_a_silo_was_opened_and_what_a_change_needs() {
         Confirmation::PasswordTyped
     );
 
+    // The password file gone mid-session asks for the password all the
+    // same: a missing file must not turn the check off.
+    let file_gone = DeviceMeans {
+        usable_key: false,
+        password: false,
+    };
+    assert_eq!(
+        state.confirmation_needed(id, Action::KeyChange, file_gone, std::time::Duration::ZERO),
+        Confirmation::PasswordTyped
+    );
+
     state.set_unlocked(id, Unlocked::RecoveryCode);
     assert_eq!(
         state.confirmation_needed(id, Action::KeyChange, no_key, std::time::Duration::ZERO),
         Confirmation::None
     );
+
+    // A host with its own session handling clears it itself.
+    state.forget_unlocked(id);
+    assert_eq!(state.unlocked(id), Unlocked::Fresh);
 }
 
 #[tokio::test]

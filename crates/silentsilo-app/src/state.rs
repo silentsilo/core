@@ -324,7 +324,10 @@ impl AppState {
         needed
     }
 
-    fn forget_unlocked(&self, id: Uuid) {
+    /// Drops how silo `id` was opened. [`Self::open_session`] and
+    /// [`Self::close_session`] call it; a host that keeps its own sessions
+    /// calls it on every open and close.
+    pub fn forget_unlocked(&self, id: Uuid) {
         self.unlocked_map().remove(&id);
     }
 

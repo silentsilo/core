@@ -44,6 +44,33 @@ async fn a_silo_without_a_password_says_to_use_the_code() {
     ));
 }
 
+#[tokio::test]
+async fn a_password_left_on_an_old_key_says_to_use_the_code() {
+    // What a rotation by a release without passwords leaves in storage: an
+    // envelope the password still opens, around a key the silo dropped.
+    let dir = tempfile::tempdir().unwrap();
+    silentsilo_fixture::create(dir.path()).await.unwrap();
+    let store = silentsilo_extract::folder_store(&store_dir(dir.path()));
+    let old_key = silentsilo_crypto::generate_dek();
+    let left = silentsilo_vault::password::seal_under_password(
+        &old_key,
+        &silentsilo_crypto::generate_content_kek(),
+        FIXTURE_PASSWORD,
+        &[],
+        false,
+    )
+    .unwrap();
+    silentsilo_sync::unlock_password::push_password_envelope(&*store, &left)
+        .await
+        .unwrap();
+    let err = open_with(&*store, Secret::Password(FIXTURE_PASSWORD))
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(err, ExtractError::PasswordOutdated), "{err}");
+    assert!(err.to_string().contains("recovery code"));
+}
+
 fn run(args: &[&str], stdin: &str) -> std::process::Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_silentsilo-extract"))
         .args(args)

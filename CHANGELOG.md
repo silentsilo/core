@@ -48,11 +48,42 @@ changed.
 - Activity log events 55 (unlock password set) and 56 (removed). Earlier
   releases show them as "Unknown event".
 - `crates/silentsilo-fixture/tests/password_on_old_clients.rs`: core 1.0.0,
-  1.6.1, 1.10.0 and 1.10.4 leave the envelope and its marker alone through a
-  join, compaction, the blob sweep and seeding, take neither for a key, and
-  open a silo with no key at all with the recovery code. The rich fixture
+  1.6.1, 1.10.0, 1.10.4 and 1.11.8 leave the envelope and its marker alone
+  through a join, compaction, the blob sweep, seeding and the key
+  reconciliation, take neither for a key, and open a silo with no key at
+  all with the recovery code. 1.11.8 opens a folder put under the password
+  with the code and not with the device secret. The rich fixture
   written today carries a password, so every older-release test reads
   storage that holds one.
+
+### Fixed (since 1.12.0-beta.1)
+
+- A removal marker no longer takes the password from a device no key opens:
+  it keeps it, stops publishing it and reports `KeptAfterRemoval`.
+- Dates: an envelope dated more than 13 hours ahead is not adopted, not
+  counted for the date floor and is written over; a marker dated more than
+  12 hours ahead is ignored and none is written further ahead. A planted
+  envelope dated in 2100 used to make the password impossible to remove.
+- Equal dates are ordered by id, so two devices settle on one password.
+- An envelope tagged under parameters lighter than Argon2id at 256 MiB is
+  not adopted or joined with.
+- Publishing writes over a copy of the envelope with one field changed;
+  removal deletes the envelope only where the marker went.
+- "Dropped after a rotation" is said only when a local copy was dropped and
+  nothing replaced it.
+- The pass puts `master.dek.enc` under the password whenever it is not yet,
+  and a failed guard no longer fails `set_unlock_password`.
+- A junk local envelope file is removed and does not count as a password.
+  A session the password opened asks for it again even if the file is gone.
+- Only a key this device has proven counts as one that opens the silo here
+  (`flows::key_opens_here`); `remove_unlock_password` takes the app's
+  answer too.
+- A silo with a password takes keys added elsewhere without a keys file,
+  and follows a key removed elsewhere even when it was the last one here.
+  A rotation of a silo with no key writes no empty keys file.
+- The extraction tool tells a password left on an old key from a wrong one,
+  and its usage line names the password.
+- `AppState::forget_unlocked` is public.
 
 ### Fixed
 

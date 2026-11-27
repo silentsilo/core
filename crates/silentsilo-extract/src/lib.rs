@@ -190,6 +190,9 @@ pub enum ExtractError {
     WrongCode,
     NoPassword,
     WrongPassword,
+    /// The password opened a vault key the silo no longer uses: the envelope
+    /// was left behind when the encryption key was replaced.
+    PasswordOutdated,
     NoContentKey,
     Vault(String),
     Io(String),
@@ -210,6 +213,10 @@ impl std::fmt::Display for ExtractError {
                 "this backup has no unlock password, so open it with the recovery code"
             ),
             Self::WrongPassword => write!(f, "that password does not open this backup"),
+            Self::PasswordOutdated => write!(
+                f,
+                "that password opens this backup's old encryption key, from before it was replaced; open it with the recovery code"
+            ),
             Self::NoContentKey => write!(
                 f,
                 "this backup has no content key, so its files cannot be opened"
@@ -249,6 +256,7 @@ pub async fn open_with(
         .map_err(|e| ExtractError::Storage(e.to_string()))?
         .ok_or(ExtractError::NoSilo)?;
 
+    let by_password = matches!(secret, Secret::Password(_));
     let dek = match secret {
         Secret::RecoveryCode(code) => {
             let envelope = silentsilo_sync::fetch_recovery_envelope(store)
@@ -283,8 +291,13 @@ pub async fn open_with(
         .await
         .map_err(|e| ExtractError::Storage(e.to_string()))?
         .ok_or(ExtractError::NoContentKey)?;
-    let kek = silentsilo_vault::unwrap_kek_bytes(&kek_bytes, &dek)
-        .map_err(|_| ExtractError::NoContentKey)?;
+    let kek = silentsilo_vault::unwrap_kek_bytes(&kek_bytes, &dek).map_err(|_| {
+        if by_password {
+            ExtractError::PasswordOutdated
+        } else {
+            ExtractError::NoContentKey
+        }
+    })?;
 
     // A compacted backup starts from its snapshot: the records below the
     // horizon are gone from storage, so replaying what is left onto an empty

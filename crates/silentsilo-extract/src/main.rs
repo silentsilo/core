@@ -14,7 +14,8 @@ use zeroize::Zeroizing;
 mod prompt;
 
 const USAGE: &str = "\
-silentsilo-extract  ·  read a SilentSilo backup with only a recovery code
+silentsilo-extract  ·  read a SilentSilo backup with only a recovery code,
+                       or its unlock password
 
   silentsilo-extract list    --from <folder> [--password]
   silentsilo-extract extract --from <folder> --to <folder> [--password]

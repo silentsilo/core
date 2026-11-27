@@ -363,7 +363,7 @@ pub async fn recovery_join_provision(
     };
     if let Some(envelope) = password {
         save_password_envelope(&root, &envelope).map_err(|e| e.to_string())?;
-        if !opened_by_a_key(&root) {
+        if !key_opens_here(&root) {
             guard_with_password(&root, join.vault_id, &envelope)?;
         }
     }
@@ -372,9 +372,20 @@ pub async fn recovery_join_provision(
     Ok(session)
 }
 
-/// Whether one of the silo's keys holds the local DEK envelope here.
-fn opened_by_a_key(root: &Path) -> bool {
-    load_fido_keys(root).is_ok_and(|keys| keys.active().any(|k| !k.wrapped_dek.is_empty()))
+/// Whether a key this device has proven opens the silo here: usable on
+/// this platform, enrolled or unlocked with here, holding an envelope. One
+/// that only came down from storage, another phone's included, does not.
+pub fn key_opens_here(root: &Path) -> bool {
+    load_fido_keys(root).is_ok_and(|keys| keys.opens_here())
+}
+
+/// Whether the local DEK envelope is not yet the password's: a set that
+/// stopped before [`guard_with_password`], or one that failed. The sync pass
+/// guards again when this says so.
+pub fn password_guard_missing(root: &Path, envelope: &PasswordEnvelope) -> bool {
+    let wanted = hex::decode(&envelope.wrapped_dek).ok();
+    let held = std::fs::read(silentsilo_vault::dek_store::dek_path(root)).ok();
+    wanted.is_none() || wanted != held
 }
 
 /// Puts the local DEK envelope under the password and retires the device
@@ -403,13 +414,9 @@ async fn adoptable_password(
     else {
         return None;
     };
-    if !envelope.is_authentic_now(kek, dek) {
-        return None;
-    }
-    match sync::revoked_at(store, kek, sync::PASSWORD_MARKER_ID).await {
-        Ok(Some(off)) if envelope.created_at <= off => None,
-        Ok(_) => Some(envelope),
-        Err(_) => None,
+    match sync::unlock_password::joinable(store, &envelope, kek, dek).await {
+        Ok(true) => Some(envelope),
+        _ => None,
     }
 }
 
@@ -477,6 +484,11 @@ pub async fn password_join_begin(
             .into());
         }
     };
+    // Lighter than this build seals with: not one SilentSilo made, and no
+    // guess is spent on it.
+    if !envelope.meets_kdf_floor() {
+        return Err(password_not_of_silo());
+    }
 
     // Argon2id at 256 MiB, off the async workers.
     let (dek, envelope) = {
@@ -506,7 +518,7 @@ pub async fn password_join_begin(
     if !envelope.is_authentic_now(&kek, &dek) {
         return Err(password_not_of_silo());
     }
-    if let Some(off) = sync::revoked_at(store, &kek, sync::PASSWORD_MARKER_ID)
+    if let Some(off) = sync::unlock_password::password_removed_at(store, &kek)
         .await
         .map_err(|e| e.to_string())?
         && envelope.created_at <= off
@@ -556,10 +568,13 @@ pub fn open_with_stored_password(
     password: &str,
     expected_vault_id: Uuid,
 ) -> Result<(VaultSession, VaultMeta), String> {
+    if !envelope.meets_kdf_floor() {
+        return Err(password_not_of_silo());
+    }
     let opened = open_with(root, envelope, password, expected_vault_id)?;
     let root = &opened.0.paths.root;
     save_password_envelope(root, envelope).map_err(|e| e.to_string())?;
-    if !opened_by_a_key(root) {
+    if !key_opens_here(root) {
         guard_with_password(root, expected_vault_id, envelope)?;
     }
     Ok(opened)
@@ -592,7 +607,7 @@ fn open_with(
         .into());
     }
     // It opens the silo without a key, so the secret has nothing left to do.
-    if !opened_by_a_key(&session.paths.root) {
+    if !key_opens_here(&session.paths.root) {
         let _ = silentsilo_vault::retire_device_secret(session.vault_id);
     }
     let vfs = Vfs::new(&session);
@@ -693,7 +708,7 @@ pub async fn set_unlock_password(
         )
         .into());
     }
-    let floor = sync::unlock_password::password_date_floor(stores, silo.kek).await;
+    let floor = sync::unlock_password::password_date_floor(stores, silo.kek, silo.dek).await;
     let mut envelope = {
         let dek = silo.dek.clone();
         let kek = silo.kek.clone();
@@ -708,14 +723,20 @@ pub async fn set_unlock_password(
         .map_err(|e| e.to_string())?
     };
     // After the one it replaces and after the newest marker or envelope any
-    // copy holds, whatever this clock says.
+    // copy holds, whatever this clock says, but never far past it.
     if let Ok(local) = load_password_envelope(silo.root) {
-        envelope.date_after(local.created_at + 1, silo.kek, silo.dek);
+        let after = local
+            .created_at
+            .saturating_add(1)
+            .min(sync::unlock_password::date_ceiling());
+        envelope.date_after(after, silo.kek, silo.dek);
     }
     envelope.date_after(floor, silo.kek, silo.dek);
     save_password_envelope(silo.root, &envelope).map_err(|e| e.to_string())?;
-    if !opened_by_a_key(silo.root) {
-        guard_with_password(silo.root, silo.vault_id, &envelope)?;
+    // The password is set from here on. A guard that fails is done again by
+    // the next sync pass ([`password_guard_missing`]).
+    if !key_opens_here(silo.root) {
+        let _ = guard_with_password(silo.root, silo.vault_id, &envelope);
     }
     Ok(envelope)
 }
@@ -724,17 +745,20 @@ pub async fn set_unlock_password(
 /// envelope deleted where deleting is allowed, the local copy gone.
 ///
 /// Refused while no key opens the silo here: a silo needs a key or a
-/// password on top of the recovery code. `targets` pairs each copy with
+/// password on top of the recovery code. `key_usable_here` is the app's
+/// answer (a phone's key whose fingerprint changed is recorded but opens
+/// nothing); [`key_opens_here`] has to agree. `targets` pairs each copy with
 /// whether it allows deletes.
 pub async fn remove_unlock_password(
     root: &Path,
     kek: &silentsilo_crypto::ContentKek,
     targets: &[(&dyn ObjectStore, bool)],
+    key_usable_here: bool,
 ) -> Result<(), String> {
     if !has_unlock_password(root) {
         return Ok(());
     }
-    if !opened_by_a_key(root) {
+    if !key_usable_here || !key_opens_here(root) {
         return Err(silentsilo_core::coded!(
             "err.password_last_way_in",
             "The password is this silo's only way in besides the recovery code. Add a key first."

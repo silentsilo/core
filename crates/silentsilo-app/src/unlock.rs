@@ -107,6 +107,12 @@ pub fn confirmation_for(action: Action, unlocked: &Unlocked, means: DeviceMeans)
     if action == Action::Everyday || *unlocked == Unlocked::RecoveryCode {
         return Confirmation::None;
     }
+    // Opened with the password and no key to ask for: the password again,
+    // even if the file holding it went away during the session. A missing
+    // file must not turn every check into nothing.
+    if *unlocked == Unlocked::Password && !means.usable_key {
+        return Confirmation::PasswordTyped;
+    }
     if means.usable_key {
         Confirmation::KeyTouch
     } else if means.password {

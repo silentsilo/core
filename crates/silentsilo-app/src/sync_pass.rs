@@ -127,9 +127,10 @@ pub struct SyncReport {
     pub recovery_turned_off: bool,
     /// The unlock password changed here because of another device: set or
     /// changed there (`Adopted`), or removed there, or dropped because a
-    /// rotation by a release without passwords left it opening nothing.
-    /// The last two are said on screen: a former holder of the content key
-    /// can write a removal marker.
+    /// rotation by a release without passwords left it opening nothing. Or
+    /// a removal reached a device no key opens, which keeps the password
+    /// (`KeptAfterRemoval`). All but the first are said on screen: a former
+    /// holder of the content key can write a removal marker.
     #[serde(default)]
     pub password: PasswordChange,
 }
@@ -143,6 +144,7 @@ pub enum PasswordChange {
     Adopted,
     RemovedElsewhere,
     DroppedAfterRotation,
+    KeptAfterRemoval,
 }
 
 /// Where a running pass is, for a status line and a marker on the file being
@@ -1252,10 +1254,24 @@ async fn pass(
 
     // Other devices' keys in, and this device's revocations out as markers,
     // before the push publishes anything: publishing first would put back a
-    // key another device just revoked. Never on a silo with no keys file.
-    if silentsilo_vault::is_fido_enrolled(&root)
-        && let Ok(mut local) = load_fido_keys(&root)
-    {
+    // key another device just revoked. Never on a silo with no keys file
+    // that opens with its device secret: it must not start asking for a
+    // key. One the password opens has retired that secret, so it takes the
+    // keys added elsewhere, starting from an empty list.
+    let password_here = silentsilo_vault::password::has_unlock_password(&root);
+    let local_keys = if silentsilo_vault::is_fido_enrolled(&root) {
+        match load_fido_keys(&root) {
+            Ok(keys) => Some(keys),
+            // An empty list, which an earlier build wrote on a rotation.
+            Err(_) if password_here => Some(silentsilo_vault::StoredFidoKeys { keys: Vec::new() }),
+            Err(_) => None,
+        }
+    } else if password_here {
+        Some(silentsilo_vault::StoredFidoKeys { keys: Vec::new() })
+    } else {
+        None
+    };
+    if let Some(mut local) = local_keys {
         // Every copy's markers first: one that was unplugged when a key was
         // removed holds its envelope and no marker, and would put it back.
         let mut marked_anywhere = std::collections::HashSet::new();
@@ -1267,12 +1283,13 @@ async fn pass(
         }
         let mut changed = false;
         for target in &targets {
-            match sync::reconcile_key_envelopes(
+            match sync::reconcile_key_envelopes_with(
                 &*target.store,
                 &kek,
                 &mut local,
                 now,
                 &marked_anywhere,
+                password_here,
             )
             .await
             {
@@ -1280,7 +1297,9 @@ async fn pass(
                 Err(e) => host.warn("keys", &format!("{}: {e}", target.label)),
             }
         }
+        // Never an empty list: it reads as broken.
         if changed
+            && !local.keys.is_empty()
             && let Err(e) = silentsilo_vault::save_fido_keys(
                 &root,
                 &local,
@@ -1361,16 +1380,25 @@ async fn pass(
 
     // The unlock password, by the same rules. Never in the way of the
     // records: nothing here can fail the pass.
-    let password_settled =
-        sync::unlock_password::settle_password_envelope(&recovery_targets, &kek, &dek, &root).await;
+    let password_settled = sync::unlock_password::settle_password_envelope(
+        &recovery_targets,
+        &kek,
+        &dek,
+        &root,
+        crate::flows::key_opens_here(&root),
+    )
+    .await;
     if password_settled.refused {
         host.warn(
             "password",
-            "an unlock password envelope no device on this silo's current key made was found,              so it was not used",
+            "an unlock password envelope this device cannot trust was found (not made on this \
+             silo's current key, too light, or dated too far ahead), so it was not used",
         );
     }
     let password_change = if password_settled.removed_elsewhere {
         PasswordChange::RemovedElsewhere
+    } else if password_settled.kept_after_removal {
+        PasswordChange::KeptAfterRemoval
     } else if password_settled.dropped_after_rotation {
         PasswordChange::DroppedAfterRotation
     } else if password_settled.adopted {
@@ -1378,10 +1406,13 @@ async fn pass(
     } else {
         PasswordChange::None
     };
-    if password_settled.adopted
-        && let Some(envelope) = &password_settled.envelope
-        && !load_fido_keys(&root).is_ok_and(|k| k.active().any(|k| !k.wrapped_dek.is_empty()))
-        && let Err(e) = crate::flows::guard_with_password(&root, vault_id, envelope)
+    // On a silo no key opens here, the local DEK envelope is the password's
+    // and the device secret is gone. Done again whenever it is not: after an
+    // adoption, or a set that stopped half way.
+    if let Ok(envelope) = silentsilo_vault::password::load_password_envelope(&root)
+        && !crate::flows::key_opens_here(&root)
+        && crate::flows::password_guard_missing(&root, &envelope)
+        && let Err(e) = crate::flows::guard_with_password(&root, vault_id, &envelope)
     {
         host.warn(
             "password",

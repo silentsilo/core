@@ -357,14 +357,28 @@ format and the tests on older releases.
 - The flows are in `silentsilo_app::flows` so the desktop and the phones do
   the same thing: `set_unlock_password`, `remove_unlock_password`,
   `open_with_password`, `password_join_begin`, `check_password`.
+- "A key opens the silo here" is `flows::key_opens_here`: a key usable on
+  this platform, enrolled or unlocked with on this device, holding an
+  envelope. A key that only came down from storage (another phone's, or one
+  a join brought) does not count until it unlocks this device.
 - On a silo no key opens here, setting or adopting a password puts
   `master.dek.enc` under it and retires the device secret
-  (`guard_with_password`), as a first key does. A key, once enrolled, takes
-  `master.dek.enc` over as before.
+  (`guard_with_password`), as a first key does. The pass does it again
+  whenever `master.dek.enc` is not the password's
+  (`password_guard_missing`), so a set that stopped half way is finished.
+  A key, once enrolled, takes `master.dek.enc` over as before.
 - Removing the password is refused while no key opens the silo here: a silo
-  keeps a key or a password on top of the recovery code. Removal writes a
-  dated marker on every copy (`keys/revoked/unlock-password.sealed`), so a
-  device that has not heard drops its copy at its next pass.
+  keeps a key or a password on top of the recovery code. The app's answer
+  (`key_usable_here`) and `key_opens_here` both have to say yes. Removal
+  writes a dated marker on every copy
+  (`keys/revoked/unlock-password.sealed`), so a device that has not heard
+  drops its copy at its next pass. A device no key opens keeps its copy,
+  stops publishing it and says so (`PasswordChange::KeptAfterRemoval`).
+- A silo with a password takes the keys other devices add even without a
+  keys file, starting from an empty list, and follows a key removed
+  elsewhere even when it was this device's last: the password stays a way
+  in (`reconcile_key_envelopes_with`). An empty keys file is never written;
+  it reads as broken.
 - The pass settles the password after the recovery code and before the
   records, and publishes it after them. Nothing there fails the pass: a copy
   that refuses the envelope still takes the records.
@@ -376,7 +390,9 @@ format and the tests on older releases.
   out.
 
 How a session was opened is `silentsilo_app::Unlocked`, kept in `AppState`
-and reset on every open. `confirmation_for` decides what a lasting change
+and reset on every open (`forget_unlocked`, public for a host that keeps its
+own sessions). A session the password opened on a device with no usable key
+asks for the password typed again even when the file holding it is gone. `confirmation_for` decides what a lasting change
 asks for: a device with a usable key asks for the key, whatever opened the
 session, since a typed password is something a keylogger can replay; a
 device without one asks for the password typed again; the recovery code

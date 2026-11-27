@@ -411,6 +411,14 @@ impl StoredFidoKeys {
             .filter(|k| usable_here(&k.kind, &k.derivation, &k.credential_id))
     }
 
+    /// Whether a key this device has proven opens the silo here: usable on
+    /// this platform, enrolled or unlocked with here, and holding an
+    /// envelope. A key that only arrived from storage does not count.
+    pub fn opens_here(&self) -> bool {
+        self.usable()
+            .any(|k| !k.unconfirmed && !k.wrapped_dek.is_empty())
+    }
+
     pub fn primary(&self) -> Option<&StoredFidoCredential> {
         self.usable().next()
     }

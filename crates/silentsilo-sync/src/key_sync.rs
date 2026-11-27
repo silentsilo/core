@@ -208,6 +208,20 @@ pub async fn reconcile_key_envelopes(
     now: i64,
     marked_elsewhere: &HashSet<String>,
 ) -> Result<KeyReconcile, SyncError> {
+    reconcile_key_envelopes_with(client, kek, local, now, marked_elsewhere, false).await
+}
+
+/// [`reconcile_key_envelopes`] on a device that also holds the silo's unlock
+/// password (`password_here`). The password stays a way in, so a removal
+/// another device made is followed even when it takes this device's last key.
+pub async fn reconcile_key_envelopes_with(
+    client: &dyn ObjectStore,
+    kek: &ContentKek,
+    local: &mut StoredFidoKeys,
+    now: i64,
+    marked_elsewhere: &HashSet<String>,
+    password_here: bool,
+) -> Result<KeyReconcile, SyncError> {
     let mut published = Vec::new();
     let mut marked = HashSet::new();
     for entry in client.list(KEYS_PREFIX).await? {
@@ -254,7 +268,7 @@ pub async fn reconcile_key_envelopes(
     }
 
     let everywhere: HashSet<String> = marked.union(marked_elsewhere).cloned().collect();
-    let mut outcome = merge(local, published, &everywhere);
+    let mut outcome = merge(local, published, &everywhere, password_here);
     outcome.marked = marked;
     Ok(outcome)
 }
@@ -269,6 +283,7 @@ fn merge(
     local: &mut StoredFidoKeys,
     published: Vec<StoredFidoCredential>,
     marked: &HashSet<String>,
+    password_here: bool,
 ) -> KeyReconcile {
     let mut outcome = KeyReconcile::default();
 
@@ -285,12 +300,13 @@ fn merge(
     // followed; the device that removed its last key did so knowingly and
     // needs no other device's help. Only keys this device has enrolled or
     // unlocked with count: an envelope planted in storage would otherwise
-    // be the one key "left" after every real one was marked.
+    // be the one key "left" after every real one was marked. The unlock
+    // password counts as a way left: it opens the silo here without a key.
     let would_remain = local
         .usable()
         .filter(|key| !key.unconfirmed && !follows(key))
         .count();
-    if would_remain > 0 {
+    if would_remain > 0 || password_here {
         for key in local.keys.iter_mut() {
             if follows(key) {
                 key.revoked = true;
@@ -359,6 +375,7 @@ mod tests {
             &mut local,
             vec![key("aa11"), key("bb22"), key("cc33")],
             &marked,
+            false,
         );
         assert_eq!(outcome.added, vec!["bb22".to_string()]);
         assert_eq!(local.keys.len(), 2);
@@ -372,7 +389,7 @@ mod tests {
             keys: vec![key("aa11"), org, key("cc33")],
         };
         let marked = HashSet::from(["aa11".to_string(), "bb22".to_string()]);
-        let outcome = merge(&mut local, Vec::new(), &marked);
+        let outcome = merge(&mut local, Vec::new(), &marked, false);
         assert_eq!(outcome.revoked, vec!["aa11".to_string()]);
         assert!(local.keys[0].revoked);
         assert!(!local.keys[1].revoked, "the organisation key is left alone");
@@ -387,6 +404,7 @@ mod tests {
             &mut local,
             vec![key("../../ops/x"), key("bb/22"), key("cc33")],
             &HashSet::new(),
+            false,
         );
         assert_eq!(outcome.added, vec!["cc33".to_string()]);
     }
@@ -397,13 +415,13 @@ mod tests {
             keys: vec![key("aa11"), key("bb22")],
         };
         let marked = HashSet::from(["aa11".to_string(), "bb22".to_string()]);
-        let outcome = merge(&mut local, Vec::new(), &marked);
+        let outcome = merge(&mut local, Vec::new(), &marked, false);
         assert!(outcome.revoked.is_empty());
         assert!(local.keys.iter().all(|k| !k.revoked));
 
         // One of two is still followed.
         let only = HashSet::from(["aa11".to_string()]);
-        let outcome = merge(&mut local, Vec::new(), &only);
+        let outcome = merge(&mut local, Vec::new(), &only, false);
         assert_eq!(outcome.revoked, vec!["aa11".to_string()]);
     }
 
@@ -415,7 +433,7 @@ mod tests {
         // A former holder of the content key plants an envelope, then marks
         // both real keys. The planted key arrives unconfirmed and does not
         // count as one that would remain.
-        merge(&mut local, vec![key("ff99")], &HashSet::new());
+        merge(&mut local, vec![key("ff99")], &HashSet::new(), false);
         assert!(
             local
                 .keys
@@ -425,13 +443,13 @@ mod tests {
                 .unconfirmed
         );
         let marked = HashSet::from(["aa11".to_string(), "bb22".to_string()]);
-        let outcome = merge(&mut local, Vec::new(), &marked);
+        let outcome = merge(&mut local, Vec::new(), &marked, false);
         assert!(outcome.revoked.is_empty());
         assert!(local.keys.iter().all(|k| !k.revoked));
 
         // Once this device has unlocked with it, it counts like any other.
         local.keys[2].unconfirmed = false;
-        let outcome = merge(&mut local, Vec::new(), &marked);
+        let outcome = merge(&mut local, Vec::new(), &marked, false);
         assert_eq!(outcome.revoked.len(), 2);
     }
 
@@ -442,7 +460,7 @@ mod tests {
         };
         let mut sent = key("bb22");
         sent.unconfirmed = false;
-        merge(&mut local, vec![sent], &HashSet::new());
+        merge(&mut local, vec![sent], &HashSet::new(), false);
         assert!(local.keys[1].unconfirmed);
     }
 
@@ -453,7 +471,7 @@ mod tests {
         };
         let mut injected = key("bb22");
         injected.policy = silentsilo_vault::POLICY_ORG.into();
-        merge(&mut local, vec![injected.clone()], &HashSet::new());
+        merge(&mut local, vec![injected.clone()], &HashSet::new(), false);
         assert!(!local.is_org_controlled());
 
         // On a silo that is administered, a second organisation key is real.
@@ -461,7 +479,22 @@ mod tests {
         org.policy = silentsilo_vault::POLICY_ORG.into();
         let mut administered = StoredFidoKeys { keys: vec![org] };
         injected.credential_id = "cc33".into();
-        merge(&mut administered, vec![injected], &HashSet::new());
+        merge(&mut administered, vec![injected], &HashSet::new(), false);
         assert_eq!(administered.managed().count(), 2);
+    }
+
+    #[test]
+    fn with_the_password_here_a_removal_elsewhere_takes_the_last_key_too() {
+        // Removed on the other computer, where the password let it go. This
+        // one follows: the password still opens the silo here.
+        let mut local = StoredFidoKeys {
+            keys: vec![key("aa11")],
+        };
+        let marked = HashSet::from(["aa11".to_string()]);
+        let outcome = merge(&mut local, Vec::new(), &marked, false);
+        assert!(outcome.revoked.is_empty(), "without the password it stays");
+        let outcome = merge(&mut local, Vec::new(), &marked, true);
+        assert_eq!(outcome.revoked, vec!["aa11".to_string()]);
+        assert!(local.keys[0].revoked);
     }
 }

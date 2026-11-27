@@ -115,7 +115,7 @@ in this list; that lives on the machine instead, in the table after this one.
 | Which silo this is | `silo.json` | `MARKER_VERSION = 1`, `silentsilo-vault/registry.rs` | Refuses a newer one; unlock uses it to tell a leftover working copy from this silo's |
 | Enrolled keys | `keys/fido.json` | `SILO_FILE_VERSION`, plus a `kind` per key | |
 | Recovery envelope | `keys/recovery.json` | Its own, as above | Its version means the shape of one wrapped key, not the file |
-| Unlock password envelope | `keys/unlock-password.json` | Its own, as in the bucket | From core 1.12. Kept only while it carries a valid `auth_dek`; anything else in its place is removed, not used |
+| Unlock password envelope | `keys/unlock-password.json` | Its own, as in the bucket | From core 1.12. Kept only while it carries a valid `auth_dek`; anything else in its place (junk included) is removed, not used. One of a newer version stays |
 | Index | `vault.db.enc` | `SCHEMA_VERSION = 5`, `silentsilo-vfs/schema.rs` | Not a format: see below |
 | Index, mid-rotation | `vault.db.enc.next` | Same envelope as `vault.db.enc` | Transient; unlock adopts it, see below |
 | Keys, mid-rotation | `keys/fido.json.next`, `keys/recovery.json.next` | Same as the files they replace | Transient, from core 1.7.0; see below |
@@ -464,21 +464,38 @@ The rules, in `silentsilo_sync::unlock_password`:
 - **Only an envelope whose `auth_dek` verifies under the current vault key
   is kept or adopted**, in storage and in the silo folder alike. A device
   without the password adopts the newest such envelope, so a password set on
-  one device opens the silo on all of them.
+  one device opens the silo on all of them. "Newest" is the later
+  `created_at`, then the larger `id`, so two envelopes with one date settle
+  on the same one everywhere.
+- **Adoption also needs** parameters at least those this build seals with
+  (Argon2id, 256 MiB, three passes), and a date no more than 13 hours ahead
+  of the device's clock. The fields are public, so a client could tag an
+  envelope with almost no work per guess; and one dated far ahead would
+  outrank every later change.
 - **One whose `auth` verifies and `auth_dek` does not** was left behind by a
   rotation on a release that does not know about passwords. It is removed
   where deleting is allowed and the user is told to set the password again.
 - **One whose `auth` does not verify** was written by someone outside the
   silo. Never used, never allowed to block publishing, reported.
 - **Publishing** writes over an empty target, junk, an older envelope, and
-  any envelope that is not current whatever its date. It never writes over
-  an object it could not read, one of a newer version, or a newer current
-  envelope.
+  any envelope a device would not adopt whatever its date, a copy of this
+  one with one field changed included. It never writes over an object it
+  could not read, one of a newer version, an exact copy, or a newer
+  envelope a device would adopt.
 - **Removal** is the sealed marker `keys/revoked/unlock-password.sealed`
   (credential id `unlock-password`, not hex, so the key reconciliation
   ignores it), dated: every envelope made at or before that date is dead. A
-  password set afterwards is dated past the newest marker or envelope any
-  copy holds (`password_date_floor`).
+  marker dated more than 12 hours ahead of the reader's clock is ignored,
+  and no device dates one further ahead. The envelope is deleted only from
+  copies that took the marker. A password set afterwards is dated past the
+  newest marker or adoptable envelope any copy holds
+  (`password_date_floor`), and never more than 13 hours ahead.
+- **A device no key opens keeps its password** when a marker arrives:
+  dropped, the recovery code would be its only way in, and a former holder
+  of the content KEK can write a marker. It stops publishing the envelope
+  and tells the user (`PasswordChange::KeptAfterRemoval`). "A key opens
+  here" means one this device enrolled or unlocked with; one that only came
+  down from storage does not count.
 
 Setting a password is refused under 10^10 estimated guesses (zxcvbn, in
 core, so every app decides the same), and under 10^14 asks the user to
@@ -487,10 +504,14 @@ strength: a password sealed under an older floor still opens.
 
 What older releases do, answered by their own code in
 `crates/silentsilo-fixture/tests/password_on_old_clients.rs` (core 1.0.0,
-1.6.1, 1.10.0 and 1.10.4): the envelope and the marker are left byte for
-byte the same through a join, compaction at its most destructive, the blob
-sweep and seeding a new copy; neither is taken for a key; a silo with no
-key, only a password and the recovery code, opens with the code. Seeding
+1.6.1, 1.10.0, 1.10.4 and 1.11.8): the envelope and the marker are left byte
+for byte the same through a join, compaction at its most destructive, the
+blob sweep, seeding a new copy and the key reconciliation (1.10.4 and
+1.11.8); neither is taken for a key; a silo with no key, only a password
+and the recovery code, opens with the code. A silo folder this build put
+under the password, opened by 1.11.8 on the same machine after a
+downgrade, does not open with the device secret and does open with the
+recovery code. Seeding
 does not copy the root, so a copy an older release seeded gets the password
 on the next pass of a current one. A rotation on an older release leaves
 the envelope under the retired key; the first current device drops it.

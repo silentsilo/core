@@ -80,7 +80,7 @@ pub fn commit_rotation_with_password(
     commit_rotation_with(root, keys, authority, recovery)?;
     match password {
         Some(envelope) => {
-            if !keys.active().any(|k| !k.wrapped_dek.is_empty())
+            if !keys.opens_here()
                 && let Ok(wrapped) = hex::decode(&envelope.wrapped_dek)
             {
                 // Past the point of no return: best effort, as the renames.
@@ -115,7 +115,13 @@ pub fn commit_rotation_with(
         return Err(VaultError::Corrupted("no key change is staged".into()));
     }
     crate::fido_store::check_authority(root, keys, authority)?;
-    crate::workdir::write_private(&staged_keys_path(root), &crate::format::encode(keys)?)?;
+    // A silo with no key (one the password opens) has no keys file, and an
+    // empty one reads as broken: none is written.
+    if keys.keys.is_empty() {
+        let _ = std::fs::remove_file(staged_keys_path(root));
+    } else {
+        crate::workdir::write_private(&staged_keys_path(root), &crate::format::encode(keys)?)?;
+    }
     match recovery {
         Some(envelope) => {
             let json = serde_json::to_vec_pretty(envelope)
@@ -974,6 +980,8 @@ mod tests {
             new.as_bytes()
         );
         assert!(load_kek(dir.path(), &new).is_ok());
+        // No key, so no keys file: an empty one reads as broken.
+        assert!(!crate::fido_store::is_fido_enrolled(dir.path()));
     }
 
     #[test]

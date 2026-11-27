@@ -77,7 +77,7 @@ pub struct PasswordAssessment {
 }
 
 /// The envelope as stored, locally and at the root of storage.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct PasswordEnvelope {
     pub version: u32,
     /// Random, so a removal marker names exactly this envelope.
@@ -170,6 +170,23 @@ impl PasswordEnvelope {
     pub fn is_authentic_now(&self, kek: &ContentKek, dek: &MasterDek) -> bool {
         blake3::Hash::from_hex(&self.auth_dek)
             .is_ok_and(|stored| self.tag_with_dek(kek, dek) == stored)
+    }
+
+    /// Whether a guess costs at least what [`seal_under_password`] makes it
+    /// cost. The fields are public, so a client can tag an envelope under
+    /// lighter parameters; none is adopted.
+    pub fn meets_kdf_floor(&self) -> bool {
+        let floor = KdfParams::unlock_password();
+        self.kdf.algorithm == floor.algorithm
+            && self.kdf.m_cost >= floor.m_cost
+            && self.kdf.t_cost >= floor.t_cost
+            && self.kdf.p_cost >= floor.p_cost
+    }
+
+    /// The one of two envelopes that wins: the later date, then the larger
+    /// id, so two devices that picked the same date still agree.
+    pub fn is_newer_than(&self, other: &PasswordEnvelope) -> bool {
+        (self.created_at, self.id.as_str()) > (other.created_at, other.id.as_str())
     }
 }
 
@@ -342,8 +359,14 @@ pub fn password_path(vault_root: &Path) -> PathBuf {
     vault_root.join(PASSWORD_FILE)
 }
 
+/// Whether the silo folder holds an envelope: one that parses, or one a
+/// newer release wrote. A file that is neither is not a password.
 pub fn has_unlock_password(vault_root: &Path) -> bool {
-    password_path(vault_root).is_file()
+    match load_password_envelope(vault_root) {
+        Ok(_) => true,
+        Err(VaultError::Corrupted(m)) => m.contains("needs a newer"),
+        Err(_) => false,
+    }
 }
 
 pub fn save_password_envelope(
@@ -363,6 +386,16 @@ pub fn load_password_envelope(vault_root: &Path) -> Result<PasswordEnvelope, Vau
 
 pub fn clear_password_envelope(vault_root: &Path) {
     let _ = std::fs::remove_file(password_path(vault_root));
+}
+
+/// Removes a local file that is not an envelope (junk, or cut short), and
+/// says whether it did. One a newer release wrote stays.
+pub fn clear_unreadable_envelope(vault_root: &Path) -> bool {
+    if !password_path(vault_root).exists() || has_unlock_password(vault_root) {
+        return false;
+    }
+    clear_password_envelope(vault_root);
+    true
 }
 
 #[cfg(test)]
@@ -702,6 +735,69 @@ mod tests {
         );
         clear_password_envelope(dir.path());
         assert!(!has_unlock_password(dir.path()));
+    }
+
+    #[test]
+    fn a_junk_local_file_is_not_a_password_and_is_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("keys")).unwrap();
+        std::fs::write(password_path(dir.path()), b"{\"version\":1").unwrap();
+        assert!(!has_unlock_password(dir.path()));
+        assert!(clear_unreadable_envelope(dir.path()));
+        assert!(!password_path(dir.path()).exists());
+
+        // One a newer release wrote is a password this build cannot use.
+        let (dek, kek) = (generate_dek(), generate_content_kek());
+        let mut newer = sealed(&dek, &kek, STRONG);
+        newer.version = PASSWORD_ENVELOPE_VERSION + 1;
+        std::fs::write(
+            password_path(dir.path()),
+            serde_json::to_vec(&newer).unwrap(),
+        )
+        .unwrap();
+        assert!(has_unlock_password(dir.path()));
+        assert!(!clear_unreadable_envelope(dir.path()));
+        assert!(password_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn only_the_real_parameters_or_heavier_meet_the_floor() {
+        let (dek, kek) = (generate_dek(), generate_content_kek());
+        assert!(!sealed(&dek, &kek, STRONG).meets_kdf_floor());
+        let mut real = sealed(&dek, &kek, STRONG);
+        real.kdf = KdfParams::unlock_password();
+        assert!(real.meets_kdf_floor());
+        for weaker in [
+            KdfParams {
+                m_cost: 262_143,
+                ..KdfParams::unlock_password()
+            },
+            KdfParams {
+                t_cost: 2,
+                ..KdfParams::unlock_password()
+            },
+            KdfParams {
+                algorithm: "argon2i".into(),
+                ..KdfParams::unlock_password()
+            },
+        ] {
+            let mut e = real.clone();
+            e.kdf = weaker;
+            assert!(!e.meets_kdf_floor(), "{:?}", e.kdf);
+        }
+    }
+
+    #[test]
+    fn equal_dates_are_ordered_by_id_the_same_way_everywhere() {
+        let (dek, kek) = (generate_dek(), generate_content_kek());
+        let mut a = sealed(&dek, &kek, STRONG);
+        let mut b = sealed(&dek, &kek, STRONG);
+        a.created_at = 500;
+        b.created_at = 500;
+        assert_ne!(a.is_newer_than(&b), b.is_newer_than(&a));
+        assert!(!a.is_newer_than(&a));
+        b.created_at = 501;
+        assert!(b.is_newer_than(&a));
     }
 
     #[test]
