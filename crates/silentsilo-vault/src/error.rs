@@ -34,6 +34,24 @@ pub enum VaultError {
     )]
     SecretsUnprotected,
 
+    /// Below the floor in `password::REFUSED_BELOW_LOG10`.
+    #[error(
+        "That password is too easy to guess. Use the generated phrase, or a longer password.\u{1f}err.password_too_weak"
+    )]
+    PasswordTooWeak,
+
+    /// Between the floor and `password::WARNED_BELOW_LOG10`, without the
+    /// user having confirmed the warning.
+    #[error(
+        "Someone who copies your storage could break this password. Confirm the warning to use it anyway.\u{1f}err.password_weak_unconfirmed"
+    )]
+    PasswordWeakNotConfirmed,
+
+    #[error(
+        "A password cannot be empty, longer than 1024 characters, start or end with a space, or hold a control character.\u{1f}err.password_malformed"
+    )]
+    PasswordMalformed,
+
     #[error("crypto error: {0}")]
     Crypto(String),
 

@@ -44,6 +44,20 @@ impl KdfParams {
         }
     }
 
+    /// For the unlock password the user chose, published to storage like the
+    /// recovery envelope but guarding something a person can remember. The
+    /// heaviest parameters every reader since 1.10 accepts (`MAX_M_COST`):
+    /// one guess moves about 2.3 GB through memory. To be measured on the
+    /// slowest supported phone before it ships.
+    pub fn unlock_password() -> Self {
+        Self {
+            algorithm: ARGON2ID.into(),
+            m_cost: Self::MAX_M_COST,
+            t_cost: 3,
+            p_cost: 1,
+        }
+    }
+
     /// The most work an envelope is allowed to ask for. The parameters are
     /// chosen by whoever wrote the file, and `recovery.env` comes from
     /// storage the threat model does not trust: `m_cost` is in KiB, so a
@@ -131,6 +145,16 @@ mod tests {
             ),
             ("argon2id", 19_456, 2, 1)
         );
+        let password = KdfParams::unlock_password();
+        assert_eq!(
+            (
+                password.algorithm.as_str(),
+                password.m_cost,
+                password.t_cost,
+                password.p_cost
+            ),
+            ("argon2id", 262_144, 3, 1)
+        );
         let recovery = KdfParams::recovery_code();
         assert_eq!(
             (
@@ -160,6 +184,19 @@ mod tests {
         assert_eq!(
             hex::encode(key),
             "84debd75ce0eb5c80a8079cbc708b3e5ce96cadcbd38e2ce7530b466992cb97e"
+        );
+    }
+
+    #[test]
+    fn an_unlock_password_derives_the_wrap_key_it_always_has() {
+        // Pinned when the password envelope was added (core 1.12). Every
+        // password set since then opens through exactly this.
+        let key = KdfParams::unlock_password()
+            .derive("lantern-gravel-oxidize-tuba".as_bytes(), &[0x33; 16])
+            .unwrap();
+        assert_eq!(
+            hex::encode(key),
+            "f29bc018e517709fe46380fab449ab4937591d8629011b3ba5161022df3349f2"
         );
     }
 

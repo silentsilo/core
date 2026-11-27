@@ -9,6 +9,29 @@ This repository has its own version line, separate from the desktop
 application's. A client pins a tag from here; the tag it pins is what its
 release notes should say.
 
+## [Unreleased]
+
+A new persisted format: the unlock password envelope. No existing format
+changed.
+
+### Added
+
+- An optional unlock password, with the same rights as a key and synced
+  like one: `unlock-password.env` at the root of storage and
+  `keys/unlock-password.json` in the silo folder, both tagged with the
+  content KEK and the vault key (`silentsilo_vault::password`,
+  `silentsilo_sync::unlock_password`). Argon2id at 256 MiB. Refused under
+  10^10 estimated guesses and accepted under 10^14 only after a warning,
+  decided in core with zxcvbn. Removed everywhere through the sealed marker
+  `keys/revoked/unlock-password.sealed`. See FORMATS.md, "The unlock
+  password envelope".
+- `crates/silentsilo-fixture/tests/password_on_old_clients.rs`: core 1.0.0,
+  1.6.1, 1.10.0 and 1.10.4 leave the envelope and its marker alone through a
+  join, compaction, the blob sweep and seeding, take neither for a key, and
+  open a silo with no key at all with the recovery code. The rich fixture
+  written today carries a password, so every older-release test reads
+  storage that holds one.
+
 ## [1.11.8] - replay names as every release does
 
 No persisted format changed.

@@ -115,6 +115,28 @@ pub async fn mark_recovery_disabled(
     Ok(())
 }
 
+/// The id the unlock password's marker goes under. Not hex either, so the
+/// key reconciliation ignores it, as it ignores the recovery code's.
+pub const PASSWORD_MARKER_ID: &str = "unlock-password";
+
+/// Records that the unlock password was removed at `at`: every envelope made
+/// at or before then is dead, as with the recovery code.
+pub async fn mark_password_removed(
+    client: &dyn ObjectStore,
+    kek: &ContentKek,
+    at: i64,
+) -> Result<(), SyncError> {
+    let marker = RevocationMarker {
+        version: MARKER_VERSION,
+        credential_id: PASSWORD_MARKER_ID.into(),
+        revoked_at: at,
+    };
+    let json = serde_json::to_vec(&marker).map_err(|e| SyncError::Vault(e.to_string()))?;
+    let sealed = seal_with_key(&json, kek.as_bytes())?;
+    client.put(&marker_key(PASSWORD_MARKER_ID), sealed).await?;
+    Ok(())
+}
+
 /// What one reconciliation changed.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct KeyReconcile {

@@ -49,4 +49,9 @@ silentsilo-sync-v1_10_0 = { package = "silentsilo-sync", git = "https://github.c
 silentsilo-store-v1_10_0 = { package = "silentsilo-store", git = "https://github.com/silentsilo/core", tag = "v1.10.0" }
 silentsilo-crypto-v1_10_0 = { package = "silentsilo-crypto", git = "https://github.com/silentsilo/core", tag = "v1.10.0" }
 silentsilo-vfs-v1_10_0 = { package = "silentsilo-vfs", git = "https://github.com/silentsilo/core", tag = "v1.10.0" }
+# The core the phone apps 1.4.x and desktop 1.5.2 ship, for the unlock
+# password: what the devices people hold today make of storage that has one.
+silentsilo-vault-v1_10_4 = { package = "silentsilo-vault", git = "https://github.com/silentsilo/core", tag = "v1.10.4" }
+silentsilo-sync-v1_10_4 = { package = "silentsilo-sync", git = "https://github.com/silentsilo/core", tag = "v1.10.4" }
+silentsilo-store-v1_10_4 = { package = "silentsilo-store", git = "https://github.com/silentsilo/core", tag = "v1.10.4" }
 silentsilo-app = { workspace = true }

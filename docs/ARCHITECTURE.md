@@ -186,6 +186,7 @@ flowchart TD
     SE["Secure Enclave ECDH / Android Keystore AES<br/>(macOS, iOS, Android, per enrolled key)"] -->|"wraps"| DEK
     DS["device secret<br/>(keyring, per device)<br/>Argon2id + vault.salt"] -->|"wraps, until a key is enrolled"| DEK
     RC["recovery code<br/>(160-bit, on paper)<br/>Argon2id + salt in envelope"] -->|"wraps"| DEK
+    PWD["unlock password<br/>(user-chosen, from 1.12)<br/>Argon2id 256 MiB + salt in envelope"] -->|"wraps"| DEK
     DEK["vault DEK (32B)<br/>one per silo, shared by devices"]
     DEK -->|"seals"| OPS["operation records (ops/*.op)"]
     DEK -->|"seals"| SNAP["snapshots (snapshots/*.snap)"]

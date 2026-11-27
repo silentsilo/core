@@ -1,8 +1,9 @@
 //! A written-down code that can unlock the vault when every key is gone.
 //! Always app-generated: 160 bits of OS randomness is beyond brute force
-//! whatever the provider does with the envelope. There is no passphrase
-//! option anywhere in this crate, because a memorable phrase is roughly
-//! forty bits and would quietly become the real security of the design.
+//! whatever the provider does with the envelope. Nothing here wraps under a
+//! string the user chose; the unlock password has its own module, its own
+//! KDF parameters and a floor (`password.rs`), so it can never borrow this
+//! one's normalisation, which strips everything but letters and digits.
 
 use std::path::{Path, PathBuf};
 

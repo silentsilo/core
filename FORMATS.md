@@ -24,6 +24,7 @@ Anything else needs a version discriminator first.
 | Sealed payload | wraps every op record | `SEAL_VERSION = 1`, `silentsilo-crypto/sealed.rs` | Refuses, naming the version |
 | Blob | `blobs/….sslo` | `SSLO_VERSION = 1`, `silentsilo-crypto/blob.rs` | Refuses, naming the version |
 | Recovery envelope | `recovery.env` | `RECOVERY_ENVELOPE_VERSION = 1`, plus stored KDF parameters and the optional `auth` and `auth_dek` tags | Refuses on a newer structure; a parameter change needs no bump. Each tag is absent from the JSON when there is none, so a client that does not know it reads and rewrites the rest unchanged (below) |
+| Unlock password envelope | `unlock-password.env` | `PASSWORD_ENVELOPE_VERSION = 1`, `silentsilo-vault/password.rs`, plus stored KDF parameters and the `auth` and `auth_dek` tags | From core 1.12. At the root, which no release lists, so every earlier one leaves it alone; outside `keys/`, which 1.0.0 to 1.11 read as keys. A build with it refuses a newer version with "update" and never writes over it (below) |
 | Key envelopes | `keys/….env` | **No file version.** Plain JSON of one enrolled key, carrying `kind` (what unwraps its `wrapped_dek`) and `derivation` (how that key was derived from the authenticator) | Ignores an envelope whose `kind` or `derivation` it does not know, and refuses by name when none is left it can use |
 | Content KEK | `keys/content.kek` | Sealed payload under the vault DEK | Refuses, naming the version |
 | Inbox key | `inbox/keys/….sealed` | `INBOX_VERSION = 1` inside a sealed payload under the content KEK, `silentsilo-sync/inbox.rs` | 1.0.0 never lists `inbox/`. A build with the inbox skips a key it cannot read |
@@ -114,6 +115,7 @@ in this list; that lives on the machine instead, in the table after this one.
 | Which silo this is | `silo.json` | `MARKER_VERSION = 1`, `silentsilo-vault/registry.rs` | Refuses a newer one; unlock uses it to tell a leftover working copy from this silo's |
 | Enrolled keys | `keys/fido.json` | `SILO_FILE_VERSION`, plus a `kind` per key | |
 | Recovery envelope | `keys/recovery.json` | Its own, as above | Its version means the shape of one wrapped key, not the file |
+| Unlock password envelope | `keys/unlock-password.json` | Its own, as in the bucket | From core 1.12. Kept only while it carries a valid `auth_dek`; anything else in its place is removed, not used |
 | Index | `vault.db.enc` | `SCHEMA_VERSION = 5`, `silentsilo-vfs/schema.rs` | Not a format: see below |
 | Index, mid-rotation | `vault.db.enc.next` | Same envelope as `vault.db.enc` | Transient; unlock adopts it, see below |
 | Keys, mid-rotation | `keys/fido.json.next`, `keys/recovery.json.next` | Same as the files they replace | Transient, from core 1.7.0; see below |
@@ -434,6 +436,64 @@ Absent from the JSON when there is none, so a release before 1.10.0 reads
 the envelope as before and drops the field when it rewrites it; a code
 regenerated there is not adopted by an updated device, which keeps its own
 and says so, as for `auth` above.
+
+## The unlock password envelope
+
+From core 1.12. `unlock-password.env` at the root of storage and
+`keys/unlock-password.json` in the silo folder hold the same JSON:
+`version` (1), `id` (a random UUID), `kdf` (`algorithm`, `m_cost`, `t_cost`,
+`p_cost`; written as Argon2id, 256 MiB, three passes, one lane), `salt` (16
+bytes, hex), `wrapped_dek` (the vault key wrapped as in `master.dek.enc`,
+hex), `created_at` (Unix seconds), `auth` and `auth_dek`. Unknown fields are
+ignored, so a later release can add some without a bump.
+
+The key that wraps the DEK is Argon2id over the password in Unicode NFC,
+with nothing trimmed, and the envelope's salt.
+
+Both tags are required and cover the same message: the context string, a
+zero byte, `version`, `m_cost`, `t_cost` and `p_cost` big-endian,
+`created_at` as a signed 64-bit big-endian integer, then `id`, `algorithm`,
+`salt` and `wrapped_dek`, each as a big-endian 64-bit length followed by its
+bytes. `auth` is BLAKE3 keyed by `derive_key("silentsilo unlock password auth
+v1", content_kek)` over that message with that context; `auth_dek` is keyed
+by `derive_key("silentsilo unlock password auth dek v1", content_kek ||
+dek)` with its own context in the message. Hex, 32 bytes each.
+
+The rules, in `silentsilo_sync::unlock_password`:
+
+- **Only an envelope whose `auth_dek` verifies under the current vault key
+  is kept or adopted**, in storage and in the silo folder alike. A device
+  without the password adopts the newest such envelope, so a password set on
+  one device opens the silo on all of them.
+- **One whose `auth` verifies and `auth_dek` does not** was left behind by a
+  rotation on a release that does not know about passwords. It is removed
+  where deleting is allowed and the user is told to set the password again.
+- **One whose `auth` does not verify** was written by someone outside the
+  silo. Never used, never allowed to block publishing, reported.
+- **Publishing** writes over an empty target, junk, an older envelope, and
+  any envelope that is not current whatever its date. It never writes over
+  an object it could not read, one of a newer version, or a newer current
+  envelope.
+- **Removal** is the sealed marker `keys/revoked/unlock-password.sealed`
+  (credential id `unlock-password`, not hex, so the key reconciliation
+  ignores it), dated: every envelope made at or before that date is dead. A
+  password set afterwards is dated past the newest marker or envelope any
+  copy holds (`password_date_floor`).
+
+Setting a password is refused under 10^10 estimated guesses (zxcvbn, in
+core, so every app decides the same), and under 10^14 asks the user to
+confirm a warning first (`seal_under_password`). Opening never checks
+strength: a password sealed under an older floor still opens.
+
+What older releases do, answered by their own code in
+`crates/silentsilo-fixture/tests/password_on_old_clients.rs` (core 1.0.0,
+1.6.1, 1.10.0 and 1.10.4): the envelope and the marker are left byte for
+byte the same through a join, compaction at its most destructive, the blob
+sweep and seeding a new copy; neither is taken for a key; a silo with no
+key, only a password and the recovery code, opens with the code. Seeding
+does not copy the root, so a copy an older release seeded gets the password
+on the next pass of a current one. A rotation on an older release leaves
+the envelope under the retired key; the first current device drops it.
 
 ## Who administers a key
 

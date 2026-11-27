@@ -32,9 +32,11 @@ pub mod inbox;
 mod key_sync;
 pub use error::SyncError;
 pub use key_sync::{
-    KeyReconcile, RECOVERY_MARKER_ID, REVOKED_PREFIX, is_key_revoked, mark_recovery_disabled,
-    plausible_credential_id, reconcile_key_envelopes, revocation_marks, revoked_at,
+    KeyReconcile, PASSWORD_MARKER_ID, RECOVERY_MARKER_ID, REVOKED_PREFIX, is_key_revoked,
+    mark_password_removed, mark_recovery_disabled, plausible_credential_id,
+    reconcile_key_envelopes, revocation_marks, revoked_at,
 };
+pub mod unlock_password;
 
 /// Where operation objects live inside the vault prefix.
 pub const OPS_PREFIX: &str = "ops/";

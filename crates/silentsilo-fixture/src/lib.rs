@@ -57,6 +57,10 @@ const FIXTURE_BLOB_KEY: &str = "fixture-blob-key";
 /// written into the tests, and a fixture nobody can open is worse than none.
 pub const FIXTURE_CODE: &str = "TEST-TEST-TEST-TEST-TEST-TEST-TEST-TEST";
 
+/// The unlock password the rich fixtures carry from core 1.12. Strong
+/// enough to pass the floor without the warning, as a real one would.
+pub const FIXTURE_PASSWORD: &str = "fixture-lantern-gravel-oxidize-tuba";
+
 /// Where the two halves of a fixture live under its directory.
 pub fn silo_dir(root: &Path) -> PathBuf {
     root.join("silo")
@@ -168,6 +172,26 @@ async fn create_inner(root: &Path, compact: bool, rich: bool) -> Result<(), Stri
     silentsilo_sync::push_recovery_envelope(&*store, &envelope)
         .await
         .map_err(|e| e.to_string())?;
+
+    // From core 1.12 a rich silo also has an unlock password, at the root
+    // of storage where no earlier release looks. Every test that reads
+    // "written now" with an older core then answers what that release makes
+    // of storage holding one.
+    if rich {
+        let password = silentsilo_vault::password::seal_under_password(
+            &session.dek,
+            &session.kek,
+            FIXTURE_PASSWORD,
+            &[],
+            false,
+        )
+        .map_err(|e| e.to_string())?;
+        silentsilo_vault::password::save_password_envelope(&session.paths.root, &password)
+            .map_err(|e| e.to_string())?;
+        silentsilo_sync::unlock_password::push_password_envelope(&*store, &password)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
 
     session.backup_locally().map_err(|e| e.to_string())?;
     Ok(())
