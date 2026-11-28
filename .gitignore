@@ -23,3 +23,5 @@ Thumbs.db
 *.p12
 *.pfx
 *.key
+# A working copy's session key, part of the fixture SHA256SUMS pins.
+!crates/silentsilo-fixture/working-copies/**/vault.key

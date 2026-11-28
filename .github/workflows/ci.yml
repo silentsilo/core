@@ -36,6 +36,10 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
+      # The fixture builds old core tags, whose fixtures name Touch ID keys by
+      # their 81-byte id: cargo's checkout passes Windows' 260-character limit
+      # without this.
+      - run: git config --global core.longpaths true
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
