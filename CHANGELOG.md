@@ -56,6 +56,33 @@ changed.
   written today carries a password, so every older-release test reads
   storage that holds one.
 
+### Fixed (since 1.12.0-beta.3)
+
+- The unlock password's key no longer stays in memory: `argon2`, `aes`,
+  `aes-gcm` and `blake3` are built with `zeroize`, and the password's own
+  buffers are sized up front.
+- A locked device that tried the copy in storage took an older envelope over
+  a newer one held here, undoing a change, and one a removal covered.
+  `open_with_stored_password` takes the store's removal marker and refuses
+  both, and checks the tags before the session opens.
+- A planted local envelope, or forged markers from a former holder of the
+  content key, could take a device's last key on a password silo. Only an
+  authentic local envelope counts, and a removal that takes the last key is
+  followed only with a `proof` under the current vault key, which markers now
+  carry (earlier readers skip it).
+- A keys file that could not be read on a password silo was taken for an
+  empty one and written over.
+- A device whose clock is behind wrote over newer envelopes and published one
+  a removal had covered.
+- A key change on a silo the password opens here could leave it opening with
+  the recovery code only.
+- Passwords with characters that show nothing or pass for a space are
+  refused when set.
+- Dropbox, Google Drive and OneDrive read only the bytes asked for when the
+  server sends a whole object to a ranged request.
+- `SyncReport::password` says `added` when another device set a first
+  password on a silo that had none here, apart from `adopted` for a change.
+
 ### Fixed (since 1.12.0-beta.1)
 
 - A removal marker no longer takes the password from a device no key opens:

@@ -9,7 +9,8 @@ use silentsilo_crypto::generate_dek;
 use silentsilo_store::{FolderStore, ObjectStore};
 use silentsilo_sync::{
     fetch_all_ops_above, fetch_key_envelopes, fetch_missing_ops, publish_key_envelopes,
-    reconcile_key_envelopes, revocation_marks,
+    reconcile_key_envelopes, reconcile_key_envelopes_with, revocation_marks,
+    revocation_marks_proven,
 };
 use silentsilo_vault::{StoredFidoCredential, StoredFidoKeys};
 
@@ -578,4 +579,66 @@ async fn a_published_envelope_never_says_whether_a_device_used_the_key() {
         .unwrap();
     let raw = store.get("keys/aa11.env").await.unwrap();
     assert!(!String::from_utf8(raw).unwrap().contains("unconfirmed"));
+}
+
+/// Markers are sealed under the content key, which never rotates. On a
+/// device the password also opens, a set that takes its last key is
+/// followed only when a holder of the current vault key made it.
+#[tokio::test]
+async fn with_the_password_a_forged_removal_of_the_last_key_is_not_followed() {
+    let kek = silentsilo_crypto::generate_content_kek();
+    let dek = generate_dek();
+    let dir = tempfile::tempdir().unwrap();
+    let client = store(&dir);
+    let only = StoredFidoKeys {
+        keys: vec![credential("aa11", 0)],
+    };
+    publish_key_envelopes(&client as &dyn ObjectStore, &only, true)
+        .await
+        .unwrap();
+
+    // Someone who once held the content key, and no vault key, seals one.
+    let mut forger = only.clone();
+    forger.keys[0].revoked = true;
+    reconcile_key_envelopes(&client, &kek, &mut forger, 5, &Default::default())
+        .await
+        .unwrap();
+    let marks = revocation_marks_proven(&client, &kek, &dek).await.unwrap();
+    assert!(marks.all.contains("aa11") && marks.proven.is_empty());
+
+    let mut here = only.clone();
+    let outcome = reconcile_key_envelopes_with(&client, &kek, &dek, &mut here, 6, &marks, true)
+        .await
+        .unwrap();
+    assert!(outcome.revoked.is_empty(), "{outcome:?}");
+    assert!(!here.keys[0].revoked);
+
+    // The owner removes it for real on a device with the vault key: the
+    // marker is written over with a proof, and this device follows.
+    let mut owner = only.clone();
+    owner.keys[0].revoked = true;
+    reconcile_key_envelopes_with(
+        &client,
+        &kek,
+        &dek,
+        &mut owner,
+        7,
+        &Default::default(),
+        true,
+    )
+    .await
+    .unwrap();
+    let marks = revocation_marks_proven(&client, &kek, &dek).await.unwrap();
+    assert!(marks.proven.contains("aa11"));
+    let outcome = reconcile_key_envelopes_with(&client, &kek, &dek, &mut here, 8, &marks, true)
+        .await
+        .unwrap();
+    assert_eq!(outcome.revoked, vec!["aa11".to_string()]);
+
+    // A proof made with another vault key proves nothing here.
+    let other = generate_dek();
+    let marks = revocation_marks_proven(&client, &kek, &other)
+        .await
+        .unwrap();
+    assert!(marks.proven.is_empty());
 }

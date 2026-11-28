@@ -85,7 +85,11 @@ and after a rotation it still opens the inbox keys (`inbox/keys/`), so items
 phones send afterwards, and the sender records and revocation markers, which
 it could also write. A client refuses to follow revocation markers that would
 leave no key at all, so a forged set cannot lock every device out; it can
-still remove some keys, or register a sender. Moving these under a key that
+still remove some keys, or register a sender. On a device the unlock
+password also opens, a set that takes the last key is followed only when
+every marker in it carries a proof under the current vault key (from core
+1.12, a tag earlier readers skip): a forged set would otherwise swap every
+key for a typed password. Moving these under a key that
 rotates is a format change and is not done in v1. The same holder still
 reads a personal activity log, whose private key is wrapped under the KEK,
 and can tag activity segments. The activity log's policy is the exception:
@@ -535,7 +539,15 @@ activity log. On a device with a usable key, those changes still ask for the
 key, not the password. Removing the password stops new devices from joining
 with it, but a copy of the old envelope (a versioned bucket, a provider's
 history) still opens the vault key it wrapped; if the password may have
-leaked, rotate the vault key.
+leaked, rotate the vault key and choose a new password. A rotation that
+keeps the same password lets in again whoever knows it.
+
+The password is normalised to NFC before the KDF. A character that shows
+nothing (a zero-width space, a direction mark, a soft hyphen) or that passes
+for a space (a non-breaking space, an ideographic space) is refused when
+the password is set: typed on one keyboard and not another, it would make
+the password fail on the next device. The zero-width joiner stays, for
+emoji.
 
 On a silo no key opens on a device, the local DEK envelope (`master.dek.enc`)
 is wrapped under the password's key and the device secret is retired, so an
@@ -898,6 +910,12 @@ Everything that can open the vault is wiped when it goes out of scope:
   of its envelope, the recovery code once normalised, the buffers DPAPI
   returns, and the credentials and storage settings as JSON on their way to
   and from the keyring.
+- Inside the cipher and KDF crates: `argon2`, `aes`, `aes-gcm` and `blake3`
+  are built with their `zeroize` feature, so Argon2's H0 and last block
+  (either gives the password's key for one pass) and the AES round keys
+  (the first two are the key itself) are wiped when they are dropped.
+- The unlock password, as typed, normalised and estimated, in buffers sized
+  up front so none is left behind when one grows.
 - What SQLite and SQLCipher allocate: `cipher_memory_security` is on, so
   SQLCipher wipes every allocation it frees (the in-memory database, the page
   cache, the SQL text a key pragma is sent as) and asks the system to keep
@@ -916,7 +934,11 @@ deciding to remove it.
 
 What is not covered: plaintext chunk buffers are dropped after write without
 an explicit wipe, strings the keyring crate and the platform APIs copy are
-theirs, and no platform here guarantees the pages never reached swap.
+theirs, and no platform here guarantees the pages never reached swap. The
+unlock password also passes through copies nobody here can wipe: the app's
+web view and the IPC message that carries it to Rust, and the pieces the
+strength estimate (zxcvbn) cuts it into. The extraction tool reads it
+through the standard input's buffer, which lives as long as the process.
 
 Zeroization is a hardening measure against memory disclosure, not a defence
 against code running as the user: see [Malware on the user's

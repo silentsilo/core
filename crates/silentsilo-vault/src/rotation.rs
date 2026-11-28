@@ -67,6 +67,18 @@ pub fn commit_rotation_with_password(
     recovery: Option<&crate::RecoveryEnvelope>,
     password: Option<&crate::password::PasswordEnvelope>,
 ) -> Result<(), VaultError> {
+    // Dropped where no key opens the silo: only the recovery code would.
+    if password.is_none() && crate::password::has_unlock_password(root) && !keys.opens_here() {
+        return Err(VaultError::Corrupted(
+            "no key opens this silo here: the key change has to keep the password".into(),
+        ));
+    }
+    // Lighter than this build seals with: not one it made.
+    if password.is_some_and(|envelope| !envelope.meets_kdf_floor()) {
+        return Err(VaultError::Corrupted(
+            "the password sealed for the key change is too light".into(),
+        ));
+    }
     match password {
         Some(envelope) => {
             let json = serde_json::to_vec_pretty(envelope)
@@ -77,7 +89,7 @@ pub fn commit_rotation_with_password(
             let _ = std::fs::remove_file(staged_password_path(root));
         }
     }
-    commit_rotation_with(root, keys, authority, recovery)?;
+    commit_staged(root, keys, authority, recovery)?;
     match password {
         Some(envelope) => {
             if !keys.opens_here()
@@ -106,6 +118,22 @@ pub fn commit_rotation_with_password(
 /// crash anywhere in them is finished by [`finish_interrupted_commit`], which
 /// needs no key. A crash before it leaves the silo as it was, still pending.
 pub fn commit_rotation_with(
+    root: &Path,
+    keys: &crate::StoredFidoKeys,
+    authority: crate::Authority<'_>,
+    recovery: Option<&crate::RecoveryEnvelope>,
+) -> Result<(), VaultError> {
+    // The password is what opens this silo here, and this leaves it under
+    // the old key: only the recovery code would open it after.
+    if crate::password::has_unlock_password(root) && !keys.opens_here() {
+        return Err(VaultError::Corrupted(
+            "this silo opens here with its password: the key change has to carry it".into(),
+        ));
+    }
+    commit_staged(root, keys, authority, recovery)
+}
+
+fn commit_staged(
     root: &Path,
     keys: &crate::StoredFidoKeys,
     authority: crate::Authority<'_>,
@@ -985,14 +1013,25 @@ mod tests {
     }
 
     #[test]
-    fn a_rotation_dropping_the_password_leaves_no_copy_of_it() {
+    fn a_rotation_cannot_drop_the_password_where_no_key_opens_the_silo() {
         let dir = tempfile::tempdir().unwrap();
         let (old, kek) = password_silo(dir.path());
         stage_rotation(dir.path(), &generate_dek(), &kek, &old).unwrap();
         let empty = crate::StoredFidoKeys { keys: Vec::new() };
-        commit_rotation_with_password(dir.path(), &empty, crate::Authority::Machine, None, None)
-            .unwrap();
-        assert!(!crate::password::has_unlock_password(dir.path()));
+        assert!(
+            commit_rotation_with_password(
+                dir.path(),
+                &empty,
+                crate::Authority::Machine,
+                None,
+                None
+            )
+            .is_err()
+        );
+        // Nor through the call that knows nothing of passwords.
+        assert!(commit_rotation_with(dir.path(), &empty, crate::Authority::Machine, None).is_err());
+        assert!(rotation_pending(dir.path()), "nothing moved");
+        assert_eq!(opens_with_password(dir.path()).as_bytes(), old.as_bytes());
     }
 
     #[test]

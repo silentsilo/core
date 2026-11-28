@@ -97,7 +97,16 @@ pub async fn ensure_password_envelope(
             if held == *envelope {
                 return Ok(false);
             }
-            if held.is_newer_than(envelope) && adoptable(&held, kek, dek, now()) {
+            // Newer and made on the current vault key: left alone even when
+            // dated ahead of this clock, which is how this device sees every
+            // later change when its own clock is behind. Written over, the
+            // old password would keep coming back. One dated further ahead
+            // than any clock drifts is a device's error and is written over.
+            if held.is_newer_than(envelope)
+                && held.is_authentic_now(kek, dek)
+                && held.meets_kdf_floor()
+                && held.created_at <= now().saturating_add(HOLD_AHEAD_SECS)
+            {
                 return Ok(false);
             }
         }
@@ -122,6 +131,9 @@ pub struct PasswordSettlement {
     /// This device now holds an envelope another device made: a password set
     /// or changed elsewhere.
     pub adopted: bool,
+    /// The one adopted is this device's first: a password set elsewhere on a
+    /// silo that had none here, not a change.
+    pub first: bool,
     /// The password this device held was dropped because a marker says it
     /// was removed. A former holder of the KEK can write one, so the caller
     /// tells the user.
@@ -145,6 +157,11 @@ pub struct PasswordSettlement {
 /// date one past every later change.
 pub const ENVELOPE_AHEAD_SECS: i64 = 13 * 3600;
 
+/// How far ahead of this clock a newer envelope in a target is left there
+/// rather than written over: a clock that is behind sees every later change
+/// as ahead of it.
+pub const HOLD_AHEAD_SECS: i64 = 30 * 86_400;
+
 /// How far ahead a removal marker may be dated and still count, and the
 /// most this device dates one ahead. Under the envelope limit, so a
 /// password set right after a removal is never born covered by it.
@@ -164,7 +181,7 @@ pub fn date_ceiling() -> i64 {
 
 /// An envelope worth adopting: made on the current vault key, at the
 /// parameters this build seals with or heavier, not dated past the limit.
-fn adoptable(envelope: &PasswordEnvelope, kek: &ContentKek, dek: &MasterDek, now: i64) -> bool {
+pub fn adoptable(envelope: &PasswordEnvelope, kek: &ContentKek, dek: &MasterDek, now: i64) -> bool {
     envelope.is_authentic_now(kek, dek)
         && envelope.meets_kdf_floor()
         && envelope.created_at <= now.saturating_add(ENVELOPE_AHEAD_SECS)
@@ -180,6 +197,23 @@ pub async fn password_removed_at(
     Ok(revoked_at(client, kek, PASSWORD_MARKER_ID)
         .await?
         .filter(|at| *at <= limit))
+}
+
+/// The removal marker as a store holds it, fetched before the KEK is known.
+pub async fn removal_marker_bytes(client: &dyn ObjectStore) -> Result<Option<Vec<u8>>, SyncError> {
+    crate::key_sync::marker_bytes(client, PASSWORD_MARKER_ID).await
+}
+
+/// When the password was removed, from a marker fetched with
+/// [`removal_marker_bytes`], under the same limits as [`password_removed_at`].
+pub fn removal_marker_date(bytes: &[u8], kek: &ContentKek) -> Option<i64> {
+    let limit = now().saturating_add(MARKER_AHEAD_SECS);
+    crate::key_sync::marker_date(bytes, kek, PASSWORD_MARKER_ID).filter(|at| *at <= limit)
+}
+
+/// The current time, for [`adoptable`].
+pub fn now_secs() -> i64 {
+    now()
 }
 
 /// Brings this device's password envelope in line with storage before a
@@ -225,6 +259,21 @@ pub async fn settle_password_envelope(
         }
     }
     let mut publish = true;
+    // A marker dated further ahead than counts is not followed, but the
+    // envelope it would cover is not published again either: on a device
+    // whose clock is behind, that would put back a password just removed.
+    for (store, _) in targets {
+        if let Some(local) = local.as_ref()
+            && let Ok(Some(bytes)) = removal_marker_bytes(*store).await
+            && let Some(at) =
+                crate::key_sync::marker_date_as_written(&bytes, kek, crate::PASSWORD_MARKER_ID)
+            && at > now.saturating_add(MARKER_AHEAD_SECS)
+            && local.created_at <= at
+        {
+            publish = false;
+            settlement.refused = true;
+        }
+    }
     if let Some(off) = removed_at
         && local.as_ref().is_some_and(|l| l.created_at <= off)
     {
@@ -269,6 +318,7 @@ pub async fn settle_password_envelope(
     if let Some(adopt) = newest
         && save_password_envelope(vault_root, &adopt).is_ok()
     {
+        settlement.first = local.is_none();
         local = Some(adopt);
         settlement.adopted = true;
         settlement.dropped_after_rotation = false;
@@ -348,7 +398,7 @@ pub async fn joinable(
     kek: &ContentKek,
     dek: &MasterDek,
 ) -> Result<bool, SyncError> {
-    if !envelope.is_authentic_now(kek, dek) || !envelope.meets_kdf_floor() {
+    if !adoptable(envelope, kek, dek, now()) {
         return Ok(false);
     }
     Ok(match password_removed_at(store, kek).await? {

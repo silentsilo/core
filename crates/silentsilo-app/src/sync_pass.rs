@@ -125,8 +125,9 @@ pub struct SyncReport {
     /// an old recovery code still opens, so it may not have been the user.
     #[serde(default)]
     pub recovery_turned_off: bool,
-    /// The unlock password changed here because of another device: set or
-    /// changed there (`Adopted`), or removed there, or dropped because a
+    /// The unlock password changed here because of another device: set
+    /// there on a silo that had none here (`Added`), changed there
+    /// (`Adopted`), or removed there, or dropped because a
     /// rotation by a release without passwords left it opening nothing. Or
     /// a removal reached a device no key opens, which keeps the password
     /// (`KeptAfterRemoval`). All but the first are said on screen: a former
@@ -141,6 +142,7 @@ pub struct SyncReport {
 pub enum PasswordChange {
     #[default]
     None,
+    Added,
     Adopted,
     RemovedElsewhere,
     DroppedAfterRotation,
@@ -1258,12 +1260,19 @@ async fn pass(
     // that opens with its device secret: it must not start asking for a
     // key. One the password opens has retired that secret, so it takes the
     // keys added elsewhere, starting from an empty list.
-    let password_here = silentsilo_vault::password::has_unlock_password(&root);
+    // Only an envelope made on the current vault key counts: one planted in
+    // the silo folder would otherwise let markers take this device's last key.
+    let password_here = silentsilo_vault::password::load_password_envelope(&root)
+        .is_ok_and(|envelope| envelope.is_authentic_now(&kek, &dek));
     let local_keys = if silentsilo_vault::is_fido_enrolled(&root) {
         match load_fido_keys(&root) {
             Ok(keys) => Some(keys),
-            // An empty list, which an earlier build wrote on a rotation.
-            Err(_) if password_here => Some(silentsilo_vault::StoredFidoKeys { keys: Vec::new() }),
+            // An empty list, which an earlier build wrote on a rotation. A
+            // file that cannot be read now (held by another program, or
+            // damaged) is left alone: written over, it would lose its keys.
+            Err(silentsilo_vault::VaultError::InvalidCredentials) if password_here => {
+                Some(silentsilo_vault::StoredFidoKeys { keys: Vec::new() })
+            }
             Err(_) => None,
         }
     } else if password_here {
@@ -1274,9 +1283,9 @@ async fn pass(
     if let Some(mut local) = local_keys {
         // Every copy's markers first: one that was unplugged when a key was
         // removed holds its envelope and no marker, and would put it back.
-        let mut marked_anywhere = std::collections::HashSet::new();
+        let mut marked_anywhere = sync::RevocationMarks::default();
         for target in &targets {
-            match sync::revocation_marks(&*target.store, &kek).await {
+            match sync::revocation_marks_proven(&*target.store, &kek, &dek).await {
                 Ok(found) => marked_anywhere.extend(found),
                 Err(e) => host.warn("keys", &format!("{}: {e}", target.label)),
             }
@@ -1286,6 +1295,7 @@ async fn pass(
             match sync::reconcile_key_envelopes_with(
                 &*target.store,
                 &kek,
+                &dek,
                 &mut local,
                 now,
                 &marked_anywhere,
@@ -1401,6 +1411,8 @@ async fn pass(
         PasswordChange::KeptAfterRemoval
     } else if password_settled.dropped_after_rotation {
         PasswordChange::DroppedAfterRotation
+    } else if password_settled.adopted && password_settled.first {
+        PasswordChange::Added
     } else if password_settled.adopted {
         PasswordChange::Adopted
     } else {

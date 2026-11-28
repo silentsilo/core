@@ -50,11 +50,12 @@ pub fn unwrap_dek_bytes(data: &[u8], wrap_key: &[u8; 32]) -> Result<MasterDek, V
     let plain = Zeroizing::new(
         unseal_with_key(data, wrap_key).map_err(|_| VaultError::InvalidCredentials)?,
     );
-    let key: [u8; 32] = plain
-        .as_slice()
-        .try_into()
-        .map_err(|_| VaultError::InvalidCredentials)?;
-    Ok(MasterDek::from_bytes(key))
+    if plain.len() != 32 {
+        return Err(VaultError::InvalidCredentials);
+    }
+    let mut key = Zeroizing::new([0u8; 32]);
+    key.copy_from_slice(&plain);
+    Ok(MasterDek::from_bytes(*key))
 }
 
 pub fn unwrap_dek_hex(wrapped_hex: &str, wrap_key: &[u8; 32]) -> Result<MasterDek, VaultError> {

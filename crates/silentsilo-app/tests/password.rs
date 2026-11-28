@@ -863,9 +863,93 @@ async fn a_locked_device_opens_with_a_password_changed_elsewhere_from_storage() 
     else {
         panic!("no envelope in storage");
     };
-    assert!(open_with_stored_password(b_root.clone(), &stored, PASSWORD, origin.vault_id).is_err());
-    drop(open_with_stored_password(b_root.clone(), &stored, CHANGED, origin.vault_id).unwrap());
+    assert!(
+        open_with_stored_password(b_root.clone(), &stored, PASSWORD, origin.vault_id, None)
+            .is_err()
+    );
+    drop(
+        open_with_stored_password(b_root.clone(), &stored, CHANGED, origin.vault_id, None).unwrap(),
+    );
     // Kept: the new one opens from this device's own copy now.
     assert!(open_with_password(b_root.clone(), CHANGED, origin.vault_id).is_ok());
     assert!(open_with_password(b_root, PASSWORD, origin.vault_id).is_err());
+}
+
+async fn stored_envelope(store: &FolderStore) -> silentsilo_vault::password::PasswordEnvelope {
+    match silentsilo_sync::unlock_password::fetch_password_envelope(store)
+        .await
+        .unwrap()
+    {
+        silentsilo_sync::unlock_password::StoredPassword::Envelope(envelope) => envelope,
+        _ => panic!("no envelope in storage"),
+    }
+}
+
+/// Storage still holds the old password when this device changes it: the
+/// old one, typed out of habit, does not open the silo or undo the change.
+#[tokio::test]
+async fn an_older_password_in_storage_does_not_undo_a_change_made_here() {
+    let origin = origin().await;
+    let store = FolderStore::new(origin.storage.clone());
+    let old = stored_envelope(&store).await;
+    origin.a.set_password(&store, CHANGED).await;
+    origin.a.close();
+
+    let root = origin.a.root().to_path_buf();
+    let err = open_with_stored_password(root.clone(), &old, PASSWORD, origin.vault_id, None)
+        .err()
+        .unwrap();
+    assert!(is_wrong_password(&err), "{err}");
+    assert!(open_with_password(root.clone(), PASSWORD, origin.vault_id).is_err());
+    drop(open_with_password(root, CHANGED, origin.vault_id).unwrap());
+}
+
+/// A removal whose delete failed leaves the envelope in storage: the
+/// marker beside it keeps it from opening a locked device.
+#[tokio::test]
+async fn an_envelope_a_removal_covers_does_not_open_a_locked_device() {
+    let origin = origin().await;
+    let store = FolderStore::new(origin.storage.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let b_root = dir.path().join("joined");
+    drop(join_with_password(&origin, b_root.clone(), PASSWORD).await);
+    let old = stored_envelope(&store).await;
+    let old_bytes = store.get("unlock-password.env").await.unwrap();
+    {
+        let sessions = origin.a.state.sessions.lock().unwrap();
+        enrol_device_key(
+            sessions.get(&origin.vault_id).unwrap(),
+            &key([7; 32], "aa11"),
+        )
+        .unwrap();
+    }
+    let (_, kek) = origin.a.keys();
+    remove_unlock_password(origin.a.root(), &kek, &[(&store, true)], true)
+        .await
+        .unwrap();
+    store.put("unlock-password.env", old_bytes).await.unwrap();
+    // B has lost its own copy, so storage's is all it can try.
+    std::fs::remove_file(b_root.join("keys/unlock-password.json")).unwrap();
+
+    let marker = silentsilo_sync::unlock_password::removal_marker_bytes(&store)
+        .await
+        .unwrap();
+    assert!(marker.is_some(), "the removal left its marker");
+    let err = open_with_stored_password(
+        b_root.clone(),
+        &old,
+        PASSWORD,
+        origin.vault_id,
+        marker.as_deref(),
+    )
+    .err()
+    .unwrap();
+    assert_eq!(
+        english(&err),
+        "The unlock password was removed from this silo. Use the recovery code or a key."
+    );
+    assert!(
+        !b_root.join("keys/unlock-password.json").exists(),
+        "nothing kept"
+    );
 }

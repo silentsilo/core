@@ -360,6 +360,25 @@ pub(crate) async fn read_capped(
     Ok(bytes)
 }
 
+/// The first `len` bytes of a download. A server that ignores the range
+/// and sends the whole object is read only that far.
+pub(crate) async fn read_prefix(
+    mut response: Response,
+    len: u64,
+    name: &str,
+) -> Result<Vec<u8>, StoreError> {
+    let len = usize::try_from(len).unwrap_or(usize::MAX);
+    let mut bytes = Vec::new();
+    while bytes.len() < len {
+        let Some(chunk) = response.chunk().await.map_err(|e| transport(name, &e))? else {
+            break;
+        };
+        bytes.extend_from_slice(&chunk);
+    }
+    bytes.truncate(len);
+    Ok(bytes)
+}
+
 /// Writes a download to `dest` through a `.part` file, reporting each chunk.
 /// A stop or a failure removes the partial file: a caller renames what it
 /// fetched into the blob cache, and a short file there is a file that will
@@ -450,5 +469,16 @@ mod tests {
                 .map(|b| b.len()),
             Some(1000)
         );
+    }
+
+    #[tokio::test]
+    async fn a_prefix_is_read_only_as_far_as_asked() {
+        // A server that ignores the range and sends 8 MiB.
+        let bytes = read_prefix(answer_of(8 << 20).await, 64, "test")
+            .await
+            .unwrap();
+        assert_eq!(bytes.len(), 64);
+        let short = read_prefix(answer_of(10).await, 64, "test").await.unwrap();
+        assert_eq!(short.len(), 10);
     }
 }

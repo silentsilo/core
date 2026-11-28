@@ -32,9 +32,10 @@ pub mod inbox;
 mod key_sync;
 pub use error::SyncError;
 pub use key_sync::{
-    KeyReconcile, PASSWORD_MARKER_ID, RECOVERY_MARKER_ID, REVOKED_PREFIX, is_key_revoked,
-    mark_password_removed, mark_recovery_disabled, plausible_credential_id,
-    reconcile_key_envelopes, reconcile_key_envelopes_with, revocation_marks, revoked_at,
+    KeyReconcile, PASSWORD_MARKER_ID, RECOVERY_MARKER_ID, REVOKED_PREFIX, RevocationMarks,
+    is_key_revoked, mark_password_removed, mark_recovery_disabled, plausible_credential_id,
+    reconcile_key_envelopes, reconcile_key_envelopes_with, revocation_marks,
+    revocation_marks_proven, revoked_at,
 };
 pub mod unlock_password;
 

@@ -13,7 +13,7 @@ use reqwest::{Method, StatusCode};
 use silentsilo_store::{CloudConfig, ObjectStore, Progress, StoreError, StoredObject};
 
 use crate::TokenSource;
-use crate::http::{Http, read_at, stream_to_file, transport, trusted_address};
+use crate::http::{Http, read_at, read_prefix, stream_to_file, transport, trusted_address};
 
 const GRAPH: &str = "https://graph.microsoft.com/v1.0";
 /// At or under this, one PUT; over it, an upload session.
@@ -429,14 +429,7 @@ impl ObjectStore for OneDriveStore {
                 .ok_or_else(|| StoreError::NotFound(key.to_string()))?;
             return Ok(Vec::new());
         }
-        let response = self.download(key, Some(len)).await?;
-        let mut bytes = response
-            .bytes()
-            .await
-            .map_err(|e| transport("OneDrive", &e))?
-            .to_vec();
-        bytes.truncate(len as usize);
-        Ok(bytes)
+        read_prefix(self.download(key, Some(len)).await?, len, "OneDrive").await
     }
 
     async fn put_from_file(&self, key: &str, path: &Path) -> Result<(), StoreError> {

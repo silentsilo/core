@@ -410,6 +410,88 @@ reconciles_keys_past_the_password_marker!(
     "1.11.8"
 );
 
+/// A key removed by this build leaves a marker with a proof under the vault
+/// key. An older release reads the marker as it always did and follows it.
+macro_rules! follows_a_removal_whose_marker_carries_a_proof {
+    ($name:ident, $store:ident, $sync:ident, $vault:ident, $label:literal) => {
+        #[tokio::test]
+        async fn $name() {
+            use $store as store_old;
+            use $sync as sync_old;
+            use $vault as vault_old;
+
+            let (_dir, root) = rich_with_password().await;
+            let (dek, kek) = open_with_code(&root).await;
+            let new = store(&root);
+            let mut removing = silentsilo_vault::StoredFidoKeys {
+                keys: silentsilo_sync::fetch_key_envelopes(&*new).await.unwrap(),
+            };
+            assert!(removing.keys.len() >= 2, "the rich fixture has two keys");
+            let gone = removing.keys[0].credential_id.clone();
+            removing.keys[0].revoked = true;
+            silentsilo_sync::reconcile_key_envelopes_with(
+                &*new,
+                &kek,
+                &dek,
+                &mut removing,
+                5,
+                &Default::default(),
+                false,
+            )
+            .await
+            .unwrap();
+            let marks = silentsilo_sync::revocation_marks_proven(&*new, &kek, &dek)
+                .await
+                .unwrap();
+            assert!(marks.proven.contains(&gone), "written with its proof");
+
+            let old: Box<dyn store_old::ObjectStore> = store_old::StoreConfig::Folder {
+                path: store_dir(&root),
+            }
+            .open()
+            .unwrap();
+            let old_kek = vault_old::unwrap_kek_bytes(
+                &sync_old::fetch_content_kek(&*old).await.unwrap().unwrap(),
+                &vault_old::unwrap_with_code(
+                    &sync_old::fetch_recovery_envelope(&*old)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    FIXTURE_CODE,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let old_marks = sync_old::revocation_marks(&*old, &old_kek).await.unwrap();
+            assert!(old_marks.contains(&gone), "{}: marker unread", $label);
+            let mut local = vault_old::StoredFidoKeys {
+                keys: sync_old::fetch_key_envelopes(&*old).await.unwrap(),
+            };
+            assert!(local.keys.iter().any(|k| k.credential_id == gone));
+            let outcome =
+                sync_old::reconcile_key_envelopes(&*old, &old_kek, &mut local, 0, &old_marks)
+                    .await
+                    .unwrap_or_else(|e| panic!("{}: reconcile failed: {e}", $label));
+            assert_eq!(outcome.revoked, vec![gone], "{}", $label);
+        }
+    };
+}
+
+follows_a_removal_whose_marker_carries_a_proof!(
+    core_1_10_4_follows_a_removal_whose_marker_carries_a_proof,
+    silentsilo_store_v1_10_4,
+    silentsilo_sync_v1_10_4,
+    silentsilo_vault_v1_10_4,
+    "1.10.4"
+);
+follows_a_removal_whose_marker_carries_a_proof!(
+    core_1_11_8_follows_a_removal_whose_marker_carries_a_proof,
+    silentsilo_store_v1_11_8,
+    silentsilo_sync_v1_11_8,
+    silentsilo_vault_v1_11_8,
+    "1.11.8"
+);
+
 /// A silo folder this build put under the password, opened by 1.11.8 on the
 /// same machine (a downgrade): the device secret opens nothing, so it never
 /// reads the silo as something else; the recovery code still opens it, and

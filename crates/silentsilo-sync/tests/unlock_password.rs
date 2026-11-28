@@ -559,9 +559,11 @@ async fn a_planted_envelope_dated_far_ahead_does_not_move_the_date_floor() {
 }
 
 #[tokio::test]
-async fn an_envelope_dated_far_ahead_is_not_adopted_and_is_written_over() {
-    // Made on a device whose clock ran days fast. Adopted, it would outrank
-    // every later change and survive every removal.
+async fn an_envelope_dated_ahead_is_not_adopted_and_not_written_over() {
+    // Dated days ahead of this clock: made by a device whose clock runs
+    // fast, or, as this device sees it, a later change seen by a device
+    // whose clock is behind. Adopted, a fast clock's would outrank every
+    // later change; written over, the old password would come back.
     let silo = Silo::new();
     let mine = silo.envelope(now());
     save_password_envelope(&silo.root, &mine).unwrap();
@@ -572,6 +574,16 @@ async fn an_envelope_dated_far_ahead_is_not_adopted_and_is_written_over() {
     assert!(!settled.adopted);
     assert!(settled.refused);
     assert_eq!(settled.envelope.as_ref().unwrap().id, mine.id);
+    assert!(
+        !ensure_password_envelope(&silo.store, &mine, &silo.kek, &silo.dek)
+            .await
+            .unwrap()
+    );
+    assert_eq!(id_of(silo.stored().await), Some(ahead.id));
+
+    // Further ahead than any clock drifts: a device's error, written over.
+    let wild = silo.envelope(now() + 400 * 86_400);
+    push_password_envelope(&silo.store, &wild).await.unwrap();
     assert!(
         ensure_password_envelope(&silo.store, &mine, &silo.kek, &silo.dek)
             .await
@@ -607,7 +619,11 @@ async fn a_marker_dated_far_ahead_kills_nothing() {
         .unwrap();
     let settled = silo.settle().await;
     assert!(!settled.removed_elsewhere);
-    assert_eq!(settled.envelope.unwrap().id, mine.id);
+    assert!(has_unlock_password(&silo.root), "kept here");
+    // Not published again either: on a device whose clock is behind, this
+    // is a removal made a moment ago.
+    assert!(settled.envelope.is_none());
+    assert!(settled.refused);
 }
 
 #[tokio::test]
@@ -738,4 +754,20 @@ async fn a_copy_that_took_no_marker_keeps_its_envelope() {
         fetch_password_envelope(&plain).await.unwrap(),
         StoredPassword::Envelope(_)
     ));
+}
+
+#[tokio::test]
+async fn a_password_set_elsewhere_on_a_silo_without_one_here_is_said_as_first() {
+    let silo = Silo::new();
+    push_password_envelope(&silo.store, &silo.envelope(now() - 10))
+        .await
+        .unwrap();
+    let settled = silo.settle().await;
+    assert!(settled.adopted && settled.first);
+    // A change after it is a change.
+    push_password_envelope(&silo.store, &silo.envelope(now()))
+        .await
+        .unwrap();
+    let settled = silo.settle().await;
+    assert!(settled.adopted && !settled.first);
 }

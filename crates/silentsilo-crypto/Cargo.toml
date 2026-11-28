@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 aes-gcm = { workspace = true }
+aes = { workspace = true }
 blake3 = { workspace = true }
 rand = { workspace = true }
 zeroize = { workspace = true }

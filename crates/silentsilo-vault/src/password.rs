@@ -219,12 +219,38 @@ fn check_version(envelope: &PasswordEnvelope) -> Result<(), VaultError> {
 /// Mac (which tends to NFD) and on Windows derives the same key. Nothing is
 /// trimmed: a space is part of what was typed.
 fn normalized(password: &str) -> zeroize::Zeroizing<String> {
-    zeroize::Zeroizing::new(password.nfc().collect())
+    // Sized up front: a String that grows leaves its old buffers unwiped.
+    // NFC expands a character to at most three.
+    let mut out = zeroize::Zeroizing::new(String::with_capacity(password.len() * 3));
+    out.extend(password.nfc());
+    out
+}
+
+/// Characters that show nothing or pass for a plain space: pasted in, or
+/// typed by one keyboard and not another, they make the password fail on the
+/// next device. The zero-width joiner stays, for emoji.
+fn invisible(c: char) -> bool {
+    (c.is_whitespace() && c != ' ')
+        || matches!(
+            c,
+            '\u{AD}'
+                | '\u{61C}'
+                | '\u{180E}'
+                | '\u{200B}'
+                | '\u{200C}'
+                | '\u{200E}'
+                | '\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{206F}'
+                | '\u{FEFF}'
+                | '\u{FFF9}'..='\u{FFFB}'
+        )
 }
 
 /// Refuses what is never sealed, whatever its strength: empty, too long,
 /// space at either end (almost always a paste or a typo nobody can see),
-/// or a control character.
+/// a control character, or one that shows nothing or passes for a space.
 pub fn check_password_shape(password: &str) -> Result<(), VaultError> {
     let chars = password.chars().count();
     if chars == 0
@@ -232,6 +258,7 @@ pub fn check_password_shape(password: &str) -> Result<(), VaultError> {
         || password.starts_with(char::is_whitespace)
         || password.ends_with(char::is_whitespace)
         || password.chars().any(char::is_control)
+        || password.chars().any(invisible)
     {
         return Err(VaultError::PasswordMalformed);
     }
@@ -243,8 +270,8 @@ pub fn check_password_shape(password: &str) -> Result<(), VaultError> {
 /// labels. "silentsilo" is always among them.
 pub fn assess_password(password: &str, user_inputs: &[&str]) -> PasswordAssessment {
     let password = normalized(password);
-    let estimated: String = password.chars().take(MAX_ESTIMATED_CHARS).collect();
-    let estimated = zeroize::Zeroizing::new(estimated);
+    let mut estimated = zeroize::Zeroizing::new(String::with_capacity(password.len()));
+    estimated.extend(password.chars().take(MAX_ESTIMATED_CHARS));
     // Each input whole, without its spaces, and word by word: "Familia
     // Popescu" is typed as "FamiliaPopescu" as often as not.
     let mut owned: Vec<String> = vec!["silentsilo".into()];
@@ -553,6 +580,11 @@ mod tests {
             "lantern-gravel-oxidize-tuba-sprinkle ",
             "lantern-gravel\noxidize-tuba-sprinkle",
             "lantern-gravel\u{7}oxidize-tuba-sprinkle",
+            "lantern-gravel\u{A0}oxidize-tuba-sprinkle",
+            "lantern-gravel\u{200B}oxidize-tuba-sprinkle",
+            "lantern-gravel\u{202E}oxidize-tuba-sprinkle",
+            "lantern-gravel\u{3000}oxidize-tuba-sprinkle",
+            "lantern-gravel\u{FEFF}oxidize-tuba-sprinkle",
             long.as_str(),
         ] {
             let err = seal_under_password(
@@ -570,6 +602,7 @@ mod tests {
             );
         }
         assert!(check_password_shape("inner spaces are fine here").is_ok());
+        assert!(check_password_shape("family \u{1F468}\u{200D}\u{1F469} emoji").is_ok());
     }
 
     #[test]

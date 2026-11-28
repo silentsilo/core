@@ -24,7 +24,7 @@ use reqwest::{Method, Response, StatusCode};
 use silentsilo_store::{CloudConfig, ObjectStore, Progress, StoreError, StoredObject};
 
 use crate::TokenSource;
-use crate::http::{Http, read_at, stream_to_file, transport, trusted_address};
+use crate::http::{Http, read_at, read_prefix, stream_to_file, transport, trusted_address};
 
 const API: &str = "https://www.googleapis.com/drive/v3";
 const UPLOAD: &str = "https://www.googleapis.com/upload/drive/v3";
@@ -840,15 +840,7 @@ impl ObjectStore for GoogleDriveStore {
                 .ok_or_else(|| StoreError::NotFound(key.to_string()))?;
             return Ok(Vec::new());
         }
-        let mut bytes = self
-            .download(key, Some(len))
-            .await?
-            .bytes()
-            .await
-            .map_err(|e| transport("Google Drive", &e))?
-            .to_vec();
-        bytes.truncate(len as usize);
-        Ok(bytes)
+        read_prefix(self.download(key, Some(len)).await?, len, "Google Drive").await
     }
 
     async fn put_from_file(&self, key: &str, path: &Path) -> Result<(), StoreError> {

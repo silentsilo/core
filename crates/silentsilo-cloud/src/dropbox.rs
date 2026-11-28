@@ -12,7 +12,7 @@ use reqwest::{Method, Response, StatusCode};
 use silentsilo_store::{CloudConfig, ObjectStore, Progress, StoreError, StoredObject};
 
 use crate::TokenSource;
-use crate::http::{Http, read_at, stream_to_file, transport};
+use crate::http::{Http, read_at, read_prefix, stream_to_file, transport};
 
 const API: &str = "https://api.dropboxapi.com/2";
 const CONTENT: &str = "https://content.dropboxapi.com/2";
@@ -405,15 +405,7 @@ impl ObjectStore for DropboxStore {
                 .ok_or_else(|| StoreError::NotFound(key.to_string()))?;
             return Ok(Vec::new());
         }
-        let mut bytes = self
-            .download(key, Some(len))
-            .await?
-            .bytes()
-            .await
-            .map_err(|e| transport("Dropbox", &e))?
-            .to_vec();
-        bytes.truncate(len as usize);
-        Ok(bytes)
+        read_prefix(self.download(key, Some(len)).await?, len, "Dropbox").await
     }
 
     async fn put_from_file(&self, key: &str, path: &Path) -> Result<(), StoreError> {

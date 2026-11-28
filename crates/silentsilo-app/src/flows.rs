@@ -515,7 +515,7 @@ pub async fn password_join_begin(
         Ok(kek) => kek,
         Err(_) => return Err(kek_refusal(store, &dek).await),
     };
-    if !envelope.is_authentic_now(&kek, &dek) {
+    if !sync::unlock_password::adoptable(&envelope, &kek, &dek, sync::unlock_password::now_secs()) {
         return Err(password_not_of_silo());
     }
     if let Some(off) = sync::unlock_password::password_removed_at(store, &kek)
@@ -562,16 +562,45 @@ pub fn open_with_password(
 /// [`open_with_password`] with the envelope a copy holds, for a password
 /// changed on another device since this one last synced. Kept as this
 /// device's copy once it opened the silo and its tag is the silo's.
+///
+/// `removal_marker` is that store's removal marker, if it has one
+/// ([`sync::unlock_password::removal_marker_bytes`]). The copy is taken only
+/// when it is newer than the one this device holds, so a password changed
+/// here and not yet published is not undone by the old one, and never when
+/// a removal covers it.
 pub fn open_with_stored_password(
     root: PathBuf,
     envelope: &PasswordEnvelope,
     password: &str,
     expected_vault_id: Uuid,
+    removal_marker: Option<&[u8]>,
 ) -> Result<(VaultSession, VaultMeta), String> {
     if !envelope.meets_kdf_floor() {
         return Err(password_not_of_silo());
     }
-    let opened = open_with(root, envelope, password, expected_vault_id)?;
+    if let Ok(local) = load_password_envelope(&root)
+        && !envelope.is_newer_than(&local)
+    {
+        return Err(password_refused(
+            silentsilo_vault::VaultError::InvalidCredentials,
+        ));
+    }
+    let (dek, kek) = verified_dek(&root, envelope, password)?;
+    if !sync::unlock_password::adoptable(envelope, &kek, &dek, sync::unlock_password::now_secs()) {
+        return Err(password_not_of_silo());
+    }
+    if let Some(off) =
+        removal_marker.and_then(|bytes| sync::unlock_password::removal_marker_date(bytes, &kek))
+        && envelope.created_at <= off
+    {
+        return Err(silentsilo_core::coded!(
+            "err.password_removed",
+            "The unlock password was removed from this silo. Use the recovery code or a key."
+        )
+        .into());
+    }
+    drop(kek);
+    let opened = open_verified(root, dek, expected_vault_id)?;
     let root = &opened.0.paths.root;
     save_password_envelope(root, envelope).map_err(|e| e.to_string())?;
     if !key_opens_here(root) {
@@ -592,13 +621,33 @@ fn open_with(
     password: &str,
     expected_vault_id: Uuid,
 ) -> Result<(VaultSession, VaultMeta), String> {
+    let (dek, _) = verified_dek(&root, envelope, password)?;
+    open_verified(root, dek, expected_vault_id)
+}
+
+/// The vault key `envelope` gives for `password`, with the content key it
+/// opens, once its tags check out. Nothing is opened yet: whoever can write
+/// the silo folder cannot make the tag, and a forged envelope must not reach
+/// the working copy.
+fn verified_dek(
+    root: &Path,
+    envelope: &PasswordEnvelope,
+    password: &str,
+) -> Result<(MasterDek, silentsilo_crypto::ContentKek), String> {
     let dek = unwrap_with_password(envelope, password).map_err(password_refused)?;
-    let session = VaultSession::open_with_dek(root, dek).map_err(|e| e.to_string())?;
-    // The copy in the silo folder is held to the same rule as storage's:
-    // whoever can write there cannot make the tag.
-    if !envelope.is_authentic_now(&session.kek, &session.dek) {
+    let kek = silentsilo_vault::load_kek(root, &dek).map_err(|_| password_not_of_silo())?;
+    if !envelope.is_authentic_now(&kek, &dek) {
         return Err(password_not_of_silo());
     }
+    Ok((dek, kek))
+}
+
+fn open_verified(
+    root: PathBuf,
+    dek: MasterDek,
+    expected_vault_id: Uuid,
+) -> Result<(VaultSession, VaultMeta), String> {
+    let session = VaultSession::open_with_dek(root, dek).map_err(|e| e.to_string())?;
     if session.vault_id != expected_vault_id {
         return Err(silentsilo_core::coded!(
             "err.password_other_silo",

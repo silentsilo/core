@@ -304,7 +304,9 @@ So the rule for anything reading these:
   sync pass, before it publishes, reads `keys/`: an envelope for a key this
   device has never had is added to its `keys/fido.json`, and a revocation
   marker `keys/revoked/<credential_id>.sealed` (JSON `version`,
-  `credential_id`, `revoked_at`, sealed under the content KEK) turns a key
+  `credential_id`, `revoked_at`, sealed under the content KEK; from core
+  1.12 also `proof`, a tag under the vault key of the device that revoked,
+  which earlier readers skip) turns a key
   this device still has into a tombstone, so it is not published again. A
   device that revokes writes the marker before it deletes the envelope.
   From core 1.10.0 it keeps the tombstone for good: dropped once the marker
@@ -325,7 +327,10 @@ So the rule for anything reading these:
   this device no confirmed key it can use are not followed, so a former
   holder of the content key cannot plant one envelope, mark every real key
   and lock every device out. A release that does not know the field drops
-  it on save, which only makes the key count again. A recovery marker dated
+  it on save, which only makes the key count again. On a device the unlock
+  password opens (core 1.12), a set that takes the last key is followed
+  when every marker in it has a `proof` made with the current vault key;
+  a device that revokes writes its marker over one without. A recovery marker dated
   more than a day ahead of the device's clock is ignored for the same
   reason: it would kill every code made from then on.
 - **A rotation leaves a proof** (core 1.10.0) before it re-seals anything:

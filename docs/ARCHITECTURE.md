@@ -377,14 +377,31 @@ format and the tests on older releases.
 - A silo with a password takes the keys other devices add even without a
   keys file, starting from an empty list, and follows a key removed
   elsewhere even when it was this device's last: the password stays a way
-  in (`reconcile_key_envelopes_with`). An empty keys file is never written;
-  it reads as broken.
+  in (`reconcile_key_envelopes_with`). Only for markers that carry a proof
+  under the current vault key, though: the content key they are sealed
+  under never rotates, and a forged set would swap every key for a typed
+  password. "A password here" is an envelope in the silo folder that passes
+  its tags, so one planted there counts for nothing. An empty keys file is
+  never written; it reads as broken. One that cannot be read is left alone,
+  not taken for empty.
 - The pass settles the password after the recovery code and before the
   records, and publishes it after them. Nothing there fails the pass: a copy
   that refuses the envelope still takes the records.
 - Only an envelope carrying `auth_dek`, which only a holder of the current
   vault key can make, is adopted, joined with or opened with, the copy in
-  the silo folder included.
+  the silo folder included, and its tags are checked before a session
+  opens. A locked device that tries the copy in storage
+  (`open_with_stored_password`) takes it only when it is newer than its own
+  and no removal marker on that store covers it.
+- Dates: an envelope dated more than 13 hours ahead is not adopted or joined
+  with; one dated ahead but within 30 days (`HOLD_AHEAD_SECS`) is not written
+  over either, since a device whose clock is behind sees every later change
+  that way. A removal marker dated ahead is not followed, and the envelope it
+  would cover is not published again.
+- A key change on a silo the password opens here must carry the password
+  (`commit_rotation_with` refuses otherwise, and
+  `commit_rotation_with_password` refuses to drop it): after it, only the
+  recovery code would open the silo here.
 - On an organisation's silo a password needs the touch of one of its keys
   (`Authority::Organisation`): it is a way in the organisation did not hand
   out.

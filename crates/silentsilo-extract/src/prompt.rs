@@ -65,7 +65,8 @@ Press Enter to close this window."
 }
 
 fn first_line(input: &mut impl BufRead, what: &str) -> Result<Zeroizing<String>, String> {
-    let mut line = Zeroizing::new(String::new());
+    // Sized up front: a String that grows leaves its old buffers unwiped.
+    let mut line = Zeroizing::new(String::with_capacity(4096));
     input
         .read_line(&mut line)
         .map_err(|e| format!("Could not read the {what}: {e}"))?;
