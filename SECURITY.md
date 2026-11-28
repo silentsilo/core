@@ -47,6 +47,15 @@ Reports of that are documentation bugs if the docs overstate it, not
 security issues. What holds is the organisation's own copy; see the
 desktop repository's `docs/ORGANISATIONS.md`.
 
+The unlock password, on a silo whose owner set one: anyone holding the
+backup can try passwords against its envelope offline, without limit and
+without the owner knowing, at the cost [`docs/CRYPTO.md`](docs/CRYPTO.md)
+gives (Argon2id at 256 MiB). That is the documented cost of choosing a
+password over a key, not a vulnerability. A way to test a guess for less
+than that, or to open the envelope without the password, is. The minimum
+strength is checked by the clients, so a modified build can store a weaker
+password for its own user.
+
 [`FORMATS.md`](FORMATS.md) lists every persisted format with its version and
 what an older build does when it meets a newer one. A format change that could
 leave a vault unopenable is treated as a security issue, not a compatibility
